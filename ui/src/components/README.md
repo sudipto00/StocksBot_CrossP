@@ -1,5 +1,4 @@
-"""
-Reusable components directory.
+# Reusable Components
 
 TODO: Create reusable components
 - Chart components
@@ -7,4 +6,3 @@ TODO: Create reusable components
 - Table components
 - Modal components
 - Button components
-"""
