@@ -275,6 +275,63 @@ export async function getPortfolio() {
 - Run `cargo build` in `src-tauri/` to see detailed errors
 - Check Rust version: `rustc --version` (requires 1.70+)
 
+## Running Trading Strategies
+
+### Strategy Development
+
+StocksBot has a plugin-based strategy system. See [STRATEGIES.md](./STRATEGIES.md) for complete documentation.
+
+**Quick Start:**
+
+1. **Create a strategy:**
+```python
+from engine.strategy_interface import StrategyInterface, Signal
+
+class MyStrategy(StrategyInterface):
+    def on_start(self):
+        self.is_running = True
+    
+    def on_tick(self, market_data):
+        # Your strategy logic here
+        return []  # Return list of signals
+    
+    def on_stop(self):
+        self.is_running = False
+```
+
+2. **Run the strategy:**
+```python
+from engine import StrategyRunner
+from services.broker import PaperBroker
+
+# Setup
+broker = PaperBroker(starting_balance=100000.0)
+runner = StrategyRunner(broker=broker, tick_interval=60.0)
+
+# Load strategy
+config = {"name": "Test", "symbols": ["AAPL"]}
+strategy = MyStrategy(config)
+runner.load_strategy(strategy)
+
+# Start
+runner.start()
+```
+
+3. **Run tests:**
+```bash
+cd backend
+pytest tests/test_strategy_runner.py -v
+```
+
+### Sample Strategies
+
+Two sample strategies are included:
+
+- **BuyAndHoldStrategy**: Buys symbols once and holds
+- **MovingAverageCrossoverStrategy**: MA crossover (stub with TODOs)
+
+See `backend/engine/strategies.py` and [STRATEGIES.md](./STRATEGIES.md) for details.
+
 ## Next Steps
 
 This is a scaffold. Here's what needs to be implemented:
@@ -289,8 +346,13 @@ This is a scaffold. Here's what needs to be implemented:
    - ✅ Repository pattern for CRUD operations
    - ✅ Storage service integration
    - ✅ Comprehensive tests
-4. 🚧 Broker API integration (integrations/)
-5. 🚧 Trading engine (engine/)
+4. ✅ Trading engine (engine/) - Milestone 2
+   - ✅ Strategy plugin interface
+   - ✅ Strategy runner with scheduler
+   - ✅ Paper trading execution
+   - ✅ Sample strategy implementations
+   - ✅ Comprehensive tests
+5. 🚧 Broker API integration (integrations/)
 6. 🚧 Business services (services/)
 7. 🚧 Additional API routes (api/)
 8. 🚧 Export functionality (export/)
