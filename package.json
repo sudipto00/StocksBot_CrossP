@@ -1,0 +1,35 @@
+{
+  "name": "stocksbot",
+  "version": "0.1.0",
+  "description": "Cross-platform StocksBot desktop application",
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "cd ui && npm run dev",
+    "build": "cd ui && npm run build",
+    "tauri:dev": "cd src-tauri && cargo tauri dev",
+    "tauri:build": "cd src-tauri && cargo tauri build",
+    "backend:dev": "cd backend && python app.py",
+    "install:all": "cd ui && npm install && cd ../backend && pip install -r requirements.txt"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sudipto00/StocksBot_CrossP.git"
+  },
+  "keywords": [
+    "tauri",
+    "react",
+    "python",
+    "fastapi",
+    "trading",
+    "stocks"
+  ],
+  "author": "StocksBot Team",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/sudipto00/StocksBot_CrossP/issues"
+  },
+  "homepage": "https://github.com/sudipto00/StocksBot_CrossP#readme",
+  "devDependencies": {
+    "@tauri-apps/cli": "^1.5.6"
+  }
+}
