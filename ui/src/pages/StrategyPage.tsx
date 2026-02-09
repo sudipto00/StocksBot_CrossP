@@ -4,7 +4,10 @@ import {
   getStrategies, 
   createStrategy, 
   updateStrategy, 
-  deleteStrategy 
+  deleteStrategy,
+  getRunnerStatus,
+  startRunner,
+  stopRunner
 } from '../api/backend';
 import { Strategy, StrategyStatus } from '../api/types';
 
@@ -18,6 +21,10 @@ function StrategyPage() {
   const [error, setError] = useState<string | null>(null);
   const [showCreateModal, setShowCreateModal] = useState(false);
   
+  // Runner state
+  const [runnerStatus, setRunnerStatus] = useState<string>('stopped');
+  const [runnerLoading, setRunnerLoading] = useState(false);
+  
   // Form state
   const [formName, setFormName] = useState('');
   const [formDescription, setFormDescription] = useState('');
@@ -26,6 +33,7 @@ function StrategyPage() {
 
   useEffect(() => {
     loadStrategies();
+    loadRunnerStatus();
   }, []);
 
   const loadStrategies = async () => {
@@ -39,6 +47,51 @@ function StrategyPage() {
       setError(err instanceof Error ? err.message : 'Failed to load strategies');
     } finally {
       setLoading(false);
+    }
+  };
+
+  const loadRunnerStatus = async () => {
+    try {
+      const status = await getRunnerStatus();
+      setRunnerStatus(status.status);
+    } catch (err) {
+      console.error('Failed to load runner status:', err);
+    }
+  };
+
+  const handleStartRunner = async () => {
+    try {
+      setRunnerLoading(true);
+      const result = await startRunner();
+      
+      if (result.success) {
+        await showSuccessNotification('Runner Started', result.message);
+        setRunnerStatus(result.status);
+      } else {
+        await showErrorNotification('Start Failed', result.message);
+      }
+    } catch (err) {
+      await showErrorNotification('Start Error', 'Failed to start runner');
+    } finally {
+      setRunnerLoading(false);
+    }
+  };
+
+  const handleStopRunner = async () => {
+    try {
+      setRunnerLoading(true);
+      const result = await stopRunner();
+      
+      if (result.success) {
+        await showSuccessNotification('Runner Stopped', result.message);
+        setRunnerStatus(result.status);
+      } else {
+        await showErrorNotification('Stop Failed', result.message);
+      }
+    } catch (err) {
+      await showErrorNotification('Stop Error', 'Failed to stop runner');
+    } finally {
+      setRunnerLoading(false);
     }
   };
 
@@ -140,6 +193,53 @@ function StrategyPage() {
         >
           + New Strategy
         </button>
+      </div>
+
+      {/* Runner Status Card */}
+      <div className="bg-gray-800 rounded-lg p-6 border border-gray-700 mb-6">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-4">
+            <div>
+              <h3 className="text-lg font-semibold text-white mb-1">Strategy Runner</h3>
+              <p className="text-gray-400 text-sm">Control the strategy execution engine</p>
+            </div>
+            <div className="flex items-center gap-2">
+              <div className={`w-3 h-3 rounded-full ${
+                runnerStatus === 'running' ? 'bg-green-500' : 'bg-gray-500'
+              }`}></div>
+              <span className={`text-sm font-medium ${
+                runnerStatus === 'running' ? 'text-green-400' : 'text-gray-400'
+              }`}>
+                {runnerStatus.charAt(0).toUpperCase() + runnerStatus.slice(1)}
+              </span>
+            </div>
+          </div>
+          
+          <div className="flex gap-2">
+            <button
+              onClick={handleStartRunner}
+              disabled={runnerLoading || runnerStatus === 'running'}
+              className={`px-4 py-2 rounded font-medium ${
+                runnerLoading || runnerStatus === 'running'
+                  ? 'bg-gray-600 text-gray-400 cursor-not-allowed'
+                  : 'bg-green-600 hover:bg-green-700 text-white'
+              }`}
+            >
+              {runnerLoading ? 'Starting...' : 'Start Runner'}
+            </button>
+            <button
+              onClick={handleStopRunner}
+              disabled={runnerLoading || runnerStatus !== 'running'}
+              className={`px-4 py-2 rounded font-medium ${
+                runnerLoading || runnerStatus !== 'running'
+                  ? 'bg-gray-600 text-gray-400 cursor-not-allowed'
+                  : 'bg-red-600 hover:bg-red-700 text-white'
+              }`}
+            >
+              {runnerLoading ? 'Stopping...' : 'Stop Runner'}
+            </button>
+          </div>
+        </div>
       </div>
 
       {error && (

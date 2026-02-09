@@ -36,7 +36,11 @@ from .models import (
     AuditLog,
     AuditEventType,
     AuditLogsResponse,
+    # Runner models
+    RunnerStatusResponse,
+    RunnerActionResponse,
 )
+from .runner_manager import runner_manager
 
 router = APIRouter()
 
@@ -434,3 +438,39 @@ async def get_audit_logs(
         logs=logs,
         total_count=total_count,
     )
+
+
+# ============================================================================
+# Strategy Runner Endpoints
+# ============================================================================
+
+@router.get("/runner/status", response_model=RunnerStatusResponse)
+async def get_runner_status():
+    """
+    Get strategy runner status.
+    Returns current status and loaded strategies.
+    """
+    status = runner_manager.get_status()
+    return RunnerStatusResponse(**status)
+
+
+@router.post("/runner/start", response_model=RunnerActionResponse)
+async def start_runner():
+    """
+    Start the strategy runner.
+    Loads active strategies and begins execution loop.
+    Idempotent - safe to call multiple times.
+    """
+    result = runner_manager.start_runner()
+    return RunnerActionResponse(**result)
+
+
+@router.post("/runner/stop", response_model=RunnerActionResponse)
+async def stop_runner():
+    """
+    Stop the strategy runner.
+    Stops all strategies and the execution loop.
+    Idempotent - safe to call multiple times.
+    """
+    result = runner_manager.stop_runner()
+    return RunnerActionResponse(**result)
