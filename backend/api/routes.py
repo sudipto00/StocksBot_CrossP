@@ -3,8 +3,12 @@ API Routes.
 Defines all REST API endpoints for StocksBot.
 """
 from datetime import datetime
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from typing import List, Optional
+from sqlalchemy.orm import Session
+
+from storage.database import get_db
+from storage.service import StorageService
 
 from .models import (
     StatusResponse,
@@ -215,100 +219,181 @@ async def request_notification(request: NotificationRequest):
 # Strategy Endpoints
 # ============================================================================
 
-# In-memory strategy store (TODO: Replace with persistent storage)
-_strategies: dict[str, Strategy] = {}
-_strategy_counter = 0
-
-
 @router.get("/strategies", response_model=StrategiesResponse)
-async def get_strategies():
+async def get_strategies(db: Session = Depends(get_db)):
     """
     Get all strategies.
-    TODO: Load from database.
-    Returns stub data for now.
+    Loads from database.
     """
+    storage = StorageService(db)
+    db_strategies = storage.strategies.get_all()
+    
+    # Convert DB models to API models
+    strategies = []
+    for db_strat in db_strategies:
+        strategies.append(Strategy(
+            id=str(db_strat.id),
+            name=db_strat.name,
+            description=db_strat.description,
+            status=StrategyStatus.ACTIVE if db_strat.is_active else StrategyStatus.STOPPED,
+            symbols=db_strat.config.get('symbols', []),
+            created_at=db_strat.created_at,
+            updated_at=db_strat.updated_at,
+        ))
+    
     return StrategiesResponse(
-        strategies=list(_strategies.values()),
-        total_count=len(_strategies),
+        strategies=strategies,
+        total_count=len(strategies),
     )
 
 
 @router.post("/strategies", response_model=Strategy)
-async def create_strategy(request: StrategyCreateRequest):
+async def create_strategy(request: StrategyCreateRequest, db: Session = Depends(get_db)):
     """
     Create a new strategy.
-    TODO: Persist to database and validate.
-    This is a stub implementation.
+    Persists to database.
     """
-    global _strategy_counter
-    _strategy_counter += 1
+    storage = StorageService(db)
     
-    strategy_id = f"strat-{_strategy_counter}"
-    now = datetime.now()
+    # Check for duplicate name
+    existing = storage.get_strategy_by_name(request.name)
+    if existing:
+        raise HTTPException(status_code=400, detail="Strategy with this name already exists")
     
-    strategy = Strategy(
-        id=strategy_id,
+    # Create strategy config
+    config = {
+        'symbols': request.symbols,
+    }
+    
+    # Create in database
+    db_strategy = storage.create_strategy(
         name=request.name,
-        description=request.description,
-        status=StrategyStatus.STOPPED,
-        symbols=request.symbols,
-        created_at=now,
-        updated_at=now,
+        strategy_type='custom',  # Default type
+        config=config,
+        description=request.description
     )
     
-    _strategies[strategy_id] = strategy
-    return strategy
+    # Create audit log
+    storage.create_audit_log(
+        event_type='strategy_started',
+        description=f'Strategy created: {request.name}',
+        details={'strategy_id': db_strategy.id, 'symbols': request.symbols}
+    )
+    
+    # Return API model
+    return Strategy(
+        id=str(db_strategy.id),
+        name=db_strategy.name,
+        description=db_strategy.description,
+        status=StrategyStatus.STOPPED,
+        symbols=request.symbols,
+        created_at=db_strategy.created_at,
+        updated_at=db_strategy.updated_at,
+    )
 
 
 @router.get("/strategies/{strategy_id}", response_model=Strategy)
-async def get_strategy(strategy_id: str):
+async def get_strategy(strategy_id: str, db: Session = Depends(get_db)):
     """
     Get a specific strategy by ID.
-    TODO: Load from database.
+    Loads from database.
     """
-    if strategy_id not in _strategies:
+    storage = StorageService(db)
+    
+    try:
+        strategy_id_int = int(strategy_id.replace('strat-', ''))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid strategy ID format")
+    
+    db_strategy = storage.strategies.get_by_id(strategy_id_int)
+    if not db_strategy:
         raise HTTPException(status_code=404, detail="Strategy not found")
     
-    return _strategies[strategy_id]
+    return Strategy(
+        id=str(db_strategy.id),
+        name=db_strategy.name,
+        description=db_strategy.description,
+        status=StrategyStatus.ACTIVE if db_strategy.is_active else StrategyStatus.STOPPED,
+        symbols=db_strategy.config.get('symbols', []),
+        created_at=db_strategy.created_at,
+        updated_at=db_strategy.updated_at,
+    )
 
 
 @router.put("/strategies/{strategy_id}", response_model=Strategy)
-async def update_strategy(strategy_id: str, request: StrategyUpdateRequest):
+async def update_strategy(strategy_id: str, request: StrategyUpdateRequest, db: Session = Depends(get_db)):
     """
     Update a strategy.
-    TODO: Persist to database and validate.
-    This is a stub implementation.
+    Persists to database.
     """
-    if strategy_id not in _strategies:
+    storage = StorageService(db)
+    
+    try:
+        strategy_id_int = int(strategy_id.replace('strat-', ''))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid strategy ID format")
+    
+    db_strategy = storage.strategies.get_by_id(strategy_id_int)
+    if not db_strategy:
         raise HTTPException(status_code=404, detail="Strategy not found")
     
-    strategy = _strategies[strategy_id]
-    
+    # Update fields
     if request.name is not None:
-        strategy.name = request.name
+        db_strategy.name = request.name
     if request.description is not None:
-        strategy.description = request.description
+        db_strategy.description = request.description
     if request.symbols is not None:
-        strategy.symbols = request.symbols
+        db_strategy.config['symbols'] = request.symbols
     if request.status is not None:
-        strategy.status = request.status
+        db_strategy.is_active = (request.status == StrategyStatus.ACTIVE)
+        
+        # Create audit log for status change
+        storage.create_audit_log(
+            event_type='strategy_started' if db_strategy.is_active else 'strategy_stopped',
+            description=f'Strategy {"started" if db_strategy.is_active else "stopped"}: {db_strategy.name}',
+            details={'strategy_id': db_strategy.id}
+        )
     
-    strategy.updated_at = datetime.now()
+    # Save to database
+    db_strategy = storage.strategies.update(db_strategy)
     
-    return strategy
+    return Strategy(
+        id=str(db_strategy.id),
+        name=db_strategy.name,
+        description=db_strategy.description,
+        status=StrategyStatus.ACTIVE if db_strategy.is_active else StrategyStatus.STOPPED,
+        symbols=db_strategy.config.get('symbols', []),
+        created_at=db_strategy.created_at,
+        updated_at=db_strategy.updated_at,
+    )
 
 
 @router.delete("/strategies/{strategy_id}")
-async def delete_strategy(strategy_id: str):
+async def delete_strategy(strategy_id: str, db: Session = Depends(get_db)):
     """
     Delete a strategy.
-    TODO: Remove from database.
-    This is a stub implementation.
+    Removes from database.
     """
-    if strategy_id not in _strategies:
+    storage = StorageService(db)
+    
+    try:
+        strategy_id_int = int(strategy_id.replace('strat-', ''))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid strategy ID format")
+    
+    db_strategy = storage.strategies.get_by_id(strategy_id_int)
+    if not db_strategy:
         raise HTTPException(status_code=404, detail="Strategy not found")
     
-    del _strategies[strategy_id]
+    # Create audit log before deletion
+    storage.create_audit_log(
+        event_type='strategy_stopped',
+        description=f'Strategy deleted: {db_strategy.name}',
+        details={'strategy_id': db_strategy.id}
+    )
+    
+    # Delete from database
+    storage.strategies.delete(strategy_id_int)
     
     return {"message": "Strategy deleted"}
 
@@ -317,64 +402,35 @@ async def delete_strategy(strategy_id: str):
 # Audit Log Endpoints
 # ============================================================================
 
-# In-memory audit log store (TODO: Replace with persistent storage)
-_audit_logs: List[AuditLog] = []
-
-
 @router.get("/audit/logs", response_model=AuditLogsResponse)
 async def get_audit_logs(
     limit: int = 100,
-    event_type: Optional[AuditEventType] = None
+    event_type: Optional[AuditEventType] = None,
+    db: Session = Depends(get_db)
 ):
     """
     Get audit logs.
-    TODO: Load from database with filtering and pagination.
-    Returns stub data for now.
+    Loads from database with filtering and pagination.
     """
-    # Generate some stub data if empty
-    if not _audit_logs:
-        _generate_stub_audit_logs()
+    storage = StorageService(db)
     
-    # Filter by event type if specified
-    logs = _audit_logs
-    if event_type:
-        logs = [log for log in logs if log.event_type == event_type]
+    # Get logs from database
+    event_type_str = event_type.value if event_type else None
+    db_logs = storage.get_audit_logs(limit=limit, event_type=event_type_str)
+    total_count = storage.count_audit_logs(event_type=event_type_str)
     
-    # Apply limit
-    logs = logs[:limit]
+    # Convert to API models
+    logs = []
+    for db_log in db_logs:
+        logs.append(AuditLog(
+            id=str(db_log.id),
+            timestamp=db_log.timestamp,
+            event_type=AuditEventType(db_log.event_type),
+            description=db_log.description,
+            details=db_log.details
+        ))
     
     return AuditLogsResponse(
         logs=logs,
-        total_count=len(_audit_logs),
+        total_count=total_count,
     )
-
-
-def _generate_stub_audit_logs():
-    """Generate stub audit log data for development."""
-    global _audit_logs
-    
-    now = datetime.now()
-    
-    _audit_logs = [
-        AuditLog(
-            id="log-001",
-            timestamp=now,
-            event_type=AuditEventType.ORDER_CREATED,
-            description="Market order created for AAPL",
-            details={"symbol": "AAPL", "quantity": 100, "side": "buy"}
-        ),
-        AuditLog(
-            id="log-002",
-            timestamp=now,
-            event_type=AuditEventType.ORDER_FILLED,
-            description="Order filled for AAPL at $150.00",
-            details={"symbol": "AAPL", "quantity": 100, "price": 150.00}
-        ),
-        AuditLog(
-            id="log-003",
-            timestamp=now,
-            event_type=AuditEventType.POSITION_OPENED,
-            description="Position opened: AAPL 100 shares",
-            details={"symbol": "AAPL", "quantity": 100}
-        ),
-    ]

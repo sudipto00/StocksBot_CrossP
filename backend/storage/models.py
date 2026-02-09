@@ -51,6 +51,21 @@ class TradeTypeEnum(str, enum.Enum):
     ADJUSTMENT = "adjustment"
 
 
+class AuditEventTypeEnum(str, enum.Enum):
+    """Audit event type enumeration."""
+    ORDER_CREATED = "order_created"
+    ORDER_FILLED = "order_filled"
+    ORDER_CANCELLED = "order_cancelled"
+    STRATEGY_STARTED = "strategy_started"
+    STRATEGY_STOPPED = "strategy_stopped"
+    POSITION_OPENED = "position_opened"
+    POSITION_CLOSED = "position_closed"
+    CONFIG_UPDATED = "config_updated"
+    RUNNER_STARTED = "runner_started"
+    RUNNER_STOPPED = "runner_stopped"
+    ERROR = "error"
+
+
 # Database Models
 
 class Position(Base):
@@ -179,3 +194,20 @@ class Config(Base):
     # Timestamps
     created_at = Column(DateTime, default=func.now(), nullable=False)
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class AuditLog(Base):
+    """
+    AuditLog model - tracks all significant system events and actions.
+    """
+    __tablename__ = "audit_logs"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    timestamp = Column(DateTime, default=func.now(), nullable=False, index=True)
+    event_type = Column(String(50), nullable=False, index=True)
+    description = Column(Text, nullable=False)
+    details = Column(JSON, nullable=True)
+    user_id = Column(String(100), nullable=True)
+    
+    # Timestamps
+    created_at = Column(DateTime, default=func.now(), nullable=False)

@@ -8,8 +8,8 @@ from sqlalchemy.orm import Session
 from sqlalchemy import and_, or_
 
 from storage.models import (
-    Position, Order, Trade, Strategy, Config,
-    PositionSideEnum, OrderSideEnum, OrderTypeEnum, OrderStatusEnum, TradeTypeEnum
+    Position, Order, Trade, Strategy, Config, AuditLog,
+    PositionSideEnum, OrderSideEnum, OrderTypeEnum, OrderStatusEnum, TradeTypeEnum, AuditEventTypeEnum
 )
 
 
@@ -296,3 +296,59 @@ class ConfigRepository:
             self.db.commit()
             return True
         return False
+
+
+class AuditLogRepository:
+    """Repository for AuditLog CRUD operations."""
+    
+    def __init__(self, db: Session):
+        self.db = db
+    
+    def create(self, event_type: str, description: str,
+               details: Optional[Dict[str, Any]] = None,
+               user_id: Optional[str] = None,
+               timestamp: Optional[datetime] = None) -> AuditLog:
+        """Create a new audit log entry."""
+        audit_log = AuditLog(
+            event_type=event_type,
+            description=description,
+            details=details,
+            user_id=user_id,
+            timestamp=timestamp or datetime.now()
+        )
+        self.db.add(audit_log)
+        self.db.commit()
+        self.db.refresh(audit_log)
+        return audit_log
+    
+    def get_by_id(self, log_id: int) -> Optional[AuditLog]:
+        """Get audit log by ID."""
+        return self.db.query(AuditLog).filter(AuditLog.id == log_id).first()
+    
+    def get_by_event_type(self, event_type: str, limit: int = 100) -> List[AuditLog]:
+        """Get audit logs by event type."""
+        return self.db.query(AuditLog).filter(
+            AuditLog.event_type == event_type
+        ).order_by(AuditLog.timestamp.desc()).limit(limit).all()
+    
+    def get_recent(self, limit: int = 100, offset: int = 0) -> List[AuditLog]:
+        """Get recent audit logs."""
+        return self.db.query(AuditLog).order_by(
+            AuditLog.timestamp.desc()
+        ).offset(offset).limit(limit).all()
+    
+    def get_all(self, limit: int = 100, offset: int = 0) -> List[AuditLog]:
+        """Get all audit logs with pagination."""
+        return self.db.query(AuditLog).order_by(
+            AuditLog.timestamp.desc()
+        ).offset(offset).limit(limit).all()
+    
+    def count(self) -> int:
+        """Count total audit logs."""
+        return self.db.query(AuditLog).count()
+    
+    def count_by_event_type(self, event_type: str) -> int:
+        """Count audit logs by event type."""
+        return self.db.query(AuditLog).filter(
+            AuditLog.event_type == event_type
+        ).count()

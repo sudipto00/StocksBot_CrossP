@@ -8,10 +8,10 @@ from sqlalchemy.orm import Session
 
 from storage.repositories import (
     PositionRepository, OrderRepository, TradeRepository,
-    StrategyRepository, ConfigRepository
+    StrategyRepository, ConfigRepository, AuditLogRepository
 )
 from storage.models import (
-    Position, Order, Trade, Strategy, Config,
+    Position, Order, Trade, Strategy, Config, AuditLog,
     PositionSideEnum, OrderSideEnum, OrderTypeEnum, OrderStatusEnum, TradeTypeEnum
 )
 
@@ -30,6 +30,7 @@ class StorageService:
         self.trades = TradeRepository(db)
         self.strategies = StrategyRepository(db)
         self.config = ConfigRepository(db)
+        self.audit_logs = AuditLogRepository(db)
     
     # Position operations
     
@@ -171,3 +172,24 @@ class StorageService:
         """Get all config as a dictionary."""
         configs = self.config.get_all()
         return {c.key: c.value for c in configs}
+    
+    # Audit log operations
+    
+    def create_audit_log(self, event_type: str, description: str,
+                        details: Optional[Dict[str, Any]] = None,
+                        user_id: Optional[str] = None) -> AuditLog:
+        """Create an audit log entry."""
+        return self.audit_logs.create(event_type, description, details, user_id)
+    
+    def get_audit_logs(self, limit: int = 100, offset: int = 0,
+                      event_type: Optional[str] = None) -> List[AuditLog]:
+        """Get audit logs with optional filtering."""
+        if event_type:
+            return self.audit_logs.get_by_event_type(event_type, limit)
+        return self.audit_logs.get_recent(limit, offset)
+    
+    def count_audit_logs(self, event_type: Optional[str] = None) -> int:
+        """Count audit logs with optional filtering."""
+        if event_type:
+            return self.audit_logs.count_by_event_type(event_type)
+        return self.audit_logs.count()
