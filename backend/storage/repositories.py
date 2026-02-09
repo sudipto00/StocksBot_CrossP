@@ -189,6 +189,10 @@ class TradeRepository:
     def get_recent(self, limit: int = 100) -> List[Trade]:
         """Get recent trades."""
         return self.db.query(Trade).order_by(Trade.executed_at.desc()).limit(limit).all()
+    
+    def get_all(self, limit: int = 1000) -> List[Trade]:
+        """Get all trades ordered by execution time."""
+        return self.db.query(Trade).order_by(Trade.executed_at.asc()).limit(limit).all()
 
 
 class StrategyRepository:

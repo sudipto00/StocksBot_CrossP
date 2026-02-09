@@ -642,3 +642,99 @@ async def get_runner_status():
         "success": True,
         "status": status
     }
+
+
+# ============================================================================
+# Analytics Endpoints
+# ============================================================================
+
+
+@router.get("/analytics/portfolio")
+async def get_portfolio_analytics(db: Session = Depends(get_db)):
+    """
+    Get portfolio analytics including equity curve and P&L over time.
+    Returns time series data for portfolio value and P&L.
+    """
+    storage = StorageService(db)
+    
+    # Get all trades to calculate portfolio value over time
+    all_trades = storage.trades.get_all()
+    
+    # Calculate cumulative P&L over time
+    equity_curve = []
+    cumulative_pnl = 0.0
+    initial_capital = 100000.0  # Starting capital
+    
+    if all_trades:
+        for trade in all_trades:
+            cumulative_pnl += trade.realized_pnl or 0.0
+            portfolio_value = initial_capital + cumulative_pnl
+            
+            equity_curve.append({
+                "timestamp": trade.executed_at.isoformat(),
+                "portfolio_value": portfolio_value,
+                "cumulative_pnl": cumulative_pnl,
+                "trade_pnl": trade.realized_pnl or 0.0
+            })
+    
+    # Get current positions for unrealized P&L
+    positions = storage.get_open_positions()
+    unrealized_pnl = sum(pos.realized_pnl or 0.0 for pos in positions)
+    
+    current_portfolio_value = initial_capital + cumulative_pnl + unrealized_pnl
+    
+    return {
+        "equity_curve": equity_curve,
+        "summary": {
+            "initial_capital": initial_capital,
+            "current_value": current_portfolio_value,
+            "realized_pnl": cumulative_pnl,
+            "unrealized_pnl": unrealized_pnl,
+            "total_pnl": cumulative_pnl + unrealized_pnl,
+            "return_percent": ((current_portfolio_value - initial_capital) / initial_capital * 100)
+                if initial_capital > 0 else 0.0,
+            "total_trades": len(all_trades)
+        }
+    }
+
+
+@router.get("/analytics/equity-curve")
+async def get_equity_curve(
+    limit: int = 100,
+    db: Session = Depends(get_db)
+):
+    """
+    Get equity curve data (portfolio value over time).
+    Simplified endpoint that returns just the equity curve points.
+    """
+    storage = StorageService(db)
+    
+    # Get recent trades
+    all_trades = storage.trades.get_all()[-limit:] if limit else storage.trades.get_all()
+    
+    # Build equity curve
+    equity_points = []
+    cumulative_pnl = 0.0
+    initial_capital = 100000.0
+    
+    for trade in all_trades:
+        cumulative_pnl += trade.realized_pnl or 0.0
+        equity_points.append({
+            "timestamp": trade.executed_at.isoformat(),
+            "value": initial_capital + cumulative_pnl,
+            "pnl": cumulative_pnl
+        })
+    
+    # If no trades, return initial state
+    if not equity_points:
+        from datetime import datetime
+        equity_points.append({
+            "timestamp": datetime.now().isoformat(),
+            "value": initial_capital,
+            "pnl": 0.0
+        })
+    
+    return {
+        "data": equity_points,
+        "initial_capital": initial_capital
+    }

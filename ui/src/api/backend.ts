@@ -23,6 +23,9 @@ import {
   // Runner types
   RunnerResponse,
   RunnerState,
+  // Analytics types
+  EquityCurveResponse,
+  PortfolioAnalytics,
 } from './types';
 
 // Access environment variables via import.meta.env in Vite
@@ -267,6 +270,36 @@ export async function stopRunner(): Promise<RunnerResponse> {
  */
 export async function getRunnerStatus(): Promise<RunnerResponse> {
   const response = await fetch(`${BACKEND_URL}/runner/status`);
+  
+  if (!response.ok) {
+    throw new Error(`Backend returned ${response.status}`);
+  }
+  
+  return response.json();
+}
+
+/**
+ * Get portfolio analytics.
+ */
+export async function getPortfolioAnalytics(): Promise<PortfolioAnalytics> {
+  const response = await fetch(`${BACKEND_URL}/analytics/portfolio`);
+  
+  if (!response.ok) {
+    throw new Error(`Backend returned ${response.status}`);
+  }
+  
+  return response.json();
+}
+
+/**
+ * Get equity curve data.
+ */
+export async function getEquityCurve(limit?: number): Promise<EquityCurveResponse> {
+  const params = new URLSearchParams();
+  if (limit) params.append('limit', limit.toString());
+  
+  const url = `${BACKEND_URL}/analytics/equity-curve${params.toString() ? '?' + params.toString() : ''}`;
+  const response = await fetch(url);
   
   if (!response.ok) {
     throw new Error(`Backend returned ${response.status}`);

@@ -1,6 +1,8 @@
 import { useState, useEffect } from 'react';
-import { getBackendStatus, getPositions, getRunnerStatus, startRunner, stopRunner } from '../api/backend';
-import { StatusResponse, Position, RunnerState, RunnerStatus } from '../api/types';
+import { getBackendStatus, getPositions, getRunnerStatus, startRunner, stopRunner, getEquityCurve, getPortfolioAnalytics } from '../api/backend';
+import { StatusResponse, Position, RunnerState, RunnerStatus, EquityPoint, PortfolioAnalytics } from '../api/types';
+import EquityCurveChart from '../components/EquityCurveChart';
+import PnLChart from '../components/PnLChart';
 
 /**
  * Dashboard page component.
@@ -10,6 +12,9 @@ function DashboardPage() {
   const [status, setStatus] = useState<StatusResponse | null>(null);
   const [positions, setPositions] = useState<Position[]>([]);
   const [runnerState, setRunnerState] = useState<RunnerState | null>(null);
+  const [equityCurve, setEquityCurve] = useState<EquityPoint[]>([]);
+  const [analytics, setAnalytics] = useState<PortfolioAnalytics | null>(null);
+  const [initialCapital, setInitialCapital] = useState<number>(100000);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [runnerLoading, setRunnerLoading] = useState(false);
@@ -26,16 +31,21 @@ function DashboardPage() {
       setLoading(true);
       setError(null);
       
-      // Fetch status, positions, and runner state in parallel
-      const [statusData, positionsData, runnerData] = await Promise.all([
+      // Fetch status, positions, runner state, and analytics in parallel
+      const [statusData, positionsData, runnerData, equityCurveData, analyticsData] = await Promise.all([
         getBackendStatus(),
         getPositions(),
         getRunnerStatus(),
+        getEquityCurve(100),
+        getPortfolioAnalytics(),
       ]);
       
       setStatus(statusData);
       setPositions(positionsData.positions);
       setRunnerState(runnerData.status);
+      setEquityCurve(equityCurveData.data);
+      setInitialCapital(equityCurveData.initial_capital);
+      setAnalytics(analyticsData);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load data');
     } finally {
@@ -252,6 +262,21 @@ function DashboardPage() {
                   </tbody>
                 </table>
               </div>
+            )}
+          </div>
+
+          {/* Analytics Charts Section */}
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mt-8">
+            <EquityCurveChart data={equityCurve} initialCapital={initialCapital} />
+            
+            {analytics && (
+              <PnLChart 
+                data={analytics.equity_curve.map(point => ({
+                  timestamp: point.timestamp,
+                  pnl: point.trade_pnl,
+                  cumulative_pnl: point.cumulative_pnl
+                }))}
+              />
             )}
           </div>
         </>

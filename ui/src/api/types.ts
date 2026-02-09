@@ -221,3 +221,36 @@ export interface RunnerResponse {
   message?: string;
   status: RunnerState;
 }
+
+// ============================================================================
+// Analytics Types
+// ============================================================================
+
+export interface EquityPoint {
+  timestamp: string;
+  value: number;
+  pnl: number;
+}
+
+export interface EquityCurveResponse {
+  data: EquityPoint[];
+  initial_capital: number;
+}
+
+export interface PortfolioAnalytics {
+  equity_curve: Array<{
+    timestamp: string;
+    portfolio_value: number;
+    cumulative_pnl: number;
+    trade_pnl: number;
+  }>;
+  summary: {
+    initial_capital: number;
+    current_value: number;
+    realized_pnl: number;
+    unrealized_pnl: number;
+    total_pnl: number;
+    return_percent: number;
+    total_trades: number;
+  };
+}
