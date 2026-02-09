@@ -21,10 +21,11 @@ import {
   AuditLogsResponse,
   AuditEventType,
   // Runner types
-  RunnerResponse,
+  RunnerStatusResponse,
+  RunnerActionResponse,
   // Analytics types
-  EquityCurveResponse,
-  PortfolioAnalytics,
+  PortfolioAnalyticsResponse,
+  PortfolioSummaryResponse,
 } from './types';
 
 // Access environment variables via import.meta.env in Vite
@@ -235,9 +236,22 @@ export async function getAuditLogs(limit?: number, eventType?: AuditEventType): 
 }
 
 /**
+ * Get strategy runner status.
+ */
+export async function getRunnerStatus(): Promise<RunnerStatusResponse> {
+  const response = await fetch(`${BACKEND_URL}/runner/status`);
+  
+  if (!response.ok) {
+    throw new Error(`Backend returned ${response.status}`);
+  }
+  
+  return response.json();
+}
+
+/**
  * Start the strategy runner.
  */
-export async function startRunner(): Promise<RunnerResponse> {
+export async function startRunner(): Promise<RunnerActionResponse> {
   const response = await fetch(`${BACKEND_URL}/runner/start`, {
     method: 'POST',
   });
@@ -252,7 +266,7 @@ export async function startRunner(): Promise<RunnerResponse> {
 /**
  * Stop the strategy runner.
  */
-export async function stopRunner(): Promise<RunnerResponse> {
+export async function stopRunner(): Promise<RunnerActionResponse> {
   const response = await fetch(`${BACKEND_URL}/runner/stop`, {
     method: 'POST',
   });
@@ -265,40 +279,27 @@ export async function stopRunner(): Promise<RunnerResponse> {
 }
 
 /**
- * Get runner status.
+ * Get portfolio analytics time series.
  */
-export async function getRunnerStatus(): Promise<RunnerResponse> {
-  const response = await fetch(`${BACKEND_URL}/runner/status`);
-  
-  if (!response.ok) {
-    throw new Error(`Backend returned ${response.status}`);
-  }
-  
-  return response.json();
-}
-
-/**
- * Get portfolio analytics.
- */
-export async function getPortfolioAnalytics(): Promise<PortfolioAnalytics> {
-  const response = await fetch(`${BACKEND_URL}/analytics/portfolio`);
-  
-  if (!response.ok) {
-    throw new Error(`Backend returned ${response.status}`);
-  }
-  
-  return response.json();
-}
-
-/**
- * Get equity curve data.
- */
-export async function getEquityCurve(limit?: number): Promise<EquityCurveResponse> {
+export async function getPortfolioAnalytics(days?: number): Promise<PortfolioAnalyticsResponse> {
   const params = new URLSearchParams();
-  if (limit) params.append('limit', limit.toString());
+  if (days) params.append('days', days.toString());
   
-  const url = `${BACKEND_URL}/analytics/equity-curve${params.toString() ? '?' + params.toString() : ''}`;
+  const url = `${BACKEND_URL}/analytics/portfolio${params.toString() ? '?' + params.toString() : ''}`;
   const response = await fetch(url);
+  
+  if (!response.ok) {
+    throw new Error(`Backend returned ${response.status}`);
+  }
+  
+  return response.json();
+}
+
+/**
+ * Get portfolio summary statistics.
+ */
+export async function getPortfolioSummary(): Promise<PortfolioSummaryResponse> {
+  const response = await fetch(`${BACKEND_URL}/analytics/summary`);
   
   if (!response.ok) {
     throw new Error(`Backend returned ${response.status}`);

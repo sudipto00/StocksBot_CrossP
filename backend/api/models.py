@@ -224,3 +224,22 @@ class AuditLogsResponse(BaseModel):
     """Audit logs list response."""
     logs: List[AuditLog] = Field(default_factory=list, description="List of audit log entries")
     total_count: int = Field(default=0, description="Total log count")
+
+
+# ============================================================================
+# Runner Models
+# ============================================================================
+
+class RunnerStatusResponse(BaseModel):
+    """Runner status response."""
+    status: str = Field(..., description="Runner status (stopped, running, paused, error)")
+    strategies: List[Dict[str, Any]] = Field(default_factory=list, description="Loaded strategies")
+    tick_interval: float = Field(..., description="Tick interval in seconds")
+    broker_connected: bool = Field(..., description="Whether broker is connected")
+
+
+class RunnerActionResponse(BaseModel):
+    """Runner action response (start/stop)."""
+    success: bool = Field(..., description="Whether action was successful")
+    message: str = Field(..., description="Action result message")
+    status: str = Field(..., description="Current runner status")

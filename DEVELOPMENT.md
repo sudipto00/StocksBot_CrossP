@@ -332,6 +332,79 @@ Two sample strategies are included:
 
 See `backend/engine/strategies.py` and [STRATEGIES.md](./STRATEGIES.md) for details.
 
+## New Features (Latest Update)
+
+### Database-Backed Strategy and Audit Log Persistence
+
+Strategies and audit logs are now persisted to the database instead of being stored in memory:
+
+- **Strategies**: All strategy CRUD operations now use the database. Strategies persist across server restarts.
+- **Audit Logs**: All system events (strategy creation/updates, runner start/stop, etc.) are logged to the database.
+- **Database Schema**: Added `audit_logs` table via Alembic migration.
+
+**API Endpoints:**
+- `GET /strategies` - List all strategies (from DB)
+- `POST /strategies` - Create new strategy (persisted to DB)
+- `PUT /strategies/{id}` - Update strategy (persisted to DB)
+- `DELETE /strategies/{id}` - Delete strategy (from DB)
+- `GET /audit/logs` - Get audit logs with optional filtering
+
+### Strategy Runner Management from UI
+
+The strategy runner can now be controlled directly from the UI:
+
+- **Runner Status**: View real-time runner status (running/stopped)
+- **Start/Stop Controls**: Start and stop the runner with idempotent operations
+- **Safety**: Runner is managed as a singleton, preventing multiple concurrent instances
+- **Integration**: Runner loads active strategies from database on start
+
+**API Endpoints:**
+- `GET /runner/status` - Get runner status and loaded strategies
+- `POST /runner/start` - Start the strategy runner (idempotent)
+- `POST /runner/stop` - Stop the strategy runner (idempotent)
+
+**UI Integration:**
+- Strategy page now includes runner status card
+- Start/Stop buttons with loading states
+- Runner status indicator (green = running, gray = stopped)
+
+### Portfolio Analytics and Charts
+
+Real-time portfolio analytics with interactive charts:
+
+- **Time Series Data**: Equity curve and cumulative P&L over time
+- **Summary Statistics**: Total trades, win rate, position values
+- **Interactive Charts**: Built with Recharts library
+  - Equity curve (area chart)
+  - Cumulative P&L (line chart)
+- **Empty States**: Graceful handling when no data exists
+
+**API Endpoints:**
+- `GET /analytics/portfolio` - Get portfolio time series data
+- `GET /analytics/summary` - Get summary statistics
+
+**UI Integration:**
+- New Analytics page in navigation sidebar
+- Summary cards for key metrics (equity, trades, win rate, positions)
+- Responsive charts with tooltips and formatting
+- Refresh button to reload data
+
+### Testing
+
+Comprehensive test coverage for all new features:
+
+- 18 new tests for strategy CRUD operations
+- Tests for audit log querying and filtering
+- Tests for runner start/stop/status endpoints
+- Tests for analytics endpoints
+- Total: 104 tests passing
+
+**Run tests:**
+```bash
+cd backend
+pytest tests/ -v
+```
+
 ## Next Steps
 
 This is a scaffold. Here's what needs to be implemented:
@@ -354,9 +427,9 @@ This is a scaffold. Here's what needs to be implemented:
    - ✅ Comprehensive tests
 5. 🚧 Broker API integration (integrations/)
 6. 🚧 Business services (services/)
-7. 🚧 Additional API routes (api/)
+7. ✅ Additional API routes (api/) - Strategy, Audit, Runner, Analytics endpoints
 8. 🚧 Export functionality (export/)
-9. 🚧 Audit/compliance (audit/)
+9. ✅ Audit/compliance (audit/) - Database-backed audit logging
 
 ### Frontend (Priority Order)
 1. ✅ Basic React + Tailwind setup
@@ -365,11 +438,11 @@ This is a scaffold. Here's what needs to be implemented:
 4. ✅ Backend status checking
 5. 🚧 Portfolio page
 6. 🚧 Trading page
-7. 🚧 Analytics page
-8. 🚧 Settings page
+7. ✅ Analytics page - Portfolio charts and statistics
+8. ✅ Settings page
 9. 🚧 State management
 10. 🚧 Real-time updates
-11. 🚧 Charts and visualizations
+11. ✅ Charts and visualizations - Recharts integration
 
 ### Tauri (Priority Order)
 1. ✅ Basic Tauri setup

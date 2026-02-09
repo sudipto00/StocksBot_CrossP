@@ -72,7 +72,6 @@ class StorageService:
         
         if new_quantity == 0:
             # Position closed
-            # Calculate realized P&L
             if position.side == PositionSideEnum.LONG:
                 realized_pnl = quantity_delta * (price - position.avg_entry_price)
             else:  # SHORT
@@ -80,9 +79,7 @@ class StorageService:
             
             return self.positions.close_position(position, realized_pnl)
         else:
-            # Update position
             if abs(new_quantity) > abs(position.quantity):
-                # Adding to position - recalculate average entry
                 total_cost = position.cost_basis + (abs(quantity_delta) * price)
                 position.avg_entry_price = total_cost / abs(new_quantity)
             
@@ -130,7 +127,7 @@ class StorageService:
             order_id=order_id,
             symbol=symbol,
             side=OrderSideEnum(side),
-            type=TradeTypeEnum.OPEN,  # Default to OPEN, can be refined
+            type=TradeTypeEnum.OPEN,
             quantity=quantity,
             price=price,
             commission=commission,

@@ -182,6 +182,8 @@ export enum AuditEventType {
   POSITION_OPENED = "position_opened",
   POSITION_CLOSED = "position_closed",
   CONFIG_UPDATED = "config_updated",
+  RUNNER_STARTED = "runner_started",
+  RUNNER_STOPPED = "runner_stopped",
   ERROR = "error",
 }
 
@@ -202,60 +204,45 @@ export interface AuditLogsResponse {
 // Strategy Runner Types
 // ============================================================================
 
-export enum RunnerStatus {
-  STOPPED = "stopped",
-  RUNNING = "running",
-  PAUSED = "paused",
-  ERROR = "error",
-}
-
-export interface StrategyState {
-  name: string;
-  status: string;
-}
-
-export interface RunnerState {
-  status: RunnerStatus;
-  strategies: StrategyState[];
+export interface RunnerStatusResponse {
+  status: string; // stopped, running, paused, error
+  strategies: unknown[];
   tick_interval: number;
   broker_connected: boolean;
 }
 
-export interface RunnerResponse {
+export interface RunnerActionResponse {
   success: boolean;
-  message?: string;
-  status: RunnerState;
+  message: string;
+  status: string;
 }
 
 // ============================================================================
 // Analytics Types
 // ============================================================================
 
-export interface EquityPoint {
+export interface PortfolioTimeSeriesPoint {
   timestamp: string;
-  value: number;
+  equity: number;
   pnl: number;
+  cumulative_pnl: number;
+  symbol: string;
 }
 
-export interface EquityCurveResponse {
-  data: EquityPoint[];
-  initial_capital: number;
+export interface PortfolioAnalyticsResponse {
+  time_series: PortfolioTimeSeriesPoint[];
+  total_trades: number;
+  current_equity: number;
+  total_pnl: number;
 }
 
-export interface PortfolioAnalytics {
-  equity_curve: Array<{
-    timestamp: string;
-    portfolio_value: number;
-    cumulative_pnl: number;
-    trade_pnl: number;
-  }>;
-  summary: {
-    initial_capital: number;
-    current_value: number;
-    realized_pnl: number;
-    unrealized_pnl: number;
-    total_pnl: number;
-    return_percent: number;
-    total_trades: number;
-  };
+export interface PortfolioSummaryResponse {
+  total_trades: number;
+  total_pnl: number;
+  winning_trades: number;
+  losing_trades: number;
+  win_rate: number;
+  total_positions: number;
+  total_position_value: number;
+  equity: number;
 }

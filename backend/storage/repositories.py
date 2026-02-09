@@ -347,7 +347,6 @@ class AuditLogRepository:
         """Get audit logs with filtering and pagination."""
         query = self.db.query(AuditLog)
         
-        # Apply filters
         if event_type:
             query = query.filter(AuditLog.event_type == event_type)
         if strategy_id:
@@ -355,10 +354,7 @@ class AuditLogRepository:
         if order_id:
             query = query.filter(AuditLog.order_id == order_id)
         
-        # Order by timestamp descending (most recent first)
         query = query.order_by(AuditLog.timestamp.desc())
-        
-        # Apply pagination
         return query.offset(offset).limit(limit).all()
     
     def count(
