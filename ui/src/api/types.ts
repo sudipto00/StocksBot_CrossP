@@ -197,3 +197,27 @@ export interface AuditLogsResponse {
   logs: AuditLog[];
   total_count: number;
 }
+
+// ============================================================================
+// Strategy Runner Types
+// ============================================================================
+
+export enum RunnerStatus {
+  STOPPED = "stopped",
+  RUNNING = "running",
+  PAUSED = "paused",
+  ERROR = "error",
+}
+
+export interface RunnerState {
+  status: RunnerStatus;
+  strategies: any[]; // Strategy states
+  tick_interval: number;
+  broker_connected: boolean;
+}
+
+export interface RunnerResponse {
+  success: boolean;
+  message?: string;
+  status: RunnerState;
+}

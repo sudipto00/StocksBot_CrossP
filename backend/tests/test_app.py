@@ -118,3 +118,90 @@ def test_request_notification():
     data = response.json()
     assert data["success"] == True
     assert "message" in data
+
+
+# ============================================================================
+# Strategy Runner Tests
+# ============================================================================
+
+def test_get_runner_status():
+    """Test getting runner status."""
+    response = client.get("/runner/status")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["success"] == True
+    assert "status" in data
+    assert "status" in data["status"]
+    assert data["status"]["status"] in ["stopped", "running", "paused", "error"]
+
+
+def test_start_runner():
+    """Test starting the runner."""
+    # First ensure it's stopped
+    client.post("/runner/stop")
+    
+    # Create a test strategy first
+    strategy_data = {
+        "name": "Test Strategy",
+        "description": "Test strategy for runner",
+        "symbols": ["AAPL"]
+    }
+    strategy_response = client.post("/strategies", json=strategy_data)
+    assert strategy_response.status_code == 200
+    strategy = strategy_response.json()
+    
+    # Enable the strategy
+    update_data = {"status": "running"}
+    client.put(f"/strategies/{strategy['id']}", json=update_data)
+    
+    # Now start the runner
+    response = client.post("/runner/start")
+    assert response.status_code == 200
+    data = response.json()
+    # Note: might fail if no strategies are active, which is expected
+    assert "success" in data
+    assert "status" in data
+    
+    # Clean up - stop the runner and delete strategy
+    client.post("/runner/stop")
+    client.delete(f"/strategies/{strategy['id']}")
+
+
+def test_start_runner_idempotent():
+    """Test that starting an already running runner is idempotent."""
+    # Start the runner
+    client.post("/runner/start")
+    
+    # Try to start again
+    response = client.post("/runner/start")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["success"] == True
+    
+    # Clean up
+    client.post("/runner/stop")
+
+
+def test_stop_runner():
+    """Test stopping the runner."""
+    # First start it
+    client.post("/runner/start")
+    
+    # Now stop it
+    response = client.post("/runner/stop")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["success"] == True
+    assert "status" in data
+
+
+def test_stop_runner_idempotent():
+    """Test that stopping an already stopped runner is idempotent."""
+    # Ensure it's stopped
+    client.post("/runner/stop")
+    
+    # Try to stop again
+    response = client.post("/runner/stop")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["success"] == True

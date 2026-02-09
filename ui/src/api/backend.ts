@@ -20,6 +20,9 @@ import {
   // Audit types
   AuditLogsResponse,
   AuditEventType,
+  // Runner types
+  RunnerResponse,
+  RunnerState,
 } from './types';
 
 // Access environment variables via import.meta.env in Vite
@@ -221,6 +224,49 @@ export async function getAuditLogs(limit?: number, eventType?: AuditEventType): 
   
   const url = `${BACKEND_URL}/audit/logs${params.toString() ? '?' + params.toString() : ''}`;
   const response = await fetch(url);
+  
+  if (!response.ok) {
+    throw new Error(`Backend returned ${response.status}`);
+  }
+  
+  return response.json();
+}
+
+/**
+ * Start the strategy runner.
+ */
+export async function startRunner(): Promise<RunnerResponse> {
+  const response = await fetch(`${BACKEND_URL}/runner/start`, {
+    method: 'POST',
+  });
+  
+  if (!response.ok) {
+    throw new Error(`Backend returned ${response.status}`);
+  }
+  
+  return response.json();
+}
+
+/**
+ * Stop the strategy runner.
+ */
+export async function stopRunner(): Promise<RunnerResponse> {
+  const response = await fetch(`${BACKEND_URL}/runner/stop`, {
+    method: 'POST',
+  });
+  
+  if (!response.ok) {
+    throw new Error(`Backend returned ${response.status}`);
+  }
+  
+  return response.json();
+}
+
+/**
+ * Get runner status.
+ */
+export async function getRunnerStatus(): Promise<RunnerResponse> {
+  const response = await fetch(`${BACKEND_URL}/runner/status`);
   
   if (!response.ok) {
     throw new Error(`Backend returned ${response.status}`);

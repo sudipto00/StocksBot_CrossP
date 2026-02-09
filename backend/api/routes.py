@@ -448,3 +448,197 @@ async def get_audit_logs(
         logs=api_logs,
         total_count=total_count,
     )
+
+
+# ============================================================================
+# Strategy Runner Endpoints
+# ============================================================================
+
+# Global strategy runner instance (singleton)
+_runner_instance = None
+_runner_lock = None
+
+
+def get_runner_instance():
+    """Get or create the global strategy runner instance."""
+    global _runner_instance, _runner_lock
+    
+    if _runner_lock is None:
+        import threading
+        _runner_lock = threading.Lock()
+    
+    with _runner_lock:
+        if _runner_instance is None:
+            from engine.strategy_runner import StrategyRunner
+            from typing import Dict, List, Optional
+            import os
+            
+            # Try to create Alpaca broker with env vars, fall back to mock
+            try:
+                from integrations.alpaca_broker import AlpacaBroker
+                api_key = os.getenv('ALPACA_API_KEY', '')
+                secret_key = os.getenv('ALPACA_SECRET_KEY', '')
+                
+                if api_key and secret_key:
+                    broker = AlpacaBroker(api_key=api_key, secret_key=secret_key, paper=True)
+                else:
+                    raise ValueError("No API keys provided, using mock broker")
+            except Exception as e:
+                print(f"Failed to create Alpaca broker, using mock: {e}")
+                # Fallback to mock broker
+                from services.broker import BrokerInterface, OrderSide, OrderType
+                
+                class MockBroker(BrokerInterface):
+                    """Mock broker for testing."""
+                    def __init__(self):
+                        self._connected = False
+                    
+                    def connect(self) -> bool:
+                        self._connected = True
+                        return True
+                    
+                    def disconnect(self) -> bool:
+                        self._connected = False
+                        return True
+                    
+                    def is_connected(self) -> bool:
+                        return self._connected
+                    
+                    def get_account_info(self) -> Dict:
+                        return {"cash": 100000.0, "portfolio_value": 100000.0, "buying_power": 100000.0}
+                    
+                    def get_positions(self) -> List[Dict]:
+                        return []
+                    
+                    def submit_order(self, symbol: str, side: OrderSide, order_type: OrderType,
+                                   quantity: float, price: Optional[float] = None) -> Dict:
+                        return {"id": "mock-order-1", "symbol": symbol, "status": "filled"}
+                    
+                    def cancel_order(self, order_id: str) -> bool:
+                        return True
+                    
+                    def get_order(self, order_id: str) -> Dict:
+                        return {"id": order_id, "status": "filled"}
+                    
+                    def get_orders(self, status: Optional[str] = None) -> List[Dict]:
+                        return []
+                    
+                    def get_market_data(self, symbol: str) -> Dict:
+                        return {"symbol": symbol, "price": 100.0}
+                
+                broker = MockBroker()
+            
+            # Create runner with default settings
+            _runner_instance = StrategyRunner(
+                broker=broker,
+                storage_service=None,  # Will be set when starting
+                tick_interval=60.0  # 1 minute
+            )
+        
+        return _runner_instance
+
+
+@router.post("/runner/start")
+async def start_runner(db: Session = Depends(get_db)):
+    """
+    Start the strategy runner.
+    Idempotent - returns success if already running.
+    """
+    runner = get_runner_instance()
+    storage = StorageService(db)
+    
+    # Set storage service
+    runner.storage = storage
+    
+    # Check if already running
+    if runner.status.value == "running":
+        return {
+            "success": True,
+            "message": "Strategy runner is already running",
+            "status": runner.get_status()
+        }
+    
+    # Load active strategies from database
+    active_strategies = storage.strategies.get_active()
+    if not active_strategies:
+        return {
+            "success": False,
+            "message": "No active strategies found. Please enable at least one strategy.",
+            "status": runner.get_status()
+        }
+    
+    # Start the runner
+    success = runner.start()
+    
+    if success:
+        # Create audit log
+        storage.create_audit_log(
+            event_type="strategy_started",
+            description=f"Strategy runner started with {len(active_strategies)} active strategies"
+        )
+        
+        return {
+            "success": True,
+            "message": "Strategy runner started successfully",
+            "status": runner.get_status()
+        }
+    else:
+        return {
+            "success": False,
+            "message": "Failed to start strategy runner",
+            "status": runner.get_status()
+        }
+
+
+@router.post("/runner/stop")
+async def stop_runner(db: Session = Depends(get_db)):
+    """
+    Stop the strategy runner.
+    Idempotent - returns success if already stopped.
+    """
+    runner = get_runner_instance()
+    storage = StorageService(db)
+    
+    # Check if already stopped
+    if runner.status.value == "stopped":
+        return {
+            "success": True,
+            "message": "Strategy runner is already stopped",
+            "status": runner.get_status()
+        }
+    
+    # Stop the runner
+    success = runner.stop()
+    
+    if success:
+        # Create audit log
+        storage.create_audit_log(
+            event_type="strategy_stopped",
+            description="Strategy runner stopped"
+        )
+        
+        return {
+            "success": True,
+            "message": "Strategy runner stopped successfully",
+            "status": runner.get_status()
+        }
+    else:
+        return {
+            "success": False,
+            "message": "Failed to stop strategy runner",
+            "status": runner.get_status()
+        }
+
+
+@router.get("/runner/status")
+async def get_runner_status():
+    """
+    Get the current status of the strategy runner.
+    """
+    runner = get_runner_instance()
+    status = runner.get_status()
+    
+    return {
+        "success": True,
+        "status": status
+    }

@@ -1,19 +1,24 @@
 import { useState, useEffect } from 'react';
-import { getBackendStatus, getPositions } from '../api/backend';
-import { StatusResponse, Position } from '../api/types';
+import { getBackendStatus, getPositions, getRunnerStatus, startRunner, stopRunner } from '../api/backend';
+import { StatusResponse, Position, RunnerState, RunnerStatus } from '../api/types';
 
 /**
  * Dashboard page component.
- * Shows backend status, current positions, and portfolio summary.
+ * Shows backend status, current positions, portfolio summary, and runner controls.
  */
 function DashboardPage() {
   const [status, setStatus] = useState<StatusResponse | null>(null);
   const [positions, setPositions] = useState<Position[]>([]);
+  const [runnerState, setRunnerState] = useState<RunnerState | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [runnerLoading, setRunnerLoading] = useState(false);
 
   useEffect(() => {
     loadData();
+    // Poll runner status every 5 seconds
+    const interval = setInterval(loadRunnerStatus, 5000);
+    return () => clearInterval(interval);
   }, []);
 
   const loadData = async () => {
@@ -21,18 +26,56 @@ function DashboardPage() {
       setLoading(true);
       setError(null);
       
-      // Fetch status and positions in parallel
-      const [statusData, positionsData] = await Promise.all([
+      // Fetch status, positions, and runner state in parallel
+      const [statusData, positionsData, runnerData] = await Promise.all([
         getBackendStatus(),
         getPositions(),
+        getRunnerStatus(),
       ]);
       
       setStatus(statusData);
       setPositions(positionsData.positions);
+      setRunnerState(runnerData.status);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load data');
     } finally {
       setLoading(false);
+    }
+  };
+
+  const loadRunnerStatus = async () => {
+    try {
+      const runnerData = await getRunnerStatus();
+      setRunnerState(runnerData.status);
+    } catch (err) {
+      console.error('Failed to load runner status:', err);
+    }
+  };
+
+  const handleStartRunner = async () => {
+    try {
+      setRunnerLoading(true);
+      const response = await startRunner();
+      setRunnerState(response.status);
+      if (!response.success) {
+        alert(response.message || 'Failed to start runner');
+      }
+    } catch (err) {
+      alert(err instanceof Error ? err.message : 'Failed to start runner');
+    } finally {
+      setRunnerLoading(false);
+    }
+  };
+
+  const handleStopRunner = async () => {
+    try {
+      setRunnerLoading(true);
+      const response = await stopRunner();
+      setRunnerState(response.status);
+    } catch (err) {
+      alert(err instanceof Error ? err.message : 'Failed to stop runner');
+    } finally {
+      setRunnerLoading(false);
     }
   };
 
@@ -73,7 +116,7 @@ function DashboardPage() {
       {!loading && !error && (
         <>
           {/* Backend Status Card */}
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 mb-8">
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
             <div className="bg-gray-800 rounded-lg p-6 border border-gray-700">
               <h3 className="text-lg font-semibold text-white mb-4">Backend Status</h3>
               {status && (
@@ -85,6 +128,58 @@ function DashboardPage() {
                   <p className="text-gray-300 text-sm">{status.service}</p>
                   <p className="text-gray-400 text-xs">Version: {status.version}</p>
                 </div>
+              )}
+            </div>
+
+            {/* Strategy Runner Status Card */}
+            <div className="bg-gray-800 rounded-lg p-6 border border-gray-700">
+              <h3 className="text-lg font-semibold text-white mb-4">Strategy Runner</h3>
+              {runnerState ? (
+                <div className="space-y-3">
+                  <div className="flex items-center">
+                    <div className={`w-3 h-3 rounded-full mr-2 ${
+                      runnerState.status === RunnerStatus.RUNNING ? 'bg-green-500' :
+                      runnerState.status === RunnerStatus.ERROR ? 'bg-red-500' :
+                      'bg-gray-500'
+                    }`}></div>
+                    <span className={`font-medium ${
+                      runnerState.status === RunnerStatus.RUNNING ? 'text-green-400' :
+                      runnerState.status === RunnerStatus.ERROR ? 'text-red-400' :
+                      'text-gray-400'
+                    }`}>
+                      {runnerState.status.toUpperCase()}
+                    </span>
+                  </div>
+                  <div className="space-y-1 text-xs">
+                    <p className="text-gray-400">
+                      Strategies: {runnerState.strategies?.length || 0}
+                    </p>
+                    <p className="text-gray-400">
+                      Interval: {runnerState.tick_interval}s
+                    </p>
+                    <p className={`${runnerState.broker_connected ? 'text-green-400' : 'text-red-400'}`}>
+                      Broker: {runnerState.broker_connected ? 'Connected' : 'Disconnected'}
+                    </p>
+                  </div>
+                  <div className="flex gap-2 mt-3">
+                    <button
+                      onClick={handleStartRunner}
+                      disabled={runnerLoading || runnerState.status === RunnerStatus.RUNNING}
+                      className="flex-1 bg-green-600 hover:bg-green-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white px-3 py-1 rounded text-sm font-medium transition-colors"
+                    >
+                      ▶ Start
+                    </button>
+                    <button
+                      onClick={handleStopRunner}
+                      disabled={runnerLoading || runnerState.status === RunnerStatus.STOPPED}
+                      className="flex-1 bg-red-600 hover:bg-red-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white px-3 py-1 rounded text-sm font-medium transition-colors"
+                    >
+                      ⏸ Stop
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <p className="text-gray-400 text-sm">Loading...</p>
               )}
             </div>
 
