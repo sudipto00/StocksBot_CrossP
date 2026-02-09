@@ -3,8 +3,9 @@ API Routes.
 Defines all REST API endpoints for StocksBot.
 """
 from datetime import datetime
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from typing import List, Optional
+from sqlalchemy.orm import Session
 
 from .models import (
     StatusResponse,
@@ -33,6 +34,8 @@ from .models import (
     AuditEventType,
     AuditLogsResponse,
 )
+from storage.database import get_db
+from storage.service import StorageService
 
 router = APIRouter()
 
@@ -215,100 +218,188 @@ async def request_notification(request: NotificationRequest):
 # Strategy Endpoints
 # ============================================================================
 
-# In-memory strategy store (TODO: Replace with persistent storage)
-_strategies: dict[str, Strategy] = {}
-_strategy_counter = 0
-
 
 @router.get("/strategies", response_model=StrategiesResponse)
-async def get_strategies():
+async def get_strategies(db: Session = Depends(get_db)):
     """
-    Get all strategies.
-    TODO: Load from database.
-    Returns stub data for now.
+    Get all strategies from database.
     """
+    storage = StorageService(db)
+    db_strategies = storage.strategies.get_all()
+    
+    # Convert DB models to API models
+    api_strategies = [
+        Strategy(
+            id=str(s.id),
+            name=s.name,
+            description=s.description or "",
+            status=StrategyStatus.RUNNING if s.is_active else StrategyStatus.STOPPED,
+            symbols=[],  # Symbols can be stored in config JSON
+            created_at=s.created_at,
+            updated_at=s.updated_at,
+        )
+        for s in db_strategies
+    ]
+    
     return StrategiesResponse(
-        strategies=list(_strategies.values()),
-        total_count=len(_strategies),
+        strategies=api_strategies,
+        total_count=len(api_strategies),
     )
 
 
 @router.post("/strategies", response_model=Strategy)
-async def create_strategy(request: StrategyCreateRequest):
+async def create_strategy(request: StrategyCreateRequest, db: Session = Depends(get_db)):
     """
-    Create a new strategy.
-    TODO: Persist to database and validate.
-    This is a stub implementation.
+    Create a new strategy and persist to database.
     """
-    global _strategy_counter
-    _strategy_counter += 1
+    storage = StorageService(db)
     
-    strategy_id = f"strat-{_strategy_counter}"
-    now = datetime.now()
+    # Check if strategy with same name exists
+    existing = storage.strategies.get_by_name(request.name)
+    if existing:
+        raise HTTPException(status_code=400, detail="Strategy with this name already exists")
     
-    strategy = Strategy(
-        id=strategy_id,
+    # Create strategy in database
+    db_strategy = storage.strategies.create(
         name=request.name,
-        description=request.description,
-        status=StrategyStatus.STOPPED,
-        symbols=request.symbols,
-        created_at=now,
-        updated_at=now,
+        description=request.description or "",
+        strategy_type="custom",  # Default type
+        config={"symbols": request.symbols}  # Store symbols in config
     )
     
-    _strategies[strategy_id] = strategy
+    # Create audit log
+    storage.create_audit_log(
+        event_type="strategy_started",
+        description=f"Strategy '{request.name}' created",
+        strategy_id=db_strategy.id
+    )
+    
+    # Convert to API model
+    strategy = Strategy(
+        id=str(db_strategy.id),
+        name=db_strategy.name,
+        description=db_strategy.description or "",
+        status=StrategyStatus.STOPPED,
+        symbols=request.symbols,
+        created_at=db_strategy.created_at,
+        updated_at=db_strategy.updated_at,
+    )
+    
     return strategy
 
 
 @router.get("/strategies/{strategy_id}", response_model=Strategy)
-async def get_strategy(strategy_id: str):
+async def get_strategy(strategy_id: str, db: Session = Depends(get_db)):
     """
-    Get a specific strategy by ID.
-    TODO: Load from database.
+    Get a specific strategy by ID from database.
     """
-    if strategy_id not in _strategies:
+    storage = StorageService(db)
+    
+    try:
+        db_strategy = storage.strategies.get_by_id(int(strategy_id))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid strategy ID")
+    
+    if not db_strategy:
         raise HTTPException(status_code=404, detail="Strategy not found")
     
-    return _strategies[strategy_id]
+    # Convert to API model
+    symbols = db_strategy.config.get("symbols", []) if db_strategy.config else []
+    strategy = Strategy(
+        id=str(db_strategy.id),
+        name=db_strategy.name,
+        description=db_strategy.description or "",
+        status=StrategyStatus.RUNNING if db_strategy.is_active else StrategyStatus.STOPPED,
+        symbols=symbols,
+        created_at=db_strategy.created_at,
+        updated_at=db_strategy.updated_at,
+    )
+    
+    return strategy
 
 
 @router.put("/strategies/{strategy_id}", response_model=Strategy)
-async def update_strategy(strategy_id: str, request: StrategyUpdateRequest):
+async def update_strategy(
+    strategy_id: str,
+    request: StrategyUpdateRequest,
+    db: Session = Depends(get_db)
+):
     """
-    Update a strategy.
-    TODO: Persist to database and validate.
-    This is a stub implementation.
+    Update a strategy in the database.
     """
-    if strategy_id not in _strategies:
+    storage = StorageService(db)
+    
+    try:
+        db_strategy = storage.strategies.get_by_id(int(strategy_id))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid strategy ID")
+    
+    if not db_strategy:
         raise HTTPException(status_code=404, detail="Strategy not found")
     
-    strategy = _strategies[strategy_id]
-    
+    # Update fields
     if request.name is not None:
-        strategy.name = request.name
+        db_strategy.name = request.name
     if request.description is not None:
-        strategy.description = request.description
+        db_strategy.description = request.description
     if request.symbols is not None:
-        strategy.symbols = request.symbols
+        if not db_strategy.config:
+            db_strategy.config = {}
+        db_strategy.config["symbols"] = request.symbols
     if request.status is not None:
-        strategy.status = request.status
+        db_strategy.is_active = (request.status == StrategyStatus.RUNNING)
     
-    strategy.updated_at = datetime.now()
+    # Save changes
+    db_strategy = storage.strategies.update(db_strategy)
+    
+    # Create audit log
+    storage.create_audit_log(
+        event_type="config_updated",
+        description=f"Strategy '{db_strategy.name}' updated",
+        strategy_id=db_strategy.id
+    )
+    
+    # Convert to API model
+    symbols = db_strategy.config.get("symbols", []) if db_strategy.config else []
+    strategy = Strategy(
+        id=str(db_strategy.id),
+        name=db_strategy.name,
+        description=db_strategy.description or "",
+        status=StrategyStatus.RUNNING if db_strategy.is_active else StrategyStatus.STOPPED,
+        symbols=symbols,
+        created_at=db_strategy.created_at,
+        updated_at=db_strategy.updated_at,
+    )
     
     return strategy
 
 
 @router.delete("/strategies/{strategy_id}")
-async def delete_strategy(strategy_id: str):
+async def delete_strategy(strategy_id: str, db: Session = Depends(get_db)):
     """
-    Delete a strategy.
-    TODO: Remove from database.
-    This is a stub implementation.
+    Delete a strategy from the database.
     """
-    if strategy_id not in _strategies:
+    storage = StorageService(db)
+    
+    try:
+        strategy_id_int = int(strategy_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid strategy ID")
+    
+    # Check if strategy exists
+    db_strategy = storage.strategies.get_by_id(strategy_id_int)
+    if not db_strategy:
         raise HTTPException(status_code=404, detail="Strategy not found")
     
-    del _strategies[strategy_id]
+    # Create audit log before deletion
+    storage.create_audit_log(
+        event_type="strategy_stopped",
+        description=f"Strategy '{db_strategy.name}' deleted",
+        strategy_id=strategy_id_int
+    )
+    
+    # Delete strategy
+    storage.strategies.delete(strategy_id_int)
     
     return {"message": "Strategy deleted"}
 
@@ -317,64 +408,333 @@ async def delete_strategy(strategy_id: str):
 # Audit Log Endpoints
 # ============================================================================
 
-# In-memory audit log store (TODO: Replace with persistent storage)
-_audit_logs: List[AuditLog] = []
-
 
 @router.get("/audit/logs", response_model=AuditLogsResponse)
 async def get_audit_logs(
     limit: int = 100,
-    event_type: Optional[AuditEventType] = None
+    event_type: Optional[AuditEventType] = None,
+    db: Session = Depends(get_db)
 ):
     """
-    Get audit logs.
-    TODO: Load from database with filtering and pagination.
-    Returns stub data for now.
+    Get audit logs from database with filtering and pagination.
     """
-    # Generate some stub data if empty
-    if not _audit_logs:
-        _generate_stub_audit_logs()
+    storage = StorageService(db)
     
-    # Filter by event type if specified
-    logs = _audit_logs
-    if event_type:
-        logs = [log for log in logs if log.event_type == event_type]
+    # Get audit logs from database
+    db_logs = storage.get_audit_logs(
+        limit=limit,
+        offset=0,
+        event_type=event_type.value if event_type else None
+    )
     
-    # Apply limit
-    logs = logs[:limit]
+    # Get total count
+    total_count = storage.count_audit_logs(
+        event_type=event_type.value if event_type else None
+    )
+    
+    # Convert DB models to API models
+    api_logs = [
+        AuditLog(
+            id=str(log.id),
+            timestamp=log.timestamp,
+            event_type=AuditEventType(log.event_type.value),
+            description=log.description,
+            details=log.details or {}
+        )
+        for log in db_logs
+    ]
     
     return AuditLogsResponse(
-        logs=logs,
-        total_count=len(_audit_logs),
+        logs=api_logs,
+        total_count=total_count,
     )
 
 
-def _generate_stub_audit_logs():
-    """Generate stub audit log data for development."""
-    global _audit_logs
+# ============================================================================
+# Strategy Runner Endpoints
+# ============================================================================
+
+# Global strategy runner instance (singleton)
+_runner_instance = None
+_runner_lock = None
+
+
+def get_runner_instance():
+    """Get or create the global strategy runner instance."""
+    global _runner_instance, _runner_lock
     
-    now = datetime.now()
+    if _runner_lock is None:
+        import threading
+        _runner_lock = threading.Lock()
     
-    _audit_logs = [
-        AuditLog(
-            id="log-001",
-            timestamp=now,
-            event_type=AuditEventType.ORDER_CREATED,
-            description="Market order created for AAPL",
-            details={"symbol": "AAPL", "quantity": 100, "side": "buy"}
-        ),
-        AuditLog(
-            id="log-002",
-            timestamp=now,
-            event_type=AuditEventType.ORDER_FILLED,
-            description="Order filled for AAPL at $150.00",
-            details={"symbol": "AAPL", "quantity": 100, "price": 150.00}
-        ),
-        AuditLog(
-            id="log-003",
-            timestamp=now,
-            event_type=AuditEventType.POSITION_OPENED,
-            description="Position opened: AAPL 100 shares",
-            details={"symbol": "AAPL", "quantity": 100}
-        ),
-    ]
+    with _runner_lock:
+        if _runner_instance is None:
+            from engine.strategy_runner import StrategyRunner
+            from typing import Dict, List, Optional
+            import os
+            
+            # Try to create Alpaca broker with env vars, fall back to mock
+            try:
+                from integrations.alpaca_broker import AlpacaBroker
+                api_key = os.getenv('ALPACA_API_KEY', '')
+                secret_key = os.getenv('ALPACA_SECRET_KEY', '')
+                
+                if api_key and secret_key:
+                    broker = AlpacaBroker(api_key=api_key, secret_key=secret_key, paper=True)
+                else:
+                    raise ValueError("No API keys provided, using mock broker")
+            except Exception as e:
+                print(f"Failed to create Alpaca broker, using mock: {e}")
+                # Fallback to mock broker
+                from services.broker import BrokerInterface, OrderSide, OrderType
+                
+                class MockBroker(BrokerInterface):
+                    """Mock broker for testing."""
+                    def __init__(self):
+                        self._connected = False
+                    
+                    def connect(self) -> bool:
+                        self._connected = True
+                        return True
+                    
+                    def disconnect(self) -> bool:
+                        self._connected = False
+                        return True
+                    
+                    def is_connected(self) -> bool:
+                        return self._connected
+                    
+                    def get_account_info(self) -> Dict:
+                        return {"cash": 100000.0, "portfolio_value": 100000.0, "buying_power": 100000.0}
+                    
+                    def get_positions(self) -> List[Dict]:
+                        return []
+                    
+                    def submit_order(self, symbol: str, side: OrderSide, order_type: OrderType,
+                                   quantity: float, price: Optional[float] = None) -> Dict:
+                        return {"id": "mock-order-1", "symbol": symbol, "status": "filled"}
+                    
+                    def cancel_order(self, order_id: str) -> bool:
+                        return True
+                    
+                    def get_order(self, order_id: str) -> Dict:
+                        return {"id": order_id, "status": "filled"}
+                    
+                    def get_orders(self, status: Optional[str] = None) -> List[Dict]:
+                        return []
+                    
+                    def get_market_data(self, symbol: str) -> Dict:
+                        return {"symbol": symbol, "price": 100.0}
+                
+                broker = MockBroker()
+            
+            # Create runner with default settings
+            _runner_instance = StrategyRunner(
+                broker=broker,
+                storage_service=None,  # Will be set when starting
+                tick_interval=60.0  # 1 minute
+            )
+        
+        return _runner_instance
+
+
+@router.post("/runner/start")
+async def start_runner(db: Session = Depends(get_db)):
+    """
+    Start the strategy runner.
+    Idempotent - returns success if already running.
+    """
+    runner = get_runner_instance()
+    storage = StorageService(db)
+    
+    # Set storage service
+    runner.storage = storage
+    
+    # Check if already running
+    if runner.status.value == "running":
+        return {
+            "success": True,
+            "message": "Strategy runner is already running",
+            "status": runner.get_status()
+        }
+    
+    # Load active strategies from database
+    active_strategies = storage.strategies.get_active()
+    if not active_strategies:
+        return {
+            "success": False,
+            "message": "No active strategies found. Please enable at least one strategy.",
+            "status": runner.get_status()
+        }
+    
+    # Start the runner
+    success = runner.start()
+    
+    if success:
+        # Create audit log
+        storage.create_audit_log(
+            event_type="strategy_started",
+            description=f"Strategy runner started with {len(active_strategies)} active strategies"
+        )
+        
+        return {
+            "success": True,
+            "message": "Strategy runner started successfully",
+            "status": runner.get_status()
+        }
+    else:
+        return {
+            "success": False,
+            "message": "Failed to start strategy runner",
+            "status": runner.get_status()
+        }
+
+
+@router.post("/runner/stop")
+async def stop_runner(db: Session = Depends(get_db)):
+    """
+    Stop the strategy runner.
+    Idempotent - returns success if already stopped.
+    """
+    runner = get_runner_instance()
+    storage = StorageService(db)
+    
+    # Check if already stopped
+    if runner.status.value == "stopped":
+        return {
+            "success": True,
+            "message": "Strategy runner is already stopped",
+            "status": runner.get_status()
+        }
+    
+    # Stop the runner
+    success = runner.stop()
+    
+    if success:
+        # Create audit log
+        storage.create_audit_log(
+            event_type="strategy_stopped",
+            description="Strategy runner stopped"
+        )
+        
+        return {
+            "success": True,
+            "message": "Strategy runner stopped successfully",
+            "status": runner.get_status()
+        }
+    else:
+        return {
+            "success": False,
+            "message": "Failed to stop strategy runner",
+            "status": runner.get_status()
+        }
+
+
+@router.get("/runner/status")
+async def get_runner_status():
+    """
+    Get the current status of the strategy runner.
+    """
+    runner = get_runner_instance()
+    status = runner.get_status()
+    
+    return {
+        "success": True,
+        "status": status
+    }
+
+
+# ============================================================================
+# Analytics Endpoints
+# ============================================================================
+
+
+@router.get("/analytics/portfolio")
+async def get_portfolio_analytics(db: Session = Depends(get_db)):
+    """
+    Get portfolio analytics including equity curve and P&L over time.
+    Returns time series data for portfolio value and P&L.
+    """
+    storage = StorageService(db)
+    
+    # Get all trades to calculate portfolio value over time
+    all_trades = storage.trades.get_all()
+    
+    # Calculate cumulative P&L over time
+    equity_curve = []
+    cumulative_pnl = 0.0
+    initial_capital = 100000.0  # Starting capital
+    
+    if all_trades:
+        for trade in all_trades:
+            cumulative_pnl += trade.realized_pnl or 0.0
+            portfolio_value = initial_capital + cumulative_pnl
+            
+            equity_curve.append({
+                "timestamp": trade.executed_at.isoformat(),
+                "portfolio_value": portfolio_value,
+                "cumulative_pnl": cumulative_pnl,
+                "trade_pnl": trade.realized_pnl or 0.0
+            })
+    
+    # Get current positions for unrealized P&L
+    positions = storage.get_open_positions()
+    unrealized_pnl = sum(pos.realized_pnl or 0.0 for pos in positions)
+    
+    current_portfolio_value = initial_capital + cumulative_pnl + unrealized_pnl
+    
+    return {
+        "equity_curve": equity_curve,
+        "summary": {
+            "initial_capital": initial_capital,
+            "current_value": current_portfolio_value,
+            "realized_pnl": cumulative_pnl,
+            "unrealized_pnl": unrealized_pnl,
+            "total_pnl": cumulative_pnl + unrealized_pnl,
+            "return_percent": ((current_portfolio_value - initial_capital) / initial_capital * 100)
+                if initial_capital > 0 else 0.0,
+            "total_trades": len(all_trades)
+        }
+    }
+
+
+@router.get("/analytics/equity-curve")
+async def get_equity_curve(
+    limit: int = 100,
+    db: Session = Depends(get_db)
+):
+    """
+    Get equity curve data (portfolio value over time).
+    Simplified endpoint that returns just the equity curve points.
+    """
+    storage = StorageService(db)
+    
+    # Get recent trades
+    all_trades = storage.trades.get_all()[-limit:] if limit else storage.trades.get_all()
+    
+    # Build equity curve
+    equity_points = []
+    cumulative_pnl = 0.0
+    initial_capital = 100000.0
+    
+    for trade in all_trades:
+        cumulative_pnl += trade.realized_pnl or 0.0
+        equity_points.append({
+            "timestamp": trade.executed_at.isoformat(),
+            "value": initial_capital + cumulative_pnl,
+            "pnl": cumulative_pnl
+        })
+    
+    # If no trades, return initial state
+    if not equity_points:
+        from datetime import datetime
+        equity_points.append({
+            "timestamp": datetime.now().isoformat(),
+            "value": initial_capital,
+            "pnl": 0.0
+        })
+    
+    return {
+        "data": equity_points,
+        "initial_capital": initial_capital
+    }

@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { getAuditLogs } from '../api/backend';
 import { AuditLog, AuditEventType } from '../api/types';
 
@@ -12,11 +12,7 @@ function AuditPage() {
   const [error, setError] = useState<string | null>(null);
   const [filter, setFilter] = useState<AuditEventType | 'all'>('all');
 
-  useEffect(() => {
-    loadLogs();
-  }, [filter]);
-
-  const loadLogs = async () => {
+  const loadLogs = useCallback(async () => {
     try {
       setLoading(true);
       setError(null);
@@ -31,7 +27,11 @@ function AuditPage() {
     } finally {
       setLoading(false);
     }
-  };
+  }, [filter]);
+
+  useEffect(() => {
+    loadLogs();
+  }, [loadLogs]);
 
   const getEventTypeColor = (eventType: AuditEventType): string => {
     switch (eventType) {

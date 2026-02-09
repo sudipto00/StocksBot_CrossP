@@ -9,12 +9,13 @@ from sqlalchemy.orm import sessionmaker
 
 from storage.database import Base
 from storage.models import (
-    Position, Order, Trade, Strategy, Config,
-    PositionSideEnum, OrderSideEnum, OrderTypeEnum, OrderStatusEnum, TradeTypeEnum
+    Position, Order, Trade, Strategy, Config, AuditLog,
+    PositionSideEnum, OrderSideEnum, OrderTypeEnum, OrderStatusEnum, TradeTypeEnum,
+    AuditEventTypeEnum
 )
 from storage.repositories import (
     PositionRepository, OrderRepository, TradeRepository,
-    StrategyRepository, ConfigRepository
+    StrategyRepository, ConfigRepository, AuditLogRepository
 )
 from storage.service import StorageService
 
@@ -410,3 +411,132 @@ def test_storage_service_config(storage_service):
     # Get all config
     all_config = storage_service.get_all_config()
     assert "trading_enabled" in all_config
+
+
+# ============================================================================
+# Audit Log Tests
+# ============================================================================
+
+@pytest.fixture
+def audit_log_repo(db_session):
+    """Create an audit log repository."""
+    return AuditLogRepository(db_session)
+
+
+def test_create_audit_log(audit_log_repo):
+    """Test creating an audit log entry."""
+    log = audit_log_repo.create(
+        event_type=AuditEventTypeEnum.ORDER_CREATED,
+        description="Test order created",
+        details={"symbol": "AAPL", "quantity": 100}
+    )
+    assert log.id is not None
+    assert log.event_type == AuditEventTypeEnum.ORDER_CREATED
+    assert log.description == "Test order created"
+    assert log.details["symbol"] == "AAPL"
+
+
+def test_get_audit_log_by_id(audit_log_repo):
+    """Test getting an audit log by ID."""
+    log = audit_log_repo.create(
+        event_type=AuditEventTypeEnum.STRATEGY_STARTED,
+        description="Strategy started"
+    )
+    
+    retrieved = audit_log_repo.get_by_id(log.id)
+    assert retrieved is not None
+    assert retrieved.id == log.id
+    assert retrieved.event_type == AuditEventTypeEnum.STRATEGY_STARTED
+
+
+def test_get_all_audit_logs(audit_log_repo):
+    """Test getting all audit logs with filtering."""
+    # Create multiple logs
+    audit_log_repo.create(
+        event_type=AuditEventTypeEnum.ORDER_CREATED,
+        description="Order 1"
+    )
+    audit_log_repo.create(
+        event_type=AuditEventTypeEnum.ORDER_FILLED,
+        description="Order 2"
+    )
+    audit_log_repo.create(
+        event_type=AuditEventTypeEnum.ORDER_CREATED,
+        description="Order 3"
+    )
+    
+    # Get all logs
+    all_logs = audit_log_repo.get_all(limit=100)
+    assert len(all_logs) == 3
+    
+    # Filter by event type
+    order_created_logs = audit_log_repo.get_all(
+        event_type=AuditEventTypeEnum.ORDER_CREATED
+    )
+    assert len(order_created_logs) == 2
+
+
+def test_count_audit_logs(audit_log_repo):
+    """Test counting audit logs."""
+    # Create multiple logs
+    for i in range(5):
+        audit_log_repo.create(
+            event_type=AuditEventTypeEnum.ORDER_CREATED,
+            description=f"Order {i}"
+        )
+    
+    count = audit_log_repo.count()
+    assert count == 5
+    
+    # Count with filter
+    count_filtered = audit_log_repo.count(
+        event_type=AuditEventTypeEnum.ORDER_CREATED
+    )
+    assert count_filtered == 5
+
+
+def test_storage_service_create_audit_log(storage_service):
+    """Test creating audit log through storage service."""
+    log = storage_service.create_audit_log(
+        event_type="order_created",
+        description="Test order",
+        details={"test": "data"}
+    )
+    assert log.id is not None
+    assert log.description == "Test order"
+
+
+def test_storage_service_get_audit_logs(storage_service):
+    """Test getting audit logs through storage service."""
+    # Create some logs
+    storage_service.create_audit_log(
+        event_type="order_created",
+        description="Order 1"
+    )
+    storage_service.create_audit_log(
+        event_type="strategy_started",
+        description="Strategy started"
+    )
+    
+    # Get all logs
+    logs = storage_service.get_audit_logs(limit=10)
+    assert len(logs) == 2
+    
+    # Get filtered logs
+    order_logs = storage_service.get_audit_logs(
+        event_type="order_created"
+    )
+    assert len(order_logs) == 1
+
+
+def test_storage_service_count_audit_logs(storage_service):
+    """Test counting audit logs through storage service."""
+    # Create logs
+    for i in range(3):
+        storage_service.create_audit_log(
+            event_type="order_created",
+            description=f"Order {i}"
+        )
+    
+    count = storage_service.count_audit_logs()
+    assert count == 3

@@ -179,3 +179,38 @@ class Config(Base):
     # Timestamps
     created_at = Column(DateTime, default=func.now(), nullable=False)
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class AuditEventTypeEnum(str, enum.Enum):
+    """Audit event type enumeration."""
+    ORDER_CREATED = "order_created"
+    ORDER_FILLED = "order_filled"
+    ORDER_CANCELLED = "order_cancelled"
+    STRATEGY_STARTED = "strategy_started"
+    STRATEGY_STOPPED = "strategy_stopped"
+    POSITION_OPENED = "position_opened"
+    POSITION_CLOSED = "position_closed"
+    CONFIG_UPDATED = "config_updated"
+    ERROR = "error"
+
+
+class AuditLog(Base):
+    """
+    AuditLog model - tracks all system events and actions.
+    Used for compliance, debugging, and audit trails.
+    """
+    __tablename__ = "audit_logs"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    event_type = Column(SQLEnum(AuditEventTypeEnum), nullable=False, index=True)
+    description = Column(Text, nullable=False)
+    details = Column(JSON, nullable=True)  # Additional metadata as JSON
+    
+    # Optional references
+    user_id = Column(String(100), nullable=True, index=True)
+    strategy_id = Column(Integer, nullable=True, index=True)
+    order_id = Column(Integer, nullable=True, index=True)
+    
+    # Timestamps
+    timestamp = Column(DateTime, default=func.now(), nullable=False, index=True)
+    created_at = Column(DateTime, default=func.now(), nullable=False)

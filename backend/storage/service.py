@@ -8,11 +8,12 @@ from sqlalchemy.orm import Session
 
 from storage.repositories import (
     PositionRepository, OrderRepository, TradeRepository,
-    StrategyRepository, ConfigRepository
+    StrategyRepository, ConfigRepository, AuditLogRepository
 )
 from storage.models import (
-    Position, Order, Trade, Strategy, Config,
-    PositionSideEnum, OrderSideEnum, OrderTypeEnum, OrderStatusEnum, TradeTypeEnum
+    Position, Order, Trade, Strategy, Config, AuditLog,
+    PositionSideEnum, OrderSideEnum, OrderTypeEnum, OrderStatusEnum, TradeTypeEnum,
+    AuditEventTypeEnum
 )
 
 
@@ -30,6 +31,7 @@ class StorageService:
         self.trades = TradeRepository(db)
         self.strategies = StrategyRepository(db)
         self.config = ConfigRepository(db)
+        self.audit_logs = AuditLogRepository(db)
     
     # Position operations
     
@@ -171,3 +173,56 @@ class StorageService:
         """Get all config as a dictionary."""
         configs = self.config.get_all()
         return {c.key: c.value for c in configs}
+    
+    # Audit log operations
+    
+    def create_audit_log(
+        self,
+        event_type: str,
+        description: str,
+        details: Optional[Dict[str, Any]] = None,
+        user_id: Optional[str] = None,
+        strategy_id: Optional[int] = None,
+        order_id: Optional[int] = None
+    ) -> AuditLog:
+        """Create a new audit log entry."""
+        return self.audit_logs.create(
+            event_type=AuditEventTypeEnum(event_type),
+            description=description,
+            details=details,
+            user_id=user_id,
+            strategy_id=strategy_id,
+            order_id=order_id
+        )
+    
+    def get_audit_logs(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        event_type: Optional[str] = None,
+        strategy_id: Optional[int] = None,
+        order_id: Optional[int] = None
+    ) -> List[AuditLog]:
+        """Get audit logs with filtering and pagination."""
+        event_type_enum = AuditEventTypeEnum(event_type) if event_type else None
+        return self.audit_logs.get_all(
+            limit=limit,
+            offset=offset,
+            event_type=event_type_enum,
+            strategy_id=strategy_id,
+            order_id=order_id
+        )
+    
+    def count_audit_logs(
+        self,
+        event_type: Optional[str] = None,
+        strategy_id: Optional[int] = None,
+        order_id: Optional[int] = None
+    ) -> int:
+        """Count audit logs with optional filtering."""
+        event_type_enum = AuditEventTypeEnum(event_type) if event_type else None
+        return self.audit_logs.count(
+            event_type=event_type_enum,
+            strategy_id=strategy_id,
+            order_id=order_id
+        )

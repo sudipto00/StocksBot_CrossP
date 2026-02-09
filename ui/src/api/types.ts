@@ -190,10 +190,72 @@ export interface AuditLog {
   timestamp: string; // ISO datetime string
   event_type: AuditEventType;
   description: string;
-  details?: Record<string, any>;
+  details?: Record<string, unknown>;
 }
 
 export interface AuditLogsResponse {
   logs: AuditLog[];
   total_count: number;
+}
+
+// ============================================================================
+// Strategy Runner Types
+// ============================================================================
+
+export enum RunnerStatus {
+  STOPPED = "stopped",
+  RUNNING = "running",
+  PAUSED = "paused",
+  ERROR = "error",
+}
+
+export interface StrategyState {
+  name: string;
+  status: string;
+}
+
+export interface RunnerState {
+  status: RunnerStatus;
+  strategies: StrategyState[];
+  tick_interval: number;
+  broker_connected: boolean;
+}
+
+export interface RunnerResponse {
+  success: boolean;
+  message?: string;
+  status: RunnerState;
+}
+
+// ============================================================================
+// Analytics Types
+// ============================================================================
+
+export interface EquityPoint {
+  timestamp: string;
+  value: number;
+  pnl: number;
+}
+
+export interface EquityCurveResponse {
+  data: EquityPoint[];
+  initial_capital: number;
+}
+
+export interface PortfolioAnalytics {
+  equity_curve: Array<{
+    timestamp: string;
+    portfolio_value: number;
+    cumulative_pnl: number;
+    trade_pnl: number;
+  }>;
+  summary: {
+    initial_capital: number;
+    current_value: number;
+    realized_pnl: number;
+    unrealized_pnl: number;
+    total_pnl: number;
+    return_percent: number;
+    total_trades: number;
+  };
 }
