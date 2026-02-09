@@ -114,7 +114,7 @@ def test_portfolio_service_instantiation():
     portfolio = PortfolioService()
     assert portfolio is not None
     assert portfolio.cash_balance == 100000.0
-    assert len(portfolio.positions) == 0
+    assert len(portfolio.get_positions()) == 0
 
 
 def test_portfolio_service_update_position():
