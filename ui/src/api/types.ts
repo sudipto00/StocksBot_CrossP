@@ -214,3 +214,33 @@ export interface RunnerActionResponse {
   message: string;
   status: string;
 }
+
+// ============================================================================
+// Analytics Types
+// ============================================================================
+
+export interface PortfolioTimeSeriesPoint {
+  timestamp: string;
+  equity: number;
+  pnl: number;
+  cumulative_pnl: number;
+  symbol: string;
+}
+
+export interface PortfolioAnalyticsResponse {
+  time_series: PortfolioTimeSeriesPoint[];
+  total_trades: number;
+  current_equity: number;
+  total_pnl: number;
+}
+
+export interface PortfolioSummaryResponse {
+  total_trades: number;
+  total_pnl: number;
+  winning_trades: number;
+  losing_trades: number;
+  win_rate: number;
+  total_positions: number;
+  total_position_value: number;
+  equity: number;
+}

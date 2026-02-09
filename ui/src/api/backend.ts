@@ -23,6 +23,9 @@ import {
   // Runner types
   RunnerStatusResponse,
   RunnerActionResponse,
+  // Analytics types
+  PortfolioAnalyticsResponse,
+  PortfolioSummaryResponse,
 } from './types';
 
 // Access environment variables via import.meta.env in Vite
@@ -267,6 +270,36 @@ export async function stopRunner(): Promise<RunnerActionResponse> {
   const response = await fetch(`${BACKEND_URL}/runner/stop`, {
     method: 'POST',
   });
+  
+  if (!response.ok) {
+    throw new Error(`Backend returned ${response.status}`);
+  }
+  
+  return response.json();
+}
+
+/**
+ * Get portfolio analytics time series.
+ */
+export async function getPortfolioAnalytics(days?: number): Promise<PortfolioAnalyticsResponse> {
+  const params = new URLSearchParams();
+  if (days) params.append('days', days.toString());
+  
+  const url = `${BACKEND_URL}/analytics/portfolio${params.toString() ? '?' + params.toString() : ''}`;
+  const response = await fetch(url);
+  
+  if (!response.ok) {
+    throw new Error(`Backend returned ${response.status}`);
+  }
+  
+  return response.json();
+}
+
+/**
+ * Get portfolio summary statistics.
+ */
+export async function getPortfolioSummary(): Promise<PortfolioSummaryResponse> {
+  const response = await fetch(`${BACKEND_URL}/analytics/summary`);
   
   if (!response.ok) {
     throw new Error(`Backend returned ${response.status}`);

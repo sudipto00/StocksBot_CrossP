@@ -474,3 +474,83 @@ async def stop_runner():
     """
     result = runner_manager.stop_runner()
     return RunnerActionResponse(**result)
+
+
+# ============================================================================
+# Portfolio Analytics Endpoints
+# ============================================================================
+
+@router.get("/analytics/portfolio")
+async def get_portfolio_analytics(
+    days: int = 30,
+    db: Session = Depends(get_db)
+):
+    """
+    Get portfolio analytics time series data.
+    Returns equity curve and P&L over time.
+    """
+    storage = StorageService(db)
+    
+    # Get all trades for time series
+    trades = storage.get_recent_trades(limit=1000)
+    
+    # Build time series data
+    time_series = []
+    cumulative_pnl = 0.0
+    equity = 100000.0  # Starting balance
+    
+    for trade in reversed(trades):  # Oldest first
+        cumulative_pnl += trade.realized_pnl or 0.0
+        equity += trade.realized_pnl or 0.0
+        
+        time_series.append({
+            'timestamp': trade.executed_at.isoformat(),
+            'equity': equity,
+            'pnl': trade.realized_pnl or 0.0,
+            'cumulative_pnl': cumulative_pnl,
+            'symbol': trade.symbol,
+        })
+    
+    return {
+        'time_series': time_series,
+        'total_trades': len(trades),
+        'current_equity': equity,
+        'total_pnl': cumulative_pnl,
+    }
+
+
+@router.get("/analytics/summary")
+async def get_portfolio_summary(db: Session = Depends(get_db)):
+    """
+    Get portfolio summary statistics.
+    Returns aggregate metrics and performance stats.
+    """
+    storage = StorageService(db)
+    
+    # Get positions
+    positions = storage.get_open_positions()
+    
+    # Get trades
+    trades = storage.get_recent_trades(limit=1000)
+    
+    # Calculate metrics
+    total_trades = len(trades)
+    total_pnl = sum(t.realized_pnl or 0.0 for t in trades)
+    winning_trades = len([t for t in trades if (t.realized_pnl or 0.0) > 0])
+    losing_trades = len([t for t in trades if (t.realized_pnl or 0.0) < 0])
+    win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0.0
+    
+    # Calculate position values
+    total_position_value = sum(p.cost_basis for p in positions)
+    total_positions = len(positions)
+    
+    return {
+        'total_trades': total_trades,
+        'total_pnl': total_pnl,
+        'winning_trades': winning_trades,
+        'losing_trades': losing_trades,
+        'win_rate': win_rate,
+        'total_positions': total_positions,
+        'total_position_value': total_position_value,
+        'equity': 100000.0 + total_pnl,  # Starting balance + P&L
+    }

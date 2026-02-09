@@ -32,6 +32,11 @@ function Sidebar() {
           Strategy
         </NavLink>
         
+        <NavLink to="/analytics" className={navLinkClass}>
+          <span className="mr-3">📈</span>
+          Analytics
+        </NavLink>
+        
         <NavLink to="/audit" className={navLinkClass}>
           <span className="mr-3">📋</span>
           Audit
