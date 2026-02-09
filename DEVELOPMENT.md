@@ -25,6 +25,13 @@
    npm install
    ```
 
+3. **Setup database (first time only)**
+   ```bash
+   cd backend
+   # Run database migrations
+   alembic upgrade head
+   ```
+
 ### Running in Development
 
 **Option 1: Manual (Recommended for development)**
@@ -101,6 +108,44 @@ StocksBot_CrossP/
 
 ## Development Workflow
 
+### Database Management
+
+**Run Migrations:**
+```bash
+cd backend
+alembic upgrade head
+```
+
+**Create New Migration (after modifying models):**
+```bash
+cd backend
+alembic revision --autogenerate -m "Description of changes"
+alembic upgrade head
+```
+
+**Rollback Migration:**
+```bash
+cd backend
+alembic downgrade -1  # Rollback one version
+```
+
+**View Migration History:**
+```bash
+cd backend
+alembic history
+alembic current
+```
+
+The database file (`stocksbot.db`) is created automatically in the `backend/` directory when you run migrations or start the app.
+
+**Database Configuration:**
+- **Default (Development):** SQLite - `backend/stocksbot.db`
+- **Custom URL:** Set `DATABASE_URL` environment variable
+  ```bash
+  # Example for PostgreSQL in production
+  export DATABASE_URL="postgresql://user:password@localhost/stocksbot"
+  ```
+
 ### Making Changes
 
 1. **Backend Changes**
@@ -117,12 +162,23 @@ StocksBot_CrossP/
    - Edit `src-tauri/src/main.rs` or `tauri.conf.json`
    - Requires Tauri rebuild
 
+4. **Database Schema Changes**
+   - Edit models in `backend/storage/models.py`
+   - Create migration: `alembic revision --autogenerate -m "Description"`
+   - Apply migration: `alembic upgrade head`
+
 ### Testing
 
 **Backend Tests:**
 ```bash
 cd backend
 pytest tests/ -v
+
+# Run specific test file
+pytest tests/test_storage.py -v
+
+# Run with coverage
+pytest --cov=storage --cov=services tests/
 ```
 
 **Frontend Lint:**
@@ -225,8 +281,14 @@ This is a scaffold. Here's what needs to be implemented:
 
 ### Backend (Priority Order)
 1. ✅ Basic FastAPI app with /status
-2. 🚧 Configuration management (config/)
-3. 🚧 Database/storage layer (storage/)
+2. ✅ Configuration management (config/)
+3. ✅ Database/storage layer (storage/)
+   - ✅ SQLite database with SQLAlchemy
+   - ✅ Alembic migrations
+   - ✅ Models for positions, orders, trades, strategies, config
+   - ✅ Repository pattern for CRUD operations
+   - ✅ Storage service integration
+   - ✅ Comprehensive tests
 4. 🚧 Broker API integration (integrations/)
 5. 🚧 Trading engine (engine/)
 6. 🚧 Business services (services/)
