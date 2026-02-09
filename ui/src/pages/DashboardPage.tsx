@@ -184,7 +184,7 @@ function DashboardPage() {
                       disabled={runnerLoading || runnerState.status === RunnerStatus.STOPPED}
                       className="flex-1 bg-red-600 hover:bg-red-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white px-3 py-1 rounded text-sm font-medium transition-colors"
                     >
-                      ⏸ Stop
+                      ⏹ Stop
                     </button>
                   </div>
                 </div>
