@@ -1,11 +1,25 @@
-import MainLayout from "./layouts/MainLayout";
-import HomePage from "./pages/HomePage";
+import { BrowserRouter, Routes, Route } from 'react-router-dom';
+import Sidebar from './components/Sidebar';
+import DashboardPage from './pages/DashboardPage';
+import StrategyPage from './pages/StrategyPage';
+import AuditPage from './pages/AuditPage';
+import SettingsPage from './pages/SettingsPage';
 
 function App() {
   return (
-    <MainLayout>
-      <HomePage />
-    </MainLayout>
+    <BrowserRouter>
+      <div className="flex h-screen bg-gray-900">
+        <Sidebar />
+        <main className="flex-1 overflow-auto">
+          <Routes>
+            <Route path="/" element={<DashboardPage />} />
+            <Route path="/strategy" element={<StrategyPage />} />
+            <Route path="/audit" element={<AuditPage />} />
+            <Route path="/settings" element={<SettingsPage />} />
+          </Routes>
+        </main>
+      </div>
+    </BrowserRouter>
   );
 }
 
