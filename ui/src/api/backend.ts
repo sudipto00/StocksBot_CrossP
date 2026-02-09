@@ -3,7 +3,8 @@
  * Handles communication with the FastAPI sidecar backend.
  */
 
-const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || "http://127.0.0.1:8000";
+// Access environment variables via import.meta.env in Vite
+const BACKEND_URL = (import.meta as any).env?.VITE_BACKEND_URL || "http://127.0.0.1:8000";
 
 interface BackendStatusResponse {
   status: string;
