@@ -267,35 +267,81 @@ For detailed request/response schemas, see the [API Documentation](./API.md).
 
 ## Current Status
 
-This is a **scaffold version** with minimal functionality:
+This project has completed **Milestones 1-4**:
 
-✅ **Completed:**
+✅ **Milestone 1 - Database Persistence Layer (Completed):**
+- SQLite database with SQLAlchemy ORM
+- Alembic migrations for schema management
+- Database models for positions, orders, trades, strategies, and config
+- Repository pattern for CRUD operations
+- Storage service integration with backend services
+- Comprehensive test coverage for storage layer
+
+✅ **Milestone 2 - Strategy Runtime (Completed):**
+- Strategy plugin interface for custom trading strategies
+- Sample strategy implementations (Moving Average, Buy & Hold)
+- Strategy runner with scheduler loop
+- Paper trading execution path
+- Storage integration for recording trades
+
+✅ **Milestone 3 - Broker Integration: Alpaca (Completed):**
+- **Alpaca broker adapter** implementing BrokerInterface
+- Support for authentication (paper & live trading keys)
+- Account info retrieval (balance, buying power, etc.)
+- Position tracking from Alpaca API
+- Market data fetching (latest quotes)
+- Order submission (market & limit orders)
+- Order management (status tracking, cancellation)
+- Configuration via environment variables (.env)
+- Comprehensive tests with mocked Alpaca responses
+- **Documentation:** See [ALPACA_SETUP.md](./ALPACA_SETUP.md) for setup instructions
+
+✅ **Milestone 4 - UI Functionality Pass (Completed):**
+- **Settings Page:**
+  - Connected to backend /config endpoints
+  - Save/load configuration (trading enabled, paper trading, risk limits)
+  - Form validation and error handling
+  - Loading states and error messages
+- **Strategy Page:**
+  - Full CRUD operations for strategies
+  - Create new strategies with name, description, and symbols
+  - Start/stop strategy execution
+  - Delete strategies
+  - Empty state and loading indicators
+- **Audit Page:**
+  - View audit logs and system events
+  - Filter by event type
+  - Detailed event information with JSON details
+  - Stub data for demonstration
+- **Dashboard:**
+  - Refresh button to reload data
+  - Error handling and loading states
+- **Navigation:**
+  - All UI routes reachable and functional
+  - Consistent UX across all pages
+
+**Other Completed Features:**
 - Project structure and directory layout
-- FastAPI backend with /status endpoint
-- React + Tailwind UI with basic dashboard
+- FastAPI backend with comprehensive API endpoints
+- React + Tailwind UI with responsive design
 - Tauri application setup
 - Cross-platform build configuration
-- Basic backend-frontend communication
-- **Database persistence layer:**
-  - SQLite database with SQLAlchemy ORM
-  - Alembic migrations for schema management
-  - Database models for positions, orders, trades, strategies, and config
-  - Repository pattern for CRUD operations
-  - Storage service integration with backend services
-  - Comprehensive test coverage for storage layer
+- Backend-frontend communication via REST API
+- System notifications via Tauri API
 
-🚧 **TODO (Feature Parity):**
-- Trading engine implementation
-- Broker API integrations
-- Real-time position tracking via broker APIs
-- Market data feeds
-- Analytics and reporting
-- User authentication
-- Real-time updates (WebSocket)
-- System tray full implementation
-- Notifications
-- Settings management
-- Data export functionality
+🚧 **TODO (Future Enhancements):**
+- Real trading logic execution (beyond stubs)
+- Real-time position tracking and updates
+- WebSocket support for live market data
+- Advanced order types (stop-loss, trailing stop, brackets)
+- Strategy backtesting with historical data
+- Performance analytics and reporting
+- User authentication and multi-user support
+- System tray integration
+- Data export functionality (CSV, PDF)
+- More broker integrations (Interactive Brokers, etc.)
+- Advanced risk management features
+- Email/SMS notifications
 - Comprehensive integration testing
 
 ## Contributing
