@@ -154,7 +154,7 @@ function AnalyticsPage() {
                     <Tooltip 
                       contentStyle={{ backgroundColor: '#1f2937', border: '1px solid #374151' }}
                       labelStyle={{ color: '#9ca3af' }}
-                      formatter={(value: any) => formatCurrency(value)}
+                      formatter={(value: number | undefined) => value !== undefined ? formatCurrency(value) : ''}
                       labelFormatter={(label) => formatDate(label)}
                     />
                     <Area 
@@ -186,7 +186,7 @@ function AnalyticsPage() {
                     <Tooltip 
                       contentStyle={{ backgroundColor: '#1f2937', border: '1px solid #374151' }}
                       labelStyle={{ color: '#9ca3af' }}
-                      formatter={(value: any) => formatCurrency(value)}
+                      formatter={(value: number | undefined) => value !== undefined ? formatCurrency(value) : ''}
                       labelFormatter={(label) => formatDate(label)}
                     />
                     <Legend />

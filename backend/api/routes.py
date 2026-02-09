@@ -347,7 +347,10 @@ async def update_strategy(strategy_id: str, request: StrategyUpdateRequest, db: 
     if request.description is not None:
         db_strategy.description = request.description
     if request.symbols is not None:
-        db_strategy.config['symbols'] = request.symbols
+        # Update config and mark as modified
+        config = db_strategy.config.copy()
+        config['symbols'] = request.symbols
+        db_strategy.config = config
     if request.status is not None:
         db_strategy.is_active = (request.status == StrategyStatus.ACTIVE)
         

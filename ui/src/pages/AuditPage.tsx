@@ -12,10 +12,6 @@ function AuditPage() {
   const [error, setError] = useState<string | null>(null);
   const [filter, setFilter] = useState<AuditEventType | 'all'>('all');
 
-  useEffect(() => {
-    loadLogs();
-  }, [filter]);
-
   const loadLogs = async () => {
     try {
       setLoading(true);
@@ -32,6 +28,11 @@ function AuditPage() {
       setLoading(false);
     }
   };
+
+  useEffect(() => {
+    loadLogs();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filter]);
 
   const getEventTypeColor = (eventType: AuditEventType): string => {
     switch (eventType) {

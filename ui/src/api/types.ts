@@ -190,7 +190,7 @@ export interface AuditLog {
   timestamp: string; // ISO datetime string
   event_type: AuditEventType;
   description: string;
-  details?: Record<string, any>;
+  details?: Record<string, unknown>;
 }
 
 export interface AuditLogsResponse {
@@ -204,7 +204,7 @@ export interface AuditLogsResponse {
 
 export interface RunnerStatusResponse {
   status: string; // stopped, running, paused, error
-  strategies: any[];
+  strategies: unknown[];
   tick_interval: number;
   broker_connected: boolean;
 }
