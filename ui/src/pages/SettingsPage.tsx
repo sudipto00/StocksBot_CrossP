@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { showSuccessNotification } from '../utils/notifications';
 
 /**
  * Settings page component.
@@ -14,6 +15,13 @@ import { useState } from 'react';
 function SettingsPage() {
   const [tradingEnabled, setTradingEnabled] = useState(false);
   const [paperTrading, setPaperTrading] = useState(true);
+
+  const handleTestNotification = async () => {
+    await showSuccessNotification(
+      'Test Notification',
+      'Notifications are working! This is a test notification from StocksBot.'
+    );
+  };
 
   return (
     <div className="p-8">
@@ -124,6 +132,37 @@ function SettingsPage() {
 
         <div className="mt-4 text-gray-500 text-xs">
           TODO: Implement broker selection and API key management
+        </div>
+      </div>
+
+      {/* Notifications Settings */}
+      <div className="bg-gray-800 rounded-lg p-6 border border-gray-700 mb-6">
+        <h3 className="text-lg font-semibold text-white mb-4">Notifications</h3>
+        
+        <div className="space-y-4">
+          <div className="flex items-center justify-between">
+            <div>
+              <label className="text-white font-medium">Desktop Notifications</label>
+              <p className="text-gray-400 text-sm">Show system notifications for events</p>
+            </div>
+            <button
+              className="relative inline-flex h-6 w-11 items-center rounded-full bg-green-600"
+            >
+              <span className="inline-block h-4 w-4 transform rounded-full bg-white translate-x-6" />
+            </button>
+          </div>
+
+          <div>
+            <button
+              onClick={handleTestNotification}
+              className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded font-medium"
+            >
+              Test Notification
+            </button>
+            <p className="text-gray-400 text-xs mt-2">
+              Click to test system notifications. See NOTIFICATIONS.md for OS-specific setup.
+            </p>
+          </div>
         </div>
       </div>
 
