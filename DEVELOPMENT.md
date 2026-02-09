@@ -394,3 +394,39 @@ This is a scaffold. Here's what needs to be implemented:
 - [React Documentation](https://react.dev/)
 - [Tauri Documentation](https://tauri.app/)
 - [Tailwind CSS](https://tailwindcss.com/)
+
+## Recent Updates
+
+### Database Persistence (Latest)
+- ✅ **Strategies persistence**: Strategies are now stored in the database instead of in-memory
+- ✅ **Audit logs**: Complete audit trail stored in database with filtering and querying capabilities
+- ✅ **Database migrations**: Added `audit_logs` table with Alembic migration
+- ✅ **Storage service**: Extended with audit log CRUD operations
+- ✅ **API updates**: All strategy and audit endpoints now use database-backed storage
+
+### Strategy Runner Management (Latest)
+- ✅ **Runner control API**: New endpoints to start/stop/status the strategy runner
+  - `POST /runner/start` - Start the strategy runner (idempotent)
+  - `POST /runner/stop` - Stop the strategy runner (idempotent)
+  - `GET /runner/status` - Get current runner status
+- ✅ **Global runner instance**: Singleton pattern with thread-safe access
+- ✅ **Mock broker**: Fallback mock broker for testing/development without API keys
+- ✅ **UI integration**: Dashboard now shows runner status with start/stop controls
+- ✅ **Polling**: Auto-refresh runner status every 5 seconds
+
+### Portfolio Analytics & Charts (Latest)
+- ✅ **Analytics endpoints**: New endpoints for portfolio analysis
+  - `GET /analytics/portfolio` - Complete portfolio analytics with equity curve and summary
+  - `GET /analytics/equity-curve` - Simplified equity curve data
+- ✅ **Chart components**: Added recharts library with custom chart components
+  - `EquityCurveChart` - Portfolio value over time visualization
+  - `PnLChart` - Profit & loss bar chart with cumulative tracking
+- ✅ **Dashboard integration**: Charts automatically display on dashboard with empty states
+- ✅ **Real-time updates**: Charts refresh with dashboard data
+- ✅ **Performance metrics**: Win rate, total trades, and return percentage calculations
+
+### Testing
+- ✅ All tests passing (98 tests)
+- ✅ Storage layer tests for audit logs
+- ✅ API endpoint tests for runner management
+- ✅ Lint and build verification complete

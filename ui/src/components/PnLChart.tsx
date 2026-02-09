@@ -64,7 +64,10 @@ function PnLChart({ data }: PnLChartProps) {
               borderRadius: '0.5rem',
               color: '#F9FAFB',
             }}
-            formatter={(value: number) => [`$${value.toLocaleString()}`, 'P&L']}
+            formatter={(value: number | undefined) => {
+              if (value === undefined) return ['N/A', 'P&L'];
+              return [`$${value.toLocaleString()}`, 'P&L'];
+            }}
           />
           <Bar dataKey="pnl" radius={[4, 4, 0, 0]}>
             {chartData.map((entry, index) => (

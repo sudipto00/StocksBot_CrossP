@@ -190,7 +190,7 @@ export interface AuditLog {
   timestamp: string; // ISO datetime string
   event_type: AuditEventType;
   description: string;
-  details?: Record<string, any>;
+  details?: Record<string, unknown>;
 }
 
 export interface AuditLogsResponse {
@@ -209,9 +209,14 @@ export enum RunnerStatus {
   ERROR = "error",
 }
 
+export interface StrategyState {
+  name: string;
+  status: string;
+}
+
 export interface RunnerState {
   status: RunnerStatus;
-  strategies: any[]; // Strategy states
+  strategies: StrategyState[];
   tick_interval: number;
   broker_connected: boolean;
 }

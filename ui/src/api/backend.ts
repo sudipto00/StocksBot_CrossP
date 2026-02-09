@@ -22,14 +22,13 @@ import {
   AuditEventType,
   // Runner types
   RunnerResponse,
-  RunnerState,
   // Analytics types
   EquityCurveResponse,
   PortfolioAnalytics,
 } from './types';
 
 // Access environment variables via import.meta.env in Vite
-const BACKEND_URL = (import.meta as any).env?.VITE_BACKEND_URL || "http://127.0.0.1:8000";
+const BACKEND_URL = (import.meta as { env?: { VITE_BACKEND_URL?: string } }).env?.VITE_BACKEND_URL || "http://127.0.0.1:8000";
 
 /**
  * Get backend status.

@@ -60,7 +60,10 @@ function EquityCurveChart({ data, initialCapital }: EquityCurveChartProps) {
               borderRadius: '0.5rem',
               color: '#F9FAFB',
             }}
-            formatter={(value: number) => [`$${value.toLocaleString()}`, 'Portfolio Value']}
+            formatter={(value: number | undefined) => {
+              if (value === undefined) return ['N/A', 'Portfolio Value'];
+              return [`$${value.toLocaleString()}`, 'Portfolio Value'];
+            }}
           />
           <Line
             type="monotone"
