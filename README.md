@@ -102,7 +102,22 @@ cd backend
 pip install -r requirements.txt
 ```
 
-### 3. Install Tauri Dependencies
+### 3. Setup Database
+
+```bash
+cd backend
+# Run database migrations to create tables
+alembic upgrade head
+```
+
+This will create a SQLite database file `stocksbot.db` in the `backend/` directory.
+
+**Database Details:**
+- **Development:** Uses SQLite (`backend/stocksbot.db`)
+- **Production:** Can be configured to use PostgreSQL by setting `DATABASE_URL` environment variable
+- **Migrations:** Managed with Alembic (see [DEVELOPMENT.md](./DEVELOPMENT.md) for details)
+
+### 4. Install Tauri Dependencies
 
 ```bash
 cd src-tauri
@@ -261,21 +276,27 @@ This is a **scaffold version** with minimal functionality:
 - Tauri application setup
 - Cross-platform build configuration
 - Basic backend-frontend communication
+- **Database persistence layer:**
+  - SQLite database with SQLAlchemy ORM
+  - Alembic migrations for schema management
+  - Database models for positions, orders, trades, strategies, and config
+  - Repository pattern for CRUD operations
+  - Storage service integration with backend services
+  - Comprehensive test coverage for storage layer
 
 🚧 **TODO (Feature Parity):**
 - Trading engine implementation
 - Broker API integrations
-- Portfolio management
+- Real-time position tracking via broker APIs
 - Market data feeds
 - Analytics and reporting
 - User authentication
-- Database integration
 - Real-time updates (WebSocket)
 - System tray full implementation
 - Notifications
 - Settings management
 - Data export functionality
-- Comprehensive testing
+- Comprehensive integration testing
 
 ## Contributing
 

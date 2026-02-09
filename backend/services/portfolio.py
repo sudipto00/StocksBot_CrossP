@@ -1,16 +1,15 @@
 """
 Portfolio Service.
 Manages portfolio state, positions, and P&L tracking.
-
-TODO: Implement full portfolio management
-- Real-time position tracking
-- P&L calculations
-- Portfolio analytics
-- Historical performance
+Now integrated with database storage layer.
 """
 
 from typing import Dict, List, Optional, Any
 from datetime import datetime
+from sqlalchemy.orm import Session
+
+from storage.service import StorageService
+from storage.models import Position
 
 
 class PortfolioService:
@@ -18,21 +17,34 @@ class PortfolioService:
     Portfolio management service.
     
     Responsible for:
-    - Tracking current positions
+    - Tracking current positions (now database-backed)
     - Calculating P&L (realized and unrealized)
     - Portfolio value calculations
     - Position history
     - Performance analytics
     
     TODO: Integrate with broker API for real positions
-    TODO: Implement persistent storage
     TODO: Add real-time market data for valuations
     """
     
-    def __init__(self):
-        """Initialize portfolio service."""
-        # In-memory position tracking (TODO: Replace with database)
-        self.positions: Dict[str, Dict[str, Any]] = {}
+    def __init__(self, db: Optional[Session] = None, storage: Optional[StorageService] = None):
+        """
+        Initialize portfolio service.
+        
+        Args:
+            db: Database session (if storage not provided)
+            storage: StorageService instance (preferred)
+        """
+        if storage:
+            self.storage = storage
+        elif db:
+            self.storage = StorageService(db)
+        else:
+            # Fallback to in-memory mode for backward compatibility
+            self.storage = None
+            self._in_memory_positions: Dict[str, Dict[str, Any]] = {}
+        
+        # Cash balance tracking (TODO: Move to database)
         self.cash_balance: float = 100000.0  # Starting cash
         self.total_deposits: float = 100000.0
         
@@ -47,7 +59,23 @@ class PortfolioService:
         TODO: Calculate current market values
         TODO: Include unrealized P&L
         """
-        return list(self.positions.values())
+        if self.storage:
+            positions = self.storage.get_open_positions()
+            return [self._position_to_dict(p) for p in positions]
+        else:
+            # Fallback to in-memory
+            return list(self._in_memory_positions.values())
+    
+    def _position_to_dict(self, position: Position) -> Dict[str, Any]:
+        """Convert Position model to dictionary."""
+        return {
+            "symbol": position.symbol,
+            "side": position.side.value,
+            "quantity": position.quantity,
+            "avg_entry_price": position.avg_entry_price,
+            "cost_basis": position.cost_basis,
+            "realized_pnl": position.realized_pnl,
+        }
     
     def get_position(self, symbol: str) -> Optional[Dict[str, Any]]:
         """
@@ -59,7 +87,11 @@ class PortfolioService:
         Returns:
             Position dict or None
         """
-        return self.positions.get(symbol)
+        if self.storage:
+            position = self.storage.get_position_by_symbol(symbol)
+            return self._position_to_dict(position) if position else None
+        else:
+            return self._in_memory_positions.get(symbol)
     
     def update_position(
         self,
@@ -80,37 +112,55 @@ class PortfolioService:
         Returns:
             Updated position
             
-        TODO: Implement proper position tracking
         TODO: Calculate realized P&L on closes
         TODO: Update cash balance
         """
-        if symbol not in self.positions:
-            # New position
-            self.positions[symbol] = {
-                "symbol": symbol,
-                "side": side,
-                "quantity": quantity,
-                "avg_entry_price": price,
-                "cost_basis": quantity * price,
-                "realized_pnl": 0.0,
-            }
-        else:
-            # Update existing position
-            pos = self.positions[symbol]
-            new_quantity = pos["quantity"] + quantity
+        if self.storage:
+            # Database-backed implementation
+            position = self.storage.get_position_by_symbol(symbol)
             
-            if new_quantity == 0:
-                # Position closed
-                # TODO: Calculate realized P&L
-                del self.positions[symbol]
-                return {}
+            if position is None:
+                # Create new position
+                position = self.storage.create_position(
+                    symbol=symbol,
+                    side=side,
+                    quantity=quantity,
+                    avg_entry_price=price
+                )
             else:
-                # Position increased or decreased
-                # TODO: Properly handle avg entry price calculation
-                pos["quantity"] = new_quantity
-                pos["cost_basis"] = new_quantity * pos["avg_entry_price"]
-        
-        return self.positions.get(symbol, {})
+                # Update existing position
+                position = self.storage.update_position_quantity(
+                    position, quantity, price
+                )
+            
+            return self._position_to_dict(position) if position.is_open else {}
+        else:
+            # Fallback to in-memory implementation
+            if symbol not in self._in_memory_positions:
+                # New position
+                self._in_memory_positions[symbol] = {
+                    "symbol": symbol,
+                    "side": side,
+                    "quantity": quantity,
+                    "avg_entry_price": price,
+                    "cost_basis": quantity * price,
+                    "realized_pnl": 0.0,
+                }
+            else:
+                # Update existing position
+                pos = self._in_memory_positions[symbol]
+                new_quantity = pos["quantity"] + quantity
+                
+                if new_quantity == 0:
+                    # Position closed
+                    del self._in_memory_positions[symbol]
+                    return {}
+                else:
+                    # Position increased or decreased
+                    pos["quantity"] = new_quantity
+                    pos["cost_basis"] = new_quantity * pos["avg_entry_price"]
+            
+            return self._in_memory_positions.get(symbol, {})
     
     def calculate_portfolio_value(self, current_prices: Dict[str, float]) -> float:
         """
@@ -125,9 +175,10 @@ class PortfolioService:
         TODO: Use real-time market data
         TODO: Include options and other asset types
         """
+        positions = self.get_positions()
         positions_value = sum(
             pos["quantity"] * current_prices.get(pos["symbol"], pos["avg_entry_price"])
-            for pos in self.positions.values()
+            for pos in positions
         )
         return self.cash_balance + positions_value
     
@@ -144,7 +195,7 @@ class PortfolioService:
         TODO: Use real-time market data
         """
         total_pnl = 0.0
-        for pos in self.positions.values():
+        for pos in self.get_positions():
             current_price = current_prices.get(pos["symbol"], pos["avg_entry_price"])
             market_value = pos["quantity"] * current_price
             unrealized_pnl = market_value - pos["cost_basis"]
