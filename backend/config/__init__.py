@@ -1,9 +1,10 @@
 """
 Configuration module for StocksBot backend.
 
-TODO: Implement configuration management using pydantic-settings
-- Database connection settings
-- API keys and credentials
-- Feature flags
-- Logging configuration
+Provides settings management using pydantic-settings.
+Supports loading from environment variables and .env files.
 """
+
+from .settings import Settings, get_settings, has_alpaca_credentials
+
+__all__ = ["Settings", "get_settings", "has_alpaca_credentials"]

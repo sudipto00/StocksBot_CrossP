@@ -149,3 +149,78 @@ class NotificationResponse(BaseModel):
     """Notification response."""
     success: bool = Field(..., description="Whether notification was queued")
     message: str = Field(..., description="Response message")
+
+
+# ============================================================================
+# Strategy Models
+# ============================================================================
+
+class StrategyStatus(str, Enum):
+    """Strategy status enumeration."""
+    ACTIVE = "active"
+    STOPPED = "stopped"
+    ERROR = "error"
+
+
+class Strategy(BaseModel):
+    """Strategy model."""
+    id: str = Field(..., description="Strategy ID")
+    name: str = Field(..., description="Strategy name")
+    description: Optional[str] = Field(None, description="Strategy description")
+    status: StrategyStatus = Field(..., description="Strategy status")
+    symbols: List[str] = Field(default_factory=list, description="Symbols to trade")
+    created_at: datetime = Field(..., description="Creation timestamp")
+    updated_at: datetime = Field(..., description="Last update timestamp")
+
+
+class StrategyCreateRequest(BaseModel):
+    """Strategy creation request."""
+    name: str = Field(..., description="Strategy name", min_length=1, max_length=100)
+    description: Optional[str] = Field(None, description="Strategy description", max_length=500)
+    symbols: List[str] = Field(default_factory=list, description="Symbols to trade")
+
+
+class StrategyUpdateRequest(BaseModel):
+    """Strategy update request."""
+    name: Optional[str] = Field(None, description="Strategy name", min_length=1, max_length=100)
+    description: Optional[str] = Field(None, description="Strategy description", max_length=500)
+    symbols: Optional[List[str]] = Field(None, description="Symbols to trade")
+    status: Optional[StrategyStatus] = Field(None, description="Strategy status")
+
+
+class StrategiesResponse(BaseModel):
+    """Strategies list response."""
+    strategies: List[Strategy] = Field(default_factory=list, description="List of strategies")
+    total_count: int = Field(default=0, description="Total strategy count")
+
+
+# ============================================================================
+# Audit Log Models
+# ============================================================================
+
+class AuditEventType(str, Enum):
+    """Audit event type enumeration."""
+    ORDER_CREATED = "order_created"
+    ORDER_FILLED = "order_filled"
+    ORDER_CANCELLED = "order_cancelled"
+    STRATEGY_STARTED = "strategy_started"
+    STRATEGY_STOPPED = "strategy_stopped"
+    POSITION_OPENED = "position_opened"
+    POSITION_CLOSED = "position_closed"
+    CONFIG_UPDATED = "config_updated"
+    ERROR = "error"
+
+
+class AuditLog(BaseModel):
+    """Audit log entry model."""
+    id: str = Field(..., description="Log entry ID")
+    timestamp: datetime = Field(..., description="Event timestamp")
+    event_type: AuditEventType = Field(..., description="Event type")
+    description: str = Field(..., description="Event description")
+    details: Optional[Dict[str, Any]] = Field(None, description="Additional event details")
+
+
+class AuditLogsResponse(BaseModel):
+    """Audit logs list response."""
+    logs: List[AuditLog] = Field(default_factory=list, description="List of audit log entries")
+    total_count: int = Field(default=0, description="Total log count")

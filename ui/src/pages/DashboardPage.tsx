@@ -38,9 +38,20 @@ function DashboardPage() {
 
   return (
     <div className="p-8">
-      <div className="mb-8">
-        <h2 className="text-3xl font-bold text-white mb-2">Dashboard</h2>
-        <p className="text-gray-400">Portfolio overview and system status</p>
+      <div className="mb-8 flex items-center justify-between">
+        <div>
+          <h2 className="text-3xl font-bold text-white mb-2">Dashboard</h2>
+          <p className="text-gray-400">Portfolio overview and system status</p>
+        </div>
+        
+        <button
+          onClick={loadData}
+          disabled={loading}
+          className="bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 text-white px-4 py-2 rounded font-medium transition-colors flex items-center gap-2"
+        >
+          <span>🔄</span>
+          {loading ? 'Refreshing...' : 'Refresh'}
+        </button>
       </div>
 
       {loading && (
