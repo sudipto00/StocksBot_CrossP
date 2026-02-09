@@ -20,10 +20,11 @@ fn greet(name: &str) -> String {
 
 // Command to show a system notification
 #[tauri::command]
-fn show_notification(app: tauri::AppHandle, title: String, body: String) -> Result<(), String> {
-    // TODO: Implement cross-platform notification
+fn show_notification(app: tauri::AppHandle, title: String, body: String, severity: Option<String>) -> Result<(), String> {
+    // TODO: Implement cross-platform notification with severity-based styling
     // For now, just print to console
-    println!("[NOTIFICATION] {}: {}", title, body);
+    let severity_str = severity.unwrap_or_else(|| "info".to_string());
+    println!("[NOTIFICATION] {}: {} - {}", severity_str.to_uppercase(), title, body);
     
     // Future implementation:
     // app.notification()

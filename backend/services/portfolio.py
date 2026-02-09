@@ -165,6 +165,8 @@ class PortfolioService:
         """
         total_value = self.calculate_portfolio_value(current_prices)
         unrealized_pnl = self.calculate_unrealized_pnl(current_prices)
+        total_return = total_value - self.total_deposits
+        total_return_pct = (total_return / self.total_deposits * 100) if self.total_deposits > 0 else 0.0
         
         return {
             "total_value": total_value,
@@ -172,8 +174,6 @@ class PortfolioService:
             "positions_value": total_value - self.cash_balance,
             "unrealized_pnl": unrealized_pnl,
             "total_deposits": self.total_deposits,
-            "total_return": total_value - self.total_deposits,
-            "total_return_percent": ((total_value - self.total_deposits) / self.total_deposits * 100)
-            if self.total_deposits > 0
-            else 0.0,
+            "total_return": total_return,
+            "total_return_percent": total_return_pct,
         }

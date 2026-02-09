@@ -29,7 +29,8 @@ export async function showNotification(
 ): Promise<void> {
   try {
     // Call Tauri command to show notification
-    await invoke('show_notification', { title, body });
+    // TODO: Pass severity to Tauri for different notification styles
+    await invoke('show_notification', { title, body, severity });
     console.log(`[Notification] ${severity}: ${title} - ${body}`);
   } catch (error) {
     console.error('Failed to show notification:', error);

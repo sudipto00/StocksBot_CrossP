@@ -38,7 +38,7 @@ function Sidebar() {
         </NavLink>
         
         <NavLink to="/settings" className={navLinkClass}>
-          <span className="mr-3">⚙️</span>
+          <span className="mr-3">🔧</span>
           Settings
         </NavLink>
       </nav>
