@@ -6,6 +6,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
+from api.routes import router as api_router
+
 app = FastAPI(
     title="StocksBot API",
     description="Cross-platform StocksBot backend service",
@@ -41,9 +43,8 @@ async def status():
     }
 
 
-# TODO: Import and register API routes from api/ module
-# from api import routes
-# app.include_router(routes.router)
+# Include API routes
+app.include_router(api_router)
 
 
 if __name__ == "__main__":

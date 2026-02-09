@@ -234,12 +234,21 @@ npm run test
 
 ## Available API Endpoints
 
-### Backend API
+The backend provides a REST API for frontend-backend communication.
 
+**Documentation:** See [API.md](./API.md) for complete API documentation.
+
+**Quick Reference:**
 - `GET /` - Root endpoint
-- `GET /status` - Health check endpoint
+- `GET /status` - Health check
+- `GET /config` - Get configuration
+- `POST /config` - Update configuration
+- `GET /positions` - Get current positions (stub data)
+- `GET /orders` - Get orders (stub data)
+- `POST /orders` - Create order (placeholder)
+- `POST /notifications` - Request notification (placeholder)
 
-TODO: More endpoints will be added as features are implemented.
+For detailed request/response schemas, see the [API Documentation](./API.md).
 
 ## Current Status
 
