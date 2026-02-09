@@ -27,6 +27,17 @@ class Settings(BaseSettings):
     alpaca_secret_key: Optional[str] = Field(default=None, alias="ALPACA_SECRET_KEY")
     alpaca_paper: bool = Field(default=True, alias="ALPACA_PAPER")
     
+    # Validators to strip whitespace from credentials
+    @classmethod
+    def validate_api_key(cls, v):
+        """Strip whitespace from API key to prevent authentication failures."""
+        return v.strip() if v else v
+    
+    @classmethod
+    def validate_secret_key(cls, v):
+        """Strip whitespace from secret key to prevent authentication failures."""
+        return v.strip() if v else v
+    
     # Database Configuration
     database_url: str = Field(
         default="sqlite:///./stocksbot.db",

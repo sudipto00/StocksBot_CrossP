@@ -73,6 +73,21 @@ function AuditPage() {
     }
   };
 
+  const getEventTypeLabel = (eventType: AuditEventType): string => {
+    const labels: Record<AuditEventType, string> = {
+      [AuditEventType.ORDER_CREATED]: 'Order Created',
+      [AuditEventType.ORDER_FILLED]: 'Order Filled',
+      [AuditEventType.ORDER_CANCELLED]: 'Order Cancelled',
+      [AuditEventType.STRATEGY_STARTED]: 'Strategy Started',
+      [AuditEventType.STRATEGY_STOPPED]: 'Strategy Stopped',
+      [AuditEventType.POSITION_OPENED]: 'Position Opened',
+      [AuditEventType.POSITION_CLOSED]: 'Position Closed',
+      [AuditEventType.CONFIG_UPDATED]: 'Config Updated',
+      [AuditEventType.ERROR]: 'Error',
+    };
+    return labels[eventType];
+  };
+
   return (
     <div className="p-8">
       <div className="mb-8">
@@ -139,7 +154,7 @@ function AuditPage() {
         <div className="bg-gray-800 rounded-lg border border-gray-700">
           <div className="p-4 border-b border-gray-700">
             <h3 className="text-lg font-semibold text-white">
-              Recent Activity ({logs.length} {filter === 'all' ? 'events' : filter + ' events'})
+              Recent Activity ({logs.length} {filter === 'all' ? 'events' : getEventTypeLabel(filter) + ' events'})
             </h3>
           </div>
           

@@ -217,6 +217,7 @@ function StrategyPage() {
                     <div className="flex gap-2">
                       <button
                         onClick={() => handleUpdate(strategy)}
+                        aria-label={`${strategy.status === StrategyStatus.ACTIVE ? 'Stop' : 'Start'} strategy ${strategy.name}`}
                         className={`px-3 py-1 rounded text-xs font-medium ${
                           strategy.status === StrategyStatus.ACTIVE
                             ? 'bg-yellow-600 hover:bg-yellow-700 text-white'
@@ -227,6 +228,7 @@ function StrategyPage() {
                       </button>
                       <button
                         onClick={() => handleDelete(strategy)}
+                        aria-label={`Delete strategy ${strategy.name}`}
                         className="px-3 py-1 rounded text-xs font-medium bg-red-600 hover:bg-red-700 text-white"
                       >
                         Delete

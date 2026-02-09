@@ -351,13 +351,22 @@ class AlpacaBroker(BrokerInterface):
             
         Returns:
             Order dict in our format
+            
+        Note: Alpaca API sometimes uses 'order_type' and sometimes 'type' 
+        depending on the endpoint/version. We check for both.
         """
+        # Handle both 'order_type' (newer) and 'type' (older) attributes
+        if hasattr(order, 'order_type'):
+            order_type_value = order.order_type.value
+        else:
+            order_type_value = order.type.value
+            
         return {
             "id": order.id,
             "client_order_id": order.client_order_id,
             "symbol": order.symbol,
             "side": order.side.value,
-            "type": order.order_type.value if hasattr(order, 'order_type') else order.type.value,
+            "type": order_type_value,
             "quantity": float(order.qty),
             "filled_quantity": float(order.filled_qty) if order.filled_qty else 0.0,
             "price": float(order.limit_price) if order.limit_price else None,
