@@ -17,7 +17,8 @@ from services.broker import PaperBroker, OrderSide, OrderType, OrderStatus
 
 def test_strategy_runner_instantiation():
     """Test StrategyRunner can be instantiated."""
-    runner = StrategyRunner()
+    broker = PaperBroker()
+    runner = StrategyRunner(broker=broker)
     assert runner is not None
     assert runner.status == StrategyStatus.STOPPED
     assert len(runner.strategies) == 0
@@ -25,30 +26,56 @@ def test_strategy_runner_instantiation():
 
 def test_strategy_runner_load_strategy():
     """Test loading a strategy."""
-    runner = StrategyRunner()
-    config = {"param1": "value1"}
-    result = runner.load_strategy("test-strategy", config)
+    from engine.strategy_interface import StrategyInterface
+    
+    # Create a simple test strategy
+    class TestStrategy(StrategyInterface):
+        def on_start(self):
+            self.is_running = True
+        def on_tick(self, market_data):
+            return []
+        def on_stop(self):
+            self.is_running = False
+    
+    broker = PaperBroker()
+    runner = StrategyRunner(broker=broker)
+    
+    config = {"name": "test-strategy", "symbols": ["AAPL"]}
+    strategy = TestStrategy(config)
+    result = runner.load_strategy(strategy)
     
     assert result is True
     assert "test-strategy" in runner.strategies
-    assert runner.strategies["test-strategy"]["config"] == config
 
 
 def test_strategy_runner_start_stop():
     """Test starting and stopping strategies."""
-    runner = StrategyRunner()
-    runner.load_strategy("test-strategy", {})
+    from engine.strategy_interface import StrategyInterface
     
-    # Start strategy
-    result = runner.start_strategy("test-strategy")
+    # Create a simple test strategy
+    class TestStrategy(StrategyInterface):
+        def on_start(self):
+            self.is_running = True
+        def on_tick(self, market_data):
+            return []
+        def on_stop(self):
+            self.is_running = False
+    
+    broker = PaperBroker()
+    runner = StrategyRunner(broker=broker, tick_interval=0.1)
+    
+    config = {"name": "test-strategy", "symbols": ["AAPL"]}
+    strategy = TestStrategy(config)
+    runner.load_strategy(strategy)
+    
+    # Start runner
+    result = runner.start()
     assert result is True
-    assert runner.strategies["test-strategy"]["status"] == StrategyStatus.RUNNING
     assert runner.status == StrategyStatus.RUNNING
     
-    # Stop strategy
-    result = runner.stop_strategy("test-strategy")
+    # Stop runner
+    result = runner.stop()
     assert result is True
-    assert runner.strategies["test-strategy"]["status"] == StrategyStatus.STOPPED
     assert runner.status == StrategyStatus.STOPPED
 
 
