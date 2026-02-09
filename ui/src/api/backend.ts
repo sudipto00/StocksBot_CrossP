@@ -12,6 +12,14 @@ import {
   ConfigUpdateRequest,
   NotificationRequest,
   NotificationResponse,
+  // Strategy types
+  Strategy,
+  StrategyCreateRequest,
+  StrategyUpdateRequest,
+  StrategiesResponse,
+  // Audit types
+  AuditLogsResponse,
+  AuditEventType,
 } from './types';
 
 // Access environment variables via import.meta.env in Vite
@@ -118,6 +126,101 @@ export async function requestNotification(notification: NotificationRequest): Pr
     },
     body: JSON.stringify(notification),
   });
+  
+  if (!response.ok) {
+    throw new Error(`Backend returned ${response.status}`);
+  }
+  
+  return response.json();
+}
+
+/**
+ * Get all strategies.
+ */
+export async function getStrategies(): Promise<StrategiesResponse> {
+  const response = await fetch(`${BACKEND_URL}/strategies`);
+  
+  if (!response.ok) {
+    throw new Error(`Backend returned ${response.status}`);
+  }
+  
+  return response.json();
+}
+
+/**
+ * Create a new strategy.
+ */
+export async function createStrategy(strategy: StrategyCreateRequest): Promise<Strategy> {
+  const response = await fetch(`${BACKEND_URL}/strategies`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(strategy),
+  });
+  
+  if (!response.ok) {
+    throw new Error(`Backend returned ${response.status}`);
+  }
+  
+  return response.json();
+}
+
+/**
+ * Get a specific strategy by ID.
+ */
+export async function getStrategy(id: string): Promise<Strategy> {
+  const response = await fetch(`${BACKEND_URL}/strategies/${id}`);
+  
+  if (!response.ok) {
+    throw new Error(`Backend returned ${response.status}`);
+  }
+  
+  return response.json();
+}
+
+/**
+ * Update a strategy.
+ */
+export async function updateStrategy(id: string, updates: StrategyUpdateRequest): Promise<Strategy> {
+  const response = await fetch(`${BACKEND_URL}/strategies/${id}`, {
+    method: 'PUT',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(updates),
+  });
+  
+  if (!response.ok) {
+    throw new Error(`Backend returned ${response.status}`);
+  }
+  
+  return response.json();
+}
+
+/**
+ * Delete a strategy.
+ */
+export async function deleteStrategy(id: string): Promise<void> {
+  const response = await fetch(`${BACKEND_URL}/strategies/${id}`, {
+    method: 'DELETE',
+  });
+  
+  if (!response.ok) {
+    throw new Error(`Backend returned ${response.status}`);
+  }
+}
+
+/**
+ * Get audit logs.
+ */
+export async function getAuditLogs(limit?: number, eventType?: AuditEventType): Promise<AuditLogsResponse> {
+  const params = new URLSearchParams();
+  if (limit) params.append('limit', limit.toString());
+  if (eventType) params.append('event_type', eventType);
+  
+  const url = `${BACKEND_URL}/audit/logs${params.toString() ? '?' + params.toString() : ''}`;
+  const response = await fetch(url);
   
   if (!response.ok) {
     throw new Error(`Backend returned ${response.status}`);

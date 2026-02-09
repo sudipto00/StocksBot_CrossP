@@ -1,20 +1,90 @@
-import { useState } from 'react';
-import { showSuccessNotification } from '../utils/notifications';
+import { useState, useEffect } from 'react';
+import { showSuccessNotification, showErrorNotification } from '../utils/notifications';
+import { getConfig, updateConfig } from '../api/backend';
 
 /**
  * Settings page component.
  * Configure application settings, API keys, risk limits, etc.
- * 
- * TODO: Implement settings management
- * - Trading configuration (paper/live, broker selection)
- * - Risk limits (position size, daily loss, etc.)
- * - API keys management
- * - Notification preferences
- * - UI preferences (theme, etc.)
  */
 function SettingsPage() {
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  
+  // Settings state
   const [tradingEnabled, setTradingEnabled] = useState(false);
   const [paperTrading, setPaperTrading] = useState(true);
+  const [maxPositionSize, setMaxPositionSize] = useState(10000);
+  const [riskLimitDaily, setRiskLimitDaily] = useState(500);
+  const [broker, setBroker] = useState("paper");
+  
+  // Validation errors
+  const [validationErrors, setValidationErrors] = useState<Record<string, string>>({});
+
+  useEffect(() => {
+    loadSettings();
+  }, []);
+
+  const loadSettings = async () => {
+    try {
+      setLoading(true);
+      setError(null);
+      
+      const config = await getConfig();
+      
+      setTradingEnabled(config.trading_enabled);
+      setPaperTrading(config.paper_trading);
+      setMaxPositionSize(config.max_position_size);
+      setRiskLimitDaily(config.risk_limit_daily);
+      setBroker(config.broker);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to load settings');
+      await showErrorNotification('Settings Error', 'Failed to load settings');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const validateSettings = (): boolean => {
+    const errors: Record<string, string> = {};
+    
+    if (maxPositionSize <= 0) {
+      errors.maxPositionSize = 'Max position size must be greater than 0';
+    }
+    
+    if (riskLimitDaily <= 0) {
+      errors.riskLimitDaily = 'Daily risk limit must be greater than 0';
+    }
+    
+    setValidationErrors(errors);
+    return Object.keys(errors).length === 0;
+  };
+
+  const handleSave = async () => {
+    if (!validateSettings()) {
+      await showErrorNotification('Validation Error', 'Please fix the validation errors');
+      return;
+    }
+    
+    try {
+      setSaving(true);
+      setError(null);
+      
+      await updateConfig({
+        trading_enabled: tradingEnabled,
+        paper_trading: paperTrading,
+        max_position_size: maxPositionSize,
+        risk_limit_daily: riskLimitDaily,
+      });
+      
+      await showSuccessNotification('Settings Saved', 'Your settings have been saved successfully');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to save settings');
+      await showErrorNotification('Save Error', 'Failed to save settings');
+    } finally {
+      setSaving(false);
+    }
+  };
 
   const handleTestNotification = async () => {
     await showSuccessNotification(
@@ -23,12 +93,42 @@ function SettingsPage() {
     );
   };
 
+  if (loading) {
+    return (
+      <div className="p-8">
+        <div className="text-gray-400">Loading settings...</div>
+      </div>
+    );
+  }
+
   return (
     <div className="p-8">
-      <div className="mb-8">
-        <h2 className="text-3xl font-bold text-white mb-2">Settings</h2>
-        <p className="text-gray-400">Configure application settings and preferences</p>
+      <div className="mb-8 flex items-center justify-between">
+        <div>
+          <h2 className="text-3xl font-bold text-white mb-2">Settings</h2>
+          <p className="text-gray-400">Configure application settings and preferences</p>
+        </div>
+        
+        <button
+          onClick={handleSave}
+          disabled={saving}
+          className="bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 text-white px-6 py-2 rounded font-medium transition-colors"
+        >
+          {saving ? 'Saving...' : 'Save Settings'}
+        </button>
       </div>
+
+      {error && (
+        <div className="bg-red-900/20 border border-red-700 rounded-lg p-4 mb-6">
+          <p className="text-red-400">Error: {error}</p>
+          <button 
+            onClick={loadSettings}
+            className="mt-2 text-red-300 hover:text-red-200 underline"
+          >
+            Retry
+          </button>
+        </div>
+      )}
 
       {/* Trading Settings */}
       <div className="bg-gray-800 rounded-lg p-6 border border-gray-700 mb-6">
@@ -75,10 +175,6 @@ function SettingsPage() {
             </button>
           </div>
         </div>
-
-        <div className="mt-4 text-gray-500 text-xs">
-          TODO: Connect to backend /config endpoint
-        </div>
       </div>
 
       {/* Risk Settings */}
@@ -90,25 +186,35 @@ function SettingsPage() {
             <label className="text-white font-medium block mb-2">Max Position Size ($)</label>
             <input
               type="number"
-              defaultValue={10000}
-              className="bg-gray-700 text-white px-4 py-2 rounded border border-gray-600 w-full"
-              disabled
+              value={maxPositionSize}
+              onChange={(e) => setMaxPositionSize(parseFloat(e.target.value) || 0)}
+              className={`bg-gray-700 text-white px-4 py-2 rounded border ${
+                validationErrors.maxPositionSize ? 'border-red-500' : 'border-gray-600'
+              } w-full`}
+              min="0"
+              step="100"
             />
+            {validationErrors.maxPositionSize && (
+              <p className="text-red-400 text-sm mt-1">{validationErrors.maxPositionSize}</p>
+            )}
           </div>
           
           <div>
             <label className="text-white font-medium block mb-2">Daily Loss Limit ($)</label>
             <input
               type="number"
-              defaultValue={500}
-              className="bg-gray-700 text-white px-4 py-2 rounded border border-gray-600 w-full"
-              disabled
+              value={riskLimitDaily}
+              onChange={(e) => setRiskLimitDaily(parseFloat(e.target.value) || 0)}
+              className={`bg-gray-700 text-white px-4 py-2 rounded border ${
+                validationErrors.riskLimitDaily ? 'border-red-500' : 'border-gray-600'
+              } w-full`}
+              min="0"
+              step="10"
             />
+            {validationErrors.riskLimitDaily && (
+              <p className="text-red-400 text-sm mt-1">{validationErrors.riskLimitDaily}</p>
+            )}
           </div>
-        </div>
-
-        <div className="mt-4 text-gray-500 text-xs">
-          TODO: Implement risk limit configuration
         </div>
       </div>
 
@@ -119,19 +225,17 @@ function SettingsPage() {
         <div className="space-y-4">
           <div>
             <label className="text-white font-medium block mb-2">Broker</label>
-            <select 
-              className="bg-gray-700 text-white px-4 py-2 rounded border border-gray-600 w-full"
-              disabled
-            >
-              <option>Paper Trading</option>
-              <option>Alpaca</option>
-              <option>Interactive Brokers</option>
-            </select>
+            <div className="bg-gray-700 text-white px-4 py-2 rounded border border-gray-600 w-full">
+              {broker === "paper" ? "Paper Trading" : broker === "alpaca" ? "Alpaca" : "Interactive Brokers"}
+            </div>
+            <p className="text-gray-400 text-xs mt-2">
+              Current broker: {broker}. To change brokers, update backend configuration.
+            </p>
           </div>
         </div>
 
-        <div className="mt-4 text-gray-500 text-xs">
-          TODO: Implement broker selection and API key management
+        <div className="mt-4 text-blue-400 text-sm">
+          ℹ️ See ALPACA_SETUP.md for instructions on configuring Alpaca integration
         </div>
       </div>
 

@@ -4,7 +4,7 @@ Defines all REST API endpoints for StocksBot.
 """
 from datetime import datetime
 from fastapi import APIRouter, HTTPException
-from typing import List
+from typing import List, Optional
 
 from .models import (
     StatusResponse,
@@ -22,6 +22,16 @@ from .models import (
     NotificationRequest,
     NotificationResponse,
     NotificationSeverity,
+    # Strategy models
+    Strategy,
+    StrategyStatus,
+    StrategyCreateRequest,
+    StrategyUpdateRequest,
+    StrategiesResponse,
+    # Audit models
+    AuditLog,
+    AuditEventType,
+    AuditLogsResponse,
 )
 
 router = APIRouter()
@@ -199,3 +209,172 @@ async def request_notification(request: NotificationRequest):
         success=True,
         message="Notification queued (placeholder)",
     )
+
+
+# ============================================================================
+# Strategy Endpoints
+# ============================================================================
+
+# In-memory strategy store (TODO: Replace with persistent storage)
+_strategies: dict[str, Strategy] = {}
+_strategy_counter = 0
+
+
+@router.get("/strategies", response_model=StrategiesResponse)
+async def get_strategies():
+    """
+    Get all strategies.
+    TODO: Load from database.
+    Returns stub data for now.
+    """
+    return StrategiesResponse(
+        strategies=list(_strategies.values()),
+        total_count=len(_strategies),
+    )
+
+
+@router.post("/strategies", response_model=Strategy)
+async def create_strategy(request: StrategyCreateRequest):
+    """
+    Create a new strategy.
+    TODO: Persist to database and validate.
+    This is a stub implementation.
+    """
+    global _strategy_counter
+    _strategy_counter += 1
+    
+    strategy_id = f"strat-{_strategy_counter}"
+    now = datetime.now()
+    
+    strategy = Strategy(
+        id=strategy_id,
+        name=request.name,
+        description=request.description,
+        status=StrategyStatus.STOPPED,
+        symbols=request.symbols,
+        created_at=now,
+        updated_at=now,
+    )
+    
+    _strategies[strategy_id] = strategy
+    return strategy
+
+
+@router.get("/strategies/{strategy_id}", response_model=Strategy)
+async def get_strategy(strategy_id: str):
+    """
+    Get a specific strategy by ID.
+    TODO: Load from database.
+    """
+    if strategy_id not in _strategies:
+        raise HTTPException(status_code=404, detail="Strategy not found")
+    
+    return _strategies[strategy_id]
+
+
+@router.put("/strategies/{strategy_id}", response_model=Strategy)
+async def update_strategy(strategy_id: str, request: StrategyUpdateRequest):
+    """
+    Update a strategy.
+    TODO: Persist to database and validate.
+    This is a stub implementation.
+    """
+    if strategy_id not in _strategies:
+        raise HTTPException(status_code=404, detail="Strategy not found")
+    
+    strategy = _strategies[strategy_id]
+    
+    if request.name is not None:
+        strategy.name = request.name
+    if request.description is not None:
+        strategy.description = request.description
+    if request.symbols is not None:
+        strategy.symbols = request.symbols
+    if request.status is not None:
+        strategy.status = request.status
+    
+    strategy.updated_at = datetime.now()
+    
+    return strategy
+
+
+@router.delete("/strategies/{strategy_id}")
+async def delete_strategy(strategy_id: str):
+    """
+    Delete a strategy.
+    TODO: Remove from database.
+    This is a stub implementation.
+    """
+    if strategy_id not in _strategies:
+        raise HTTPException(status_code=404, detail="Strategy not found")
+    
+    del _strategies[strategy_id]
+    
+    return {"message": "Strategy deleted"}
+
+
+# ============================================================================
+# Audit Log Endpoints
+# ============================================================================
+
+# In-memory audit log store (TODO: Replace with persistent storage)
+_audit_logs: List[AuditLog] = []
+
+
+@router.get("/audit/logs", response_model=AuditLogsResponse)
+async def get_audit_logs(
+    limit: int = 100,
+    event_type: Optional[AuditEventType] = None
+):
+    """
+    Get audit logs.
+    TODO: Load from database with filtering and pagination.
+    Returns stub data for now.
+    """
+    # Generate some stub data if empty
+    if not _audit_logs:
+        _generate_stub_audit_logs()
+    
+    # Filter by event type if specified
+    logs = _audit_logs
+    if event_type:
+        logs = [log for log in logs if log.event_type == event_type]
+    
+    # Apply limit
+    logs = logs[:limit]
+    
+    return AuditLogsResponse(
+        logs=logs,
+        total_count=len(_audit_logs),
+    )
+
+
+def _generate_stub_audit_logs():
+    """Generate stub audit log data for development."""
+    global _audit_logs
+    
+    now = datetime.now()
+    
+    _audit_logs = [
+        AuditLog(
+            id="log-001",
+            timestamp=now,
+            event_type=AuditEventType.ORDER_CREATED,
+            description="Market order created for AAPL",
+            details={"symbol": "AAPL", "quantity": 100, "side": "buy"}
+        ),
+        AuditLog(
+            id="log-002",
+            timestamp=now,
+            event_type=AuditEventType.ORDER_FILLED,
+            description="Order filled for AAPL at $150.00",
+            details={"symbol": "AAPL", "quantity": 100, "price": 150.00}
+        ),
+        AuditLog(
+            id="log-003",
+            timestamp=now,
+            event_type=AuditEventType.POSITION_OPENED,
+            description="Position opened: AAPL 100 shares",
+            details={"symbol": "AAPL", "quantity": 100}
+        ),
+    ]
