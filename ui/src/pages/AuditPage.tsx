@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { getAuditLogs } from '../api/backend';
 import { AuditLog, AuditEventType } from '../api/types';
 
@@ -12,13 +12,13 @@ function AuditPage() {
   const [error, setError] = useState<string | null>(null);
   const [filter, setFilter] = useState<AuditEventType | 'all'>('all');
 
-  const loadLogs = async () => {
+  const loadLogs = useCallback(async () => {
     try {
       setLoading(true);
       setError(null);
-      
+
       const response = await getAuditLogs(
-        100, 
+        100,
         filter === 'all' ? undefined : filter
       );
       setLogs(response.logs);
@@ -27,21 +27,22 @@ function AuditPage() {
     } finally {
       setLoading(false);
     }
-  };
+  }, [filter]);
 
   useEffect(() => {
     loadLogs();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filter]);
+  }, [loadLogs]);
 
   const getEventTypeColor = (eventType: AuditEventType): string => {
     switch (eventType) {
       case AuditEventType.ORDER_FILLED:
       case AuditEventType.POSITION_OPENED:
+      case AuditEventType.RUNNER_STARTED:
         return 'text-green-400';
       case AuditEventType.ORDER_CANCELLED:
       case AuditEventType.POSITION_CLOSED:
       case AuditEventType.STRATEGY_STOPPED:
+      case AuditEventType.RUNNER_STOPPED:
         return 'text-yellow-400';
       case AuditEventType.ERROR:
         return 'text-red-400';
@@ -61,6 +62,10 @@ function AuditPage() {
         return '▶️';
       case AuditEventType.STRATEGY_STOPPED:
         return '⏸️';
+      case AuditEventType.RUNNER_STARTED:
+        return '🏃';
+      case AuditEventType.RUNNER_STOPPED:
+        return '🛑';
       case AuditEventType.POSITION_OPENED:
         return '📈';
       case AuditEventType.POSITION_CLOSED:
@@ -84,6 +89,8 @@ function AuditPage() {
       [AuditEventType.POSITION_OPENED]: 'Position Opened',
       [AuditEventType.POSITION_CLOSED]: 'Position Closed',
       [AuditEventType.CONFIG_UPDATED]: 'Config Updated',
+      [AuditEventType.RUNNER_STARTED]: 'Runner Started',
+      [AuditEventType.RUNNER_STOPPED]: 'Runner Stopped',
       [AuditEventType.ERROR]: 'Error',
     };
     return labels[eventType];
@@ -113,9 +120,11 @@ function AuditPage() {
           <option value={AuditEventType.POSITION_OPENED}>Positions Opened</option>
           <option value={AuditEventType.POSITION_CLOSED}>Positions Closed</option>
           <option value={AuditEventType.CONFIG_UPDATED}>Config Updates</option>
+          <option value={AuditEventType.RUNNER_STARTED}>Runner Started</option>
+          <option value={AuditEventType.RUNNER_STOPPED}>Runner Stopped</option>
           <option value={AuditEventType.ERROR}>Errors</option>
         </select>
-        
+
         <button
           onClick={loadLogs}
           className="ml-auto bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded font-medium"
@@ -127,7 +136,7 @@ function AuditPage() {
       {error && (
         <div className="bg-red-900/20 border border-red-700 rounded-lg p-4 mb-6">
           <p className="text-red-400">Error: {error}</p>
-          <button 
+          <button
             onClick={loadLogs}
             className="mt-2 text-red-300 hover:text-red-200 underline"
           >
@@ -145,7 +154,7 @@ function AuditPage() {
             <div className="text-gray-500 text-6xl mb-4">📋</div>
             <p className="text-gray-400 mb-2">No audit logs available</p>
             <p className="text-gray-500 text-sm">
-              {filter === 'all' 
+              {filter === 'all'
                 ? 'Activity logs will appear here as you use the system'
                 : `No ${filter} events found`}
             </p>
@@ -158,13 +167,13 @@ function AuditPage() {
               Recent Activity ({logs.length} {filter === 'all' ? 'events' : getEventTypeLabel(filter) + ' events'})
             </h3>
           </div>
-          
+
           <div className="divide-y divide-gray-700">
             {logs.map((log) => (
               <div key={log.id} className="p-4 hover:bg-gray-750 transition-colors">
                 <div className="flex items-start gap-3">
                   <div className="text-2xl mt-1">{getEventTypeIcon(log.event_type)}</div>
-                  
+
                   <div className="flex-1">
                     <div className="flex items-center gap-2 mb-1">
                       <span className={`font-medium ${getEventTypeColor(log.event_type)}`}>
@@ -174,9 +183,9 @@ function AuditPage() {
                         {new Date(log.timestamp).toLocaleString()}
                       </span>
                     </div>
-                    
+
                     <p className="text-white">{log.description}</p>
-                    
+
                     {log.details && Object.keys(log.details).length > 0 && (
                       <details className="mt-2">
                         <summary className="text-gray-400 text-sm cursor-pointer hover:text-gray-300">

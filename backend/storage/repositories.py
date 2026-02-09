@@ -9,7 +9,8 @@ from sqlalchemy import and_, or_
 
 from storage.models import (
     Position, Order, Trade, Strategy, Config, AuditLog,
-    PositionSideEnum, OrderSideEnum, OrderTypeEnum, OrderStatusEnum, TradeTypeEnum, AuditEventTypeEnum
+    PositionSideEnum, OrderSideEnum, OrderTypeEnum, OrderStatusEnum, TradeTypeEnum,
+    AuditEventTypeEnum
 )
 
 
@@ -188,6 +189,10 @@ class TradeRepository:
     def get_recent(self, limit: int = 100) -> List[Trade]:
         """Get recent trades."""
         return self.db.query(Trade).order_by(Trade.executed_at.desc()).limit(limit).all()
+    
+    def get_all(self, limit: int = 1000) -> List[Trade]:
+        """Get all trades ordered by execution time."""
+        return self.db.query(Trade).order_by(Trade.executed_at.asc()).limit(limit).all()
 
 
 class StrategyRepository:
@@ -304,17 +309,23 @@ class AuditLogRepository:
     def __init__(self, db: Session):
         self.db = db
     
-    def create(self, event_type: str, description: str,
-               details: Optional[Dict[str, Any]] = None,
-               user_id: Optional[str] = None,
-               timestamp: Optional[datetime] = None) -> AuditLog:
+    def create(
+        self,
+        event_type: AuditEventTypeEnum,
+        description: str,
+        details: Optional[Dict[str, Any]] = None,
+        user_id: Optional[str] = None,
+        strategy_id: Optional[int] = None,
+        order_id: Optional[int] = None
+    ) -> AuditLog:
         """Create a new audit log entry."""
         audit_log = AuditLog(
             event_type=event_type,
             description=description,
             details=details,
             user_id=user_id,
-            timestamp=timestamp or datetime.now()
+            strategy_id=strategy_id,
+            order_id=order_id
         )
         self.db.add(audit_log)
         self.db.commit()
@@ -325,30 +336,52 @@ class AuditLogRepository:
         """Get audit log by ID."""
         return self.db.query(AuditLog).filter(AuditLog.id == log_id).first()
     
-    def get_by_event_type(self, event_type: str, limit: int = 100) -> List[AuditLog]:
-        """Get audit logs by event type."""
-        return self.db.query(AuditLog).filter(
-            AuditLog.event_type == event_type
-        ).order_by(AuditLog.timestamp.desc()).limit(limit).all()
+    def get_all(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        event_type: Optional[AuditEventTypeEnum] = None,
+        strategy_id: Optional[int] = None,
+        order_id: Optional[int] = None
+    ) -> List[AuditLog]:
+        """Get audit logs with filtering and pagination."""
+        query = self.db.query(AuditLog)
+        
+        if event_type:
+            query = query.filter(AuditLog.event_type == event_type)
+        if strategy_id:
+            query = query.filter(AuditLog.strategy_id == strategy_id)
+        if order_id:
+            query = query.filter(AuditLog.order_id == order_id)
+        
+        query = query.order_by(AuditLog.timestamp.desc())
+        return query.offset(offset).limit(limit).all()
     
-    def get_recent(self, limit: int = 100, offset: int = 0) -> List[AuditLog]:
-        """Get recent audit logs."""
-        return self.db.query(AuditLog).order_by(
-            AuditLog.timestamp.desc()
-        ).offset(offset).limit(limit).all()
+    def count(
+        self,
+        event_type: Optional[AuditEventTypeEnum] = None,
+        strategy_id: Optional[int] = None,
+        order_id: Optional[int] = None
+    ) -> int:
+        """Count audit logs with optional filtering."""
+        query = self.db.query(AuditLog)
+        
+        if event_type:
+            query = query.filter(AuditLog.event_type == event_type)
+        if strategy_id:
+            query = query.filter(AuditLog.strategy_id == strategy_id)
+        if order_id:
+            query = query.filter(AuditLog.order_id == order_id)
+        
+        return query.count()
     
-    def get_all(self, limit: int = 100, offset: int = 0) -> List[AuditLog]:
-        """Get all audit logs with pagination."""
-        return self.db.query(AuditLog).order_by(
-            AuditLog.timestamp.desc()
-        ).offset(offset).limit(limit).all()
-    
-    def count(self) -> int:
-        """Count total audit logs."""
-        return self.db.query(AuditLog).count()
-    
-    def count_by_event_type(self, event_type: str) -> int:
-        """Count audit logs by event type."""
-        return self.db.query(AuditLog).filter(
-            AuditLog.event_type == event_type
-        ).count()
+    def delete_old_logs(self, days: int = 90) -> int:
+        """Delete audit logs older than specified days."""
+        from datetime import timedelta
+        cutoff_date = datetime.now() - timedelta(days=days)
+        
+        deleted = self.db.query(AuditLog).filter(
+            AuditLog.timestamp < cutoff_date
+        ).delete()
+        self.db.commit()
+        return deleted

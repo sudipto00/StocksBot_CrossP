@@ -198,16 +198,21 @@ class Config(Base):
 
 class AuditLog(Base):
     """
-    AuditLog model - tracks all significant system events and actions.
+    AuditLog model - tracks all system events and actions.
+    Used for compliance, debugging, and audit trails.
     """
     __tablename__ = "audit_logs"
     
     id = Column(Integer, primary_key=True, index=True)
-    timestamp = Column(DateTime, default=func.now(), nullable=False, index=True)
-    event_type = Column(String(50), nullable=False, index=True)
+    event_type = Column(SQLEnum(AuditEventTypeEnum), nullable=False, index=True)
     description = Column(Text, nullable=False)
     details = Column(JSON, nullable=True)
-    user_id = Column(String(100), nullable=True)
+    
+    # Optional references
+    user_id = Column(String(100), nullable=True, index=True)
+    strategy_id = Column(Integer, nullable=True, index=True)
+    order_id = Column(Integer, nullable=True, index=True)
     
     # Timestamps
+    timestamp = Column(DateTime, default=func.now(), nullable=False, index=True)
     created_at = Column(DateTime, default=func.now(), nullable=False)

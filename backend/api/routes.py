@@ -76,7 +76,7 @@ async def update_config(request: ConfigUpdateRequest):
     TODO: Persist to storage and validate changes.
     """
     global _config
-    
+
     if request.trading_enabled is not None:
         _config.trading_enabled = request.trading_enabled
     if request.paper_trading is not None:
@@ -85,7 +85,7 @@ async def update_config(request: ConfigUpdateRequest):
         _config.max_position_size = request.max_position_size
     if request.risk_limit_daily is not None:
         _config.risk_limit_daily = request.risk_limit_daily
-    
+
     return _config
 
 
@@ -125,12 +125,12 @@ async def get_positions():
             market_value=15500.00,
         ),
     ]
-    
+
     total_value = sum(p.market_value for p in stub_positions)
     total_pnl = sum(p.unrealized_pnl for p in stub_positions)
     total_cost = sum(p.cost_basis for p in stub_positions)
     total_pnl_percent = (total_pnl / total_cost * 100) if total_cost > 0 else 0.0
-    
+
     return PositionsResponse(
         positions=stub_positions,
         total_value=total_value,
@@ -178,7 +178,7 @@ async def get_orders():
             updated_at=datetime.now(),
         ),
     ]
-    
+
     return OrdersResponse(
         orders=stub_orders,
         total_count=len(stub_orders),
@@ -212,7 +212,7 @@ async def request_notification(request: NotificationRequest):
     """
     # Placeholder - just log for now
     print(f"[NOTIFICATION] {request.severity.upper()}: {request.title} - {request.message}")
-    
+
     return NotificationResponse(
         success=True,
         message="Notification queued (placeholder)",
@@ -226,25 +226,23 @@ async def request_notification(request: NotificationRequest):
 @router.get("/strategies", response_model=StrategiesResponse)
 async def get_strategies(db: Session = Depends(get_db)):
     """
-    Get all strategies.
-    Loads from database.
+    Get all strategies from database.
     """
     storage = StorageService(db)
     db_strategies = storage.strategies.get_all()
-    
-    # Convert DB models to API models
+
     strategies = []
     for db_strat in db_strategies:
         strategies.append(Strategy(
             id=str(db_strat.id),
             name=db_strat.name,
-            description=db_strat.description,
+            description=db_strat.description or "",
             status=StrategyStatus.ACTIVE if db_strat.is_active else StrategyStatus.STOPPED,
-            symbols=db_strat.config.get('symbols', []),
+            symbols=db_strat.config.get('symbols', []) if db_strat.config else [],
             created_at=db_strat.created_at,
             updated_at=db_strat.updated_at,
         ))
-    
+
     return StrategiesResponse(
         strategies=strategies,
         total_count=len(strategies),
@@ -254,41 +252,31 @@ async def get_strategies(db: Session = Depends(get_db)):
 @router.post("/strategies", response_model=Strategy)
 async def create_strategy(request: StrategyCreateRequest, db: Session = Depends(get_db)):
     """
-    Create a new strategy.
-    Persists to database.
+    Create a new strategy and persist to database.
     """
     storage = StorageService(db)
-    
-    # Check for duplicate name
-    existing = storage.get_strategy_by_name(request.name)
+
+    existing = storage.strategies.get_by_name(request.name)
     if existing:
         raise HTTPException(status_code=400, detail="Strategy with this name already exists")
-    
-    # Create strategy config
-    config = {
-        'symbols': request.symbols,
-    }
-    
-    # Create in database
-    db_strategy = storage.create_strategy(
+
+    db_strategy = storage.strategies.create(
         name=request.name,
-        strategy_type='custom',  # Default type
-        config=config,
-        description=request.description
+        description=request.description or "",
+        strategy_type="custom",
+        config={"symbols": request.symbols},
     )
-    
-    # Create audit log
+
     storage.create_audit_log(
-        event_type='strategy_started',
-        description=f'Strategy created: {request.name}',
-        details={'strategy_id': db_strategy.id, 'symbols': request.symbols}
+        event_type="strategy_started",
+        description=f"Strategy created: {request.name}",
+        details={"strategy_id": db_strategy.id, "symbols": request.symbols},
     )
-    
-    # Return API model
+
     return Strategy(
         id=str(db_strategy.id),
         name=db_strategy.name,
-        description=db_strategy.description,
+        description=db_strategy.description or "",
         status=StrategyStatus.STOPPED,
         symbols=request.symbols,
         created_at=db_strategy.created_at,
@@ -299,26 +287,25 @@ async def create_strategy(request: StrategyCreateRequest, db: Session = Depends(
 @router.get("/strategies/{strategy_id}", response_model=Strategy)
 async def get_strategy(strategy_id: str, db: Session = Depends(get_db)):
     """
-    Get a specific strategy by ID.
-    Loads from database.
+    Get a specific strategy by ID from database.
     """
     storage = StorageService(db)
-    
+
     try:
-        strategy_id_int = int(strategy_id.replace('strat-', ''))
+        strategy_id_int = int(strategy_id)
     except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid strategy ID format")
-    
+        raise HTTPException(status_code=400, detail="Invalid strategy ID")
+
     db_strategy = storage.strategies.get_by_id(strategy_id_int)
     if not db_strategy:
         raise HTTPException(status_code=404, detail="Strategy not found")
-    
+
     return Strategy(
         id=str(db_strategy.id),
         name=db_strategy.name,
-        description=db_strategy.description,
+        description=db_strategy.description or "",
         status=StrategyStatus.ACTIVE if db_strategy.is_active else StrategyStatus.STOPPED,
-        symbols=db_strategy.config.get('symbols', []),
+        symbols=db_strategy.config.get('symbols', []) if db_strategy.config else [],
         created_at=db_strategy.created_at,
         updated_at=db_strategy.updated_at,
     )
@@ -327,49 +314,43 @@ async def get_strategy(strategy_id: str, db: Session = Depends(get_db)):
 @router.put("/strategies/{strategy_id}", response_model=Strategy)
 async def update_strategy(strategy_id: str, request: StrategyUpdateRequest, db: Session = Depends(get_db)):
     """
-    Update a strategy.
-    Persists to database.
+    Update a strategy in the database.
     """
     storage = StorageService(db)
-    
+
     try:
-        strategy_id_int = int(strategy_id.replace('strat-', ''))
+        strategy_id_int = int(strategy_id)
     except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid strategy ID format")
-    
+        raise HTTPException(status_code=400, detail="Invalid strategy ID")
+
     db_strategy = storage.strategies.get_by_id(strategy_id_int)
     if not db_strategy:
         raise HTTPException(status_code=404, detail="Strategy not found")
-    
-    # Update fields
+
     if request.name is not None:
         db_strategy.name = request.name
     if request.description is not None:
         db_strategy.description = request.description
     if request.symbols is not None:
-        # Update config and mark as modified
-        config = db_strategy.config.copy()
-        config['symbols'] = request.symbols
-        db_strategy.config = config
+        if not db_strategy.config:
+            db_strategy.config = {}
+        db_strategy.config["symbols"] = request.symbols
     if request.status is not None:
         db_strategy.is_active = (request.status == StrategyStatus.ACTIVE)
-        
-        # Create audit log for status change
         storage.create_audit_log(
-            event_type='strategy_started' if db_strategy.is_active else 'strategy_stopped',
-            description=f'Strategy {"started" if db_strategy.is_active else "stopped"}: {db_strategy.name}',
-            details={'strategy_id': db_strategy.id}
+            event_type="strategy_started" if db_strategy.is_active else "strategy_stopped",
+            description=f"Strategy {'started' if db_strategy.is_active else 'stopped'}: {db_strategy.name}",
+            details={"strategy_id": db_strategy.id},
         )
-    
-    # Save to database
+
     db_strategy = storage.strategies.update(db_strategy)
-    
+
     return Strategy(
         id=str(db_strategy.id),
         name=db_strategy.name,
-        description=db_strategy.description,
+        description=db_strategy.description or "",
         status=StrategyStatus.ACTIVE if db_strategy.is_active else StrategyStatus.STOPPED,
-        symbols=db_strategy.config.get('symbols', []),
+        symbols=db_strategy.config.get('symbols', []) if db_strategy.config else [],
         created_at=db_strategy.created_at,
         updated_at=db_strategy.updated_at,
     )
@@ -378,30 +359,27 @@ async def update_strategy(strategy_id: str, request: StrategyUpdateRequest, db: 
 @router.delete("/strategies/{strategy_id}")
 async def delete_strategy(strategy_id: str, db: Session = Depends(get_db)):
     """
-    Delete a strategy.
-    Removes from database.
+    Delete a strategy from the database.
     """
     storage = StorageService(db)
-    
+
     try:
-        strategy_id_int = int(strategy_id.replace('strat-', ''))
+        strategy_id_int = int(strategy_id)
     except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid strategy ID format")
-    
+        raise HTTPException(status_code=400, detail="Invalid strategy ID")
+
     db_strategy = storage.strategies.get_by_id(strategy_id_int)
     if not db_strategy:
         raise HTTPException(status_code=404, detail="Strategy not found")
-    
-    # Create audit log before deletion
+
     storage.create_audit_log(
-        event_type='strategy_stopped',
-        description=f'Strategy deleted: {db_strategy.name}',
-        details={'strategy_id': db_strategy.id}
+        event_type="strategy_stopped",
+        description=f"Strategy deleted: {db_strategy.name}",
+        details={"strategy_id": db_strategy.id},
     )
-    
-    # Delete from database
+
     storage.strategies.delete(strategy_id_int)
-    
+
     return {"message": "Strategy deleted"}
 
 
@@ -416,17 +394,14 @@ async def get_audit_logs(
     db: Session = Depends(get_db)
 ):
     """
-    Get audit logs.
-    Loads from database with filtering and pagination.
+    Get audit logs from database with filtering and pagination.
     """
     storage = StorageService(db)
-    
-    # Get logs from database
+
     event_type_str = event_type.value if event_type else None
     db_logs = storage.get_audit_logs(limit=limit, event_type=event_type_str)
     total_count = storage.count_audit_logs(event_type=event_type_str)
-    
-    # Convert to API models
+
     logs = []
     for db_log in db_logs:
         logs.append(AuditLog(
@@ -434,9 +409,9 @@ async def get_audit_logs(
             timestamp=db_log.timestamp,
             event_type=AuditEventType(db_log.event_type),
             description=db_log.description,
-            details=db_log.details
+            details=db_log.details or {},
         ))
-    
+
     return AuditLogsResponse(
         logs=logs,
         total_count=total_count,
@@ -493,19 +468,17 @@ async def get_portfolio_analytics(
     Returns equity curve and P&L over time.
     """
     storage = StorageService(db)
-    
-    # Get all trades for time series
+
     trades = storage.get_recent_trades(limit=1000)
-    
-    # Build time series data
+
     time_series = []
     cumulative_pnl = 0.0
-    equity = 100000.0  # Starting balance
-    
-    for trade in reversed(trades):  # Oldest first
+    equity = 100000.0
+
+    for trade in reversed(trades):
         cumulative_pnl += trade.realized_pnl or 0.0
         equity += trade.realized_pnl or 0.0
-        
+
         time_series.append({
             'timestamp': trade.executed_at.isoformat(),
             'equity': equity,
@@ -513,7 +486,7 @@ async def get_portfolio_analytics(
             'cumulative_pnl': cumulative_pnl,
             'symbol': trade.symbol,
         })
-    
+
     return {
         'time_series': time_series,
         'total_trades': len(trades),
@@ -529,24 +502,19 @@ async def get_portfolio_summary(db: Session = Depends(get_db)):
     Returns aggregate metrics and performance stats.
     """
     storage = StorageService(db)
-    
-    # Get positions
+
     positions = storage.get_open_positions()
-    
-    # Get trades
     trades = storage.get_recent_trades(limit=1000)
-    
-    # Calculate metrics
+
     total_trades = len(trades)
     total_pnl = sum(t.realized_pnl or 0.0 for t in trades)
     winning_trades = len([t for t in trades if (t.realized_pnl or 0.0) > 0])
     losing_trades = len([t for t in trades if (t.realized_pnl or 0.0) < 0])
     win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0.0
-    
-    # Calculate position values
+
     total_position_value = sum(p.cost_basis for p in positions)
     total_positions = len(positions)
-    
+
     return {
         'total_trades': total_trades,
         'total_pnl': total_pnl,
@@ -555,5 +523,5 @@ async def get_portfolio_summary(db: Session = Depends(get_db)):
         'win_rate': win_rate,
         'total_positions': total_positions,
         'total_position_value': total_position_value,
-        'equity': 100000.0 + total_pnl,  # Starting balance + P&L
+        'equity': 100000.0 + total_pnl,
     }

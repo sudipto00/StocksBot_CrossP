@@ -182,6 +182,8 @@ export enum AuditEventType {
   POSITION_OPENED = "position_opened",
   POSITION_CLOSED = "position_closed",
   CONFIG_UPDATED = "config_updated",
+  RUNNER_STARTED = "runner_started",
+  RUNNER_STOPPED = "runner_stopped",
   ERROR = "error",
 }
 

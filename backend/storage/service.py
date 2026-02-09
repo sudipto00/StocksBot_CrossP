@@ -12,7 +12,8 @@ from storage.repositories import (
 )
 from storage.models import (
     Position, Order, Trade, Strategy, Config, AuditLog,
-    PositionSideEnum, OrderSideEnum, OrderTypeEnum, OrderStatusEnum, TradeTypeEnum
+    PositionSideEnum, OrderSideEnum, OrderTypeEnum, OrderStatusEnum, TradeTypeEnum,
+    AuditEventTypeEnum
 )
 
 
@@ -71,7 +72,6 @@ class StorageService:
         
         if new_quantity == 0:
             # Position closed
-            # Calculate realized P&L
             if position.side == PositionSideEnum.LONG:
                 realized_pnl = quantity_delta * (price - position.avg_entry_price)
             else:  # SHORT
@@ -79,9 +79,7 @@ class StorageService:
             
             return self.positions.close_position(position, realized_pnl)
         else:
-            # Update position
             if abs(new_quantity) > abs(position.quantity):
-                # Adding to position - recalculate average entry
                 total_cost = position.cost_basis + (abs(quantity_delta) * price)
                 position.avg_entry_price = total_cost / abs(new_quantity)
             
@@ -129,7 +127,7 @@ class StorageService:
             order_id=order_id,
             symbol=symbol,
             side=OrderSideEnum(side),
-            type=TradeTypeEnum.OPEN,  # Default to OPEN, can be refined
+            type=TradeTypeEnum.OPEN,
             quantity=quantity,
             price=price,
             commission=commission,
@@ -175,21 +173,53 @@ class StorageService:
     
     # Audit log operations
     
-    def create_audit_log(self, event_type: str, description: str,
-                        details: Optional[Dict[str, Any]] = None,
-                        user_id: Optional[str] = None) -> AuditLog:
-        """Create an audit log entry."""
-        return self.audit_logs.create(event_type, description, details, user_id)
+    def create_audit_log(
+        self,
+        event_type: str,
+        description: str,
+        details: Optional[Dict[str, Any]] = None,
+        user_id: Optional[str] = None,
+        strategy_id: Optional[int] = None,
+        order_id: Optional[int] = None
+    ) -> AuditLog:
+        """Create a new audit log entry."""
+        return self.audit_logs.create(
+            event_type=AuditEventTypeEnum(event_type),
+            description=description,
+            details=details,
+            user_id=user_id,
+            strategy_id=strategy_id,
+            order_id=order_id
+        )
     
-    def get_audit_logs(self, limit: int = 100, offset: int = 0,
-                      event_type: Optional[str] = None) -> List[AuditLog]:
-        """Get audit logs with optional filtering."""
-        if event_type:
-            return self.audit_logs.get_by_event_type(event_type, limit)
-        return self.audit_logs.get_recent(limit, offset)
+    def get_audit_logs(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        event_type: Optional[str] = None,
+        strategy_id: Optional[int] = None,
+        order_id: Optional[int] = None
+    ) -> List[AuditLog]:
+        """Get audit logs with filtering and pagination."""
+        event_type_enum = AuditEventTypeEnum(event_type) if event_type else None
+        return self.audit_logs.get_all(
+            limit=limit,
+            offset=offset,
+            event_type=event_type_enum,
+            strategy_id=strategy_id,
+            order_id=order_id
+        )
     
-    def count_audit_logs(self, event_type: Optional[str] = None) -> int:
+    def count_audit_logs(
+        self,
+        event_type: Optional[str] = None,
+        strategy_id: Optional[int] = None,
+        order_id: Optional[int] = None
+    ) -> int:
         """Count audit logs with optional filtering."""
-        if event_type:
-            return self.audit_logs.count_by_event_type(event_type)
-        return self.audit_logs.count()
+        event_type_enum = AuditEventTypeEnum(event_type) if event_type else None
+        return self.audit_logs.count(
+            event_type=event_type_enum,
+            strategy_id=strategy_id,
+            order_id=order_id
+        )
