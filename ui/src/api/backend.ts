@@ -32,6 +32,7 @@ import {
 
 // Access environment variables via import.meta.env in Vite
 const BACKEND_URL = (import.meta as { env?: { VITE_BACKEND_URL?: string } }).env?.VITE_BACKEND_URL || "http://127.0.0.1:8000";
+const DEFAULT_INITIAL_CAPITAL = 100000;
 
 /**
  * Get backend status.
@@ -338,7 +339,7 @@ export async function getEquityCurve(limit?: number): Promise<{ data: EquityPoin
   }));
   
   // Calculate initial capital from first equity point or use default
-  const initial_capital = equityData.length > 0 ? equityData[0].value : 100000;
+  const initial_capital = equityData.length > 0 ? equityData[0].value : DEFAULT_INITIAL_CAPITAL;
   
   return {
     data: equityData,

@@ -96,6 +96,8 @@ function DashboardPage() {
       if (response.success) {
         // Reload runner status to get full state
         await loadRunnerStatus();
+      } else {
+        alert(response.message || 'Failed to stop runner');
       }
     } catch (err) {
       alert(err instanceof Error ? err.message : 'Failed to stop runner');
