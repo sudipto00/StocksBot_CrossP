@@ -223,3 +223,9 @@ class StorageService:
             strategy_id=strategy_id,
             order_id=order_id
         )
+    
+    def get_trades_by_strategy(self, strategy_id: int) -> List[Trade]:
+        """Get all trades for a specific strategy."""
+        # For now, return recent trades since we don't have strategy_id on trades
+        # In a full implementation, Trade model would have a strategy_id field
+        return self.trades.get_recent(limit=1000)

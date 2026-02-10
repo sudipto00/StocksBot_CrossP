@@ -28,6 +28,14 @@ import {
   PortfolioSummaryResponse,
   EquityPoint,
   PortfolioAnalytics,
+  // Strategy configuration types
+  StrategyConfig,
+  StrategyConfigUpdateRequest,
+  StrategyMetrics,
+  BacktestRequest,
+  BacktestResult,
+  ParameterTuneRequest,
+  ParameterTuneResponse,
 } from './types';
 
 // Access environment variables via import.meta.env in Vite
@@ -345,4 +353,96 @@ export async function getEquityCurve(limit?: number): Promise<{ data: EquityPoin
     data: equityData,
     initial_capital,
   };
+}
+
+/**
+ * Get strategy configuration.
+ */
+export async function getStrategyConfig(strategyId: string): Promise<StrategyConfig> {
+  const response = await fetch(`${BACKEND_URL}/strategies/${strategyId}/config`);
+  
+  if (!response.ok) {
+    throw new Error(`Backend returned ${response.status}`);
+  }
+  
+  return response.json();
+}
+
+/**
+ * Update strategy configuration.
+ */
+export async function updateStrategyConfig(
+  strategyId: string,
+  updates: StrategyConfigUpdateRequest
+): Promise<StrategyConfig> {
+  const response = await fetch(`${BACKEND_URL}/strategies/${strategyId}/config`, {
+    method: 'PUT',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(updates),
+  });
+  
+  if (!response.ok) {
+    throw new Error(`Backend returned ${response.status}`);
+  }
+  
+  return response.json();
+}
+
+/**
+ * Get strategy performance metrics.
+ */
+export async function getStrategyMetrics(strategyId: string): Promise<StrategyMetrics> {
+  const response = await fetch(`${BACKEND_URL}/strategies/${strategyId}/metrics`);
+  
+  if (!response.ok) {
+    throw new Error(`Backend returned ${response.status}`);
+  }
+  
+  return response.json();
+}
+
+/**
+ * Run strategy backtest.
+ */
+export async function runBacktest(
+  strategyId: string,
+  request: BacktestRequest
+): Promise<BacktestResult> {
+  const response = await fetch(`${BACKEND_URL}/strategies/${strategyId}/backtest`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(request),
+  });
+  
+  if (!response.ok) {
+    throw new Error(`Backend returned ${response.status}`);
+  }
+  
+  return response.json();
+}
+
+/**
+ * Tune strategy parameter.
+ */
+export async function tuneParameter(
+  strategyId: string,
+  request: ParameterTuneRequest
+): Promise<ParameterTuneResponse> {
+  const response = await fetch(`${BACKEND_URL}/strategies/${strategyId}/tune`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(request),
+  });
+  
+  if (!response.ok) {
+    throw new Error(`Backend returned ${response.status}`);
+  }
+  
+  return response.json();
 }
