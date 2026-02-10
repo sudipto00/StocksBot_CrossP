@@ -42,7 +42,12 @@ function DashboardPage() {
       
       setStatus(statusData);
       setPositions(positionsData.positions);
-      setRunnerState(runnerData.status);
+      setRunnerState({
+        status: runnerData.status as RunnerStatus,
+        strategies: runnerData.strategies,
+        tick_interval: runnerData.tick_interval,
+        broker_connected: runnerData.broker_connected,
+      });
       setEquityCurve(equityCurveData.data);
       setInitialCapital(equityCurveData.initial_capital);
       setAnalytics(analyticsData);
@@ -56,7 +61,12 @@ function DashboardPage() {
   const loadRunnerStatus = async () => {
     try {
       const runnerData = await getRunnerStatus();
-      setRunnerState(runnerData.status);
+      setRunnerState({
+        status: runnerData.status as RunnerStatus,
+        strategies: runnerData.strategies,
+        tick_interval: runnerData.tick_interval,
+        broker_connected: runnerData.broker_connected,
+      });
     } catch (err) {
       console.error('Failed to load runner status:', err);
     }
@@ -66,8 +76,10 @@ function DashboardPage() {
     try {
       setRunnerLoading(true);
       const response = await startRunner();
-      setRunnerState(response.status);
-      if (!response.success) {
+      if (response.success) {
+        // Reload runner status to get full state
+        await loadRunnerStatus();
+      } else {
         alert(response.message || 'Failed to start runner');
       }
     } catch (err) {
@@ -81,7 +93,10 @@ function DashboardPage() {
     try {
       setRunnerLoading(true);
       const response = await stopRunner();
-      setRunnerState(response.status);
+      if (response.success) {
+        // Reload runner status to get full state
+        await loadRunnerStatus();
+      }
     } catch (err) {
       alert(err instanceof Error ? err.message : 'Failed to stop runner');
     } finally {
