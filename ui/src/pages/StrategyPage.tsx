@@ -1,9 +1,9 @@
 import { useState, useEffect, useCallback } from 'react';
 import { showSuccessNotification, showErrorNotification } from '../utils/notifications';
-import { 
-  getStrategies, 
-  createStrategy, 
-  updateStrategy, 
+import {
+  getStrategies,
+  createStrategy,
+  updateStrategy,
   deleteStrategy,
   getRunnerStatus,
   startRunner,
@@ -14,9 +14,9 @@ import {
   runBacktest,
   tuneParameter,
 } from '../api/backend';
-import { 
-  Strategy, 
-  StrategyStatus, 
+import {
+  Strategy,
+  StrategyStatus,
   StrategyConfig,
   StrategyMetrics,
   BacktestResult,
@@ -32,11 +32,11 @@ function StrategyPage() {
   const [strategies, setStrategies] = useState<Strategy[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [showCreateModal, setShowCreateModal] = useState(false);
-  
+
   // Runner state
   const [runnerStatus, setRunnerStatus] = useState<string>('stopped');
   const [runnerLoading, setRunnerLoading] = useState(false);
-  
+
   // Form state
   const [formName, setFormName] = useState('');
   const [formDescription, setFormDescription] = useState('');
@@ -48,17 +48,18 @@ function StrategyPage() {
   const [strategyConfig, setStrategyConfig] = useState<StrategyConfig | null>(null);
   const [strategyMetrics, setStrategyMetrics] = useState<StrategyMetrics | null>(null);
   const [metricsLoading, setMetricsLoading] = useState(false);
-  
+  const [configSymbols, setConfigSymbols] = useState('');
+  const [configEnabled, setConfigEnabled] = useState(true);
+  const [configSaving, setConfigSaving] = useState(false);
+  const [parameterDrafts, setParameterDrafts] = useState<Record<string, number>>({});
+  const [parameterSaving, setParameterSaving] = useState<Record<string, boolean>>({});
+
   // Backtest state
-  const [showBacktestModal, setShowBacktestModal] = useState(false);
   const [backtestLoading, setBacktestLoading] = useState(false);
   const [backtestResult, setBacktestResult] = useState<BacktestResult | null>(null);
   const [backtestStartDate, setBacktestStartDate] = useState('2024-01-01');
   const [backtestEndDate, setBacktestEndDate] = useState('2024-12-31');
   const [backtestCapital, setBacktestCapital] = useState('100000');
-
-  // Parameter tuning state
-  const [tuningParameter, setTuningParameter] = useState<StrategyParameter | null>(null);
 
   useEffect(() => {
     loadStrategies();
@@ -67,20 +68,20 @@ function StrategyPage() {
 
   // Auto-refresh metrics every 10 seconds when a strategy is selected
   useEffect(() => {
-    if (selectedStrategy && !metricsLoading) {
+    if (selectedStrategy) {
       const interval = setInterval(() => {
         loadStrategyMetrics(selectedStrategy.id);
       }, 10000);
-      
+
       return () => clearInterval(interval);
     }
-  }, [selectedStrategy, metricsLoading]);
+  }, [selectedStrategy, loadStrategyMetrics]);
 
   const loadStrategies = async () => {
     try {
       setLoading(true);
       setError(null);
-      
+
       const response = await getStrategies();
       setStrategies(response.strategies);
     } catch (err) {
@@ -103,6 +104,14 @@ function StrategyPage() {
     try {
       const config = await getStrategyConfig(strategyId);
       setStrategyConfig(config);
+      setConfigSymbols(config.symbols.join(', '));
+      setConfigEnabled(config.enabled);
+      setParameterDrafts(
+        config.parameters.reduce((acc, param) => {
+          acc[param.name] = param.value;
+          return acc;
+        }, {} as Record<string, number>)
+      );
     } catch (err) {
       console.error('Failed to load strategy config:', err);
       await showErrorNotification('Config Error', 'Failed to load strategy configuration');
@@ -126,26 +135,16 @@ function StrategyPage() {
     setStrategyConfig(null);
     setStrategyMetrics(null);
     setBacktestResult(null);
-    
-    // Load config and metrics
+
     await loadStrategyConfig(strategy.id);
     await loadStrategyMetrics(strategy.id);
-  };
-
-  const loadRunnerStatus = async () => {
-    try {
-      const status = await getRunnerStatus();
-      setRunnerStatus(status.status);
-    } catch (err) {
-      console.error('Failed to load runner status:', err);
-    }
   };
 
   const handleStartRunner = async () => {
     try {
       setRunnerLoading(true);
       const result = await startRunner();
-      
+
       if (result.success) {
         await showSuccessNotification('Runner Started', result.message);
         setRunnerStatus(result.status);
@@ -163,7 +162,7 @@ function StrategyPage() {
     try {
       setRunnerLoading(true);
       const result = await stopRunner();
-      
+
       if (result.success) {
         await showSuccessNotification('Runner Stopped', result.message);
         setRunnerStatus(result.status);
@@ -179,16 +178,16 @@ function StrategyPage() {
 
   const validateForm = (): boolean => {
     const errors: Record<string, string> = {};
-    
+
     if (!formName.trim()) {
       errors.name = 'Strategy name is required';
     }
-    
-    const symbols = formSymbols.split(',').map(s => s.trim()).filter(s => s);
+
+    const symbols = formSymbols.split(',').map((s) => s.trim()).filter((s) => s);
     if (symbols.length === 0) {
       errors.symbols = 'At least one symbol is required';
     }
-    
+
     setFormErrors(errors);
     return Object.keys(errors).length === 0;
   };
@@ -197,19 +196,18 @@ function StrategyPage() {
     if (!validateForm()) {
       return;
     }
-    
+
     try {
-      const symbols = formSymbols.split(',').map(s => s.trim().toUpperCase()).filter(s => s);
-      
+      const symbols = formSymbols.split(',').map((s) => s.trim().toUpperCase()).filter((s) => s);
+
       await createStrategy({
         name: formName,
         description: formDescription || undefined,
         symbols,
       });
-      
+
       await showSuccessNotification('Strategy Created', `Strategy "${formName}" created successfully`);
-      
-      // Reset form and reload
+
       setFormName('');
       setFormDescription('');
       setFormSymbols('');
@@ -222,17 +220,17 @@ function StrategyPage() {
 
   const handleUpdate = async (strategy: Strategy) => {
     try {
-      const newStatus = strategy.status === StrategyStatus.ACTIVE 
-        ? StrategyStatus.STOPPED 
+      const newStatus = strategy.status === StrategyStatus.ACTIVE
+        ? StrategyStatus.STOPPED
         : StrategyStatus.ACTIVE;
-      
+
       await updateStrategy(strategy.id, { status: newStatus });
-      
+
       await showSuccessNotification(
-        'Strategy Updated', 
+        'Strategy Updated',
         `Strategy "${strategy.name}" ${newStatus === StrategyStatus.ACTIVE ? 'started' : 'stopped'}`
       );
-      
+
       await loadStrategies();
     } catch (err) {
       await showErrorNotification('Update Error', 'Failed to update strategy');
@@ -243,7 +241,7 @@ function StrategyPage() {
     if (!confirm(`Delete strategy "${strategy.name}"?`)) {
       return;
     }
-    
+
     try {
       await deleteStrategy(strategy.id);
       await showSuccessNotification('Strategy Deleted', `Strategy "${strategy.name}" deleted`);
@@ -258,22 +256,38 @@ function StrategyPage() {
     }
   };
 
-  const handleConfigUpdate = async (symbols?: string[], enabled?: boolean) => {
+  const handleConfigUpdate = async () => {
     if (!selectedStrategy) return;
-    
+
     try {
-      await updateStrategyConfig(selectedStrategy.id, { symbols, enabled });
+      setConfigSaving(true);
+      const symbols = configSymbols.split(',').map((s) => s.trim().toUpperCase()).filter((s) => s);
+      await updateStrategyConfig(selectedStrategy.id, {
+        symbols,
+        enabled: configEnabled,
+      });
       await showSuccessNotification('Config Updated', 'Strategy configuration updated');
       await loadStrategyConfig(selectedStrategy.id);
     } catch (err) {
       await showErrorNotification('Update Error', 'Failed to update configuration');
+    } finally {
+      setConfigSaving(false);
     }
   };
 
-  const handleParameterChange = async (param: StrategyParameter, value: number) => {
+  const handleParameterChange = (param: StrategyParameter, value: number) => {
+    setParameterDrafts((prev) => ({
+      ...prev,
+      [param.name]: value,
+    }));
+  };
+
+  const handleApplyParameter = async (param: StrategyParameter) => {
     if (!selectedStrategy) return;
-    
+
     try {
+      setParameterSaving((prev) => ({ ...prev, [param.name]: true }));
+      const value = parameterDrafts[param.name] ?? param.value;
       await tuneParameter(selectedStrategy.id, {
         parameter_name: param.name,
         value,
@@ -282,12 +296,14 @@ function StrategyPage() {
       await loadStrategyConfig(selectedStrategy.id);
     } catch (err) {
       await showErrorNotification('Tune Error', 'Failed to update parameter');
+    } finally {
+      setParameterSaving((prev) => ({ ...prev, [param.name]: false }));
     }
   };
 
   const handleRunBacktest = async () => {
     if (!selectedStrategy) return;
-    
+
     try {
       setBacktestLoading(true);
       const result = await runBacktest(selectedStrategy.id, {
@@ -319,7 +335,7 @@ function StrategyPage() {
           <h2 className="text-3xl font-bold text-white mb-2">Trading Strategies</h2>
           <p className="text-gray-400">Manage and monitor your trading strategies</p>
         </div>
-        
+
         <button
           onClick={openCreateModal}
           className="bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded font-medium"
@@ -342,12 +358,10 @@ function StrategyPage() {
               }`}></div>
               <span className={`text-sm font-medium ${
                 runnerStatus === 'running' ? 'text-green-400' : 'text-gray-400'
-              }`}>
-                {runnerStatus.charAt(0).toUpperCase() + runnerStatus.slice(1)}
-              </span>
+              }`}>{runnerStatus.charAt(0).toUpperCase() + runnerStatus.slice(1)}</span>
             </div>
           </div>
-          
+
           <div className="flex gap-2">
             <button
               onClick={handleStartRunner}
@@ -356,7 +370,7 @@ function StrategyPage() {
                 runnerLoading || runnerStatus === 'running'
                   ? 'bg-gray-600 text-gray-400 cursor-not-allowed'
                   : 'bg-green-600 hover:bg-green-700 text-white'
-              }`}
+              }`
             >
               {runnerLoading ? 'Starting...' : 'Start Runner'}
             </button>
@@ -367,7 +381,7 @@ function StrategyPage() {
                 runnerLoading || runnerStatus !== 'running'
                   ? 'bg-gray-600 text-gray-400 cursor-not-allowed'
                   : 'bg-red-600 hover:bg-red-700 text-white'
-              }`}
+              }`
             >
               {runnerLoading ? 'Stopping...' : 'Stop Runner'}
             </button>
@@ -378,7 +392,7 @@ function StrategyPage() {
       {error && (
         <div className="bg-red-900/20 border border-red-700 rounded-lg p-4 mb-6">
           <p className="text-red-400">Error: {error}</p>
-          <button 
+          <button
             onClick={loadStrategies}
             className="mt-2 text-red-300 hover:text-red-200 underline"
           >
@@ -421,19 +435,17 @@ function StrategyPage() {
                     onClick={() => handleSelectStrategy(strategy)}
                     className={`p-4 cursor-pointer hover:bg-gray-750 transition-colors ${
                       selectedStrategy?.id === strategy.id ? 'bg-gray-750 border-l-4 border-blue-500' : ''
-                    }`}
+                    }`
                   >
                     <div className="flex items-center justify-between mb-2">
                       <div className="text-white font-medium">{strategy.name}</div>
                       <span className={`px-2 py-1 rounded text-xs font-medium ${
-                        strategy.status === StrategyStatus.ACTIVE 
-                          ? 'bg-green-900/30 text-green-400' 
+                        strategy.status === StrategyStatus.ACTIVE
+                          ? 'bg-green-900/30 text-green-400'
                           : strategy.status === StrategyStatus.ERROR
                           ? 'bg-red-900/30 text-red-400'
                           : 'bg-gray-700 text-gray-400'
-                      }`}>
-                        {strategy.status}
-                      </span>
+                      }`}>{strategy.status}</span>
                     </div>
                     {strategy.description && (
                       <div className="text-gray-400 text-sm mb-2">{strategy.description}</div>
@@ -455,9 +467,13 @@ function StrategyPage() {
                 <div className="bg-gray-800 rounded-lg border border-gray-700 p-6">
                   <div className="flex items-center justify-between mb-4">
                     <h3 className="text-lg font-semibold text-white">Performance Metrics</h3>
-                    {metricsLoading && (
-                      <span className="text-gray-400 text-sm">Refreshing...</span>
-                    )}
+                    <button
+                      onClick={() => loadStrategyMetrics(selectedStrategy.id)}
+                      disabled={metricsLoading}
+                      className="text-sm text-blue-400 hover:text-blue-300"
+                    >
+                      {metricsLoading ? 'Refreshing...' : 'Refresh'}
+                    </button>
                   </div>
                   {strategyMetrics ? (
                     <div className="grid grid-cols-3 gap-4">
@@ -495,9 +511,7 @@ function StrategyPage() {
                         <div className="text-gray-400 text-sm mb-1">Total P&L</div>
                         <div className={`text-2xl font-bold ${
                           strategyMetrics.total_pnl >= 0 ? 'text-green-400' : 'text-red-400'
-                        }`}>
-                          ${strategyMetrics.total_pnl.toFixed(2)}
-                        </div>
+                        }`}>$ {strategyMetrics.total_pnl.toFixed(2)}</div>
                       </div>
                     </div>
                   ) : (
@@ -509,47 +523,89 @@ function StrategyPage() {
                 {strategyConfig && (
                   <div className="bg-gray-800 rounded-lg border border-gray-700 p-6">
                     <h3 className="text-lg font-semibold text-white mb-4">Configuration</h3>
-                    
+
                     <div className="space-y-4">
                       <div>
                         <label className="text-white font-medium block mb-2">Symbols</label>
-                        <div className="flex flex-wrap gap-2">
-                          {strategyConfig.symbols.map((symbol) => (
-                            <span key={symbol} className="bg-blue-900/30 text-blue-400 px-3 py-1 rounded text-sm">
-                              {symbol}
-                            </span>
-                          ))}
-                        </div>
+                        <input
+                          type="text"
+                          value={configSymbols}
+                          onChange={(e) => setConfigSymbols(e.target.value)}
+                          className="bg-gray-700 text-white px-4 py-2 rounded border border-gray-600 w-full"
+                          placeholder="AAPL, MSFT, GOOGL"
+                        />
+                        <p className="text-gray-400 text-xs mt-1">Comma-separated list of symbols</p>
+                      </div>
+
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="checkbox"
+                          checked={configEnabled}
+                          onChange={(e) => setConfigEnabled(e.target.checked)}
+                          className="h-4 w-4 text-blue-600"
+                        />
+                        <span className="text-gray-300 text-sm">Enable strategy</span>
                       </div>
 
                       <div>
                         <label className="text-white font-medium block mb-2">Parameters</label>
                         <div className="space-y-3">
-                          {strategyConfig.parameters.map((param) => (
-                            <div key={param.name} className="bg-gray-900 rounded p-3">
-                              <div className="flex justify-between items-center mb-2">
-                                <span className="text-white text-sm">{param.description || param.name}</span>
-                                <span className="text-blue-400 font-mono">{param.value.toFixed(2)}</span>
+                          {strategyConfig.parameters.map((param) => {
+                            const value = parameterDrafts[param.name] ?? param.value;
+                            return (
+                              <div key={param.name} className="bg-gray-900 rounded p-3">
+                                <div className="flex justify-between items-center mb-2">
+                                  <span className="text-white text-sm">{param.description || param.name}</span>
+                                  <span className="text-blue-400 font-mono">{value.toFixed(2)}</span>
+                                </div>
+                                <input
+                                  type="range"
+                                  min={param.min_value}
+                                  max={param.max_value}
+                                  step={param.step}
+                                  value={value}
+                                  onChange={(e) => handleParameterChange(param, parseFloat(e.target.value))}
+                                  className="w-full h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer slider"
+                                />
+                                <div className="flex justify-between text-xs text-gray-500 mt-1">
+                                  <span>{param.min_value}</span>
+                                  <span>{param.max_value}</span>
+                                </div>
+                                <button
+                                  onClick={() => handleApplyParameter(param)}
+                                  disabled={parameterSaving[param.name]}
+                                  className={`mt-2 px-3 py-1 rounded text-xs font-medium ${
+                                    parameterSaving[param.name]
+                                      ? 'bg-gray-600 text-gray-400 cursor-not-allowed'
+                                      : 'bg-blue-600 hover:bg-blue-700 text-white'
+                                  }`}
+                                >
+                                  {parameterSaving[param.name] ? 'Applying...' : 'Apply'}
+                                </button>
                               </div>
-                              <input
-                                type="range"
-                                min={param.min_value}
-                                max={param.max_value}
-                                step={param.step}
-                                value={param.value}
-                                onChange={(e) => handleParameterChange(param, parseFloat(e.target.value))}
-                                className="w-full h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer slider"
-                              />
-                              <div className="flex justify-between text-xs text-gray-500 mt-1">
-                                <span>{param.min_value}</span>
-                                <span>{param.max_value}</span>
-                              </div>
-                            </div>
-                          ))}
+                            );
+                          })}
                         </div>
                       </div>
 
                       <div className="flex gap-2">
+                        <button
+                          onClick={handleConfigUpdate}
+                          disabled={configSaving}
+                          className={`px-4 py-2 rounded font-medium ${
+                            configSaving
+                              ? 'bg-gray-600 text-gray-400 cursor-not-allowed'
+                              : 'bg-blue-600 hover:bg-blue-700 text-white'
+                          }`}
+                        >
+                          {configSaving ? 'Saving...' : 'Save Config'}
+                        </button>
+                        <button
+                          onClick={() => selectedStrategy && loadStrategyConfig(selectedStrategy.id)}
+                          className="px-4 py-2 rounded font-medium bg-gray-600 hover:bg-gray-700 text-white"
+                        >
+                          Reset
+                        </button>
                         <button
                           onClick={() => handleUpdate(selectedStrategy)}
                           className={`px-4 py-2 rounded font-medium ${
@@ -574,7 +630,7 @@ function StrategyPage() {
                 {/* Backtesting Card */}
                 <div className="bg-gray-800 rounded-lg border border-gray-700 p-6">
                   <h3 className="text-lg font-semibold text-white mb-4">Backtesting</h3>
-                  
+
                   {!backtestResult ? (
                     <div className="space-y-4">
                       <div className="grid grid-cols-2 gap-4">
@@ -597,7 +653,7 @@ function StrategyPage() {
                           />
                         </div>
                       </div>
-                      
+
                       <div>
                         <label className="text-white font-medium block mb-2">Initial Capital</label>
                         <input
@@ -628,42 +684,58 @@ function StrategyPage() {
                           <div className="text-gray-400 text-sm mb-1">Total Return</div>
                           <div className={`text-2xl font-bold ${
                             backtestResult.total_return >= 0 ? 'text-green-400' : 'text-red-400'
-                          }`}>
-                            {backtestResult.total_return.toFixed(2)}%
-                          </div>
+                          }`}>{backtestResult.total_return.toFixed(2)}%</div>
                         </div>
                         <div className="bg-gray-900 rounded p-4">
                           <div className="text-gray-400 text-sm mb-1">Final Capital</div>
-                          <div className="text-2xl font-bold text-white">
-                            ${backtestResult.final_capital.toLocaleString()}
-                          </div>
+                          <div className="text-2xl font-bold text-white">${backtestResult.final_capital.toLocaleString()}</div>
                         </div>
                         <div className="bg-gray-900 rounded p-4">
                           <div className="text-gray-400 text-sm mb-1">Win Rate</div>
-                          <div className="text-2xl font-bold text-white">
-                            {backtestResult.win_rate.toFixed(1)}%
-                          </div>
+                          <div className="text-2xl font-bold text-white">{backtestResult.win_rate.toFixed(1)}%</div>
                         </div>
                         <div className="bg-gray-900 rounded p-4">
                           <div className="text-gray-400 text-sm mb-1">Max Drawdown</div>
-                          <div className="text-2xl font-bold text-red-400">
-                            {backtestResult.max_drawdown.toFixed(2)}%
-                          </div>
+                          <div className="text-2xl font-bold text-red-400">{backtestResult.max_drawdown.toFixed(2)}%</div>
                         </div>
                         <div className="bg-gray-900 rounded p-4">
                           <div className="text-gray-400 text-sm mb-1">Total Trades</div>
-                          <div className="text-2xl font-bold text-white">
-                            {backtestResult.total_trades}
-                          </div>
+                          <div className="text-2xl font-bold text-white">{backtestResult.total_trades}</div>
                         </div>
                         <div className="bg-gray-900 rounded p-4">
                           <div className="text-gray-400 text-sm mb-1">Sharpe Ratio</div>
-                          <div className="text-2xl font-bold text-white">
-                            {backtestResult.sharpe_ratio.toFixed(2)}
-                          </div>
+                          <div className="text-2xl font-bold text-white">{backtestResult.sharpe_ratio.toFixed(2)}</div>
                         </div>
                       </div>
-                      
+
+                      {backtestResult.trades.length > 0 && (
+                        <div className="bg-gray-900 rounded p-4">
+                          <div className="text-white font-medium mb-2">Recent Trades</div>
+                          <div className="max-h-48 overflow-auto">
+                            <table className="w-full text-sm text-gray-300">
+                              <thead className="text-gray-400">
+                                <tr>
+                                  <th className="text-left py-1">Symbol</th>
+                                  <th className="text-left py-1">Entry</th>
+                                  <th className="text-left py-1">Exit</th>
+                                  <th className="text-right py-1">P&L</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {backtestResult.trades.slice(0, 10).map((trade) => (
+                                  <tr key={trade.id} className="border-t border-gray-700">
+                                    <td className="py-1">{trade.symbol}</td>
+                                    <td className="py-1">{trade.entry_price.toFixed(2)}</td>
+                                    <td className="py-1">{trade.exit_price.toFixed(2)}</td>
+                                    <td className={`py-1 text-right ${trade.pnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>{trade.pnl.toFixed(2)}</td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                        </div>
+                      )}
+
                       <button
                         onClick={() => setBacktestResult(null)}
                         className="px-4 py-2 rounded font-medium bg-gray-600 hover:bg-gray-700 text-white w-full"
@@ -689,7 +761,7 @@ function StrategyPage() {
         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
           <div className="bg-gray-800 rounded-lg p-6 border border-gray-700 w-full max-w-md">
             <h3 className="text-xl font-bold text-white mb-4">Create New Strategy</h3>
-            
+
             <div className="space-y-4">
               <div>
                 <label className="text-white font-medium block mb-2">Strategy Name *</label>
@@ -706,7 +778,7 @@ function StrategyPage() {
                   <p className="text-red-400 text-sm mt-1">{formErrors.name}</p>
                 )}
               </div>
-              
+
               <div>
                 <label className="text-white font-medium block mb-2">Description</label>
                 <textarea
@@ -717,7 +789,7 @@ function StrategyPage() {
                   placeholder="Optional description..."
                 />
               </div>
-              
+
               <div>
                 <label className="text-white font-medium block mb-2">Symbols *</label>
                 <input
@@ -735,7 +807,7 @@ function StrategyPage() {
                 )}
               </div>
             </div>
-            
+
             <div className="flex gap-2 mt-6">
               <button
                 onClick={handleCreate}
@@ -750,7 +822,7 @@ function StrategyPage() {
                 Cancel
               </button>
             </div>
-            
+
             <p className="text-yellow-400 text-xs mt-4">
               ⚠️ Note: This is a stub implementation. Strategies won't actually execute trades yet.
             </p>
