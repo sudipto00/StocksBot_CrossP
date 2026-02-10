@@ -279,3 +279,101 @@ export interface PortfolioSummaryResponse {
   total_position_value: number;
   equity: number;
 }
+
+// ============================================================================
+// Strategy Configuration Types
+// ============================================================================
+
+export interface StrategyParameter {
+  name: string;
+  value: number;
+  min_value: number;
+  max_value: number;
+  step: number;
+  description?: string;
+}
+
+export interface StrategyConfig {
+  strategy_id: string;
+  name: string;
+  description?: string;
+  symbols: string[];
+  parameters: StrategyParameter[];
+  enabled: boolean;
+}
+
+export interface StrategyConfigUpdateRequest {
+  symbols?: string[];
+  parameters?: Record<string, number>;
+  enabled?: boolean;
+}
+
+export interface StrategyMetrics {
+  strategy_id: string;
+  win_rate: number;
+  volatility: number;
+  drawdown: number;
+  total_trades: number;
+  winning_trades: number;
+  losing_trades: number;
+  total_pnl: number;
+  sharpe_ratio?: number;
+  updated_at: string;
+}
+
+export interface BacktestRequest {
+  start_date: string;
+  end_date: string;
+  initial_capital?: number;
+  symbols?: string[];
+  parameters?: Record<string, number>;
+}
+
+export interface BacktestTrade {
+  id: number;
+  symbol: string;
+  entry_date: string;
+  exit_date: string;
+  entry_price: number;
+  exit_price: number;
+  quantity: number;
+  pnl: number;
+  return_pct: number;
+}
+
+export interface BacktestEquityPoint {
+  timestamp: string;
+  equity: number;
+}
+
+export interface BacktestResult {
+  strategy_id: string;
+  start_date: string;
+  end_date: string;
+  initial_capital: number;
+  final_capital: number;
+  total_return: number;
+  total_trades: number;
+  winning_trades: number;
+  losing_trades: number;
+  win_rate: number;
+  max_drawdown: number;
+  sharpe_ratio: number;
+  volatility: number;
+  trades: BacktestTrade[];
+  equity_curve: BacktestEquityPoint[];
+}
+
+export interface ParameterTuneRequest {
+  parameter_name: string;
+  value: number;
+}
+
+export interface ParameterTuneResponse {
+  strategy_id: string;
+  parameter_name: string;
+  old_value: number;
+  new_value: number;
+  success: boolean;
+  message: string;
+}

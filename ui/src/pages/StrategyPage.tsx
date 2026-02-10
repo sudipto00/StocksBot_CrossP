@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { showSuccessNotification, showErrorNotification } from '../utils/notifications';
 import { 
   getStrategies, 
@@ -7,13 +7,25 @@ import {
   deleteStrategy,
   getRunnerStatus,
   startRunner,
-  stopRunner
+  stopRunner,
+  getStrategyConfig,
+  updateStrategyConfig,
+  getStrategyMetrics,
+  runBacktest,
+  tuneParameter,
 } from '../api/backend';
-import { Strategy, StrategyStatus } from '../api/types';
+import { 
+  Strategy, 
+  StrategyStatus, 
+  StrategyConfig,
+  StrategyMetrics,
+  BacktestResult,
+  StrategyParameter,
+} from '../api/types';
 
 /**
  * Strategy page component.
- * Manage trading strategies - start, stop, configure.
+ * Manage trading strategies - start, stop, configure, backtest, and tune.
  */
 function StrategyPage() {
   const [loading, setLoading] = useState(true);
@@ -31,10 +43,38 @@ function StrategyPage() {
   const [formSymbols, setFormSymbols] = useState('');
   const [formErrors, setFormErrors] = useState<Record<string, string>>({});
 
+  // Selected strategy for detailed view
+  const [selectedStrategy, setSelectedStrategy] = useState<Strategy | null>(null);
+  const [strategyConfig, setStrategyConfig] = useState<StrategyConfig | null>(null);
+  const [strategyMetrics, setStrategyMetrics] = useState<StrategyMetrics | null>(null);
+  const [metricsLoading, setMetricsLoading] = useState(false);
+  
+  // Backtest state
+  const [showBacktestModal, setShowBacktestModal] = useState(false);
+  const [backtestLoading, setBacktestLoading] = useState(false);
+  const [backtestResult, setBacktestResult] = useState<BacktestResult | null>(null);
+  const [backtestStartDate, setBacktestStartDate] = useState('2024-01-01');
+  const [backtestEndDate, setBacktestEndDate] = useState('2024-12-31');
+  const [backtestCapital, setBacktestCapital] = useState('100000');
+
+  // Parameter tuning state
+  const [tuningParameter, setTuningParameter] = useState<StrategyParameter | null>(null);
+
   useEffect(() => {
     loadStrategies();
     loadRunnerStatus();
   }, []);
+
+  // Auto-refresh metrics every 10 seconds when a strategy is selected
+  useEffect(() => {
+    if (selectedStrategy && !metricsLoading) {
+      const interval = setInterval(() => {
+        loadStrategyMetrics(selectedStrategy.id);
+      }, 10000);
+      
+      return () => clearInterval(interval);
+    }
+  }, [selectedStrategy, metricsLoading]);
 
   const loadStrategies = async () => {
     try {
@@ -48,6 +88,48 @@ function StrategyPage() {
     } finally {
       setLoading(false);
     }
+  };
+
+  const loadRunnerStatus = async () => {
+    try {
+      const status = await getRunnerStatus();
+      setRunnerStatus(status.status);
+    } catch (err) {
+      console.error('Failed to load runner status:', err);
+    }
+  };
+
+  const loadStrategyConfig = useCallback(async (strategyId: string) => {
+    try {
+      const config = await getStrategyConfig(strategyId);
+      setStrategyConfig(config);
+    } catch (err) {
+      console.error('Failed to load strategy config:', err);
+      await showErrorNotification('Config Error', 'Failed to load strategy configuration');
+    }
+  }, []);
+
+  const loadStrategyMetrics = useCallback(async (strategyId: string) => {
+    try {
+      setMetricsLoading(true);
+      const metrics = await getStrategyMetrics(strategyId);
+      setStrategyMetrics(metrics);
+    } catch (err) {
+      console.error('Failed to load strategy metrics:', err);
+    } finally {
+      setMetricsLoading(false);
+    }
+  }, []);
+
+  const handleSelectStrategy = async (strategy: Strategy) => {
+    setSelectedStrategy(strategy);
+    setStrategyConfig(null);
+    setStrategyMetrics(null);
+    setBacktestResult(null);
+    
+    // Load config and metrics
+    await loadStrategyConfig(strategy.id);
+    await loadStrategyMetrics(strategy.id);
   };
 
   const loadRunnerStatus = async () => {
@@ -165,9 +247,60 @@ function StrategyPage() {
     try {
       await deleteStrategy(strategy.id);
       await showSuccessNotification('Strategy Deleted', `Strategy "${strategy.name}" deleted`);
+      if (selectedStrategy?.id === strategy.id) {
+        setSelectedStrategy(null);
+        setStrategyConfig(null);
+        setStrategyMetrics(null);
+      }
       await loadStrategies();
     } catch (err) {
       await showErrorNotification('Delete Error', 'Failed to delete strategy');
+    }
+  };
+
+  const handleConfigUpdate = async (symbols?: string[], enabled?: boolean) => {
+    if (!selectedStrategy) return;
+    
+    try {
+      await updateStrategyConfig(selectedStrategy.id, { symbols, enabled });
+      await showSuccessNotification('Config Updated', 'Strategy configuration updated');
+      await loadStrategyConfig(selectedStrategy.id);
+    } catch (err) {
+      await showErrorNotification('Update Error', 'Failed to update configuration');
+    }
+  };
+
+  const handleParameterChange = async (param: StrategyParameter, value: number) => {
+    if (!selectedStrategy) return;
+    
+    try {
+      await tuneParameter(selectedStrategy.id, {
+        parameter_name: param.name,
+        value,
+      });
+      await showSuccessNotification('Parameter Updated', `${param.name} updated to ${value}`);
+      await loadStrategyConfig(selectedStrategy.id);
+    } catch (err) {
+      await showErrorNotification('Tune Error', 'Failed to update parameter');
+    }
+  };
+
+  const handleRunBacktest = async () => {
+    if (!selectedStrategy) return;
+    
+    try {
+      setBacktestLoading(true);
+      const result = await runBacktest(selectedStrategy.id, {
+        start_date: backtestStartDate,
+        end_date: backtestEndDate,
+        initial_capital: parseFloat(backtestCapital),
+      });
+      setBacktestResult(result);
+      await showSuccessNotification('Backtest Complete', `Completed ${result.total_trades} trades`);
+    } catch (err) {
+      await showErrorNotification('Backtest Error', 'Failed to run backtest');
+    } finally {
+      setBacktestLoading(false);
     }
   };
 
@@ -274,71 +407,280 @@ function StrategyPage() {
           </div>
         </div>
       ) : (
-        <div className="bg-gray-800 rounded-lg border border-gray-700 overflow-hidden">
-          <table className="w-full">
-            <thead className="bg-gray-900">
-              <tr className="text-left text-gray-400 text-sm">
-                <th className="p-4">Name</th>
-                <th className="p-4">Status</th>
-                <th className="p-4">Symbols</th>
-                <th className="p-4">Created</th>
-                <th className="p-4">Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              {strategies.map((strategy) => (
-                <tr key={strategy.id} className="border-t border-gray-700 hover:bg-gray-750">
-                  <td className="p-4">
-                    <div className="text-white font-medium">{strategy.name}</div>
-                    {strategy.description && (
-                      <div className="text-gray-400 text-sm">{strategy.description}</div>
-                    )}
-                  </td>
-                  <td className="p-4">
-                    <span className={`px-2 py-1 rounded text-xs font-medium ${
-                      strategy.status === StrategyStatus.ACTIVE 
-                        ? 'bg-green-900/30 text-green-400' 
-                        : strategy.status === StrategyStatus.ERROR
-                        ? 'bg-red-900/30 text-red-400'
-                        : 'bg-gray-700 text-gray-400'
-                    }`}>
-                      {strategy.status}
-                    </span>
-                  </td>
-                  <td className="p-4">
-                    <div className="text-gray-300 text-sm">
-                      {strategy.symbols.join(', ') || 'None'}
+        <div className="grid grid-cols-12 gap-6">
+          {/* Strategy List - Left Side */}
+          <div className="col-span-4">
+            <div className="bg-gray-800 rounded-lg border border-gray-700 overflow-hidden">
+              <div className="bg-gray-900 p-4 border-b border-gray-700">
+                <h3 className="text-lg font-semibold text-white">Strategies</h3>
+              </div>
+              <div className="divide-y divide-gray-700">
+                {strategies.map((strategy) => (
+                  <div
+                    key={strategy.id}
+                    onClick={() => handleSelectStrategy(strategy)}
+                    className={`p-4 cursor-pointer hover:bg-gray-750 transition-colors ${
+                      selectedStrategy?.id === strategy.id ? 'bg-gray-750 border-l-4 border-blue-500' : ''
+                    }`}
+                  >
+                    <div className="flex items-center justify-between mb-2">
+                      <div className="text-white font-medium">{strategy.name}</div>
+                      <span className={`px-2 py-1 rounded text-xs font-medium ${
+                        strategy.status === StrategyStatus.ACTIVE 
+                          ? 'bg-green-900/30 text-green-400' 
+                          : strategy.status === StrategyStatus.ERROR
+                          ? 'bg-red-900/30 text-red-400'
+                          : 'bg-gray-700 text-gray-400'
+                      }`}>
+                        {strategy.status}
+                      </span>
                     </div>
-                  </td>
-                  <td className="p-4 text-gray-400 text-sm">
-                    {new Date(strategy.created_at).toLocaleDateString()}
-                  </td>
-                  <td className="p-4">
-                    <div className="flex gap-2">
+                    {strategy.description && (
+                      <div className="text-gray-400 text-sm mb-2">{strategy.description}</div>
+                    )}
+                    <div className="text-gray-500 text-xs">
+                      {strategy.symbols.length} symbols
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          {/* Strategy Details - Right Side */}
+          <div className="col-span-8">
+            {selectedStrategy ? (
+              <div className="space-y-6">
+                {/* Performance Metrics Card */}
+                <div className="bg-gray-800 rounded-lg border border-gray-700 p-6">
+                  <div className="flex items-center justify-between mb-4">
+                    <h3 className="text-lg font-semibold text-white">Performance Metrics</h3>
+                    {metricsLoading && (
+                      <span className="text-gray-400 text-sm">Refreshing...</span>
+                    )}
+                  </div>
+                  {strategyMetrics ? (
+                    <div className="grid grid-cols-3 gap-4">
+                      <div className="bg-gray-900 rounded p-4">
+                        <div className="text-gray-400 text-sm mb-1">Win Rate</div>
+                        <div className="text-2xl font-bold text-white">
+                          {strategyMetrics.win_rate.toFixed(1)}%
+                        </div>
+                      </div>
+                      <div className="bg-gray-900 rounded p-4">
+                        <div className="text-gray-400 text-sm mb-1">Volatility</div>
+                        <div className="text-2xl font-bold text-white">
+                          {strategyMetrics.volatility.toFixed(2)}
+                        </div>
+                      </div>
+                      <div className="bg-gray-900 rounded p-4">
+                        <div className="text-gray-400 text-sm mb-1">Max Drawdown</div>
+                        <div className="text-2xl font-bold text-red-400">
+                          {strategyMetrics.drawdown.toFixed(2)}%
+                        </div>
+                      </div>
+                      <div className="bg-gray-900 rounded p-4">
+                        <div className="text-gray-400 text-sm mb-1">Total Trades</div>
+                        <div className="text-2xl font-bold text-white">
+                          {strategyMetrics.total_trades}
+                        </div>
+                      </div>
+                      <div className="bg-gray-900 rounded p-4">
+                        <div className="text-gray-400 text-sm mb-1">Win/Loss</div>
+                        <div className="text-2xl font-bold text-white">
+                          {strategyMetrics.winning_trades}/{strategyMetrics.losing_trades}
+                        </div>
+                      </div>
+                      <div className="bg-gray-900 rounded p-4">
+                        <div className="text-gray-400 text-sm mb-1">Total P&L</div>
+                        <div className={`text-2xl font-bold ${
+                          strategyMetrics.total_pnl >= 0 ? 'text-green-400' : 'text-red-400'
+                        }`}>
+                          ${strategyMetrics.total_pnl.toFixed(2)}
+                        </div>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="text-gray-400">Loading metrics...</div>
+                  )}
+                </div>
+
+                {/* Configuration Card */}
+                {strategyConfig && (
+                  <div className="bg-gray-800 rounded-lg border border-gray-700 p-6">
+                    <h3 className="text-lg font-semibold text-white mb-4">Configuration</h3>
+                    
+                    <div className="space-y-4">
+                      <div>
+                        <label className="text-white font-medium block mb-2">Symbols</label>
+                        <div className="flex flex-wrap gap-2">
+                          {strategyConfig.symbols.map((symbol) => (
+                            <span key={symbol} className="bg-blue-900/30 text-blue-400 px-3 py-1 rounded text-sm">
+                              {symbol}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+
+                      <div>
+                        <label className="text-white font-medium block mb-2">Parameters</label>
+                        <div className="space-y-3">
+                          {strategyConfig.parameters.map((param) => (
+                            <div key={param.name} className="bg-gray-900 rounded p-3">
+                              <div className="flex justify-between items-center mb-2">
+                                <span className="text-white text-sm">{param.description || param.name}</span>
+                                <span className="text-blue-400 font-mono">{param.value.toFixed(2)}</span>
+                              </div>
+                              <input
+                                type="range"
+                                min={param.min_value}
+                                max={param.max_value}
+                                step={param.step}
+                                value={param.value}
+                                onChange={(e) => handleParameterChange(param, parseFloat(e.target.value))}
+                                className="w-full h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer slider"
+                              />
+                              <div className="flex justify-between text-xs text-gray-500 mt-1">
+                                <span>{param.min_value}</span>
+                                <span>{param.max_value}</span>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+
+                      <div className="flex gap-2">
+                        <button
+                          onClick={() => handleUpdate(selectedStrategy)}
+                          className={`px-4 py-2 rounded font-medium ${
+                            selectedStrategy.status === StrategyStatus.ACTIVE
+                              ? 'bg-yellow-600 hover:bg-yellow-700 text-white'
+                              : 'bg-green-600 hover:bg-green-700 text-white'
+                          }`}
+                        >
+                          {selectedStrategy.status === StrategyStatus.ACTIVE ? 'Stop Strategy' : 'Start Strategy'}
+                        </button>
+                        <button
+                          onClick={() => handleDelete(selectedStrategy)}
+                          className="px-4 py-2 rounded font-medium bg-red-600 hover:bg-red-700 text-white"
+                        >
+                          Delete Strategy
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {/* Backtesting Card */}
+                <div className="bg-gray-800 rounded-lg border border-gray-700 p-6">
+                  <h3 className="text-lg font-semibold text-white mb-4">Backtesting</h3>
+                  
+                  {!backtestResult ? (
+                    <div className="space-y-4">
+                      <div className="grid grid-cols-2 gap-4">
+                        <div>
+                          <label className="text-white font-medium block mb-2">Start Date</label>
+                          <input
+                            type="date"
+                            value={backtestStartDate}
+                            onChange={(e) => setBacktestStartDate(e.target.value)}
+                            className="bg-gray-700 text-white px-4 py-2 rounded border border-gray-600 w-full"
+                          />
+                        </div>
+                        <div>
+                          <label className="text-white font-medium block mb-2">End Date</label>
+                          <input
+                            type="date"
+                            value={backtestEndDate}
+                            onChange={(e) => setBacktestEndDate(e.target.value)}
+                            className="bg-gray-700 text-white px-4 py-2 rounded border border-gray-600 w-full"
+                          />
+                        </div>
+                      </div>
+                      
+                      <div>
+                        <label className="text-white font-medium block mb-2">Initial Capital</label>
+                        <input
+                          type="number"
+                          value={backtestCapital}
+                          onChange={(e) => setBacktestCapital(e.target.value)}
+                          className="bg-gray-700 text-white px-4 py-2 rounded border border-gray-600 w-full"
+                          placeholder="100000"
+                        />
+                      </div>
+
                       <button
-                        onClick={() => handleUpdate(strategy)}
-                        aria-label={`${strategy.status === StrategyStatus.ACTIVE ? 'Stop' : 'Start'} strategy ${strategy.name}`}
-                        className={`px-3 py-1 rounded text-xs font-medium ${
-                          strategy.status === StrategyStatus.ACTIVE
-                            ? 'bg-yellow-600 hover:bg-yellow-700 text-white'
-                            : 'bg-green-600 hover:bg-green-700 text-white'
+                        onClick={handleRunBacktest}
+                        disabled={backtestLoading}
+                        className={`px-4 py-2 rounded font-medium w-full ${
+                          backtestLoading
+                            ? 'bg-gray-600 text-gray-400 cursor-not-allowed'
+                            : 'bg-purple-600 hover:bg-purple-700 text-white'
                         }`}
                       >
-                        {strategy.status === StrategyStatus.ACTIVE ? 'Stop' : 'Start'}
-                      </button>
-                      <button
-                        onClick={() => handleDelete(strategy)}
-                        aria-label={`Delete strategy ${strategy.name}`}
-                        className="px-3 py-1 rounded text-xs font-medium bg-red-600 hover:bg-red-700 text-white"
-                      >
-                        Delete
+                        {backtestLoading ? 'Running Backtest...' : 'Run Backtest'}
                       </button>
                     </div>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+                  ) : (
+                    <div className="space-y-4">
+                      <div className="grid grid-cols-2 gap-4">
+                        <div className="bg-gray-900 rounded p-4">
+                          <div className="text-gray-400 text-sm mb-1">Total Return</div>
+                          <div className={`text-2xl font-bold ${
+                            backtestResult.total_return >= 0 ? 'text-green-400' : 'text-red-400'
+                          }`}>
+                            {backtestResult.total_return.toFixed(2)}%
+                          </div>
+                        </div>
+                        <div className="bg-gray-900 rounded p-4">
+                          <div className="text-gray-400 text-sm mb-1">Final Capital</div>
+                          <div className="text-2xl font-bold text-white">
+                            ${backtestResult.final_capital.toLocaleString()}
+                          </div>
+                        </div>
+                        <div className="bg-gray-900 rounded p-4">
+                          <div className="text-gray-400 text-sm mb-1">Win Rate</div>
+                          <div className="text-2xl font-bold text-white">
+                            {backtestResult.win_rate.toFixed(1)}%
+                          </div>
+                        </div>
+                        <div className="bg-gray-900 rounded p-4">
+                          <div className="text-gray-400 text-sm mb-1">Max Drawdown</div>
+                          <div className="text-2xl font-bold text-red-400">
+                            {backtestResult.max_drawdown.toFixed(2)}%
+                          </div>
+                        </div>
+                        <div className="bg-gray-900 rounded p-4">
+                          <div className="text-gray-400 text-sm mb-1">Total Trades</div>
+                          <div className="text-2xl font-bold text-white">
+                            {backtestResult.total_trades}
+                          </div>
+                        </div>
+                        <div className="bg-gray-900 rounded p-4">
+                          <div className="text-gray-400 text-sm mb-1">Sharpe Ratio</div>
+                          <div className="text-2xl font-bold text-white">
+                            {backtestResult.sharpe_ratio.toFixed(2)}
+                          </div>
+                        </div>
+                      </div>
+                      
+                      <button
+                        onClick={() => setBacktestResult(null)}
+                        className="px-4 py-2 rounded font-medium bg-gray-600 hover:bg-gray-700 text-white w-full"
+                      >
+                        Run New Backtest
+                      </button>
+                    </div>
+                  )}
+                </div>
+              </div>
+            ) : (
+              <div className="bg-gray-800 rounded-lg border border-gray-700 p-12 text-center">
+                <div className="text-gray-500 text-6xl mb-4">👈</div>
+                <p className="text-gray-400">Select a strategy to view details</p>
+              </div>
+            )}
+          </div>
         </div>
       )}
 
@@ -415,19 +757,6 @@ function StrategyPage() {
           </div>
         </div>
       )}
-
-      {/* Planned Features */}
-      <div className="mt-6 bg-blue-900/20 border border-blue-700 rounded-lg p-6">
-        <h4 className="text-lg font-semibold text-blue-400 mb-2">Planned Features</h4>
-        <ul className="text-blue-200/80 text-sm space-y-1">
-          <li>• Full strategy configuration editor</li>
-          <li>• Real-time strategy performance metrics</li>
-          <li>• Strategy backtesting</li>
-          <li>• Custom strategy code editor</li>
-          <li>• Strategy templates library</li>
-          <li>• Advanced parameter tuning</li>
-        </ul>
-      </div>
     </div>
   );
 }
