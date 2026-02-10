@@ -563,12 +563,20 @@ async def get_strategy_config(strategy_id: str, db: Session = Depends(get_db)):
     config_params = db_strategy.config.get('parameters', {}) if db_strategy.config else {}
     default_params = get_default_parameters()
     
-    # Merge with stored values
+    # Merge with stored values and convert to API models
     parameters = []
     for param in default_params:
         if param.name in config_params:
             param.value = config_params[param.name]
-        parameters.append(param)
+        # Convert to API model
+        parameters.append(StrategyParameter(
+            name=param.name,
+            value=param.value,
+            min_value=param.min_value,
+            max_value=param.max_value,
+            step=param.step,
+            description=param.description,
+        ))
     
     return StrategyConfigResponse(
         strategy_id=str(db_strategy.id),
@@ -604,16 +612,24 @@ async def update_strategy_config(
     if not db_strategy.config:
         db_strategy.config = {}
     
+    config_changed = False
     if request.symbols is not None:
         db_strategy.config['symbols'] = request.symbols
+        config_changed = True
     
     if request.parameters is not None:
         if 'parameters' not in db_strategy.config:
             db_strategy.config['parameters'] = {}
         db_strategy.config['parameters'].update(request.parameters)
+        config_changed = True
     
     if request.enabled is not None:
         db_strategy.is_active = request.enabled
+    
+    # Mark config as modified if changed (needed for SQLAlchemy JSON fields)
+    if config_changed:
+        from sqlalchemy.orm.attributes import flag_modified
+        flag_modified(db_strategy, 'config')
     
     # Save changes
     db_strategy = storage.strategies.update(db_strategy)
@@ -621,7 +637,7 @@ async def update_strategy_config(
     storage.create_audit_log(
         event_type="config_updated",
         description=f"Strategy config updated: {db_strategy.name}",
-        details={"strategy_id": db_strategy.id, "updates": request.dict(exclude_none=True)},
+        details={"strategy_id": db_strategy.id, "updates": request.model_dump(exclude_none=True)},
     )
     
     # Return updated config
@@ -789,6 +805,10 @@ async def tune_strategy_parameter(
     
     old_value = db_strategy.config['parameters'].get(request.parameter_name, param_def.value)
     db_strategy.config['parameters'][request.parameter_name] = request.value
+    
+    # Mark config as modified (needed for SQLAlchemy JSON fields)
+    from sqlalchemy.orm.attributes import flag_modified
+    flag_modified(db_strategy, 'config')
     
     # Save changes
     db_strategy = storage.strategies.update(db_strategy)
