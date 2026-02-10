@@ -26,10 +26,13 @@ import {
   // Analytics types
   PortfolioAnalyticsResponse,
   PortfolioSummaryResponse,
+  EquityPoint,
+  PortfolioAnalytics,
 } from './types';
 
 // Access environment variables via import.meta.env in Vite
 const BACKEND_URL = (import.meta as { env?: { VITE_BACKEND_URL?: string } }).env?.VITE_BACKEND_URL || "http://127.0.0.1:8000";
+const DEFAULT_INITIAL_CAPITAL = 100000;
 
 /**
  * Get backend status.
@@ -280,8 +283,9 @@ export async function stopRunner(): Promise<RunnerActionResponse> {
 
 /**
  * Get portfolio analytics time series.
+ * Maps backend response to UI-expected PortfolioAnalytics format.
  */
-export async function getPortfolioAnalytics(days?: number): Promise<PortfolioAnalyticsResponse> {
+export async function getPortfolioAnalytics(days?: number): Promise<PortfolioAnalytics> {
   const params = new URLSearchParams();
   if (days) params.append('days', days.toString());
   
@@ -292,7 +296,20 @@ export async function getPortfolioAnalytics(days?: number): Promise<PortfolioAna
     throw new Error(`Backend returned ${response.status}`);
   }
   
-  return response.json();
+  const data: PortfolioAnalyticsResponse = await response.json();
+  
+  // Map backend response to UI expected format
+  return {
+    equity_curve: data.time_series.map(point => ({
+      timestamp: point.timestamp,
+      equity: point.equity,
+      trade_pnl: point.pnl,
+      cumulative_pnl: point.cumulative_pnl,
+    })),
+    total_trades: data.total_trades,
+    current_equity: data.current_equity,
+    total_pnl: data.total_pnl,
+  };
 }
 
 /**
@@ -306,4 +323,26 @@ export async function getPortfolioSummary(): Promise<PortfolioSummaryResponse> {
   }
   
   return response.json();
+}
+
+/**
+ * Get equity curve data.
+ * Maps portfolio analytics to equity curve format expected by UI.
+ */
+export async function getEquityCurve(limit?: number): Promise<{ data: EquityPoint[]; initial_capital: number }> {
+  const analytics = await getPortfolioAnalytics(limit);
+  
+  // Transform analytics equity curve to equity points
+  const equityData: EquityPoint[] = analytics.equity_curve.map(point => ({
+    timestamp: point.timestamp,
+    value: point.equity,
+  }));
+  
+  // Calculate initial capital from first equity point or use default
+  const initial_capital = equityData.length > 0 ? equityData[0].value : DEFAULT_INITIAL_CAPITAL;
+  
+  return {
+    data: equityData,
+    initial_capital,
+  };
 }

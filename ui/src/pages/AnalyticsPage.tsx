@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { LineChart, Line, AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
 import { getPortfolioAnalytics, getPortfolioSummary } from '../api/backend';
-import { PortfolioAnalyticsResponse, PortfolioSummaryResponse } from '../api/types';
+import { PortfolioAnalytics, PortfolioSummaryResponse } from '../api/types';
 
 /**
  * Analytics page component.
@@ -10,7 +10,7 @@ import { PortfolioAnalyticsResponse, PortfolioSummaryResponse } from '../api/typ
 function AnalyticsPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [analytics, setAnalytics] = useState<PortfolioAnalyticsResponse | null>(null);
+  const [analytics, setAnalytics] = useState<PortfolioAnalytics | null>(null);
   const [summary, setSummary] = useState<PortfolioSummaryResponse | null>(null);
 
   useEffect(() => {
@@ -128,13 +128,13 @@ function AnalyticsPage() {
           </div>
 
           {/* Charts */}
-          {analytics.time_series.length > 0 ? (
+          {analytics.equity_curve.length > 0 ? (
             <>
               {/* Equity Curve */}
               <div className="bg-gray-800 rounded-lg p-6 border border-gray-700 mb-6">
                 <h3 className="text-lg font-semibold text-white mb-4">Equity Curve</h3>
                 <ResponsiveContainer width="100%" height={300}>
-                  <AreaChart data={analytics.time_series}>
+                  <AreaChart data={analytics.equity_curve}>
                     <defs>
                       <linearGradient id="colorEquity" x1="0" y1="0" x2="0" y2="1">
                         <stop offset="5%" stopColor="#3b82f6" stopOpacity={0.8}/>
@@ -172,7 +172,7 @@ function AnalyticsPage() {
               <div className="bg-gray-800 rounded-lg p-6 border border-gray-700">
                 <h3 className="text-lg font-semibold text-white mb-4">Cumulative P&L</h3>
                 <ResponsiveContainer width="100%" height={300}>
-                  <LineChart data={analytics.time_series}>
+                  <LineChart data={analytics.equity_curve}>
                     <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
                     <XAxis 
                       dataKey="timestamp" 

@@ -40,6 +40,13 @@ export enum NotificationSeverity {
   SUCCESS = "success",
 }
 
+export enum RunnerStatus {
+  STOPPED = "stopped",
+  RUNNING = "running",
+  PAUSED = "paused",
+  ERROR = "error",
+}
+
 // ============================================================================
 // Response Types
 // ============================================================================
@@ -204,6 +211,13 @@ export interface AuditLogsResponse {
 // Strategy Runner Types
 // ============================================================================
 
+export interface RunnerState {
+  status: RunnerStatus;
+  strategies: unknown[];
+  tick_interval: number;
+  broker_connected: boolean;
+}
+
 export interface RunnerStatusResponse {
   status: string; // stopped, running, paused, error
   strategies: unknown[];
@@ -220,6 +234,25 @@ export interface RunnerActionResponse {
 // ============================================================================
 // Analytics Types
 // ============================================================================
+
+export interface EquityPoint {
+  timestamp: string;
+  value: number;
+}
+
+export interface EquityCurvePoint {
+  timestamp: string;
+  equity: number;
+  trade_pnl: number;
+  cumulative_pnl: number;
+}
+
+export interface PortfolioAnalytics {
+  equity_curve: EquityCurvePoint[];
+  total_trades: number;
+  current_equity: number;
+  total_pnl: number;
+}
 
 export interface PortfolioTimeSeriesPoint {
   timestamp: string;
