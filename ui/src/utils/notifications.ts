@@ -3,7 +3,7 @@
  * Helpers for showing system notifications via Tauri.
  */
 
-import { invoke } from '@tauri-apps/api/tauri';
+import { invoke } from "@tauri-apps/api/core";
 
 export enum NotificationSeverity {
   INFO = 'info',

@@ -1,11 +1,8 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::process::{Command, Child};
+use std::process::Child;
 use std::sync::Mutex;
-use tauri::{
-    CustomMenuItem, Manager, SystemTray, SystemTrayEvent, SystemTrayMenu, SystemTrayMenuItem,
-};
 
 // State to manage the sidecar process
 struct SidecarState {
@@ -20,7 +17,7 @@ fn greet(name: &str) -> String {
 
 // Command to show a system notification
 #[tauri::command]
-fn show_notification(app: tauri::AppHandle, title: String, body: String, severity: Option<String>) -> Result<(), String> {
+fn show_notification(_app: tauri::AppHandle, title: String, body: String, severity: Option<String>) -> Result<(), String> {
     // TODO: Implement cross-platform notification with severity-based styling
     // For now, just print to console
     let severity_str = severity.unwrap_or_else(|| "info".to_string());
@@ -46,24 +43,9 @@ fn get_notification_permission() -> Result<String, String> {
 }
 
 fn main() {
-    // Build system tray menu
-    let quit = CustomMenuItem::new("quit".to_string(), "Quit StocksBot");
-    let show = CustomMenuItem::new("show".to_string(), "Show Window");
-    let hide = CustomMenuItem::new("hide".to_string(), "Hide Window");
-    let status = CustomMenuItem::new("status".to_string(), "Backend Status").disabled();
-    
-    let tray_menu = SystemTrayMenu::new()
-        .add_item(show)
-        .add_item(hide)
-        .add_native_item(SystemTrayMenuItem::Separator)
-        .add_item(status)
-        .add_native_item(SystemTrayMenuItem::Separator)
-        .add_item(quit);
-    
-    let tray = SystemTray::new().with_menu(tray_menu);
-
     tauri::Builder::default()
-        .setup(|app| {
+        .plugin(tauri_plugin_shell::init())
+        .setup(|_app| {
             // TODO: Launch Python FastAPI sidecar on app startup
             // The sidecar executable should be bundled with the app
             // Example of how to start sidecar (to be implemented):
@@ -94,39 +76,10 @@ fn main() {
             
             Ok(())
         })
-        .system_tray(tray)
-        .on_system_tray_event(|app, event| match event {
-            SystemTrayEvent::LeftClick { .. } => {
-                // Show window on tray click
-                let window = app.get_window("main").unwrap();
-                window.show().unwrap();
-                window.set_focus().unwrap();
-            }
-            SystemTrayEvent::MenuItemClick { id, .. } => {
-                match id.as_str() {
-                    "quit" => {
-                        // TODO: Cleanup sidecar process before exit
-                        println!("Quitting StocksBot...");
-                        std::process::exit(0);
-                    }
-                    "show" => {
-                        let window = app.get_window("main").unwrap();
-                        window.show().unwrap();
-                        window.set_focus().unwrap();
-                    }
-                    "hide" => {
-                        let window = app.get_window("main").unwrap();
-                        window.hide().unwrap();
-                    }
-                    _ => {}
-                }
-            }
-            _ => {}
-        })
-        .on_window_event(|event| match event.event() {
+        .on_window_event(|window, event| match event {
             tauri::WindowEvent::CloseRequested { api, .. } => {
-                // Hide to tray instead of closing
-                event.window().hide().unwrap();
+                // Hide to tray instead of closing (tray handling to be re-added for v2)
+                window.hide().unwrap();
                 api.prevent_close();
             }
             _ => {}
