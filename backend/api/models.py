@@ -243,3 +243,92 @@ class RunnerActionResponse(BaseModel):
     success: bool = Field(..., description="Whether action was successful")
     message: str = Field(..., description="Action result message")
     status: str = Field(..., description="Current runner status")
+
+
+# ============================================================================
+# Strategy Configuration Models
+# ============================================================================
+
+class StrategyParameter(BaseModel):
+    """Strategy parameter model."""
+    name: str = Field(..., description="Parameter name")
+    value: float = Field(..., description="Parameter value")
+    min_value: float = Field(default=0.0, description="Minimum allowed value")
+    max_value: float = Field(default=100.0, description="Maximum allowed value")
+    step: float = Field(default=0.1, description="Adjustment step size")
+    description: Optional[str] = Field(None, description="Parameter description")
+
+
+class StrategyConfigResponse(BaseModel):
+    """Strategy configuration response."""
+    strategy_id: str = Field(..., description="Strategy ID")
+    name: str = Field(..., description="Strategy name")
+    description: Optional[str] = Field(None, description="Strategy description")
+    symbols: List[str] = Field(default_factory=list, description="Trading symbols")
+    parameters: List[StrategyParameter] = Field(default_factory=list, description="Strategy parameters")
+    enabled: bool = Field(default=True, description="Whether strategy is enabled")
+
+
+class StrategyConfigUpdateRequest(BaseModel):
+    """Request to update strategy configuration."""
+    symbols: Optional[List[str]] = Field(None, description="Trading symbols")
+    parameters: Optional[Dict[str, float]] = Field(None, description="Parameter updates")
+    enabled: Optional[bool] = Field(None, description="Enable/disable strategy")
+
+
+class StrategyMetricsResponse(BaseModel):
+    """Strategy performance metrics response."""
+    strategy_id: str = Field(..., description="Strategy ID")
+    win_rate: float = Field(..., description="Win rate percentage")
+    volatility: float = Field(..., description="Returns volatility")
+    drawdown: float = Field(..., description="Maximum drawdown percentage")
+    total_trades: int = Field(..., description="Total number of trades")
+    winning_trades: int = Field(..., description="Number of winning trades")
+    losing_trades: int = Field(..., description="Number of losing trades")
+    total_pnl: float = Field(..., description="Total profit/loss")
+    sharpe_ratio: Optional[float] = Field(None, description="Sharpe ratio")
+    updated_at: datetime = Field(..., description="Last update timestamp")
+
+
+class BacktestRequest(BaseModel):
+    """Backtest request model."""
+    start_date: str = Field(..., description="Start date (ISO format)")
+    end_date: str = Field(..., description="End date (ISO format)")
+    initial_capital: float = Field(default=100000.0, description="Initial capital")
+    symbols: Optional[List[str]] = Field(None, description="Symbols to backtest")
+    parameters: Optional[Dict[str, float]] = Field(None, description="Strategy parameters")
+
+
+class BacktestResponse(BaseModel):
+    """Backtest result response."""
+    strategy_id: str = Field(..., description="Strategy ID")
+    start_date: str = Field(..., description="Backtest start date")
+    end_date: str = Field(..., description="Backtest end date")
+    initial_capital: float = Field(..., description="Initial capital")
+    final_capital: float = Field(..., description="Final capital")
+    total_return: float = Field(..., description="Total return percentage")
+    total_trades: int = Field(..., description="Total trades executed")
+    winning_trades: int = Field(..., description="Number of winning trades")
+    losing_trades: int = Field(..., description="Number of losing trades")
+    win_rate: float = Field(..., description="Win rate percentage")
+    max_drawdown: float = Field(..., description="Maximum drawdown percentage")
+    sharpe_ratio: float = Field(..., description="Sharpe ratio")
+    volatility: float = Field(..., description="Returns volatility")
+    trades: List[Dict[str, Any]] = Field(default_factory=list, description="Trade history")
+    equity_curve: List[Dict[str, Any]] = Field(default_factory=list, description="Equity curve data")
+
+
+class ParameterTuneRequest(BaseModel):
+    """Parameter tuning request model."""
+    parameter_name: str = Field(..., description="Parameter to tune")
+    value: float = Field(..., description="New parameter value")
+
+
+class ParameterTuneResponse(BaseModel):
+    """Parameter tuning response model."""
+    strategy_id: str = Field(..., description="Strategy ID")
+    parameter_name: str = Field(..., description="Parameter name")
+    old_value: float = Field(..., description="Previous value")
+    new_value: float = Field(..., description="New value")
+    success: bool = Field(..., description="Whether update was successful")
+    message: str = Field(..., description="Result message")

@@ -39,8 +39,19 @@ from .models import (
     # Runner models
     RunnerStatusResponse,
     RunnerActionResponse,
+    # Strategy configuration models
+    StrategyConfigResponse,
+    StrategyConfigUpdateRequest,
+    StrategyMetricsResponse,
+    BacktestRequest,
+    BacktestResponse,
+    ParameterTuneRequest,
+    ParameterTuneResponse,
+    StrategyParameter,
 )
 from .runner_manager import runner_manager
+from services.strategy_analytics import StrategyAnalyticsService
+from config.strategy_config import get_default_parameters
 
 router = APIRouter()
 
@@ -525,3 +536,279 @@ async def get_portfolio_summary(db: Session = Depends(get_db)):
         'total_position_value': total_position_value,
         'equity': 100000.0 + total_pnl,
     }
+
+
+# ============================================================================
+# Strategy Configuration Endpoints
+# ============================================================================
+
+@router.get("/strategies/{strategy_id}/config", response_model=StrategyConfigResponse)
+async def get_strategy_config(strategy_id: str, db: Session = Depends(get_db)):
+    """
+    Get detailed configuration for a specific strategy.
+    Returns parameters, symbols, and settings.
+    """
+    storage = StorageService(db)
+    
+    try:
+        strategy_id_int = int(strategy_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid strategy ID")
+    
+    db_strategy = storage.strategies.get_by_id(strategy_id_int)
+    if not db_strategy:
+        raise HTTPException(status_code=404, detail="Strategy not found")
+    
+    # Get parameters from config or use defaults
+    config_params = db_strategy.config.get('parameters', {}) if db_strategy.config else {}
+    default_params = get_default_parameters()
+    
+    # Merge with stored values
+    parameters = []
+    for param in default_params:
+        if param.name in config_params:
+            param.value = config_params[param.name]
+        parameters.append(param)
+    
+    return StrategyConfigResponse(
+        strategy_id=str(db_strategy.id),
+        name=db_strategy.name,
+        description=db_strategy.description or "",
+        symbols=db_strategy.config.get('symbols', []) if db_strategy.config else [],
+        parameters=parameters,
+        enabled=db_strategy.is_active,
+    )
+
+
+@router.put("/strategies/{strategy_id}/config", response_model=StrategyConfigResponse)
+async def update_strategy_config(
+    strategy_id: str,
+    request: StrategyConfigUpdateRequest,
+    db: Session = Depends(get_db)
+):
+    """
+    Update strategy configuration including symbols and parameters.
+    """
+    storage = StorageService(db)
+    
+    try:
+        strategy_id_int = int(strategy_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid strategy ID")
+    
+    db_strategy = storage.strategies.get_by_id(strategy_id_int)
+    if not db_strategy:
+        raise HTTPException(status_code=404, detail="Strategy not found")
+    
+    # Update config
+    if not db_strategy.config:
+        db_strategy.config = {}
+    
+    if request.symbols is not None:
+        db_strategy.config['symbols'] = request.symbols
+    
+    if request.parameters is not None:
+        if 'parameters' not in db_strategy.config:
+            db_strategy.config['parameters'] = {}
+        db_strategy.config['parameters'].update(request.parameters)
+    
+    if request.enabled is not None:
+        db_strategy.is_active = request.enabled
+    
+    # Save changes
+    db_strategy = storage.strategies.update(db_strategy)
+    
+    storage.create_audit_log(
+        event_type="config_updated",
+        description=f"Strategy config updated: {db_strategy.name}",
+        details={"strategy_id": db_strategy.id, "updates": request.dict(exclude_none=True)},
+    )
+    
+    # Return updated config
+    return await get_strategy_config(strategy_id, db)
+
+
+# ============================================================================
+# Strategy Metrics Endpoints
+# ============================================================================
+
+@router.get("/strategies/{strategy_id}/metrics", response_model=StrategyMetricsResponse)
+async def get_strategy_metrics(strategy_id: str, db: Session = Depends(get_db)):
+    """
+    Get real-time performance metrics for a strategy.
+    Returns win rate, volatility, drawdown, and other key metrics.
+    """
+    try:
+        strategy_id_int = int(strategy_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid strategy ID")
+    
+    storage = StorageService(db)
+    db_strategy = storage.strategies.get_by_id(strategy_id_int)
+    if not db_strategy:
+        raise HTTPException(status_code=404, detail="Strategy not found")
+    
+    # Calculate metrics using analytics service
+    analytics = StrategyAnalyticsService(db)
+    metrics = analytics.get_strategy_metrics(strategy_id_int)
+    
+    return StrategyMetricsResponse(
+        strategy_id=metrics.strategy_id,
+        win_rate=metrics.win_rate,
+        volatility=metrics.volatility,
+        drawdown=metrics.drawdown,
+        total_trades=metrics.total_trades,
+        winning_trades=metrics.winning_trades,
+        losing_trades=metrics.losing_trades,
+        total_pnl=metrics.total_pnl,
+        sharpe_ratio=metrics.sharpe_ratio,
+        updated_at=metrics.updated_at,
+    )
+
+
+# ============================================================================
+# Strategy Backtesting Endpoints
+# ============================================================================
+
+@router.post("/strategies/{strategy_id}/backtest", response_model=BacktestResponse)
+async def run_strategy_backtest(
+    strategy_id: str,
+    request: BacktestRequest,
+    db: Session = Depends(get_db)
+):
+    """
+    Run a backtest for the strategy with specified parameters.
+    Returns simulated performance metrics and trade history.
+    """
+    try:
+        strategy_id_int = int(strategy_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid strategy ID")
+    
+    storage = StorageService(db)
+    db_strategy = storage.strategies.get_by_id(strategy_id_int)
+    if not db_strategy:
+        raise HTTPException(status_code=404, detail="Strategy not found")
+    
+    # Use strategy symbols if not provided in request
+    if not request.symbols and db_strategy.config:
+        request.symbols = db_strategy.config.get('symbols', ['AAPL', 'MSFT'])
+    
+    # Run backtest
+    analytics = StrategyAnalyticsService(db)
+    from config.strategy_config import BacktestRequest as BacktestReq
+    
+    backtest_req = BacktestReq(
+        strategy_id=strategy_id,
+        start_date=request.start_date,
+        end_date=request.end_date,
+        initial_capital=request.initial_capital,
+        symbols=request.symbols,
+        parameters=request.parameters,
+    )
+    
+    result = analytics.run_backtest(backtest_req)
+    
+    storage.create_audit_log(
+        event_type="strategy_started",
+        description=f"Backtest completed for strategy: {db_strategy.name}",
+        details={
+            "strategy_id": db_strategy.id,
+            "start_date": request.start_date,
+            "end_date": request.end_date,
+            "total_trades": result.total_trades,
+            "win_rate": result.win_rate,
+        },
+    )
+    
+    return BacktestResponse(
+        strategy_id=result.strategy_id,
+        start_date=result.start_date,
+        end_date=result.end_date,
+        initial_capital=result.initial_capital,
+        final_capital=result.final_capital,
+        total_return=result.total_return,
+        total_trades=result.total_trades,
+        winning_trades=result.winning_trades,
+        losing_trades=result.losing_trades,
+        win_rate=result.win_rate,
+        max_drawdown=result.max_drawdown,
+        sharpe_ratio=result.sharpe_ratio,
+        volatility=result.volatility,
+        trades=result.trades,
+        equity_curve=result.equity_curve,
+    )
+
+
+# ============================================================================
+# Parameter Tuning Endpoints
+# ============================================================================
+
+@router.post("/strategies/{strategy_id}/tune", response_model=ParameterTuneResponse)
+async def tune_strategy_parameter(
+    strategy_id: str,
+    request: ParameterTuneRequest,
+    db: Session = Depends(get_db)
+):
+    """
+    Tune a specific strategy parameter.
+    Updates the parameter value and validates against constraints.
+    """
+    try:
+        strategy_id_int = int(strategy_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid strategy ID")
+    
+    storage = StorageService(db)
+    db_strategy = storage.strategies.get_by_id(strategy_id_int)
+    if not db_strategy:
+        raise HTTPException(status_code=404, detail="Strategy not found")
+    
+    # Get default parameters to validate constraints
+    default_params = get_default_parameters()
+    param_def = next((p for p in default_params if p.name == request.parameter_name), None)
+    
+    if not param_def:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown parameter: {request.parameter_name}"
+        )
+    
+    # Validate value is within bounds
+    if not (param_def.min_value <= request.value <= param_def.max_value):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Value {request.value} outside allowed range [{param_def.min_value}, {param_def.max_value}]"
+        )
+    
+    # Update parameter
+    if not db_strategy.config:
+        db_strategy.config = {}
+    if 'parameters' not in db_strategy.config:
+        db_strategy.config['parameters'] = {}
+    
+    old_value = db_strategy.config['parameters'].get(request.parameter_name, param_def.value)
+    db_strategy.config['parameters'][request.parameter_name] = request.value
+    
+    # Save changes
+    db_strategy = storage.strategies.update(db_strategy)
+    
+    storage.create_audit_log(
+        event_type="config_updated",
+        description=f"Parameter tuned: {request.parameter_name} = {request.value}",
+        details={
+            "strategy_id": db_strategy.id,
+            "parameter": request.parameter_name,
+            "old_value": old_value,
+            "new_value": request.value,
+        },
+    )
+    
+    return ParameterTuneResponse(
+        strategy_id=str(db_strategy.id),
+        parameter_name=request.parameter_name,
+        old_value=old_value,
+        new_value=request.value,
+        success=True,
+        message=f"Parameter {request.parameter_name} updated successfully",
+    )
