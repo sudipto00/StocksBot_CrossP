@@ -106,6 +106,11 @@ function DashboardPage() {
     }
   };
 
+  const totalValue = positions.reduce((sum, pos) => sum + pos.market_value, 0);
+  const totalPnl = positions.reduce((sum, pos) => sum + pos.unrealized_pnl, 0);
+  const totalCost = positions.reduce((sum, pos) => sum + pos.cost_basis, 0);
+  const totalPnlPercent = totalCost > 0 ? (totalPnl / totalCost) * 100 : 0;
+
   return (
     <div className="p-8">
       <div className="mb-8 flex items-center justify-between">
@@ -142,23 +147,36 @@ function DashboardPage() {
 
       {!loading && !error && (
         <>
-          {/* Backend Status Card */}
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
-            <div className="bg-gray-800 rounded-lg p-6 border border-gray-700">
-              <h3 className="text-lg font-semibold text-white mb-4">Backend Status</h3>
-              {status && (
-                <div className="space-y-2">
-                  <div className="flex items-center">
-                    <div className="w-3 h-3 bg-green-500 rounded-full mr-2"></div>
-                    <span className="text-green-400 font-medium">{status.status}</span>
-                  </div>
-                  <p className="text-gray-300 text-sm">{status.service}</p>
-                  <p className="text-gray-400 text-xs">Version: {status.version}</p>
+          <div className="mb-8 grid grid-cols-1 lg:grid-cols-3 gap-6">
+            <div className="lg:col-span-2 bg-gray-800 rounded-lg p-6 border border-gray-700">
+              <div className="flex items-center justify-between">
+                <h3 className="text-lg font-semibold text-white">Summary</h3>
+                <span className="text-gray-400 text-sm">Updated just now</span>
+              </div>
+              <div className="mt-4 grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
+                <div>
+                  <p className="text-gray-400">Total Value</p>
+                  <p className="text-white text-lg font-semibold">${totalValue.toLocaleString()}</p>
                 </div>
-              )}
+                <div>
+                  <p className="text-gray-400">Unrealized P&L</p>
+                  <p className={`text-lg font-semibold ${totalPnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>  
+                    {totalPnl >= 0 ? '+' : ''}${totalPnl.toLocaleString()}
+                  </p>
+                  <p className="text-xs text-gray-500">{totalPnlPercent.toFixed(2)}%</p>
+                </div>
+                <div>
+                  <p className="text-gray-400">Positions</p>
+                  <p className="text-white text-lg font-semibold">{positions.length}</p>
+                </div>
+                <div>
+                  <p className="text-gray-400">Equity</p>
+                  <p className="text-white text-lg font-semibold">
+                    ${analytics?.current_equity?.toLocaleString() ?? totalValue.toLocaleString()}
+                  </p>
+                </div>
+              </div>
             </div>
-
-            {/* Strategy Runner Status Card */}
             <div className="bg-gray-800 rounded-lg p-6 border border-gray-700">
               <h3 className="text-lg font-semibold text-white mb-4">Strategy Runner</h3>
               {runnerState ? (
@@ -184,7 +202,7 @@ function DashboardPage() {
                     <p className="text-gray-400">
                       Interval: {runnerState.tick_interval}s
                     </p>
-                    <p className={`${runnerState.broker_connected ? 'text-green-400' : 'text-red-400'}`}>
+                    <p className={`${runnerState.broker_connected ? 'text-green-400' : 'text-red-400'}`}>  
                       Broker: {runnerState.broker_connected ? 'Connected' : 'Disconnected'}
                     </p>
                   </div>
@@ -209,27 +227,23 @@ function DashboardPage() {
                 <p className="text-gray-400 text-sm">Loading...</p>
               )}
             </div>
+          </div>
 
-            {/* Portfolio Summary */}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-8">
             <div className="bg-gray-800 rounded-lg p-6 border border-gray-700">
-              <h3 className="text-lg font-semibold text-white mb-4">Portfolio Summary</h3>
-              <div className="space-y-2">
-                <div className="flex justify-between">
-                  <span className="text-gray-400 text-sm">Positions:</span>
-                  <span className="text-white font-medium">{positions.length}</span>
+              <h3 className="text-lg font-semibold text-white mb-4">Backend Status</h3>
+              {status && (
+                <div className="space-y-2">
+                  <div className="flex items-center">
+                    <div className="w-3 h-3 bg-green-500 rounded-full mr-2"></div>
+                    <span className="text-green-400 font-medium">{status.status}</span>
+                  </div>
+                  <p className="text-gray-300 text-sm">{status.service}</p>
+                  <p className="text-gray-400 text-xs">Version: {status.version}</p>
                 </div>
-                <div className="flex justify-between">
-                  <span className="text-gray-400 text-sm">Total Value:</span>
-                  <span className="text-white font-medium">$31,000</span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-gray-400 text-sm">Total P&L:</span>
-                  <span className="text-green-400 font-medium">+$1,000 (+3.3%)</span>
-                </div>
-              </div>
+              )}
             </div>
 
-            {/* Market Status */}
             <div className="bg-gray-800 rounded-lg p-6 border border-gray-700">
               <h3 className="text-lg font-semibold text-white mb-4">Market Status</h3>
               <div className="space-y-2">
@@ -242,7 +256,6 @@ function DashboardPage() {
             </div>
           </div>
 
-          {/* Positions Table */}
           <div className="bg-gray-800 rounded-lg p-6 border border-gray-700">
             <h3 className="text-lg font-semibold text-white mb-4">Current Positions</h3>
             
@@ -268,10 +281,10 @@ function DashboardPage() {
                         <td className="py-3">{pos.quantity}</td>
                         <td className="py-3">${pos.avg_entry_price.toFixed(2)}</td>
                         <td className="py-3">${pos.current_price.toFixed(2)}</td>
-                        <td className={`py-3 ${pos.unrealized_pnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                        <td className={`py-3 ${pos.unrealized_pnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>  
                           {pos.unrealized_pnl >= 0 ? '+' : ''}${pos.unrealized_pnl.toFixed(2)}
                         </td>
-                        <td className={`py-3 ${pos.unrealized_pnl_percent >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                        <td className={`py-3 ${pos.unrealized_pnl_percent >= 0 ? 'text-green-400' : 'text-red-400'}`}>  
                           {pos.unrealized_pnl_percent >= 0 ? '+' : ''}{pos.unrealized_pnl_percent.toFixed(2)}%
                         </td>
                       </tr>
@@ -282,7 +295,6 @@ function DashboardPage() {
             )}
           </div>
 
-          {/* Analytics Charts Section */}
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mt-8">
             <EquityCurveChart data={equityCurve} initialCapital={initialCapital} />
             
