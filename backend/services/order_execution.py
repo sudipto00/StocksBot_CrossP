@@ -207,12 +207,26 @@ class OrderExecutionService:
             # Update order with broker's external ID and status
             order.external_id = broker_response.get("id")
             order.status = self._map_broker_status(broker_response.get("status"))
+            
+            # Update fill information if available
+            filled_quantity = broker_response.get("filled_quantity", 0)
+            avg_fill_price = broker_response.get("avg_fill_price")
+            
+            if filled_quantity > 0:
+                order.filled_quantity = filled_quantity
+                order.avg_fill_price = avg_fill_price
+            
             order = self.storage.orders.update(order)
             
             logger.info(
                 f"Order submitted: {order.id} (external: {order.external_id}), "
-                f"{side} {quantity} {symbol} @ {price or 'market'}"
+                f"{side} {quantity} {symbol} @ {price or 'market'}, "
+                f"status: {order.status.value}"
             )
+            
+            # If order was filled immediately, process the fill
+            if order.status.value == "filled" and filled_quantity > 0:
+                self._process_fill(order, filled_quantity, avg_fill_price)
             
             # Create audit log
             self.storage.create_audit_log(
@@ -225,7 +239,8 @@ class OrderExecutionService:
                     "side": side,
                     "type": order_type,
                     "quantity": quantity,
-                    "price": price
+                    "price": price,
+                    "status": order.status.value
                 },
                 order_id=order.id,
                 strategy_id=strategy_id
@@ -407,9 +422,10 @@ class OrderExecutionService:
         # Map common broker statuses
         status_mapping = {
             "pending": OrderStatusEnum.PENDING,
-            "submitted": OrderStatusEnum.SUBMITTED,
-            "accepted": OrderStatusEnum.SUBMITTED,
-            "new": OrderStatusEnum.SUBMITTED,
+            "submitted": OrderStatusEnum.OPEN,
+            "accepted": OrderStatusEnum.OPEN,
+            "new": OrderStatusEnum.OPEN,
+            "open": OrderStatusEnum.OPEN,
             "filled": OrderStatusEnum.FILLED,
             "partially_filled": OrderStatusEnum.PARTIALLY_FILLED,
             "partial_fill": OrderStatusEnum.PARTIALLY_FILLED,
