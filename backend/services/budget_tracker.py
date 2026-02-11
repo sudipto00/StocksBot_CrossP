@@ -179,6 +179,7 @@ class WeeklyBudgetTracker:
         # Calculate metrics
         avg_trade_size = (self._used_budget / self._trades_this_week) if self._trades_this_week > 0 else 0
         roi_percent = (self._weekly_pnl / self._used_budget * 100) if self._used_budget > 0 else 0
+        used_percent = status.get("used_percent", 0)
         
         return {
             **status,

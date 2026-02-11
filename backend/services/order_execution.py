@@ -14,6 +14,8 @@ from sqlalchemy.orm import Session
 from services.broker import BrokerInterface, OrderSide, OrderType, OrderStatus
 from storage.service import StorageService
 from storage.models import Order, Trade
+from services.budget_tracker import get_budget_tracker
+from config.risk_profiles import RiskProfile, validate_trade, get_position_size
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +52,9 @@ class OrderExecutionService:
         broker: BrokerInterface,
         storage: StorageService,
         max_position_size: float = 10000.0,
-        risk_limit_daily: float = 500.0
+        risk_limit_daily: float = 500.0,
+        enable_budget_tracking: bool = True,
+        risk_profile: Optional[RiskProfile] = None
     ):
         """
         Initialize order execution service.
@@ -60,11 +64,21 @@ class OrderExecutionService:
             storage: Storage service for persistence
             max_position_size: Maximum position size in dollars
             risk_limit_daily: Daily risk limit in dollars
+            enable_budget_tracking: Enable weekly budget tracking
+            risk_profile: Optional risk profile for validation
         """
         self.broker = broker
         self.storage = storage
         self.max_position_size = max_position_size
         self.risk_limit_daily = risk_limit_daily
+        self.enable_budget_tracking = enable_budget_tracking
+        self.risk_profile = risk_profile
+        
+        # Get budget tracker if enabled
+        if self.enable_budget_tracking:
+            self.budget_tracker = get_budget_tracker()
+        else:
+            self.budget_tracker = None
     
     def validate_order(
         self,
@@ -144,6 +158,40 @@ class OrderExecutionService:
                     f"Insufficient buying power: need ${order_value:.2f}, "
                     f"have ${buying_power:.2f}"
                 )
+            
+            # Check weekly budget if enabled
+            if self.enable_budget_tracking and self.budget_tracker:
+                can_trade, reason = self.budget_tracker.can_trade(order_value)
+                if not can_trade:
+                    raise OrderValidationError(f"Budget check failed: {reason}")
+            
+            # Check risk profile limits if configured
+            if self.risk_profile:
+                # Get current positions count
+                positions = self.storage.get_open_positions()
+                current_positions = len(positions)
+                
+                # Get budget status for weekly loss calculation
+                weekly_loss = 0.0
+                if self.budget_tracker:
+                    status = self.budget_tracker.get_budget_status()
+                    # Weekly loss is negative P&L
+                    weekly_loss = abs(min(0.0, status.get("weekly_pnl", 0.0)))
+                    weekly_budget = status.get("weekly_budget", 200.0)
+                else:
+                    weekly_budget = 200.0
+                
+                # Validate against risk profile
+                is_valid, msg = validate_trade(
+                    self.risk_profile,
+                    order_value,
+                    weekly_budget,
+                    current_positions,
+                    weekly_loss
+                )
+                
+                if not is_valid:
+                    raise OrderValidationError(f"Risk profile check failed: {msg}")
     
     def submit_order(
         self,
@@ -227,6 +275,12 @@ class OrderExecutionService:
             # If order was filled immediately, process the fill
             if order.status.value == "filled" and filled_quantity > 0:
                 self._process_fill(order, filled_quantity, avg_fill_price)
+                
+                # Record trade in budget tracker if enabled
+                if self.enable_budget_tracking and self.budget_tracker and side == "buy":
+                    trade_value = filled_quantity * avg_fill_price
+                    self.budget_tracker.record_trade(trade_value, is_buy=True)
+                    logger.info(f"Recorded trade in budget tracker: ${trade_value:.2f}")
             
             # Create audit log
             self.storage.create_audit_log(
