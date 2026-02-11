@@ -9,6 +9,9 @@ from sqlalchemy.orm import Session
 
 from storage.database import get_db
 from storage.service import StorageService
+from services.broker import BrokerInterface, PaperBroker
+from services.order_execution import OrderExecutionService, OrderValidationError, BrokerError
+from config.settings import get_settings, has_alpaca_credentials
 
 from .models import (
     StatusResponse,
@@ -54,6 +57,68 @@ from services.strategy_analytics import StrategyAnalyticsService
 from config.strategy_config import get_default_parameters
 
 router = APIRouter()
+
+# ============================================================================
+# Broker Initialization
+# ============================================================================
+
+_broker_instance: Optional[BrokerInterface] = None
+
+
+def get_broker() -> BrokerInterface:
+    """
+    Get or create broker instance.
+    
+    Returns:
+        Configured broker instance (Paper or Alpaca)
+    """
+    global _broker_instance
+    
+    if _broker_instance is None:
+        settings = get_settings()
+        
+        # Use Alpaca if credentials are available, otherwise use PaperBroker
+        if has_alpaca_credentials():
+            from integrations.alpaca_broker import AlpacaBroker
+            _broker_instance = AlpacaBroker(
+                api_key=settings.alpaca_api_key,
+                secret_key=settings.alpaca_secret_key,
+                paper=settings.alpaca_paper
+            )
+        else:
+            _broker_instance = PaperBroker()
+        
+        # Connect broker
+        if not _broker_instance.connect():
+            raise RuntimeError("Failed to connect to broker")
+    
+    return _broker_instance
+
+
+def get_order_execution_service(
+    db: Session = Depends(get_db)
+) -> OrderExecutionService:
+    """
+    Get order execution service with broker and storage.
+    
+    Args:
+        db: Database session
+        
+    Returns:
+        OrderExecutionService instance
+    """
+    broker = get_broker()
+    storage = StorageService(db)
+    
+    # Get config for risk limits
+    config = _config
+    
+    return OrderExecutionService(
+        broker=broker,
+        storage=storage,
+        max_position_size=config.max_position_size,
+        risk_limit_daily=config.risk_limit_daily
+    )
 
 
 # ============================================================================
@@ -196,18 +261,61 @@ async def get_orders():
     )
 
 
-@router.post("/orders")
-async def create_order(request: OrderRequest):
+@router.post("/orders", response_model=Order)
+async def create_order(
+    request: OrderRequest,
+    execution_service: OrderExecutionService = Depends(get_order_execution_service)
+):
     """
-    Create a new order.
-    TODO: Validate order, integrate with order service and broker API.
-    This is a placeholder that doesn't execute real trades.
+    Create and execute a new order.
+    
+    This endpoint:
+    1. Validates the order against account and risk limits
+    2. Submits the order to the configured broker (Paper or Alpaca)
+    3. Persists the order to the database
+    4. Returns the created order with broker confirmation
+    
+    Args:
+        request: Order request with symbol, side, type, quantity, and price
+        execution_service: Order execution service (injected)
+        
+    Returns:
+        Created order with status
+        
+    Raises:
+        HTTPException: If validation fails or broker execution fails
     """
-    # Placeholder response
-    return {
-        "message": f"Order placeholder created for {request.quantity} shares of {request.symbol}",
-        "note": "This is a stub endpoint. Real order execution not implemented.",
-    }
+    try:
+        # Execute order
+        order = execution_service.submit_order(
+            symbol=request.symbol,
+            side=request.side.value,
+            order_type=request.type.value,
+            quantity=request.quantity,
+            price=request.price
+        )
+        
+        # Map to response model
+        return Order(
+            id=str(order.id),
+            symbol=order.symbol,
+            side=OrderSide(order.side.value),
+            type=OrderType(order.type.value),
+            quantity=order.quantity,
+            price=order.price,
+            status=OrderStatus(order.status.value),
+            filled_quantity=order.filled_quantity or 0.0,
+            avg_fill_price=order.avg_fill_price,
+            created_at=order.created_at,
+            updated_at=order.updated_at
+        )
+        
+    except OrderValidationError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except BrokerError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
 
 
 # ============================================================================

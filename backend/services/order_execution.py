@@ -1,0 +1,422 @@
+"""
+Order Execution Service.
+
+Orchestrates the order lifecycle from submission to fill tracking.
+Handles validation, broker integration, and storage persistence.
+"""
+
+from typing import Dict, Any, Optional
+from datetime import datetime
+import logging
+
+from sqlalchemy.orm import Session
+
+from services.broker import BrokerInterface, OrderSide, OrderType, OrderStatus
+from storage.service import StorageService
+from storage.models import Order, Trade
+
+logger = logging.getLogger(__name__)
+
+
+class OrderExecutionError(Exception):
+    """Base exception for order execution errors."""
+    pass
+
+
+class OrderValidationError(OrderExecutionError):
+    """Exception raised when order validation fails."""
+    pass
+
+
+class BrokerError(OrderExecutionError):
+    """Exception raised when broker operation fails."""
+    pass
+
+
+class OrderExecutionService:
+    """
+    Service for executing trading orders.
+    
+    This service:
+    1. Validates orders against account limits and risk rules
+    2. Submits orders to the configured broker
+    3. Persists orders and tracks external broker IDs
+    4. Polls broker for order fills
+    5. Creates trade records and updates positions
+    """
+    
+    def __init__(
+        self,
+        broker: BrokerInterface,
+        storage: StorageService,
+        max_position_size: float = 10000.0,
+        risk_limit_daily: float = 500.0
+    ):
+        """
+        Initialize order execution service.
+        
+        Args:
+            broker: Broker interface for order execution
+            storage: Storage service for persistence
+            max_position_size: Maximum position size in dollars
+            risk_limit_daily: Daily risk limit in dollars
+        """
+        self.broker = broker
+        self.storage = storage
+        self.max_position_size = max_position_size
+        self.risk_limit_daily = risk_limit_daily
+    
+    def validate_order(
+        self,
+        symbol: str,
+        side: str,
+        order_type: str,
+        quantity: float,
+        price: Optional[float] = None
+    ) -> None:
+        """
+        Validate order against account and risk limits.
+        
+        Args:
+            symbol: Stock symbol
+            side: Order side (buy/sell)
+            order_type: Order type (market/limit)
+            quantity: Order quantity
+            price: Order price (for limit orders)
+            
+        Raises:
+            OrderValidationError: If validation fails
+        """
+        # Validate quantity
+        if quantity <= 0:
+            raise OrderValidationError("Order quantity must be positive")
+        
+        # Validate price for limit orders
+        if order_type == "limit" and price is None:
+            raise OrderValidationError("Price required for limit orders")
+        
+        if price is not None and price <= 0:
+            raise OrderValidationError("Price must be positive")
+        
+        # Check broker connection
+        if not self.broker.is_connected():
+            raise BrokerError("Broker is not connected")
+        
+        # Check account info
+        try:
+            account_info = self.broker.get_account_info()
+        except Exception as e:
+            logger.error(f"Failed to get account info: {e}")
+            raise BrokerError(f"Failed to get account info: {e}")
+        
+        # Validate buying power for buy orders
+        if side == "buy":
+            # Estimate order cost
+            if order_type == "market":
+                # For market orders, get current price
+                try:
+                    market_data = self.broker.get_market_data(symbol)
+                    estimated_price = market_data.get("price", price or 0)
+                except Exception as e:
+                    logger.warning(f"Failed to get market data for {symbol}: {e}")
+                    # Use provided price or a conservative estimate
+                    estimated_price = price or 0
+                    if estimated_price == 0:
+                        raise OrderValidationError(
+                            "Cannot validate market order without price data"
+                        )
+            else:
+                estimated_price = price
+            
+            order_value = quantity * estimated_price
+            
+            # Check position size limit
+            if order_value > self.max_position_size:
+                raise OrderValidationError(
+                    f"Order value ${order_value:.2f} exceeds maximum position "
+                    f"size ${self.max_position_size:.2f}"
+                )
+            
+            # Check buying power
+            buying_power = account_info.get("buying_power", 0)
+            if order_value > buying_power:
+                raise OrderValidationError(
+                    f"Insufficient buying power: need ${order_value:.2f}, "
+                    f"have ${buying_power:.2f}"
+                )
+    
+    def submit_order(
+        self,
+        symbol: str,
+        side: str,
+        order_type: str,
+        quantity: float,
+        price: Optional[float] = None,
+        strategy_id: Optional[int] = None
+    ) -> Order:
+        """
+        Submit an order for execution.
+        
+        This method:
+        1. Validates the order
+        2. Creates an order record in storage
+        3. Submits the order to the broker
+        4. Updates the order with the broker's external ID
+        
+        Args:
+            symbol: Stock symbol
+            side: Order side (buy/sell)
+            order_type: Order type (market/limit)
+            quantity: Order quantity
+            price: Order price (for limit orders)
+            strategy_id: Optional strategy ID
+            
+        Returns:
+            Created order
+            
+        Raises:
+            OrderValidationError: If validation fails
+            BrokerError: If broker submission fails
+        """
+        # Validate order
+        self.validate_order(symbol, side, order_type, quantity, price)
+        
+        # Create order in storage with PENDING status
+        order = self.storage.create_order(
+            symbol=symbol,
+            side=side,
+            order_type=order_type,
+            quantity=quantity,
+            price=price,
+            strategy_id=strategy_id
+        )
+        
+        try:
+            # Submit to broker
+            broker_side = OrderSide.BUY if side == "buy" else OrderSide.SELL
+            broker_type = OrderType[order_type.upper()]
+            
+            broker_response = self.broker.submit_order(
+                symbol=symbol,
+                side=broker_side,
+                order_type=broker_type,
+                quantity=quantity,
+                price=price
+            )
+            
+            # Update order with broker's external ID and status
+            order.external_id = broker_response.get("id")
+            order.status = self._map_broker_status(broker_response.get("status"))
+            order = self.storage.orders.update(order)
+            
+            logger.info(
+                f"Order submitted: {order.id} (external: {order.external_id}), "
+                f"{side} {quantity} {symbol} @ {price or 'market'}"
+            )
+            
+            # Create audit log
+            self.storage.create_audit_log(
+                event_type="order_created",
+                description=f"Order created: {side} {quantity} {symbol}",
+                details={
+                    "order_id": order.id,
+                    "external_id": order.external_id,
+                    "symbol": symbol,
+                    "side": side,
+                    "type": order_type,
+                    "quantity": quantity,
+                    "price": price
+                },
+                order_id=order.id,
+                strategy_id=strategy_id
+            )
+            
+            return order
+            
+        except Exception as e:
+            # Mark order as rejected
+            from storage.models import OrderStatusEnum
+            order.status = OrderStatusEnum.REJECTED
+            order = self.storage.orders.update(order)
+            
+            logger.error(f"Failed to submit order {order.id}: {e}")
+            raise BrokerError(f"Failed to submit order to broker: {e}")
+    
+    def update_order_status(self, order: Order) -> Order:
+        """
+        Update order status from broker.
+        
+        Args:
+            order: Order to update
+            
+        Returns:
+            Updated order
+        """
+        if not order.external_id:
+            logger.warning(f"Order {order.id} has no external ID, cannot update status")
+            return order
+        
+        try:
+            # Get current status from broker
+            broker_order = self.broker.get_order(order.external_id)
+            broker_status = broker_order.get("status")
+            
+            # Map broker status to our status
+            new_status = self._map_broker_status(broker_status)
+            
+            # Check if order was filled
+            filled_quantity = broker_order.get("filled_quantity", 0)
+            avg_fill_price = broker_order.get("avg_fill_price")
+            
+            # Update order in storage
+            if new_status != order.status or filled_quantity != order.filled_quantity:
+                order = self.storage.update_order_status(
+                    order.id,
+                    new_status.value,
+                    filled_quantity=filled_quantity,
+                    avg_fill_price=avg_fill_price
+                )
+                
+                logger.info(
+                    f"Order {order.id} updated: {order.status.value}, "
+                    f"filled {filled_quantity}/{order.quantity}"
+                )
+                
+                # If order was filled, create trade and update position
+                if new_status.value == "filled" and filled_quantity > 0:
+                    self._process_fill(order, filled_quantity, avg_fill_price)
+            
+            return order
+            
+        except Exception as e:
+            logger.error(f"Failed to update order {order.id} status: {e}")
+            return order
+    
+    def _process_fill(
+        self,
+        order: Order,
+        filled_quantity: float,
+        avg_fill_price: float
+    ) -> None:
+        """
+        Process order fill by creating trade and updating position.
+        
+        Args:
+            order: Filled order
+            filled_quantity: Quantity filled
+            avg_fill_price: Average fill price
+        """
+        # Create trade record
+        trade = self.storage.record_trade(
+            order_id=order.id,
+            symbol=order.symbol,
+            side=order.side.value,
+            quantity=filled_quantity,
+            price=avg_fill_price,
+            commission=0.0,  # TODO: Get commission from broker
+            fees=0.0
+        )
+        
+        logger.info(
+            f"Trade recorded: {trade.id}, {order.side.value} "
+            f"{filled_quantity} {order.symbol} @ ${avg_fill_price:.2f}"
+        )
+        
+        # Update or create position
+        position = self.storage.get_position_by_symbol(order.symbol)
+        
+        if position is None:
+            # Create new position
+            if order.side.value == "buy":
+                self.storage.create_position(
+                    symbol=order.symbol,
+                    side="long",
+                    quantity=filled_quantity,
+                    avg_entry_price=avg_fill_price
+                )
+                logger.info(
+                    f"Position opened: LONG {filled_quantity} {order.symbol} "
+                    f"@ ${avg_fill_price:.2f}"
+                )
+            else:  # sell - short position
+                self.storage.create_position(
+                    symbol=order.symbol,
+                    side="short",
+                    quantity=filled_quantity,
+                    avg_entry_price=avg_fill_price
+                )
+                logger.info(
+                    f"Position opened: SHORT {filled_quantity} {order.symbol} "
+                    f"@ ${avg_fill_price:.2f}"
+                )
+        else:
+            # Update existing position
+            if order.side.value == "buy":
+                quantity_delta = filled_quantity
+            else:  # sell
+                quantity_delta = -filled_quantity
+            
+            updated_position = self.storage.update_position_quantity(
+                position,
+                quantity_delta,
+                avg_fill_price
+            )
+            
+            if updated_position.is_open:
+                logger.info(
+                    f"Position updated: {updated_position.side.value.upper()} "
+                    f"{updated_position.quantity} {order.symbol} "
+                    f"@ ${updated_position.avg_entry_price:.2f}"
+                )
+            else:
+                logger.info(
+                    f"Position closed: {order.symbol}, "
+                    f"P&L: ${updated_position.realized_pnl:.2f}"
+                )
+        
+        # Create audit log
+        self.storage.create_audit_log(
+            event_type="order_filled",
+            description=f"Order filled: {order.side.value} {filled_quantity} {order.symbol}",
+            details={
+                "order_id": order.id,
+                "trade_id": trade.id,
+                "symbol": order.symbol,
+                "side": order.side.value,
+                "quantity": filled_quantity,
+                "price": avg_fill_price
+            },
+            order_id=order.id
+        )
+    
+    def _map_broker_status(self, broker_status: str) -> Any:
+        """
+        Map broker status to our OrderStatus enum.
+        
+        Args:
+            broker_status: Broker status string
+            
+        Returns:
+            OrderStatusEnum value
+        """
+        from storage.models import OrderStatusEnum
+        
+        # Normalize status string
+        status_lower = broker_status.lower() if broker_status else "pending"
+        
+        # Map common broker statuses
+        status_mapping = {
+            "pending": OrderStatusEnum.PENDING,
+            "submitted": OrderStatusEnum.SUBMITTED,
+            "accepted": OrderStatusEnum.SUBMITTED,
+            "new": OrderStatusEnum.SUBMITTED,
+            "filled": OrderStatusEnum.FILLED,
+            "partially_filled": OrderStatusEnum.PARTIALLY_FILLED,
+            "partial_fill": OrderStatusEnum.PARTIALLY_FILLED,
+            "cancelled": OrderStatusEnum.CANCELLED,
+            "canceled": OrderStatusEnum.CANCELLED,
+            "rejected": OrderStatusEnum.REJECTED,
+            "expired": OrderStatusEnum.CANCELLED,
+        }
+        
+        return status_mapping.get(status_lower, OrderStatusEnum.PENDING)
