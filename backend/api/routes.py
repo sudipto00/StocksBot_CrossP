@@ -113,11 +113,16 @@ def get_order_execution_service(
     # Get config for risk limits
     config = _config
     
+    # Only enable budget tracking when trading is enabled
+    # This prevents breaking existing tests and allows gradual adoption
+    enable_budget = config.trading_enabled
+    
     return OrderExecutionService(
         broker=broker,
         storage=storage,
         max_position_size=config.max_position_size,
-        risk_limit_daily=config.risk_limit_daily
+        risk_limit_daily=config.risk_limit_daily,
+        enable_budget_tracking=enable_budget
     )
 
 
