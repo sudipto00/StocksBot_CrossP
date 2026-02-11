@@ -103,7 +103,8 @@ def execution_service(paper_broker, storage_service):
         broker=paper_broker,
         storage=storage_service,
         max_position_size=10000.0,
-        risk_limit_daily=500.0
+        risk_limit_daily=500.0,
+        enable_budget_tracking=False  # Disable budget tracking for tests
     )
 
 

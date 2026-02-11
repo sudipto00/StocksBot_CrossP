@@ -332,3 +332,98 @@ class ParameterTuneResponse(BaseModel):
     new_value: float = Field(..., description="New value")
     success: bool = Field(..., description="Whether update was successful")
     message: str = Field(..., description="Result message")
+
+
+# ============================================================================
+# Market Screener Models
+# ============================================================================
+
+class AssetType(str, Enum):
+    """Asset type enumeration."""
+    STOCK = "stock"
+    ETF = "etf"
+    BOTH = "both"
+
+
+class ScreenerAsset(BaseModel):
+    """Screener asset model."""
+    symbol: str = Field(..., description="Asset symbol")
+    name: str = Field(..., description="Asset name")
+    asset_type: str = Field(..., description="Asset type (stock/etf)")
+    volume: int = Field(..., description="Average daily volume")
+    price: float = Field(..., description="Current price")
+    change_percent: float = Field(..., description="Price change percentage")
+    last_updated: str = Field(..., description="Last update timestamp")
+
+
+class ScreenerResponse(BaseModel):
+    """Market screener response."""
+    assets: List[ScreenerAsset] = Field(default_factory=list, description="List of screened assets")
+    total_count: int = Field(..., description="Total count")
+    asset_type: str = Field(..., description="Asset type filter applied")
+    limit: int = Field(..., description="Limit applied")
+
+
+# ============================================================================
+# Risk Profile Models
+# ============================================================================
+
+class RiskProfile(str, Enum):
+    """Risk profile enumeration."""
+    CONSERVATIVE = "conservative"
+    BALANCED = "balanced"
+    AGGRESSIVE = "aggressive"
+
+
+class RiskProfileInfo(BaseModel):
+    """Risk profile information."""
+    name: str = Field(..., description="Profile name")
+    description: str = Field(..., description="Profile description")
+    max_position_size: float = Field(..., description="Maximum position size")
+    max_positions: int = Field(..., description="Maximum number of positions")
+    position_size_percent: float = Field(..., description="Position size as percent of budget")
+    stop_loss_percent: float = Field(..., description="Stop loss percentage")
+    take_profit_percent: float = Field(..., description="Take profit percentage")
+    max_weekly_loss: float = Field(..., description="Max weekly loss as percent of budget")
+
+
+class RiskProfilesResponse(BaseModel):
+    """Risk profiles list response."""
+    profiles: Dict[str, RiskProfileInfo] = Field(..., description="Available risk profiles")
+
+
+class TradingPreferencesRequest(BaseModel):
+    """Trading preferences update request."""
+    asset_type: Optional[AssetType] = Field(None, description="Preferred asset type")
+    risk_profile: Optional[RiskProfile] = Field(None, description="Risk profile")
+    weekly_budget: Optional[float] = Field(None, description="Weekly budget", gt=0)
+    screener_limit: Optional[int] = Field(None, description="Screener result limit", ge=10, le=200)
+
+
+class TradingPreferencesResponse(BaseModel):
+    """Trading preferences response."""
+    asset_type: AssetType = Field(..., description="Preferred asset type")
+    risk_profile: RiskProfile = Field(..., description="Current risk profile")
+    weekly_budget: float = Field(..., description="Weekly trading budget")
+    screener_limit: int = Field(..., description="Screener result limit")
+
+
+# ============================================================================
+# Budget Tracking Models
+# ============================================================================
+
+class BudgetStatus(BaseModel):
+    """Weekly budget status."""
+    weekly_budget: float = Field(..., description="Total weekly budget")
+    used_budget: float = Field(..., description="Budget used this week")
+    remaining_budget: float = Field(..., description="Budget remaining this week")
+    used_percent: float = Field(..., description="Percentage of budget used")
+    trades_this_week: int = Field(..., description="Number of trades this week")
+    weekly_pnl: float = Field(..., description="Weekly profit/loss")
+    week_start: str = Field(..., description="Current week start date")
+    days_remaining: int = Field(..., description="Days remaining in week")
+
+
+class BudgetUpdateRequest(BaseModel):
+    """Budget update request."""
+    weekly_budget: float = Field(..., description="New weekly budget", gt=0)

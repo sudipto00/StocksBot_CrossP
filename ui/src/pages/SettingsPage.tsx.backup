@@ -271,23 +271,9 @@ function SettingsPage() {
       </div>
 
       {/* Planned Features */}
-      <div className="bg-blue-900/20 border border-blue-700 rounded-lg p-6 mb-6">
-        <h4 className="text-lg font-semibold text-blue-400 mb-2">New Features Available!</h4>
+      <div className="bg-blue-900/20 border border-blue-700 rounded-lg p-6">
+        <h4 className="text-lg font-semibold text-blue-400 mb-2">Planned Features</h4>
         <ul className="text-blue-200/80 text-sm space-y-1">
-          <li>✓ Market Screener - View most actively traded stocks and ETFs</li>
-          <li>✓ Risk Profiles - Conservative, Balanced, and Aggressive strategies</li>
-          <li>✓ Weekly Budget Tracking - Manage up to $200/week trading budget</li>
-          <li>✓ Asset Type Preferences - Choose between stocks, ETFs, or both</li>
-        </ul>
-        <p className="text-blue-200/60 text-sm mt-3">
-          Visit the new Screener page to explore these features!
-        </p>
-      </div>
-
-      {/* Other Planned Features */}
-      <div className="bg-gray-800/50 border border-gray-700 rounded-lg p-6">
-        <h4 className="text-lg font-semibold text-gray-400 mb-2">Future Enhancements</h4>
-        <ul className="text-gray-500 text-sm space-y-1">
           <li>• API key management (encrypted storage)</li>
           <li>• Notification preferences (email, push, etc.)</li>
           <li>• UI theme customization</li>
