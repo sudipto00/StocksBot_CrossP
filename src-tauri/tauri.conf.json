@@ -1,34 +1,13 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "identifier": "com.stocksbot.app",
   "productName": "StocksBot",
   "version": "0.1.0",
+  "identifier": "com.stocksbot.app",
   "build": {
     "beforeDevCommand": "npm --prefix ui run dev",
     "beforeBuildCommand": "npm --prefix ui run build",
     "devUrl": "http://localhost:1420",
     "frontendDist": "../ui/dist"
-  },
-  "app": {
-    "security": {
-      "csp": null
-    },
-    "windows": [
-      {
-        "fullscreen": false,
-        "resizable": true,
-        "title": "StocksBot",
-        "width": 1200,
-        "height": 800,
-        "minWidth": 800,
-        "minHeight": 600
-      }
-    ],
-    "trayIcon": {
-      "iconPath": "icons/icon.png",
-      "iconAsTemplate": true,
-      "menuOnLeftClick": false
-    }
   },
   "bundle": {
     "active": true,
@@ -41,7 +20,6 @@
       "icons/icon.ico"
     ],
     "resources": [],
-    "externalBin": [],
     "copyright": "",
     "category": "Finance",
     "shortDescription": "Cross-platform trading bot",
@@ -63,6 +41,28 @@
       "certificateThumbprint": null,
       "digestAlgorithm": "sha256",
       "timestampUrl": ""
+    }
+  },
+  "plugins": {},
+  "app": {
+    "security": {
+      "csp": null
+    },
+    "windows": [
+      {
+        "fullscreen": false,
+        "resizable": true,
+        "title": "StocksBot",
+        "width": 1200,
+        "height": 800,
+        "minWidth": 800,
+        "minHeight": 600
+      }
+    ],
+    "trayIcon": {
+      "iconPath": "icons/icon.png",
+      "iconAsTemplate": true,
+      "menuOnLeftClick": false
     }
   }
 }
