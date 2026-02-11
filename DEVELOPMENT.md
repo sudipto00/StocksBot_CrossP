@@ -301,6 +301,9 @@ export async function getPortfolio() {
 - Check CORS settings in `backend/app.py`
 - Check browser console for errors
 
+### Git stash error for a single file
+If you need to stash only `package-lock.json`, run `git stash push -- package-lock.json`. Running `git stash package-lock.json` fails because Git expects a subcommand like `push` when you target specific paths.
+
 ### Tauri build fails
 - Install system dependencies (see README.md prerequisites)
 - Run `cargo build` in `src-tauri/` to see detailed errors
