@@ -940,3 +940,233 @@ async def tune_strategy_parameter(
         success=True,
         message=f"Parameter {request.parameter_name} updated successfully",
     )
+
+
+# ============================================================================
+# Market Screener Endpoints
+# ============================================================================
+
+from .models import (
+    AssetType, ScreenerAsset, ScreenerResponse,
+    RiskProfile, RiskProfileInfo, RiskProfilesResponse,
+    TradingPreferencesRequest, TradingPreferencesResponse,
+    BudgetStatus, BudgetUpdateRequest,
+)
+from services.market_screener import MarketScreener
+from services.budget_tracker import get_budget_tracker
+from config.risk_profiles import get_risk_profile, get_all_profiles
+
+# In-memory trading preferences (would be persisted in production)
+_trading_preferences = TradingPreferencesResponse(
+    asset_type=AssetType.BOTH,
+    risk_profile=RiskProfile.BALANCED,
+    weekly_budget=200.0,
+    screener_limit=50,
+)
+
+
+@router.get("/screener/stocks", response_model=ScreenerResponse)
+async def get_active_stocks(limit: int = 50):
+    """
+    Get most actively traded stocks.
+    
+    Args:
+        limit: Number of stocks to return (10-200)
+        
+    Returns:
+        List of actively traded stocks
+    """
+    limit = max(10, min(200, limit))
+    
+    screener = MarketScreener()
+    stocks = screener.get_active_stocks(limit)
+    
+    assets = [ScreenerAsset(**stock) for stock in stocks]
+    
+    return ScreenerResponse(
+        assets=assets,
+        total_count=len(assets),
+        asset_type="stock",
+        limit=limit,
+    )
+
+
+@router.get("/screener/etfs", response_model=ScreenerResponse)
+async def get_active_etfs(limit: int = 50):
+    """
+    Get most actively traded ETFs.
+    
+    Args:
+        limit: Number of ETFs to return (10-200)
+        
+    Returns:
+        List of actively traded ETFs
+    """
+    limit = max(10, min(200, limit))
+    
+    screener = MarketScreener()
+    etfs = screener.get_active_etfs(limit)
+    
+    assets = [ScreenerAsset(**etf) for etf in etfs]
+    
+    return ScreenerResponse(
+        assets=assets,
+        total_count=len(assets),
+        asset_type="etf",
+        limit=limit,
+    )
+
+
+@router.get("/screener/all", response_model=ScreenerResponse)
+async def get_screener_results(
+    asset_type: Optional[AssetType] = None,
+    limit: Optional[int] = None
+):
+    """
+    Get screener results based on user preferences or provided filters.
+    
+    Args:
+        asset_type: Asset type filter (overrides preferences)
+        limit: Result limit (overrides preferences)
+        
+    Returns:
+        List of assets based on filters
+    """
+    # Use preferences if not overridden
+    final_asset_type = asset_type or _trading_preferences.asset_type
+    final_limit = limit or _trading_preferences.screener_limit
+    final_limit = max(10, min(200, final_limit))
+    
+    screener = MarketScreener()
+    
+    # Import AssetType from market_screener
+    from services.market_screener import AssetType as ScreenerAssetType
+    screener_asset_type = ScreenerAssetType(final_asset_type.value)
+    
+    results = screener.get_screener_results(screener_asset_type, final_limit)
+    
+    assets = [ScreenerAsset(**asset) for asset in results]
+    
+    return ScreenerResponse(
+        assets=assets,
+        total_count=len(assets),
+        asset_type=final_asset_type.value,
+        limit=final_limit,
+    )
+
+
+# ============================================================================
+# Risk Profile Endpoints
+# ============================================================================
+
+@router.get("/risk-profiles", response_model=RiskProfilesResponse)
+async def get_risk_profiles():
+    """
+    Get all available risk profiles with their configurations.
+    
+    Returns:
+        Dictionary of risk profiles
+    """
+    profiles_data = get_all_profiles()
+    
+    profiles = {}
+    for key, config in profiles_data.items():
+        profiles[key] = RiskProfileInfo(
+            name=config["name"],
+            description=config["description"],
+            max_position_size=config["max_position_size"],
+            max_positions=config["max_positions"],
+            position_size_percent=config["position_size_percent"],
+            stop_loss_percent=config["stop_loss_percent"],
+            take_profit_percent=config["take_profit_percent"],
+            max_weekly_loss=config["max_weekly_loss"],
+        )
+    
+    return RiskProfilesResponse(profiles=profiles)
+
+
+# ============================================================================
+# Trading Preferences Endpoints
+# ============================================================================
+
+@router.get("/preferences", response_model=TradingPreferencesResponse)
+async def get_trading_preferences():
+    """
+    Get current trading preferences.
+    
+    Returns:
+        Current trading preferences including asset type, risk profile, and budget
+    """
+    return _trading_preferences
+
+
+@router.post("/preferences", response_model=TradingPreferencesResponse)
+async def update_trading_preferences(request: TradingPreferencesRequest):
+    """
+    Update trading preferences.
+    
+    Args:
+        request: Preferences to update
+        
+    Returns:
+        Updated preferences
+    """
+    global _trading_preferences
+    
+    if request.asset_type is not None:
+        _trading_preferences.asset_type = request.asset_type
+    
+    if request.risk_profile is not None:
+        _trading_preferences.risk_profile = request.risk_profile
+    
+    if request.weekly_budget is not None:
+        _trading_preferences.weekly_budget = request.weekly_budget
+        # Update budget tracker
+        tracker = get_budget_tracker()
+        tracker.set_weekly_budget(request.weekly_budget)
+    
+    if request.screener_limit is not None:
+        _trading_preferences.screener_limit = request.screener_limit
+    
+    return _trading_preferences
+
+
+# ============================================================================
+# Budget Tracking Endpoints
+# ============================================================================
+
+@router.get("/budget/status", response_model=BudgetStatus)
+async def get_budget_status():
+    """
+    Get current weekly budget status.
+    
+    Returns:
+        Budget status including usage, remaining, and P&L
+    """
+    tracker = get_budget_tracker(_trading_preferences.weekly_budget)
+    status = tracker.get_budget_status()
+    
+    return BudgetStatus(**status)
+
+
+@router.post("/budget/update", response_model=BudgetStatus)
+async def update_weekly_budget(request: BudgetUpdateRequest):
+    """
+    Update the weekly budget amount.
+    
+    Args:
+        request: New budget amount
+        
+    Returns:
+        Updated budget status
+    """
+    global _trading_preferences
+    
+    tracker = get_budget_tracker()
+    tracker.set_weekly_budget(request.weekly_budget)
+    
+    # Also update preferences
+    _trading_preferences.weekly_budget = request.weekly_budget
+    
+    status = tracker.get_budget_status()
+    return BudgetStatus(**status)
