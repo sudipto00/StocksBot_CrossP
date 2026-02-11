@@ -233,19 +233,55 @@ let child = Command::new(sidecar_path)
 
 ## Testing
 
+### Quick Test (Recent Changes)
+
+```bash
+# Run automated test script for all recent changes
+./test-recent-changes.sh
+
+# Or use Make commands
+make test              # Run all tests
+make test-new          # Test new features only
+make quick-test        # Quick validation
+```
+
 ### Backend Tests
 
 ```bash
 cd backend
-pytest tests/
+
+# Run all tests
+python -m pytest tests/ -v
+
+# Run specific feature tests
+python -m pytest tests/test_market_screener.py -v
+python -m pytest tests/test_budget_tracker.py -v
+python -m pytest tests/test_risk_profiles.py -v
+
+# Run with coverage
+python -m pytest tests/ --cov=. --cov-report=html
 ```
 
-### Frontend Tests (TODO)
+### Frontend Tests
 
 ```bash
 cd ui
-npm run test
+
+# Lint code
+npm run lint
+
+# Build for production
+npm run build
 ```
+
+### Complete Testing Guide
+
+See **[TESTING_AND_BUILD.md](./TESTING_AND_BUILD.md)** for comprehensive testing and build instructions, including:
+- How to test all recent changes
+- API endpoint testing
+- Build procedures for all components
+- Troubleshooting guide
+- CI/CD testing workflow
 
 ## Available API Endpoints
 

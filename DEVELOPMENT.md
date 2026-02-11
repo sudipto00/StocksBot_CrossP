@@ -12,6 +12,10 @@
 
 2. **Install all dependencies**
    ```bash
+   # Quick install with Make
+   make install
+   
+   # Or manual installation:
    # Install UI dependencies
    cd ui
    npm install
@@ -27,14 +31,41 @@
 
 3. **Setup database (first time only)**
    ```bash
+   # Using Make
+   make db-migrate
+   
+   # Or manually:
    cd backend
-   # Run database migrations
    alembic upgrade head
    ```
 
+### Testing Recent Changes
+
+**Quick test all recent features:**
+```bash
+# Run automated test script
+./test-recent-changes.sh
+
+# Or use Make
+make quick-test    # Tests new features + builds
+make test-new      # Tests new features only
+make test          # Run all tests
+```
+
+See **[TESTING_AND_BUILD.md](./TESTING_AND_BUILD.md)** for complete testing documentation.
+
 ### Running in Development
 
-**Option 1: Manual (Recommended for development)**
+**Option 1: Using Make (Easiest)**
+```bash
+# Terminal 1 - Backend
+make dev-backend
+
+# Terminal 2 - Frontend  
+make dev-frontend
+```
+
+**Option 2: Manual (Recommended for development)**
 
 Open two terminal windows:
 
