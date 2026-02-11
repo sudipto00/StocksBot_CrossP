@@ -202,15 +202,72 @@ Create a new order.
 - `quantity` (number, required): Order quantity (> 0)
 - `price` (number, optional): Limit/stop price (required for limit/stop orders, > 0)
 
-**Response:**
+**Response (Success):**
 ```json
 {
-  "message": "Order placeholder created for 100 shares of AAPL",
-  "note": "This is a stub endpoint. Real order execution not implemented."
+  "id": "1",
+  "symbol": "AAPL",
+  "side": "buy",
+  "type": "market",
+  "quantity": 100.0,
+  "price": null,
+  "status": "filled",
+  "filled_quantity": 100.0,
+  "avg_fill_price": 150.25,
+  "created_at": "2024-01-01T12:00:00",
+  "updated_at": "2024-01-01T12:00:00.123456"
 }
 ```
 
-**Status:** Placeholder endpoint. Does not execute real trades.
+**Response (Validation Error - 400):**
+```json
+{
+  "detail": "Order value $150000.00 exceeds maximum position size $10000.00"
+}
+```
+
+**Response (Broker Error - 503):**
+```json
+{
+  "detail": "Failed to submit order to broker: Not connected to Alpaca"
+}
+```
+
+**Order Execution Flow:**
+1. **Validation**: Order is validated against:
+   - Account buying power (for buy orders)
+   - Maximum position size limit (default: $10,000)
+   - Daily risk limits
+   - Required fields (e.g., price for limit orders)
+
+2. **Broker Submission**: 
+   - Paper trading mode (default): Uses PaperBroker
+     - Market orders are filled immediately at simulated price ($100)
+     - Limit orders stay pending
+   - Live trading: Uses configured broker (e.g., Alpaca)
+     - Requires `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` environment variables
+     - Set `ALPACA_PAPER=true` for paper trading, `false` for live
+
+3. **Persistence**: Order is saved to database with:
+   - Internal order ID
+   - External broker order ID
+   - Current status
+   - Fill information (if filled)
+
+4. **Position Updates**: For filled orders:
+   - Trade record is created
+   - Position is created or updated
+   - P&L is calculated for closing trades
+
+**Order Status Values:**
+- `pending`: Order created but not yet submitted
+- `open`: Order submitted to broker, awaiting fill
+- `filled`: Order completely filled
+- `partially_filled`: Order partially filled
+- `cancelled`: Order cancelled
+- `rejected`: Order rejected by broker or validation
+
+**Note**: Currently only market and limit orders are fully supported. Stop and stop-limit orders will return an error.
 
 ---
 
