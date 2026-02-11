@@ -244,11 +244,35 @@ class PaperBroker(BrokerInterface):
         """
         Submit a paper order.
         
-        TODO: Implement order simulation
-        TODO: Simulate fills with market data
+        For market orders, immediately fill at the current simulated price.
+        For limit orders, create pending order (fill simulation not yet implemented).
         """
         self.order_counter += 1
         order_id = f"paper-{self.order_counter}"
+        
+        # Get current market price
+        market_data = self.get_market_data(symbol)
+        current_price = market_data["price"]
+        
+        # Determine if order should be filled immediately
+        if order_type == OrderType.MARKET:
+            # Market orders fill immediately at current price
+            status = OrderStatus.FILLED.value
+            filled_quantity = quantity
+            avg_fill_price = current_price
+            
+            # Update balance for buy orders
+            if side == OrderSide.BUY:
+                cost = filled_quantity * avg_fill_price
+                self.balance -= cost
+            else:  # SELL
+                proceeds = filled_quantity * avg_fill_price
+                self.balance += proceeds
+        else:
+            # Limit orders stay pending (TODO: implement fill simulation)
+            status = OrderStatus.PENDING.value
+            filled_quantity = 0.0
+            avg_fill_price = None
         
         order = {
             "id": order_id,
@@ -257,7 +281,9 @@ class PaperBroker(BrokerInterface):
             "type": order_type.value,
             "quantity": quantity,
             "price": price,
-            "status": OrderStatus.PENDING.value,
+            "status": status,
+            "filled_quantity": filled_quantity,
+            "avg_fill_price": avg_fill_price,
             "created_at": datetime.now().isoformat(),
         }
         
