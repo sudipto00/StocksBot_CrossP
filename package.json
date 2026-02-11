@@ -6,8 +6,8 @@
     "tauri": "tauri",
     "dev": "cd ui && npm run dev",
     "build": "cd ui && npm run build",
-    "tauri:dev": "cd src-tauri && cargo tauri dev",
-    "tauri:build": "cd src-tauri && cargo tauri build",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build",
     "backend:dev": "cd backend && python app.py",
     "install:all": "cd ui && npm install && cd ../backend && pip install -r requirements.txt"
   },
@@ -30,6 +30,6 @@
   },
   "homepage": "https://github.com/sudipto00/StocksBot_CrossP#readme",
   "devDependencies": {
-    "@tauri-apps/cli": "^1.5.6"
+    "@tauri-apps/cli": "^2.0.0"
   }
 }
