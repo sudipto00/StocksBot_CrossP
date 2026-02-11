@@ -28,7 +28,8 @@ from alpaca.trading.enums import (
     OrderStatus as AlpacaOrderStatus,
 )
 from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockLatestQuoteRequest
+from alpaca.data.requests import StockLatestQuoteRequest, StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
 
 from services.broker import BrokerInterface, OrderSide, OrderType, OrderStatus
 
@@ -47,12 +48,11 @@ class AlpacaBroker(BrokerInterface):
         - paper: Whether to use paper trading (default: True)
     """
     
-    def __init__(
-        self,
+    def __init__(self,
         api_key: str,
         secret_key: str,
         paper: bool = True
-    ):
+    ):  
         """
         Initialize Alpaca broker.
         
@@ -173,7 +173,7 @@ class AlpacaBroker(BrokerInterface):
                 "market_value": float(pos.market_value),
                 "cost_basis": float(pos.cost_basis),
                 "unrealized_pnl": float(pos.unrealized_pl),
-                "unrealized_pnl_percent": float(pos.unrealized_plpc) * 100,
+                "unrealized_pnl_percent": float(pos.unrealized.plpc) * 100,
             })
         
         return result
@@ -341,6 +341,54 @@ class AlpacaBroker(BrokerInterface):
             "bid_size": int(quote.bid_size),
             "timestamp": quote.timestamp.isoformat(),
         }
+
+    def get_historical_bars(
+        self,
+        symbol: str,
+        start: datetime,
+        end: Optional[datetime] = None,
+        limit: Optional[int] = None,
+        timeframe: TimeFrame = TimeFrame.Day,
+    ) -> List[Dict[str, Any]]:
+        """
+        Get historical bars for a symbol.
+
+        Args:
+            symbol: Stock symbol
+            start: Start datetime for bars
+            end: Optional end datetime
+            limit: Optional number of bars to return
+            timeframe: Bar timeframe (default: 1 day)
+
+        Returns:
+            List of bars with OHLCV data
+        """
+        if not self.is_connected():
+            raise RuntimeError("Not connected to Alpaca")
+
+        request = StockBarsRequest(
+            symbol_or_symbols=[symbol],
+            timeframe=timeframe,
+            start=start,
+            end=end,
+            limit=limit,
+        )
+        bars = self._data_client.get_stock_bars(request)
+        bar_data = bars.data if hasattr(bars, "data") else bars
+        symbol_bars = bar_data.get(symbol, []) if isinstance(bar_data, dict) else []
+
+        result = []
+        for bar in symbol_bars:
+            result.append({
+                "timestamp": bar.timestamp,
+                "open": float(bar.open),
+                "high": float(bar.high),
+                "low": float(bar.low),
+                "close": float(bar.close),
+                "volume": int(bar.volume),
+            })
+
+        return result
     
     def _map_alpaca_order(self, order) -> Dict[str, Any]:
         """
