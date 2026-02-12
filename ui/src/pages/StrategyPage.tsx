@@ -60,22 +60,12 @@ function StrategyPage() {
   const [backtestStartDate, setBacktestStartDate] = useState('2024-01-01');
   const [backtestEndDate, setBacktestEndDate] = useState('2024-12-31');
   const [backtestCapital, setBacktestCapital] = useState('100000');
+  const activeStrategyCount = strategies.filter((s) => s.status === StrategyStatus.ACTIVE).length;
 
   useEffect(() => {
     loadStrategies();
     loadRunnerStatus();
   }, []);
-
-  // Auto-refresh metrics every 10 seconds when a strategy is selected
-  useEffect(() => {
-    if (selectedStrategy) {
-      const interval = setInterval(() => {
-        loadStrategyMetrics(selectedStrategy.id);
-      }, 10000);
-
-      return () => clearInterval(interval);
-    }
-  }, [selectedStrategy, loadStrategyMetrics]);
 
   const loadStrategies = async () => {
     try {
@@ -129,6 +119,17 @@ function StrategyPage() {
       setMetricsLoading(false);
     }
   }, []);
+
+  // Auto-refresh metrics every 10 seconds when a strategy is selected
+  useEffect(() => {
+    if (selectedStrategy) {
+      const interval = setInterval(() => {
+        loadStrategyMetrics(selectedStrategy.id);
+      }, 10000);
+
+      return () => clearInterval(interval);
+    }
+  }, [selectedStrategy, loadStrategyMetrics]);
 
   const handleSelectStrategy = async (strategy: Strategy) => {
     setSelectedStrategy(strategy);
@@ -365,12 +366,12 @@ function StrategyPage() {
           <div className="flex gap-2">
             <button
               onClick={handleStartRunner}
-              disabled={runnerLoading || runnerStatus === 'running'}
+              disabled={runnerLoading || runnerStatus === 'running' || activeStrategyCount === 0}
               className={`px-4 py-2 rounded font-medium ${
-                runnerLoading || runnerStatus === 'running'
+                runnerLoading || runnerStatus === 'running' || activeStrategyCount === 0
                   ? 'bg-gray-600 text-gray-400 cursor-not-allowed'
                   : 'bg-green-600 hover:bg-green-700 text-white'
-              }`
+              }`}
             >
               {runnerLoading ? 'Starting...' : 'Start Runner'}
             </button>
@@ -381,12 +382,17 @@ function StrategyPage() {
                 runnerLoading || runnerStatus !== 'running'
                   ? 'bg-gray-600 text-gray-400 cursor-not-allowed'
                   : 'bg-red-600 hover:bg-red-700 text-white'
-              }`
+              }`}
             >
               {runnerLoading ? 'Stopping...' : 'Stop Runner'}
             </button>
           </div>
         </div>
+        {activeStrategyCount === 0 && (
+          <p className="text-yellow-400 text-xs mt-3">
+            Activate at least one strategy before starting the runner.
+          </p>
+        )}
       </div>
 
       {error && (
@@ -430,30 +436,34 @@ function StrategyPage() {
               </div>
               <div className="divide-y divide-gray-700">
                 {strategies.map((strategy) => (
-                  <div
-                    key={strategy.id}
-                    onClick={() => handleSelectStrategy(strategy)}
-                    className={`p-4 cursor-pointer hover:bg-gray-750 transition-colors ${
-                      selectedStrategy?.id === strategy.id ? 'bg-gray-750 border-l-4 border-blue-500' : ''
-                    }`
-                  >
-                    <div className="flex items-center justify-between mb-2">
-                      <div className="text-white font-medium">{strategy.name}</div>
-                      <span className={`px-2 py-1 rounded text-xs font-medium ${
+                <div
+                  key={strategy.id}
+                  onClick={() => handleSelectStrategy(strategy)}
+                  className={`p-4 cursor-pointer hover:bg-gray-750 transition-colors ${
+                    selectedStrategy?.id === strategy.id ? 'bg-gray-750 border-l-4 border-blue-500' : ''
+                  }`}
+                >
+                  <div className="flex items-center justify-between mb-2">
+                    <div className="text-white font-medium">{strategy.name}</div>
+                    <span
+                      className={`px-2 py-1 rounded text-xs font-medium ${
                         strategy.status === StrategyStatus.ACTIVE
                           ? 'bg-green-900/30 text-green-400'
                           : strategy.status === StrategyStatus.ERROR
                           ? 'bg-red-900/30 text-red-400'
                           : 'bg-gray-700 text-gray-400'
-                      }`}>{strategy.status}</span>
-                    </div>
-                    {strategy.description && (
-                      <div className="text-gray-400 text-sm mb-2">{strategy.description}</div>
-                    )}
-                    <div className="text-gray-500 text-xs">
-                      {strategy.symbols.length} symbols
-                    </div>
+                      }`}
+                    >
+                      {strategy.status}
+                    </span>
                   </div>
+                  {strategy.description && (
+                    <div className="text-gray-400 text-sm mb-2">{strategy.description}</div>
+                  )}
+                  <div className="text-gray-500 text-xs">
+                    {strategy.symbols.length} symbols
+                  </div>
+                </div>
                 ))}
               </div>
             </div>

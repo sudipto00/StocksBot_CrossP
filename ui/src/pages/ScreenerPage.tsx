@@ -28,6 +28,14 @@ interface BudgetStatus {
   days_remaining: number;
 }
 
+const BACKEND_URL =
+  (import.meta as { env?: { VITE_BACKEND_URL?: string } }).env?.VITE_BACKEND_URL ||
+  'http://127.0.0.1:8000';
+type ScreenerMode = 'most_active' | 'preset';
+type StockPreset = 'weekly_optimized' | 'three_to_five_weekly' | 'monthly_optimized' | 'small_budget_weekly';
+type EtfPreset = 'conservative' | 'balanced' | 'aggressive';
+type PresetType = StockPreset | EtfPreset;
+
 const ScreenerPage: React.FC = () => {
   const [assets, setAssets] = useState<Asset[]>([]);
   const [preferences, setPreferences] = useState<Preferences>({
@@ -37,23 +45,23 @@ const ScreenerPage: React.FC = () => {
     screener_limit: 50,
   });
   const [budgetStatus, setBudgetStatus] = useState<BudgetStatus | null>(null);
+  const [screenerMode, setScreenerMode] = useState<ScreenerMode>('most_active');
+  const [preset, setPreset] = useState<PresetType>('weekly_optimized');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Fetch preferences on mount
   useEffect(() => {
     fetchPreferences();
     fetchBudgetStatus();
   }, []);
 
-  // Fetch assets when preferences change
   useEffect(() => {
     fetchAssets();
-  }, [preferences.asset_type, preferences.screener_limit]);
+  }, [preferences.asset_type, preferences.screener_limit, screenerMode, preset]);
 
   const fetchPreferences = async () => {
     try {
-      const response = await fetch('http://127.0.0.1:8000/preferences');
+      const response = await fetch(`${BACKEND_URL}/preferences`);
       if (!response.ok) throw new Error('Failed to fetch preferences');
       const data = await response.json();
       setPreferences(data);
@@ -64,7 +72,7 @@ const ScreenerPage: React.FC = () => {
 
   const fetchBudgetStatus = async () => {
     try {
-      const response = await fetch('http://127.0.0.1:8000/budget/status');
+      const response = await fetch(`${BACKEND_URL}/budget/status`);
       if (!response.ok) throw new Error('Failed to fetch budget status');
       const data = await response.json();
       setBudgetStatus(data);
@@ -77,7 +85,10 @@ const ScreenerPage: React.FC = () => {
     setLoading(true);
     setError(null);
     try {
-      const url = `http://127.0.0.1:8000/screener/all?asset_type=${preferences.asset_type}&limit=${preferences.screener_limit}`;
+      let url = `${BACKEND_URL}/screener/all?asset_type=${preferences.asset_type}&limit=${preferences.screener_limit}`;
+      if (screenerMode === 'preset' && preferences.asset_type !== 'both') {
+        url = `${BACKEND_URL}/screener/preset?asset_type=${preferences.asset_type}&preset=${preset}&limit=${preferences.screener_limit}`;
+      }
       const response = await fetch(url);
       if (!response.ok) throw new Error('Failed to fetch assets');
       const data = await response.json();
@@ -91,7 +102,7 @@ const ScreenerPage: React.FC = () => {
 
   const updatePreferences = async (updates: Partial<Preferences>) => {
     try {
-      const response = await fetch('http://127.0.0.1:8000/preferences', {
+      const response = await fetch(`${BACKEND_URL}/preferences`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(updates),
@@ -104,44 +115,47 @@ const ScreenerPage: React.FC = () => {
     }
   };
 
-  const formatCurrency = (value: number) => {
-    return new Intl.NumberFormat('en-US', {
+  const formatCurrency = (value: number) =>
+    new Intl.NumberFormat('en-US', {
       style: 'currency',
       currency: 'USD',
     }).format(value);
-  };
 
-  const formatPercent = (value: number) => {
-    return `${value >= 0 ? '+' : ''}${value.toFixed(2)}%`;
-  };
+  const formatPercent = (value: number) => `${value >= 0 ? '+' : ''}${value.toFixed(2)}%`;
+
+  const stockPresets: Array<{ value: StockPreset; label: string }> = [
+    { value: 'weekly_optimized', label: 'Weekly Optimized' },
+    { value: 'three_to_five_weekly', label: '3-5 Trades / Week' },
+    { value: 'monthly_optimized', label: 'Monthly Optimized' },
+    { value: 'small_budget_weekly', label: 'Small Budget Weekly' },
+  ];
+  const etfPresets: Array<{ value: EtfPreset; label: string }> = [
+    { value: 'conservative', label: 'Conservative' },
+    { value: 'balanced', label: 'Balanced' },
+    { value: 'aggressive', label: 'Aggressive' },
+  ];
+  const presetOptions = preferences.asset_type === 'etf' ? etfPresets : stockPresets;
 
   return (
     <div className="min-h-screen bg-gray-50 p-6">
       <div className="max-w-7xl mx-auto">
         <h1 className="text-3xl font-bold text-gray-900 mb-6">Market Screener</h1>
 
-        {/* Budget Status Card */}
         {budgetStatus && (
           <div className="bg-white rounded-lg shadow-md p-6 mb-6">
             <h2 className="text-xl font-semibold mb-4">Weekly Budget Status</h2>
             <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
               <div>
                 <p className="text-sm text-gray-600">Weekly Budget</p>
-                <p className="text-2xl font-bold text-gray-900">
-                  {formatCurrency(budgetStatus.weekly_budget)}
-                </p>
+                <p className="text-2xl font-bold text-gray-900">{formatCurrency(budgetStatus.weekly_budget)}</p>
               </div>
               <div>
                 <p className="text-sm text-gray-600">Remaining</p>
-                <p className="text-2xl font-bold text-green-600">
-                  {formatCurrency(budgetStatus.remaining_budget)}
-                </p>
+                <p className="text-2xl font-bold text-green-600">{formatCurrency(budgetStatus.remaining_budget)}</p>
               </div>
               <div>
                 <p className="text-sm text-gray-600">Used</p>
-                <p className="text-2xl font-bold text-blue-600">
-                  {budgetStatus.used_percent.toFixed(1)}%
-                </p>
+                <p className="text-2xl font-bold text-blue-600">{budgetStatus.used_percent.toFixed(1)}%</p>
               </div>
               <div>
                 <p className="text-sm text-gray-600">Weekly P&L</p>
@@ -150,33 +164,27 @@ const ScreenerPage: React.FC = () => {
                 </p>
               </div>
             </div>
-            <div className="mt-4">
-              <div className="flex justify-between text-sm text-gray-600 mb-1">
-                <span>Budget Utilization</span>
-                <span>{budgetStatus.used_percent.toFixed(1)}%</span>
-              </div>
-              <div className="w-full bg-gray-200 rounded-full h-2">
-                <div
-                  className="bg-blue-600 h-2 rounded-full transition-all"
-                  style={{ width: `${Math.min(budgetStatus.used_percent, 100)}%` }}
-                />
-              </div>
-            </div>
           </div>
         )}
 
-        {/* Filters Card */}
         <div className="bg-white rounded-lg shadow-md p-6 mb-6">
           <h2 className="text-xl font-semibold mb-4">Filter Settings</h2>
           <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
-            {/* Asset Type */}
             <div>
-              <label className="block text-sm font-medium text-gray-700 mb-2">
-                Asset Type
-              </label>
+              <label className="block text-sm font-medium text-gray-700 mb-2">Asset Type</label>
               <select
                 value={preferences.asset_type}
-                onChange={(e) => updatePreferences({ asset_type: e.target.value as any })}
+                onChange={(e) => {
+                  const next = e.target.value as Preferences['asset_type'];
+                  updatePreferences({ asset_type: next });
+                  if (next === 'both') {
+                    setScreenerMode('most_active');
+                  } else if (next === 'stock') {
+                    setPreset('weekly_optimized');
+                  } else {
+                    setPreset('conservative');
+                  }
+                }}
                 className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
               >
                 <option value="both">Both</option>
@@ -185,27 +193,37 @@ const ScreenerPage: React.FC = () => {
               </select>
             </div>
 
-            {/* Risk Profile */}
             <div>
-              <label className="block text-sm font-medium text-gray-700 mb-2">
-                Risk Profile
-              </label>
+              <label className="block text-sm font-medium text-gray-700 mb-2">Universe Source</label>
               <select
-                value={preferences.risk_profile}
-                onChange={(e) => updatePreferences({ risk_profile: e.target.value as any })}
+                value={screenerMode}
+                onChange={(e) => setScreenerMode(e.target.value as ScreenerMode)}
                 className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                disabled={preferences.asset_type === 'both'}
               >
-                <option value="conservative">Conservative</option>
-                <option value="balanced">Balanced</option>
-                <option value="aggressive">Aggressive</option>
+                <option value="most_active">Most Active (10-200)</option>
+                <option value="preset">Strategy Preset</option>
               </select>
             </div>
 
-            {/* Limit */}
             <div>
-              <label className="block text-sm font-medium text-gray-700 mb-2">
-                Results Limit
-              </label>
+              <label className="block text-sm font-medium text-gray-700 mb-2">Preset</label>
+              <select
+                value={preset}
+                onChange={(e) => setPreset(e.target.value as PresetType)}
+                className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                disabled={preferences.asset_type === 'both' || screenerMode !== 'preset'}
+              >
+                {presetOptions.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-2">Results Limit</label>
               <select
                 value={preferences.screener_limit}
                 onChange={(e) => updatePreferences({ screener_limit: parseInt(e.target.value) })}
@@ -218,12 +236,22 @@ const ScreenerPage: React.FC = () => {
                 <option value="200">200</option>
               </select>
             </div>
-
-            {/* Weekly Budget */}
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4">
             <div>
-              <label className="block text-sm font-medium text-gray-700 mb-2">
-                Weekly Budget
-              </label>
+              <label className="block text-sm font-medium text-gray-700 mb-2">Risk Profile</label>
+              <select
+                value={preferences.risk_profile}
+                onChange={(e) => updatePreferences({ risk_profile: e.target.value as Preferences['risk_profile'] })}
+                className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+              >
+                <option value="conservative">Conservative</option>
+                <option value="balanced">Balanced</option>
+                <option value="aggressive">Aggressive</option>
+              </select>
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-2">Weekly Budget</label>
               <input
                 type="number"
                 value={preferences.weekly_budget}
@@ -237,7 +265,6 @@ const ScreenerPage: React.FC = () => {
           </div>
         </div>
 
-        {/* Assets Table */}
         <div className="bg-white rounded-lg shadow-md overflow-hidden">
           <div className="px-6 py-4 border-b border-gray-200 flex justify-between items-center">
             <h2 className="text-xl font-semibold">
@@ -252,77 +279,51 @@ const ScreenerPage: React.FC = () => {
             </button>
           </div>
 
-          {error && (
-            <div className="px-6 py-4 bg-red-50 text-red-700">
-              Error: {error}
-            </div>
-          )}
+          {error && <div className="px-6 py-4 bg-red-50 text-red-700">Error: {error}</div>}
 
           {loading ? (
-            <div className="px-6 py-12 text-center text-gray-500">
-              Loading assets...
-            </div>
+            <div className="px-6 py-12 text-center text-gray-500">Loading assets...</div>
           ) : (
             <div className="overflow-x-auto">
               <table className="min-w-full divide-y divide-gray-200">
                 <thead className="bg-gray-50">
                   <tr>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      Symbol
-                    </th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      Name
-                    </th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      Type
-                    </th>
-                    <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      Price
-                    </th>
-                    <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      Change
-                    </th>
-                    <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      Volume
-                    </th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Symbol</th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Name</th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Type</th>
+                    <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Price</th>
+                    <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Change</th>
+                    <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Volume</th>
                   </tr>
                 </thead>
                 <tbody className="bg-white divide-y divide-gray-200">
                   {assets.map((asset) => (
                     <tr key={asset.symbol} className="hover:bg-gray-50">
                       <td className="px-6 py-4 whitespace-nowrap">
-                        <span className="text-sm font-semibold text-gray-900">
-                          {asset.symbol}
-                        </span>
+                        <span className="text-sm font-semibold text-gray-900">{asset.symbol}</span>
                       </td>
                       <td className="px-6 py-4 whitespace-nowrap">
                         <span className="text-sm text-gray-900">{asset.name}</span>
                       </td>
                       <td className="px-6 py-4 whitespace-nowrap">
-                        <span className={`px-2 py-1 text-xs font-semibold rounded ${
-                          asset.asset_type === 'stock'
-                            ? 'bg-blue-100 text-blue-800'
-                            : 'bg-green-100 text-green-800'
-                        }`}>
+                        <span
+                          className={`px-2 py-1 text-xs font-semibold rounded ${
+                            asset.asset_type === 'stock' ? 'bg-blue-100 text-blue-800' : 'bg-green-100 text-green-800'
+                          }`}
+                        >
                           {asset.asset_type.toUpperCase()}
                         </span>
                       </td>
                       <td className="px-6 py-4 whitespace-nowrap text-right">
-                        <span className="text-sm text-gray-900">
-                          {formatCurrency(asset.price)}
-                        </span>
+                        <span className="text-sm text-gray-900">{formatCurrency(asset.price)}</span>
                       </td>
                       <td className="px-6 py-4 whitespace-nowrap text-right">
-                        <span className={`text-sm font-semibold ${
-                          asset.change_percent >= 0 ? 'text-green-600' : 'text-red-600'
-                        }`}>
+                        <span className={`text-sm font-semibold ${asset.change_percent >= 0 ? 'text-green-600' : 'text-red-600'}`}>
                           {formatPercent(asset.change_percent)}
                         </span>
                       </td>
                       <td className="px-6 py-4 whitespace-nowrap text-right">
-                        <span className="text-sm text-gray-500">
-                          {asset.volume.toLocaleString()}
-                        </span>
+                        <span className="text-sm text-gray-500">{asset.volume.toLocaleString()}</span>
                       </td>
                     </tr>
                   ))}
