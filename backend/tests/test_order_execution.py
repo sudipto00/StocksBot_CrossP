@@ -43,8 +43,6 @@ def override_get_db():
         db.close()
 
 
-app.dependency_overrides[get_db] = override_get_db
-
 client = TestClient(app)
 
 
@@ -67,9 +65,11 @@ def reset_broker():
 @pytest.fixture(autouse=True)
 def setup_database():
     """Create and drop test database for each test."""
+    app.dependency_overrides[get_db] = override_get_db
     Base.metadata.create_all(bind=engine)
     yield
     Base.metadata.drop_all(bind=engine)
+    app.dependency_overrides.pop(get_db, None)
 
 
 @pytest.fixture

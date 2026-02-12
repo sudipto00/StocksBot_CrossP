@@ -9,9 +9,37 @@ TODO: Implement comprehensive test suite
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 from app import app
+from storage.database import Base, get_db
+
+SQLALCHEMY_DATABASE_URL = "sqlite:///./test_app.db"
+engine = create_engine(
+    SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False}
+)
+TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+
+def override_get_db():
+    """Override database dependency for testing."""
+    try:
+        db = TestingSessionLocal()
+        yield db
+    finally:
+        db.close()
 
 client = TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def setup_database():
+    """Create and drop test database for each test."""
+    app.dependency_overrides[get_db] = override_get_db
+    Base.metadata.create_all(bind=engine)
+    yield
+    Base.metadata.drop_all(bind=engine)
+    app.dependency_overrides.pop(get_db, None)
 
 
 def test_root():
@@ -80,7 +108,7 @@ def test_get_orders():
 
 
 def test_create_order():
-    """Test create order endpoint (placeholder)."""
+    """Test create order endpoint."""
     order_data = {
         "symbol": "AAPL",
         "side": "buy",
@@ -90,7 +118,10 @@ def test_create_order():
     response = client.post("/orders", json=order_data)
     assert response.status_code == 200
     data = response.json()
-    assert "message" in data
+    assert data["symbol"] == "AAPL"
+    assert data["side"] == "buy"
+    assert data["type"] == "market"
+    assert data["quantity"] == 100
 
 
 def test_create_order_validation():
@@ -129,10 +160,11 @@ def test_get_runner_status():
     response = client.get("/runner/status")
     assert response.status_code == 200
     data = response.json()
-    assert data["success"] == True
     assert "status" in data
-    assert "status" in data["status"]
-    assert data["status"]["status"] in ["stopped", "running", "paused", "error"]
+    assert data["status"] in ["stopped", "running", "paused", "error"]
+    assert "strategies" in data
+    assert "tick_interval" in data
+    assert "broker_connected" in data
 
 
 def test_start_runner():
