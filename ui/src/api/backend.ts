@@ -10,6 +10,8 @@ import {
   OrdersResponse,
   OrderRequest,
   ConfigUpdateRequest,
+  BrokerCredentialsRequest,
+  BrokerCredentialsStatusResponse,
   NotificationRequest,
   NotificationResponse,
   // Strategy types
@@ -84,6 +86,40 @@ export async function updateConfig(config: ConfigUpdateRequest): Promise<ConfigR
     throw new Error(`Backend returned ${response.status}`);
   }
   
+  return response.json();
+}
+
+/**
+ * Set runtime broker credentials (provided by desktop keychain flow).
+ */
+export async function setBrokerCredentials(
+  request: BrokerCredentialsRequest
+): Promise<BrokerCredentialsStatusResponse> {
+  const response = await fetch(`${BACKEND_URL}/broker/credentials`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(request),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Backend returned ${response.status}`);
+  }
+
+  return response.json();
+}
+
+/**
+ * Get runtime broker credentials status.
+ */
+export async function getBrokerCredentialsStatus(): Promise<BrokerCredentialsStatusResponse> {
+  const response = await fetch(`${BACKEND_URL}/broker/credentials/status`);
+
+  if (!response.ok) {
+    throw new Error(`Backend returned ${response.status}`);
+  }
+
   return response.json();
 }
 

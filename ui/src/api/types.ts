@@ -121,6 +121,20 @@ export interface ConfigUpdateRequest {
   paper_trading?: boolean;
   max_position_size?: number;
   risk_limit_daily?: number;
+  broker?: string;
+}
+
+export interface BrokerCredentialsRequest {
+  mode: 'paper' | 'live';
+  api_key: string;
+  secret_key: string;
+}
+
+export interface BrokerCredentialsStatusResponse {
+  paper_available: boolean;
+  live_available: boolean;
+  active_mode: 'paper' | 'live';
+  using_runtime_credentials: boolean;
 }
 
 // ============================================================================
