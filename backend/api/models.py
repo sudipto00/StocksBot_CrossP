@@ -124,6 +124,22 @@ class ConfigUpdateRequest(BaseModel):
     paper_trading: Optional[bool] = Field(None, description="Enable/disable paper trading")
     max_position_size: Optional[float] = Field(None, description="Maximum position size", gt=0)
     risk_limit_daily: Optional[float] = Field(None, description="Daily risk limit", gt=0)
+    broker: Optional[str] = Field(None, description="Broker name (paper/alpaca)")
+
+
+class BrokerCredentialsRequest(BaseModel):
+    """Runtime broker credentials request (not persisted)."""
+    mode: str = Field(..., description="Credential mode: paper or live")
+    api_key: str = Field(..., description="Alpaca API key", min_length=1)
+    secret_key: str = Field(..., description="Alpaca secret key", min_length=1)
+
+
+class BrokerCredentialsStatusResponse(BaseModel):
+    """Runtime broker credentials status."""
+    paper_available: bool = Field(..., description="Paper credentials are available")
+    live_available: bool = Field(..., description="Live credentials are available")
+    active_mode: str = Field(..., description="Current runtime mode in use")
+    using_runtime_credentials: bool = Field(..., description="Whether runtime credentials are active")
 
 
 # ============================================================================
@@ -343,6 +359,17 @@ class AssetType(str, Enum):
     STOCK = "stock"
     ETF = "etf"
     BOTH = "both"
+
+
+class ScreenerPreset(str, Enum):
+    """Curated screener preset names."""
+    WEEKLY_OPTIMIZED = "weekly_optimized"
+    THREE_TO_FIVE_WEEKLY = "three_to_five_weekly"
+    MONTHLY_OPTIMIZED = "monthly_optimized"
+    SMALL_BUDGET_WEEKLY = "small_budget_weekly"
+    CONSERVATIVE = "conservative"
+    BALANCED = "balanced"
+    AGGRESSIVE = "aggressive"
 
 
 class ScreenerAsset(BaseModel):

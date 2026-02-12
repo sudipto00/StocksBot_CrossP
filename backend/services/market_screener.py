@@ -143,6 +143,54 @@ class MarketScreener:
             combined.sort(key=lambda x: x.get("volume", 0), reverse=True)
             
             return combined[:limit]
+
+    def get_preset_assets(self, asset_type: str, preset: str, limit: int = 50) -> List[Dict[str, Any]]:
+        """
+        Get curated assets for a specific strategy preset.
+
+        Args:
+            asset_type: "stock" or "etf"
+            preset: Preset name
+            limit: Max results (10-200)
+        """
+        limit = max(10, min(200, limit))
+        asset_type = asset_type.lower()
+        preset = preset.lower()
+
+        if asset_type not in ("stock", "etf"):
+            raise ValueError("asset_type must be 'stock' or 'etf'")
+
+        stock_presets = {
+            "weekly_optimized": ["NVDA", "TSLA", "AMD", "META", "AMZN", "AAPL", "MSFT", "GOOGL", "INTC", "CRM"],
+            "three_to_five_weekly": ["AAPL", "MSFT", "AMZN", "GOOGL", "JPM", "V", "WMT", "KO", "PEP", "DIS"],
+            "monthly_optimized": ["MSFT", "AAPL", "GOOGL", "JPM", "V", "WMT", "PEP", "KO", "CSCO", "ORCL"],
+            "small_budget_weekly": ["INTC", "PFE", "CSCO", "PYPL", "BABA", "NKE", "DIS", "KO", "XLF", "IWM"],
+        }
+        etf_presets = {
+            "conservative": ["SPY", "VOO", "IVV", "AGG", "TLT", "XLP", "XLV", "VEA", "VTI", "DIA"],
+            "balanced": ["SPY", "QQQ", "VTI", "IWM", "XLF", "XLK", "XLI", "VEA", "VWO", "AGG"],
+            "aggressive": ["QQQ", "IWM", "XLE", "XLK", "XLY", "EEM", "VWO", "XLF", "SPY", "DIA"],
+        }
+
+        all_assets = self.get_active_stocks(200) if asset_type == "stock" else self.get_active_etfs(200)
+        by_symbol = {asset["symbol"]: asset for asset in all_assets}
+
+        preset_map = stock_presets if asset_type == "stock" else etf_presets
+        symbols = preset_map.get(preset)
+        if not symbols:
+            raise ValueError(f"Unknown preset '{preset}' for asset type '{asset_type}'")
+
+        selected = [by_symbol[s] for s in symbols if s in by_symbol]
+        if len(selected) < limit:
+            existing = {s["symbol"] for s in selected}
+            for asset in all_assets:
+                if asset["symbol"] in existing:
+                    continue
+                selected.append(asset)
+                if len(selected) >= limit:
+                    break
+
+        return selected[:limit]
     
     def _fetch_active_from_alpaca(
         self,

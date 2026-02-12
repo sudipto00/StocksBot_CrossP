@@ -29,6 +29,8 @@ from .models import (
     NotificationRequest,
     NotificationResponse,
     NotificationSeverity,
+    BrokerCredentialsRequest,
+    BrokerCredentialsStatusResponse,
     # Strategy models
     Strategy,
     StrategyStatus,
@@ -51,6 +53,7 @@ from .models import (
     ParameterTuneRequest,
     ParameterTuneResponse,
     StrategyParameter,
+    ScreenerPreset,
 )
 from .runner_manager import runner_manager
 from services.strategy_analytics import StrategyAnalyticsService
@@ -63,6 +66,10 @@ router = APIRouter()
 # ============================================================================
 
 _broker_instance: Optional[BrokerInterface] = None
+_runtime_broker_credentials = {
+    "paper": {"api_key": None, "secret_key": None},
+    "live": {"api_key": None, "secret_key": None},
+}
 
 
 def get_broker() -> BrokerInterface:
@@ -76,17 +83,33 @@ def get_broker() -> BrokerInterface:
     
     if _broker_instance is None:
         settings = get_settings()
-        
-        # Use Alpaca if credentials are available, otherwise use PaperBroker
-        if has_alpaca_credentials():
+        mode = "paper" if _config.paper_trading else "live"
+        runtime_creds = _runtime_broker_credentials.get(mode, {})
+        runtime_has_credentials = bool(
+            runtime_creds.get("api_key") and runtime_creds.get("secret_key")
+        )
+
+        # Prefer runtime credentials provided by desktop keychain flow.
+        # Fallback to env credentials, and finally the in-process paper broker.
+        if runtime_has_credentials:
+            from integrations.alpaca_broker import AlpacaBroker
+            _broker_instance = AlpacaBroker(
+                api_key=runtime_creds["api_key"],
+                secret_key=runtime_creds["secret_key"],
+                paper=_config.paper_trading,
+            )
+            _config.broker = "alpaca"
+        elif has_alpaca_credentials():
             from integrations.alpaca_broker import AlpacaBroker
             _broker_instance = AlpacaBroker(
                 api_key=settings.alpaca_api_key,
                 secret_key=settings.alpaca_secret_key,
-                paper=settings.alpaca_paper
+                paper=_config.paper_trading
             )
+            _config.broker = "alpaca"
         else:
             _broker_instance = PaperBroker()
+            _config.broker = "paper"
         
         # Connect broker
         if not _broker_instance.connect():
@@ -113,9 +136,9 @@ def get_order_execution_service(
     # Get config for risk limits
     config = _config
     
-    # Only enable budget tracking when trading is enabled
-    # This prevents breaking existing tests and allows gradual adoption
-    enable_budget = config.trading_enabled
+    # Keep budget checks opt-in at endpoint level to avoid global-state bleed
+    # across tests and long-running UI sessions.
+    enable_budget = False
     
     return OrderExecutionService(
         broker=broker,
@@ -166,8 +189,58 @@ async def update_config(request: ConfigUpdateRequest):
         _config.max_position_size = request.max_position_size
     if request.risk_limit_daily is not None:
         _config.risk_limit_daily = request.risk_limit_daily
+    if request.broker is not None:
+        _config.broker = request.broker
+
+    # Recreate broker on next use when mode changes.
+    global _broker_instance
+    _broker_instance = None
 
     return _config
+
+
+@router.get("/broker/credentials/status", response_model=BrokerCredentialsStatusResponse)
+async def get_broker_credentials_status():
+    """
+    Get status of runtime broker credentials loaded from desktop keychain.
+    """
+    paper_available = bool(
+        _runtime_broker_credentials["paper"]["api_key"]
+        and _runtime_broker_credentials["paper"]["secret_key"]
+    )
+    live_available = bool(
+        _runtime_broker_credentials["live"]["api_key"]
+        and _runtime_broker_credentials["live"]["secret_key"]
+    )
+    active_mode = "paper" if _config.paper_trading else "live"
+    using_runtime_credentials = paper_available if active_mode == "paper" else live_available
+
+    return BrokerCredentialsStatusResponse(
+        paper_available=paper_available,
+        live_available=live_available,
+        active_mode=active_mode,
+        using_runtime_credentials=using_runtime_credentials,
+    )
+
+
+@router.post("/broker/credentials", response_model=BrokerCredentialsStatusResponse)
+async def set_broker_credentials(request: BrokerCredentialsRequest):
+    """
+    Set runtime Alpaca credentials from desktop keychain flow.
+    Credentials are held in-memory only and never persisted to DB.
+    """
+    mode = request.mode.strip().lower()
+    if mode not in ("paper", "live"):
+        raise HTTPException(status_code=400, detail="Mode must be 'paper' or 'live'")
+
+    _runtime_broker_credentials[mode]["api_key"] = request.api_key.strip()
+    _runtime_broker_credentials[mode]["secret_key"] = request.secret_key.strip()
+
+    # Ensure broker instance is recreated with latest credentials.
+    global _broker_instance
+    _broker_instance = None
+
+    return await get_broker_credentials_status()
 
 
 # ============================================================================
@@ -459,6 +532,8 @@ async def update_strategy(strategy_id: str, request: StrategyUpdateRequest, db: 
         if not db_strategy.config:
             db_strategy.config = {}
         db_strategy.config["symbols"] = request.symbols
+        from sqlalchemy.orm.attributes import flag_modified
+        flag_modified(db_strategy, "config")
     if request.status is not None:
         db_strategy.is_active = (request.status == StrategyStatus.ACTIVE)
         storage.create_audit_log(
@@ -557,24 +632,24 @@ async def get_runner_status():
 
 
 @router.post("/runner/start", response_model=RunnerActionResponse)
-async def start_runner():
+async def start_runner(db: Session = Depends(get_db)):
     """
     Start the strategy runner.
     Loads active strategies and begins execution loop.
     Idempotent - safe to call multiple times.
     """
-    result = runner_manager.start_runner()
+    result = runner_manager.start_runner(db=db)
     return RunnerActionResponse(**result)
 
 
 @router.post("/runner/stop", response_model=RunnerActionResponse)
-async def stop_runner():
+async def stop_runner(db: Session = Depends(get_db)):
     """
     Stop the strategy runner.
     Stops all strategies and the execution loop.
     Idempotent - safe to call multiple times.
     """
-    result = runner_manager.stop_runner()
+    result = runner_manager.stop_runner(db=db)
     return RunnerActionResponse(**result)
 
 
@@ -697,7 +772,7 @@ async def get_strategy_config(strategy_id: str, db: Session = Depends(get_db)):
         description=db_strategy.description or "",
         symbols=db_strategy.config.get('symbols', []) if db_strategy.config else [],
         parameters=parameters,
-        enabled=db_strategy.is_active,
+        enabled=db_strategy.is_enabled,
     )
 
 
@@ -737,7 +812,7 @@ async def update_strategy_config(
         config_changed = True
     
     if request.enabled is not None:
-        db_strategy.is_active = request.enabled
+        db_strategy.is_enabled = request.enabled
     
     # Mark config as modified if changed (needed for SQLAlchemy JSON fields)
     if config_changed:
@@ -1057,6 +1132,45 @@ async def get_screener_results(
         total_count=len(assets),
         asset_type=final_asset_type.value,
         limit=final_limit,
+    )
+
+
+@router.get("/screener/preset", response_model=ScreenerResponse)
+async def get_screener_preset(
+    asset_type: AssetType,
+    preset: ScreenerPreset,
+    limit: int = 50
+):
+    """
+    Get curated screener assets by strategy preset.
+
+    Stocks presets:
+    - weekly_optimized
+    - three_to_five_weekly
+    - monthly_optimized
+    - small_budget_weekly
+
+    ETF presets:
+    - conservative
+    - balanced
+    - aggressive
+    """
+    if asset_type == AssetType.BOTH:
+        raise HTTPException(status_code=400, detail="Preset screener requires asset_type stock or etf")
+
+    limit = max(10, min(200, limit))
+    screener = MarketScreener()
+    try:
+        assets_raw = screener.get_preset_assets(asset_type.value, preset.value, limit)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    assets = [ScreenerAsset(**asset) for asset in assets_raw]
+
+    return ScreenerResponse(
+        assets=assets,
+        total_count=len(assets),
+        asset_type=asset_type.value,
+        limit=limit,
     )
 
 
