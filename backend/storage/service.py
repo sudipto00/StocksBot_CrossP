@@ -15,6 +15,7 @@ from storage.models import (
     PositionSideEnum, OrderSideEnum, OrderTypeEnum, OrderStatusEnum, TradeTypeEnum,
     AuditEventTypeEnum
 )
+from storage.database import Base
 
 
 class StorageService:
@@ -26,6 +27,9 @@ class StorageService:
     def __init__(self, db: Session):
         """Initialize storage service with database session."""
         self.db = db
+        # Ensure schema exists for the active DB bind.
+        # This keeps API behavior stable across different test DB overrides.
+        Base.metadata.create_all(bind=self.db.get_bind())
         self.positions = PositionRepository(db)
         self.orders = OrderRepository(db)
         self.trades = TradeRepository(db)

@@ -258,6 +258,7 @@ class StrategyRunner:
                 # Record in storage if available
                 if self.storage:
                     try:
+                        fill_price = price or order.get("avg_fill_price") or order.get("price") or 100.0
                         db_order = self.storage.create_order(
                             symbol=symbol,
                             side=side.value,
@@ -271,7 +272,7 @@ class StrategyRunner:
                             order_id=db_order.id,
                             status="filled",
                             filled_quantity=quantity,
-                            avg_fill_price=price or order.get("price", 0)
+                            avg_fill_price=fill_price
                         )
                         
                         # Record trade
@@ -280,7 +281,7 @@ class StrategyRunner:
                             symbol=symbol,
                             side=side.value,
                             quantity=quantity,
-                            price=price or order.get("price", 0)
+                            price=fill_price
                         )
                         
                         print(f"[StrategyRunner] Recorded order and trade in storage")

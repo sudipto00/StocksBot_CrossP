@@ -173,7 +173,7 @@ class AlpacaBroker(BrokerInterface):
                 "market_value": float(pos.market_value),
                 "cost_basis": float(pos.cost_basis),
                 "unrealized_pnl": float(pos.unrealized_pl),
-                "unrealized_pnl_percent": float(pos.unrealized.plpc) * 100,
+                "unrealized_pnl_percent": float(pos.unrealized_plpc) * 100,
             })
         
         return result
