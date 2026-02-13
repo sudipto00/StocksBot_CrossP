@@ -10,14 +10,11 @@ from services.market_screener import MarketScreener
 
 class MovingAverageCrossoverStrategy(StrategyInterface):
     """
-    Sample strategy: Moving Average Crossover.
-    
-    Strategy Logic (TODO):
-    - Calculate short-term and long-term moving averages
-    - BUY when short MA crosses above long MA
-    - SELL when short MA crosses below long MA
-    
-    This is a STUB implementation with TODOs for demonstration.
+    Moving average crossover strategy.
+
+    Logic:
+    - BUY when short MA crosses above long MA.
+    - SELL when short MA crosses below long MA.
     """
     
     def __init__(self, config: Dict[str, Any]):
@@ -34,45 +31,40 @@ class MovingAverageCrossoverStrategy(StrategyInterface):
         self.short_window = config.get("short_window", 10)
         self.long_window = config.get("long_window", 50)
         self.position_size = config.get("position_size", 100)
+        if self.short_window <= 0 or self.long_window <= 0:
+            raise ValueError("short_window and long_window must be positive")
+        if self.short_window >= self.long_window:
+            raise ValueError("short_window must be smaller than long_window")
+        if self.position_size <= 0:
+            raise ValueError("position_size must be positive")
         
         # State tracking
         self.state = {
             "price_history": {},  # symbol -> list of prices
-            "positions": {},  # symbol -> position info
-            "last_signal": {}  # symbol -> last signal
+            "in_position": {},  # symbol -> bool
+            "last_signal": {},  # symbol -> last signal
+            "last_spread_sign": {},  # symbol -> -1/0/1
         }
     
     def on_start(self) -> None:
         """
-        Initialize strategy on start.
-        
-        TODO:
-        - Load historical price data for MA calculation
-        - Initialize price history for each symbol
-        - Set up any required indicators
+        Initialize strategy state.
         """
         print(f"[{self.name}] Starting MA Crossover Strategy")
         print(f"  Symbols: {self.symbols}")
         print(f"  Short MA: {self.short_window}, Long MA: {self.long_window}")
         
-        # TODO: Initialize price history from market data provider
         for symbol in self.symbols:
             self.state["price_history"][symbol] = []
-            self.state["positions"][symbol] = None
+            self.state["in_position"][symbol] = False
             self.state["last_signal"][symbol] = Signal.HOLD
+            self.state["last_spread_sign"][symbol] = 0
         
         self.is_running = True
     
     def on_tick(self, market_data: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
-        Process market data and generate signals.
-        
-        TODO:
-        - Update price history with new data
-        - Calculate moving averages
-        - Detect crossovers
-        - Generate buy/sell signals
-        - Implement position management
+        Process market data and generate crossover signals.
         """
         signals = []
         
@@ -81,58 +73,63 @@ class MovingAverageCrossoverStrategy(StrategyInterface):
                 continue
             
             data = market_data[symbol]
-            current_price = data.get("price", 0)
-            
-            # TODO: Update price history
-            # self.state["price_history"][symbol].append(current_price)
-            # Keep only the required window
-            # if len(self.state["price_history"][symbol]) > self.long_window:
-            #     self.state["price_history"][symbol].pop(0)
-            
-            # TODO: Calculate moving averages
-            # short_ma = self._calculate_ma(symbol, self.short_window)
-            # long_ma = self._calculate_ma(symbol, self.long_window)
-            
-            # TODO: Detect crossover and generate signal
-            # if short_ma > long_ma and self.state["last_signal"][symbol] != Signal.BUY:
-            #     signals.append({
-            #         "symbol": symbol,
-            #         "signal": Signal.BUY,
-            #         "quantity": self.position_size,
-            #         "order_type": "market",
-            #         "reason": f"MA crossover - short {short_ma:.2f} > long {long_ma:.2f}"
-            #     })
-            #     self.state["last_signal"][symbol] = Signal.BUY
-            
-            # Placeholder: Just hold for now
-            pass
+            current_price = float(data.get("price", 0.0) or 0.0)
+            if current_price <= 0:
+                continue
+
+            history = self.state["price_history"][symbol]
+            history.append(current_price)
+            if len(history) > self.long_window + 5:
+                self.state["price_history"][symbol] = history[-(self.long_window + 5):]
+                history = self.state["price_history"][symbol]
+
+            if len(history) < self.long_window:
+                continue
+
+            short_ma = self._calculate_ma(symbol, self.short_window)
+            long_ma = self._calculate_ma(symbol, self.long_window)
+            spread = short_ma - long_ma
+            sign = 1 if spread > 0 else (-1 if spread < 0 else 0)
+            prev_sign = int(self.state["last_spread_sign"][symbol])
+            in_position = bool(self.state["in_position"][symbol])
+            self.state["last_spread_sign"][symbol] = sign
+
+            crossed_up = sign > 0 and prev_sign <= 0
+            crossed_down = sign < 0 and prev_sign >= 0
+
+            if crossed_up and not in_position:
+                signals.append({
+                    "symbol": symbol,
+                    "signal": Signal.BUY,
+                    "quantity": float(self.position_size),
+                    "order_type": "market",
+                    "reason": f"MA crossover up: short={short_ma:.2f} long={long_ma:.2f}",
+                })
+                self.state["in_position"][symbol] = True
+                self.state["last_signal"][symbol] = Signal.BUY
+            elif crossed_down and in_position:
+                signals.append({
+                    "symbol": symbol,
+                    "signal": Signal.SELL,
+                    "quantity": float(self.position_size),
+                    "order_type": "market",
+                    "reason": f"MA crossover down: short={short_ma:.2f} long={long_ma:.2f}",
+                })
+                self.state["in_position"][symbol] = False
+                self.state["last_signal"][symbol] = Signal.SELL
         
         return signals
     
     def on_stop(self) -> None:
         """
-        Clean up when strategy stops.
-        
-        TODO:
-        - Close any open positions if configured
-        - Save strategy state
-        - Clean up resources
+        Stop strategy.
         """
         print(f"[{self.name}] Stopping MA Crossover Strategy")
-        
-        # TODO: Implement position closing logic
-        # for symbol, position in self.state["positions"].items():
-        #     if position:
-        #         # Generate close signal
-        #         pass
-        
         self.is_running = False
     
     def _calculate_ma(self, symbol: str, window: int) -> float:
         """
         Calculate moving average for a symbol.
-        
-        TODO: Implement actual moving average calculation
         
         Args:
             symbol: Stock symbol
@@ -141,24 +138,17 @@ class MovingAverageCrossoverStrategy(StrategyInterface):
         Returns:
             Moving average value
         """
-        # TODO: Implement
-        # prices = self.state["price_history"][symbol]
-        # if len(prices) < window:
-        #     return 0.0
-        # return sum(prices[-window:]) / window
-        return 0.0
+        prices = self.state["price_history"].get(symbol, [])
+        if len(prices) < window or window <= 0:
+            return 0.0
+        return float(sum(prices[-window:]) / window)
 
 
 class BuyAndHoldStrategy(StrategyInterface):
     """
-    Sample strategy: Buy and Hold.
-    
-    Strategy Logic (TODO):
-    - Buy specified symbols on start
-    - Hold positions indefinitely
-    - Optionally sell on stop
-    
-    This is a STUB implementation with TODOs for demonstration.
+    Buy-and-hold strategy.
+
+    Buys configured symbols once and then holds them.
     """
     
     def __init__(self, config: Dict[str, Any]):
@@ -180,11 +170,7 @@ class BuyAndHoldStrategy(StrategyInterface):
     
     def on_start(self) -> None:
         """
-        Buy symbols on strategy start.
-        
-        TODO:
-        - Check if we already have positions
-        - Generate buy orders for each symbol
+        Initialize strategy state.
         """
         print(f"[{self.name}] Starting Buy and Hold Strategy")
         print(f"  Symbols: {self.symbols}")
@@ -197,25 +183,21 @@ class BuyAndHoldStrategy(StrategyInterface):
     def on_tick(self, market_data: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
         Buy symbols that haven't been bought yet.
-        
-        TODO:
-        - Check current positions
-        - Buy symbols we don't have yet
-        - Track purchases
         """
         signals = []
         
         for symbol in self.symbols:
             if symbol not in market_data:
                 continue
+            price = float(market_data[symbol].get("price", 0.0) or 0.0)
+            if price <= 0:
+                continue
             
-            # TODO: Check if we already have a position
-            # TODO: If not, generate buy signal
-            if not self.state["bought"][symbol]:
+            if not bool(self.state["bought"].get(symbol, False)):
                 signals.append({
                     "symbol": symbol,
                     "signal": Signal.BUY,
-                    "quantity": self.position_size,
+                    "quantity": float(self.position_size),
                     "order_type": "market",
                     "reason": "Buy and hold - initial purchase"
                 })
@@ -225,21 +207,9 @@ class BuyAndHoldStrategy(StrategyInterface):
     
     def on_stop(self) -> None:
         """
-        Optionally sell positions when strategy stops.
-        
-        TODO:
-        - If sell_on_stop is True, generate sell signals
-        - Close all positions
+        Stop strategy.
         """
         print(f"[{self.name}] Stopping Buy and Hold Strategy")
-        
-        # TODO: Implement sell logic if sell_on_stop is True
-        # if self.sell_on_stop:
-        #     for symbol in self.symbols:
-        #         if self.state["bought"][symbol]:
-        #             # Generate sell signal
-        #             pass
-        
         self.is_running = False
 
 

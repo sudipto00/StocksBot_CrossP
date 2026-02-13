@@ -272,7 +272,7 @@ class PortfolioService:
                 live_price = self._safe_float(market_data.get("price", 0.0), 0.0)
                 if live_price > 0:
                     return live_price
-            except Exception:
+            except (RuntimeError, ValueError, TypeError, KeyError):
                 pass
         return self._safe_float(fallback_price, 0.0)
 
@@ -288,7 +288,7 @@ class PortfolioService:
         try:
             rows = self.broker.get_positions()
             return rows if isinstance(rows, list) else []
-        except Exception:
+        except (RuntimeError, ValueError, TypeError):
             return []
 
     def _get_broker_account_info(self) -> Dict[str, Any]:
@@ -297,7 +297,7 @@ class PortfolioService:
         try:
             info = self.broker.get_account_info()
             return info if isinstance(info, dict) else {}
-        except Exception:
+        except (RuntimeError, ValueError, TypeError):
             return {}
 
     @staticmethod

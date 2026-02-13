@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 import json
 import math
 import re
+import secrets
 import threading
 import time
 import asyncio
@@ -93,6 +94,51 @@ _runtime_broker_credentials = {
     "paper": {"api_key": None, "secret_key": None},
     "live": {"api_key": None, "secret_key": None},
 }
+_state_lock = threading.RLock()
+
+
+def _set_config_snapshot(cfg: ConfigResponse) -> None:
+    """Atomically replace runtime config snapshot."""
+    global _config
+    with _state_lock:
+        _config = cfg.model_copy(deep=True)
+
+
+def _get_config_snapshot() -> ConfigResponse:
+    """Read a stable runtime config snapshot."""
+    with _state_lock:
+        return _config.model_copy(deep=True)
+
+
+def _get_runtime_credentials(mode: str) -> Dict[str, Optional[str]]:
+    """Read runtime broker credentials for a mode under lock."""
+    with _state_lock:
+        creds = _runtime_broker_credentials.get(mode, {})
+        return {
+            "api_key": creds.get("api_key"),
+            "secret_key": creds.get("secret_key"),
+        }
+
+
+def _set_runtime_credentials(mode: str, api_key: str, secret_key: str) -> None:
+    """Store runtime broker credentials for a mode under lock."""
+    with _state_lock:
+        _runtime_broker_credentials[mode]["api_key"] = api_key
+        _runtime_broker_credentials[mode]["secret_key"] = secret_key
+
+
+def _invalidate_broker_instance() -> None:
+    """Invalidate cached broker instance and disconnect previous instance safely."""
+    global _broker_instance
+    stale_broker: Optional[BrokerInterface] = None
+    with _state_lock:
+        stale_broker = _broker_instance
+        _broker_instance = None
+    if stale_broker is not None:
+        try:
+            stale_broker.disconnect()
+        except RuntimeError:
+            pass
 
 
 def get_broker() -> BrokerInterface:
@@ -102,11 +148,14 @@ def get_broker() -> BrokerInterface:
     Returns:
         Configured broker instance (Paper or Alpaca)
     """
-    global _broker_instance
-    
-    if _broker_instance is None:
+    global _broker_instance, _config
+    with _state_lock:
+        if _broker_instance is not None:
+            return _broker_instance
+
         settings = get_settings()
-        mode = "paper" if _config.paper_trading else "live"
+        config = _config.model_copy(deep=True)
+        mode = "paper" if config.paper_trading else "live"
         runtime_creds = _runtime_broker_credentials.get(mode, {})
         runtime_has_credentials = bool(
             runtime_creds.get("api_key") and runtime_creds.get("secret_key")
@@ -116,29 +165,29 @@ def get_broker() -> BrokerInterface:
         # Fallback to env credentials, and finally the in-process paper broker.
         if runtime_has_credentials:
             from integrations.alpaca_broker import AlpacaBroker
-            _broker_instance = AlpacaBroker(
+            broker = AlpacaBroker(
                 api_key=runtime_creds["api_key"],
                 secret_key=runtime_creds["secret_key"],
-                paper=_config.paper_trading,
+                paper=config.paper_trading,
             )
-            _config.broker = "alpaca"
+            broker_name = "alpaca"
         elif has_alpaca_credentials():
             from integrations.alpaca_broker import AlpacaBroker
-            _broker_instance = AlpacaBroker(
+            broker = AlpacaBroker(
                 api_key=settings.alpaca_api_key,
                 secret_key=settings.alpaca_secret_key,
-                paper=_config.paper_trading
+                paper=config.paper_trading,
             )
-            _config.broker = "alpaca"
+            broker_name = "alpaca"
         else:
-            _broker_instance = PaperBroker()
-            _config.broker = "paper"
-        
-        # Connect broker
-        if not _broker_instance.connect():
+            broker = PaperBroker()
+            broker_name = "paper"
+
+        if not broker.connect():
             raise RuntimeError("Failed to connect to broker")
-    
-    return _broker_instance
+        _broker_instance = broker
+        _config = _config.model_copy(update={"broker": broker_name})
+        return _broker_instance
 
 
 def get_order_execution_service(
@@ -158,9 +207,8 @@ def get_order_execution_service(
     set_global_kill_switch(_load_kill_switch(storage))
     
     # Get config for risk limits
-    global _config
-    _config = _load_runtime_config(storage)
-    config = _config
+    config = _load_runtime_config(storage)
+    _set_config_snapshot(config)
     
     # Keep budget checks opt-in at endpoint level to avoid global-state bleed
     # across tests and long-running UI sessions.
@@ -221,6 +269,31 @@ _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _PHONE_RE = re.compile(r"^\+?[1-9]\d{7,14}$")
 
 
+def _is_api_auth_required() -> bool:
+    settings = get_settings()
+    if settings.api_auth_enabled:
+        return True
+    return bool(settings.api_auth_key and settings.api_auth_key.strip())
+
+
+def _extract_api_key_from_headers(headers: Any) -> str:
+    direct = (headers.get("x-api-key") or "").strip()
+    if direct:
+        return direct
+    auth_header = (headers.get("authorization") or "").strip()
+    if auth_header.lower().startswith("bearer "):
+        return auth_header[7:].strip()
+    return ""
+
+
+def _is_api_key_valid(provided_key: str) -> bool:
+    settings = get_settings()
+    expected = (settings.api_auth_key or "").strip()
+    if not expected:
+        return False
+    return bool(provided_key) and secrets.compare_digest(provided_key, expected)
+
+
 def _idempotency_cache_get(endpoint: str, key: Optional[str]) -> Optional[Dict[str, Any]]:
     if not key:
         return None
@@ -251,12 +324,12 @@ def _load_runtime_config(storage: StorageService) -> ConfigResponse:
     """Load runtime config from DB config store or fallback to defaults."""
     entry = storage.config.get_by_key(_CONFIG_KEY)
     if not entry or not entry.value:
-        return _config
+        return _get_config_snapshot()
     try:
         raw = json.loads(entry.value)
         return ConfigResponse(**raw)
-    except Exception:
-        return _config
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return _get_config_snapshot()
 
 
 def _save_runtime_config(storage: StorageService, cfg: ConfigResponse) -> None:
@@ -287,7 +360,13 @@ def _save_kill_switch(storage: StorageService, active: bool) -> None:
 
 def _set_last_broker_sync(ts_iso: Optional[str]) -> None:
     global _last_broker_sync_at
-    _last_broker_sync_at = ts_iso
+    with _state_lock:
+        _last_broker_sync_at = ts_iso
+
+
+def _get_last_broker_sync() -> Optional[str]:
+    with _state_lock:
+        return _last_broker_sync_at
 
 
 def _balance_adjusted_limits(
@@ -300,7 +379,7 @@ def _balance_adjusted_limits(
         account = broker.get_account_info()
         equity = float(account.get("equity", account.get("portfolio_value", 0.0)) or 0.0)
         buying_power = float(account.get("buying_power", 0.0) or 0.0)
-    except Exception:
+    except (RuntimeError, ValueError, TypeError, KeyError):
         return requested_max_position_size, requested_risk_limit_daily
 
     adjusted_max_position_size = float(requested_max_position_size)
@@ -331,7 +410,7 @@ def _load_account_snapshot(broker: Optional[BrokerInterface]) -> Dict[str, float
         return {"equity": 0.0, "buying_power": 0.0, "cash": 0.0}
     try:
         info = broker.get_account_info()
-    except Exception:
+    except (RuntimeError, ValueError, TypeError, KeyError):
         return {"equity": 0.0, "buying_power": 0.0, "cash": 0.0}
     return {
         "equity": _safe_float(info.get("equity", info.get("portfolio_value", 0.0)), 0.0),
@@ -368,7 +447,7 @@ def _load_holdings_snapshot(storage: StorageService, broker: Optional[BrokerInte
                 })
             if holdings:
                 return holdings
-        except Exception:
+        except (RuntimeError, ValueError, TypeError, KeyError):
             holdings = []
 
     # Fallback to local stored positions.
@@ -427,7 +506,7 @@ def _load_summary_notification_preferences(storage: StorageService) -> SummaryNo
         return _summary_notification_preferences
     try:
         return SummaryNotificationPreferencesResponse(**json.loads(config_entry.value))
-    except Exception:
+    except (TypeError, ValueError, json.JSONDecodeError):
         return _summary_notification_preferences
 
 
@@ -438,9 +517,10 @@ def _run_housekeeping(storage: StorageService, force: bool = False) -> Dict[str,
     if not force and _last_housekeeping_run and (now - _last_housekeeping_run).total_seconds() < 3600:
         return {"audit_rows_deleted": 0, "log_files_deleted": 0, "audit_files_deleted": 0}
     _last_housekeeping_run = now
-    audit_rows_deleted = storage.audit_logs.delete_old_logs(days=_config.audit_retention_days)
-    log_files_deleted = cleanup_old_files(_config.log_directory, _config.log_retention_days)
-    audit_files_deleted = cleanup_old_files(_config.audit_export_directory, _config.audit_retention_days)
+    config = _get_config_snapshot()
+    audit_rows_deleted = storage.audit_logs.delete_old_logs(days=config.audit_retention_days)
+    log_files_deleted = cleanup_old_files(config.log_directory, config.log_retention_days)
+    audit_files_deleted = cleanup_old_files(config.audit_export_directory, config.audit_retention_days)
     return {
         "audit_rows_deleted": int(audit_rows_deleted),
         "log_files_deleted": int(log_files_deleted),
@@ -520,10 +600,10 @@ async def get_config(db: Session = Depends(get_db)):
     Get current configuration.
     TODO: Load from persistent storage.
     """
-    global _config
     storage = StorageService(db)
-    _config = _load_runtime_config(storage)
-    return _config
+    config = _load_runtime_config(storage)
+    _set_config_snapshot(config)
+    return config
 
 
 @router.post("/config", response_model=ConfigResponse)
@@ -536,67 +616,66 @@ async def update_config(
     Update configuration.
     TODO: Persist to storage and validate changes.
     """
-    global _config
     cached = _idempotency_cache_get("/config", x_idempotency_key)
     if cached is not None:
         return ConfigResponse(**cached)
 
     storage = StorageService(db)
-    _config = _load_runtime_config(storage)
+    config = _load_runtime_config(storage)
 
     if request.trading_enabled is not None:
-        _config.trading_enabled = request.trading_enabled
+        config.trading_enabled = request.trading_enabled
     if request.paper_trading is not None:
-        _config.paper_trading = request.paper_trading
+        config.paper_trading = request.paper_trading
     if request.max_position_size is not None:
         if not math.isfinite(request.max_position_size):
             raise HTTPException(status_code=400, detail="max_position_size must be a finite number")
         if request.max_position_size < 1 or request.max_position_size > 10_000_000:
             raise HTTPException(status_code=400, detail="max_position_size must be within [1, 10000000]")
-        _config.max_position_size = request.max_position_size
+        config.max_position_size = request.max_position_size
     if request.risk_limit_daily is not None:
         if not math.isfinite(request.risk_limit_daily):
             raise HTTPException(status_code=400, detail="risk_limit_daily must be a finite number")
         if request.risk_limit_daily < 1 or request.risk_limit_daily > 1_000_000:
             raise HTTPException(status_code=400, detail="risk_limit_daily must be within [1, 1000000]")
-        _config.risk_limit_daily = request.risk_limit_daily
+        config.risk_limit_daily = request.risk_limit_daily
     if request.tick_interval_seconds is not None:
         if not math.isfinite(request.tick_interval_seconds):
             raise HTTPException(status_code=400, detail="tick_interval_seconds must be a finite number")
         if request.tick_interval_seconds < 5 or request.tick_interval_seconds > 3600:
             raise HTTPException(status_code=400, detail="tick_interval_seconds must be within [5, 3600]")
-        _config.tick_interval_seconds = request.tick_interval_seconds
-        runner_manager.set_tick_interval(_config.tick_interval_seconds)
+        config.tick_interval_seconds = request.tick_interval_seconds
+        runner_manager.set_tick_interval(config.tick_interval_seconds)
     if request.streaming_enabled is not None:
-        _config.streaming_enabled = request.streaming_enabled
-        runner_manager.set_streaming_enabled(_config.streaming_enabled)
+        config.streaming_enabled = request.streaming_enabled
+        runner_manager.set_streaming_enabled(config.streaming_enabled)
     if request.log_directory is not None:
         candidate = request.log_directory.strip()
         if not candidate:
             raise HTTPException(status_code=400, detail="log_directory cannot be empty")
-        _config.log_directory = str(configure_file_logging(candidate))
+        config.log_directory = str(configure_file_logging(candidate))
     if request.audit_export_directory is not None:
         candidate = request.audit_export_directory.strip()
         if not candidate:
             raise HTTPException(status_code=400, detail="audit_export_directory cannot be empty")
         export_dir = Path(candidate).expanduser().resolve()
         export_dir.mkdir(parents=True, exist_ok=True)
-        _config.audit_export_directory = str(export_dir)
+        config.audit_export_directory = str(export_dir)
     if request.log_retention_days is not None:
-        _config.log_retention_days = int(request.log_retention_days)
+        config.log_retention_days = int(request.log_retention_days)
     if request.audit_retention_days is not None:
-        _config.audit_retention_days = int(request.audit_retention_days)
+        config.audit_retention_days = int(request.audit_retention_days)
     if request.broker is not None:
-        _config.broker = request.broker
+        config.broker = request.broker
 
     # Recreate broker on next use when mode changes.
-    global _broker_instance
-    _broker_instance = None
+    _set_config_snapshot(config)
+    _invalidate_broker_instance()
     _run_housekeeping(storage, force=True)
-    _save_runtime_config(storage, _config)
-    _idempotency_cache_set("/config", x_idempotency_key, _config.model_dump())
+    _save_runtime_config(storage, config)
+    _idempotency_cache_set("/config", x_idempotency_key, config.model_dump())
 
-    return _config
+    return config
 
 
 @router.get("/broker/credentials/status", response_model=BrokerCredentialsStatusResponse)
@@ -604,15 +683,12 @@ async def get_broker_credentials_status():
     """
     Get status of runtime broker credentials loaded from desktop keychain.
     """
-    paper_available = bool(
-        _runtime_broker_credentials["paper"]["api_key"]
-        and _runtime_broker_credentials["paper"]["secret_key"]
-    )
-    live_available = bool(
-        _runtime_broker_credentials["live"]["api_key"]
-        and _runtime_broker_credentials["live"]["secret_key"]
-    )
-    active_mode = "paper" if _config.paper_trading else "live"
+    paper_creds = _get_runtime_credentials("paper")
+    live_creds = _get_runtime_credentials("live")
+    paper_available = bool(paper_creds.get("api_key") and paper_creds.get("secret_key"))
+    live_available = bool(live_creds.get("api_key") and live_creds.get("secret_key"))
+    config = _get_config_snapshot()
+    active_mode = "paper" if config.paper_trading else "live"
     using_runtime_credentials = paper_available if active_mode == "paper" else live_available
 
     return BrokerCredentialsStatusResponse(
@@ -642,12 +718,10 @@ async def set_broker_credentials(request: BrokerCredentialsRequest):
     if any(ch.isspace() for ch in api_key) or any(ch.isspace() for ch in secret_key):
         raise HTTPException(status_code=400, detail="API key and secret key cannot contain whitespace")
 
-    _runtime_broker_credentials[mode]["api_key"] = api_key
-    _runtime_broker_credentials[mode]["secret_key"] = secret_key
+    _set_runtime_credentials(mode, api_key, secret_key)
 
     # Ensure broker instance is recreated with latest credentials.
-    global _broker_instance
-    _broker_instance = None
+    _invalidate_broker_instance()
 
     return await get_broker_credentials_status()
 
@@ -659,16 +733,18 @@ async def get_broker_account():
     Returns an informative disconnected payload if unavailable.
     """
     status = await get_broker_credentials_status()
-    mode = "paper" if _config.paper_trading else "live"
+    config = _get_config_snapshot()
+    mode = "paper" if config.paper_trading else "live"
     try:
         broker = get_broker()
+        config = _get_config_snapshot()
         info = broker.get_account_info()
         cash = float(info.get("cash", 0.0))
         equity = float(info.get("equity", info.get("portfolio_value", 0.0)))
         buying_power = float(info.get("buying_power", 0.0))
         currency = str(info.get("currency", "USD"))
         return BrokerAccountResponse(
-            broker=_config.broker,
+            broker=config.broker,
             mode=mode,
             connected=True,
             using_runtime_credentials=status.using_runtime_credentials,
@@ -678,9 +754,9 @@ async def get_broker_account():
             buying_power=buying_power,
             message="Account fetched successfully",
         )
-    except Exception as exc:
+    except (RuntimeError, ValueError, TypeError, KeyError) as exc:
         return BrokerAccountResponse(
-            broker=_config.broker,
+            broker=config.broker,
             mode=mode,
             connected=False,
             using_runtime_credentials=status.using_runtime_credentials,
@@ -709,7 +785,7 @@ async def get_positions(db: Session = Depends(get_db)):
     try:
         broker = get_broker()
         broker_positions = broker.get_positions()
-    except Exception:
+    except RuntimeError:
         storage = StorageService(db)
         local_positions = storage.get_open_positions()
         for position in local_positions:
@@ -870,7 +946,7 @@ async def create_order(
         raise HTTPException(status_code=400, detail=str(e))
     except BrokerError as e:
         raise HTTPException(status_code=503, detail=str(e))
-    except Exception as e:
+    except (RuntimeError, ValueError, TypeError) as e:
         raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
 
 
@@ -1262,8 +1338,9 @@ async def get_runner_status():
 @router.get("/maintenance/storage")
 async def get_storage_settings():
     """Get configured log/audit storage paths and a quick file inventory."""
-    log_dir = Path(_config.log_directory).expanduser().resolve()
-    audit_dir = Path(_config.audit_export_directory).expanduser().resolve()
+    config = _get_config_snapshot()
+    log_dir = Path(config.log_directory).expanduser().resolve()
+    audit_dir = Path(config.audit_export_directory).expanduser().resolve()
     log_files = []
     audit_files = []
     if log_dir.exists():
@@ -1281,8 +1358,8 @@ async def get_storage_settings():
     return {
         "log_directory": str(log_dir),
         "audit_export_directory": str(audit_dir),
-        "log_retention_days": _config.log_retention_days,
-        "audit_retention_days": _config.audit_retention_days,
+        "log_retention_days": config.log_retention_days,
+        "audit_retention_days": config.audit_retention_days,
         "log_files": log_files,
         "audit_files": audit_files,
     }
@@ -1331,10 +1408,11 @@ async def reset_audit_data(
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Failed to reset audit database rows: {exc}")
 
+    config = _get_config_snapshot()
     if clear_log_files:
-        log_files_deleted = _delete_all_files(_config.log_directory)
+        log_files_deleted = _delete_all_files(config.log_directory)
     if clear_audit_export_files:
-        audit_files_deleted = _delete_all_files(_config.audit_export_directory)
+        audit_files_deleted = _delete_all_files(config.audit_export_directory)
 
     return {
         "success": True,
@@ -1440,6 +1518,11 @@ async def run_reconciliation(db: Session = Depends(get_db)):
 @router.websocket("/ws/system-health")
 async def ws_system_health(websocket: WebSocket):
     """Realtime health snapshot stream for UI surfaces."""
+    if _is_api_auth_required():
+        provided_key = _extract_api_key_from_headers(websocket.headers)
+        if not _is_api_key_valid(provided_key):
+            await websocket.close(code=4401)
+            return
     await websocket.accept()
     try:
         while True:
@@ -1457,7 +1540,7 @@ async def ws_system_health(websocket: WebSocket):
                 "last_resume_at": status.get("last_resume_at"),
                 "market_session_open": status.get("market_session_open"),
                 "kill_switch_active": get_global_kill_switch(),
-                "last_broker_sync_at": _last_broker_sync_at,
+                "last_broker_sync_at": _get_last_broker_sync(),
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
             await websocket.send_json(payload)
@@ -1480,22 +1563,22 @@ async def start_runner(
     if cached is not None:
         return RunnerActionResponse(**cached)
 
-    global _config
     storage = StorageService(db)
-    _config = _load_runtime_config(storage)
+    config = _load_runtime_config(storage)
+    _set_config_snapshot(config)
     broker = get_broker()
     max_position_size, risk_limit_daily = _balance_adjusted_limits(
         broker=broker,
-        requested_max_position_size=_config.max_position_size,
-        requested_risk_limit_daily=_config.risk_limit_daily,
+        requested_max_position_size=config.max_position_size,
+        requested_risk_limit_daily=config.risk_limit_daily,
     )
     result = runner_manager.start_runner(
         db=db,
         broker=broker,
         max_position_size=max_position_size,
         risk_limit_daily=risk_limit_daily,
-        tick_interval=_config.tick_interval_seconds,
-        streaming_enabled=_config.streaming_enabled,
+        tick_interval=config.tick_interval_seconds,
+        streaming_enabled=config.streaming_enabled,
     )
     _idempotency_cache_set("/runner/start", x_idempotency_key, result)
     return RunnerActionResponse(**result)
@@ -1553,7 +1636,7 @@ async def selloff_all_positions(x_idempotency_key: Optional[str] = Header(defaul
         )
         _idempotency_cache_set("/portfolio/selloff", x_idempotency_key, response.model_dump())
         return response
-    except Exception as e:
+    except (RuntimeError, ValueError, TypeError) as e:
         return RunnerActionResponse(
             success=False,
             message=f"Selloff failed: {str(e)}",
@@ -2012,7 +2095,7 @@ def _load_trading_preferences(storage: StorageService) -> TradingPreferencesResp
     try:
         raw = json.loads(config_entry.value)
         return TradingPreferencesResponse(**raw)
-    except Exception:
+    except (TypeError, ValueError, json.JSONDecodeError):
         return _trading_preferences
 
 
@@ -2028,8 +2111,9 @@ def _save_trading_preferences(storage: StorageService, preferences: TradingPrefe
 
 def _create_market_screener() -> MarketScreener:
     """Create market screener with runtime keychain credentials when available."""
-    mode = "paper" if _config.paper_trading else "live"
-    runtime_creds = _runtime_broker_credentials.get(mode, {})
+    config = _get_config_snapshot()
+    mode = "paper" if config.paper_trading else "live"
+    runtime_creds = _get_runtime_credentials(mode)
     api_key = (runtime_creds.get("api_key") or "").strip()
     secret_key = (runtime_creds.get("secret_key") or "").strip()
     if api_key and secret_key:
@@ -2148,7 +2232,7 @@ async def get_screener_results(
     broker: Optional[BrokerInterface] = None
     try:
         broker = get_broker()
-    except Exception:
+    except RuntimeError:
         broker = None
     account_snapshot = _load_account_snapshot(broker)
     holdings_snapshot = _load_holdings_snapshot(storage, broker)
@@ -2255,7 +2339,7 @@ async def get_screener_preset(
     broker: Optional[BrokerInterface] = None
     try:
         broker = get_broker()
-    except Exception:
+    except RuntimeError:
         broker = None
     account_snapshot = _load_account_snapshot(broker)
     holdings_snapshot = _load_holdings_snapshot(storage, broker)
@@ -2435,7 +2519,7 @@ async def get_preference_recommendation(
     broker: Optional[BrokerInterface] = None
     try:
         broker = get_broker()
-    except Exception:
+    except RuntimeError:
         broker = None
     account_snapshot = _load_account_snapshot(broker)
     holdings_snapshot = _load_holdings_snapshot(storage, broker)

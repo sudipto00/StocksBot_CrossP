@@ -5,7 +5,6 @@ Loads configuration from environment variables and config files.
 Supports Alpaca broker credentials and other app settings.
 """
 
-import os
 from typing import Optional
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
@@ -47,6 +46,10 @@ class Settings(BaseSettings):
     # Application Configuration
     environment: str = Field(default="development", alias="ENVIRONMENT")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
+
+    # API authentication (optional for local desktop dev/test)
+    api_auth_enabled: bool = Field(default=False, alias="STOCKSBOT_API_KEY_AUTH_ENABLED")
+    api_auth_key: Optional[str] = Field(default=None, alias="STOCKSBOT_API_KEY")
     
     model_config = SettingsConfigDict(
         env_file=".env",

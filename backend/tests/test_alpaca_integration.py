@@ -278,19 +278,55 @@ class TestAlpacaBrokerOrders:
                 quantity=100
             )
     
-    def test_submit_stop_order_not_implemented(self, alpaca_broker):
-        """Test that stop orders raise NotImplementedError."""
-        alpaca_broker._connected = True
-        alpaca_broker._trading_client = Mock()
-        
-        with pytest.raises(NotImplementedError):
-            alpaca_broker.submit_order(
-                symbol="AAPL",
-                side=OrderSide.BUY,
-                order_type=OrderType.STOP,
-                quantity=100,
-                price=150.00
-            )
+    @patch('integrations.alpaca_broker.TradingClient')
+    @patch('integrations.alpaca_broker.StockHistoricalDataClient')
+    def test_submit_stop_order(self, mock_data_client, mock_trading_client, alpaca_broker, mock_order, mock_account):
+        """Test submitting a stop order."""
+        from alpaca.trading.enums import OrderType as AlpacaOrderType
+        mock_order.order_type = AlpacaOrderType.STOP
+        mock_order.limit_price = None
+        mock_order.stop_price = "149.50"
+
+        mock_client_instance = MagicMock()
+        mock_client_instance.get_account.return_value = mock_account
+        mock_client_instance.submit_order.return_value = mock_order
+        mock_trading_client.return_value = mock_client_instance
+        alpaca_broker.connect()
+
+        result = alpaca_broker.submit_order(
+            symbol="AAPL",
+            side=OrderSide.BUY,
+            order_type=OrderType.STOP,
+            quantity=100,
+            price=149.50
+        )
+        assert result["type"] == "stop"
+        assert result["price"] == 149.50
+
+    @patch('integrations.alpaca_broker.TradingClient')
+    @patch('integrations.alpaca_broker.StockHistoricalDataClient')
+    def test_submit_stop_limit_order(self, mock_data_client, mock_trading_client, alpaca_broker, mock_order, mock_account):
+        """Test submitting a stop-limit order."""
+        from alpaca.trading.enums import OrderType as AlpacaOrderType
+        mock_order.order_type = AlpacaOrderType.STOP_LIMIT
+        mock_order.limit_price = "149.00"
+        mock_order.stop_price = "149.00"
+
+        mock_client_instance = MagicMock()
+        mock_client_instance.get_account.return_value = mock_account
+        mock_client_instance.submit_order.return_value = mock_order
+        mock_trading_client.return_value = mock_client_instance
+        alpaca_broker.connect()
+
+        result = alpaca_broker.submit_order(
+            symbol="AAPL",
+            side=OrderSide.BUY,
+            order_type=OrderType.STOP_LIMIT,
+            quantity=100,
+            price=149.00
+        )
+        assert result["type"] == "stop_limit"
+        assert result["price"] == 149.00
     
     @patch('integrations.alpaca_broker.TradingClient')
     @patch('integrations.alpaca_broker.StockHistoricalDataClient')

@@ -345,46 +345,8 @@ class MarketScreener:
         max_sector_weight_pct: float,
         regime: str,
         auto_regime_adjust: bool = True,
-        current_holdings: Optional[List[Dict[str, Any]]] = None,
-        buying_power: Optional[float] = None,
-        equity: Optional[float] = None,
-        weekly_budget: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
-        """Apply scoring and guardrails with optional portfolio-aware adjustments."""
-        holdings = self._normalize_holdings(current_holdings or [])
-        holding_symbols = {h["symbol"] for h in holdings}
-        holding_sector_values: Dict[str, float] = {}
-        total_holding_value = 0.0
-        for holding in holdings:
-            sector = str(holding.get("sector") or "Other")
-            value = float(holding.get("market_value", 0.0))
-            holding_sector_values[sector] = holding_sector_values.get(sector, 0.0) + value
-            total_holding_value += value
-        max_existing_sector_fraction = (
-            max((v / total_holding_value) for v in holding_sector_values.values())
-            if total_holding_value > 0 and holding_sector_values
-            else 0.0
-        )
-
-        if buying_power is not None and math.isfinite(float(buying_power)):
-            bp = max(0.0, float(buying_power))
-            if bp < 2_500:
-                min_dollar_volume = max(min_dollar_volume, 15_000_000)
-                max_spread_bps = min(max_spread_bps, 40)
-            elif bp < 10_000:
-                min_dollar_volume = max(min_dollar_volume, 12_000_000)
-                max_spread_bps = min(max_spread_bps, 45)
-        if weekly_budget is not None and math.isfinite(float(weekly_budget)):
-            wb = max(0.0, float(weekly_budget))
-            if wb < 300:
-                min_dollar_volume = max(min_dollar_volume, 12_000_000)
-                max_spread_bps = min(max_spread_bps, 45)
-        if equity is not None and math.isfinite(float(equity)):
-            eq = max(0.0, float(equity))
-            if eq < 5_000:
-                min_dollar_volume = max(min_dollar_volume, 12_000_000)
-                max_spread_bps = min(max_spread_bps, 45)
-
+        """Apply scoring and guardrails (liquidity/spread/sector concentration)."""
         if auto_regime_adjust:
             if regime == "high_volatility_range":
                 max_spread_bps = min(max_spread_bps, 35)
@@ -393,46 +355,18 @@ class MarketScreener:
                 max_spread_bps = min(max_spread_bps + 10, 90)
             elif regime == "trending_down":
                 min_dollar_volume = max(min_dollar_volume, 18_000_000)
-        if max_existing_sector_fraction >= 0.45:
-            max_sector_weight_pct = min(max_sector_weight_pct, 35)
-        elif max_existing_sector_fraction >= 0.35:
-            max_sector_weight_pct = min(max_sector_weight_pct, 40)
 
         candidates = self._enrich_assets(assets)
         for asset in candidates:
             dollar_volume = float(asset.get("dollar_volume", 0.0))
             spread = float(asset.get("spread_bps", 999.0))
-            symbol = str(asset.get("symbol", "")).upper()
-            sector = str(asset.get("sector", "Other"))
-            base_score = float(asset.get("score", 0.0))
-
-            overlap_penalty = 12.0 if symbol in holding_symbols else 0.0
-            sector_penalty = 0.0
-            if total_holding_value > 0 and sector in holding_sector_values:
-                sector_fraction = holding_sector_values[sector] / total_holding_value
-                if sector_fraction >= 0.45:
-                    sector_penalty = 18.0
-                elif sector_fraction >= 0.35:
-                    sector_penalty = 10.0
-                elif sector_fraction >= 0.25:
-                    sector_penalty = 4.0
-
-            adjusted_score = max(0.0, base_score - overlap_penalty - sector_penalty)
-            asset["score"] = round(adjusted_score, 2)
             tradable = dollar_volume >= min_dollar_volume and spread <= max_spread_bps
             asset["tradable"] = tradable
             if tradable:
-                reasons = [
-                    f"Score {asset.get('score', 0):.1f}",
-                    f"${dollar_volume/1_000_000:.1f}M dollar vol",
-                    f"{spread:.1f} bps spread",
-                ]
-                if overlap_penalty > 0:
-                    reasons.append("existing holding overlap")
-                if sector_penalty > 0:
-                    reasons.append("sector concentration penalty")
                 asset["selection_reason"] = (
-                    "; ".join(reasons)
+                    f"Score {asset.get('score', 0):.1f}; "
+                    f"${dollar_volume/1_000_000:.1f}M dollar vol; "
+                    f"{spread:.1f} bps spread"
                 )
             else:
                 reasons = []
@@ -448,11 +382,6 @@ class MarketScreener:
         per_sector_cap = max(1, int(limit * max_sector_fraction))
         selected: List[Dict[str, Any]] = []
         sector_counts: Dict[str, int] = {}
-        if total_holding_value > 0:
-            for sector, value in holding_sector_values.items():
-                sector_fraction = value / total_holding_value
-                # Existing exposure consumes part of per-sector capacity.
-                sector_counts[sector] = min(per_sector_cap, int(round(sector_fraction * limit)))
         for asset in tradable_assets:
             sector = asset.get("sector", "Other")
             if sector_counts.get(sector, 0) >= per_sector_cap:
@@ -470,34 +399,6 @@ class MarketScreener:
                 if len(selected) >= limit:
                     break
         return selected[:limit]
-
-    def _normalize_holdings(self, holdings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Normalize holdings into symbol/sector/market_value snapshot."""
-        normalized: List[Dict[str, Any]] = []
-        for raw in holdings:
-            symbol = str(raw.get("symbol", "")).strip().upper()
-            if not symbol:
-                continue
-            qty = float(raw.get("quantity", 0.0) or 0.0)
-            current_price = float(raw.get("current_price", raw.get("price", 0.0)) or 0.0)
-            avg_entry_price = float(raw.get("avg_entry_price", 0.0) or 0.0)
-            market_value = float(raw.get("market_value", 0.0) or 0.0)
-            if market_value <= 0:
-                market_value = abs(qty) * (current_price if current_price > 0 else avg_entry_price)
-            asset_type = str(raw.get("asset_type", "")).lower()
-            if asset_type not in {"stock", "etf"}:
-                # Infer ETF-like instruments from common symbols/prefixes.
-                asset_type = "etf" if symbol.startswith("XL") or symbol in {
-                    "SPY", "VOO", "IVV", "QQQ", "IWM", "DIA", "VTI", "VEA", "VWO", "AGG", "TLT", "IEF", "BND",
-                    "XLF", "XLK", "XLE", "XLI", "XLP", "XLV", "XLY", "EEM"
-                } else "stock"
-            normalized.append({
-                "symbol": symbol,
-                "asset_type": asset_type,
-                "market_value": max(0.0, market_value),
-                "sector": self._infer_sector(symbol, asset_type),
-            })
-        return normalized
 
     def _enrich_assets(self, assets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Attach sector/spread/dollar-volume/score fields for explainability."""

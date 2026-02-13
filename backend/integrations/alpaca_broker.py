@@ -3,13 +3,6 @@ Alpaca Broker Integration.
 
 Implements the BrokerInterface for Alpaca Markets API.
 Supports both paper trading and live trading via API credentials.
-
-TODO: Full trading logic implementation
-- Real order execution and tracking
-- Advanced order types (stop-loss, take-profit, etc.)
-- Position management and reconciliation
-- Historical data fetching
-- Streaming market data
 """
 
 from typing import Dict, List, Optional, Any, Callable
@@ -21,16 +14,20 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
     MarketOrderRequest,
     LimitOrderRequest,
+    StopOrderRequest,
+    StopLimitOrderRequest,
     GetOrdersRequest,
 )
 from alpaca.trading.enums import (
     OrderSide as AlpacaOrderSide,
+    OrderType as AlpacaOrderType,
     TimeInForce,
     OrderStatus as AlpacaOrderStatus,
 )
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestQuoteRequest, StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
+from alpaca.common.exceptions import APIError
 
 from services.broker import BrokerInterface, OrderSide, OrderType, OrderStatus
 
@@ -163,7 +160,7 @@ class AlpacaBroker(BrokerInterface):
         try:
             clock = self._trading_client.get_clock()
             return bool(getattr(clock, "is_open", False))
-        except Exception:
+        except (RuntimeError, APIError, OSError):
             return False
 
     def is_symbol_tradable(self, symbol: str) -> bool:
@@ -173,7 +170,7 @@ class AlpacaBroker(BrokerInterface):
         try:
             asset = self._trading_client.get_asset(symbol)
             return bool(getattr(asset, "tradable", False))
-        except Exception:
+        except (RuntimeError, APIError, OSError):
             return False
 
     def get_next_market_open(self) -> Optional[datetime]:
@@ -188,7 +185,7 @@ class AlpacaBroker(BrokerInterface):
             if isinstance(next_open, datetime):
                 return next_open
             return None
-        except Exception:
+        except (RuntimeError, APIError, OSError):
             return None
     
     def get_positions(self) -> List[Dict[str, Any]]:
@@ -230,17 +227,12 @@ class AlpacaBroker(BrokerInterface):
         """
         Submit an order to Alpaca.
         
-        TODO: Add support for all order types (stop, stop_limit)
-        TODO: Add order validation and risk checks
-        TODO: Add support for fractional shares
-        TODO: Add support for extended hours trading
-        
         Args:
             symbol: Stock symbol
             side: Buy or sell
             order_type: Market, limit, etc.
             quantity: Number of shares
-            price: Limit price (for limit orders)
+            price: Limit/stop price for non-market orders
             
         Returns:
             Order confirmation dict
@@ -273,10 +265,37 @@ class AlpacaBroker(BrokerInterface):
                 limit_price=price
             )
             order = self._trading_client.submit_order(order_data)
+
+        elif order_type == OrderType.STOP:
+            if price is None:
+                raise ValueError("Price required for stop orders")
+
+            order_data = StopOrderRequest(
+                symbol=symbol,
+                qty=quantity,
+                side=alpaca_side,
+                time_in_force=TimeInForce.DAY,
+                stop_price=price,
+            )
+            order = self._trading_client.submit_order(order_data)
+
+        elif order_type == OrderType.STOP_LIMIT:
+            if price is None:
+                raise ValueError("Price required for stop_limit orders")
+            # Broker interface currently carries a single optional price field.
+            # Use it for both stop and limit legs for now.
+            order_data = StopLimitOrderRequest(
+                symbol=symbol,
+                qty=quantity,
+                side=alpaca_side,
+                time_in_force=TimeInForce.DAY,
+                stop_price=price,
+                limit_price=price,
+            )
+            order = self._trading_client.submit_order(order_data)
         
         else:
-            # TODO: Implement stop and stop_limit orders
-            raise NotImplementedError(f"Order type {order_type} not yet implemented")
+            raise ValueError(f"Unsupported order type: {order_type}")
         
         return self._map_alpaca_order(order)
     
@@ -450,7 +469,7 @@ class AlpacaBroker(BrokerInterface):
         def _run_stream() -> None:
             try:
                 from alpaca.trading.stream import TradingStream
-            except Exception as exc:
+            except (ImportError, ModuleNotFoundError) as exc:
                 logger.warning(f"TradingStream not available, streaming disabled: {exc}")
                 self._trade_stream_running = False
                 return
@@ -465,14 +484,14 @@ class AlpacaBroker(BrokerInterface):
                     }
                     if self._trade_update_callback:
                         self._trade_update_callback(payload)
-                except Exception as callback_exc:
+                except (RuntimeError, ValueError, TypeError) as callback_exc:
                     logger.warning(f"Trade update callback error: {callback_exc}")
 
             try:
                 self._trade_stream = TradingStream(self.api_key, self.secret_key, paper=self.paper)
                 self._trade_stream.subscribe_trade_updates(_handler)
                 self._trade_stream.run()
-            except Exception as stream_exc:
+            except (RuntimeError, APIError, OSError) as stream_exc:
                 logger.warning(f"Trade update stream ended: {stream_exc}")
             finally:
                 self._trade_stream_running = False
@@ -493,7 +512,7 @@ class AlpacaBroker(BrokerInterface):
                     stop_ws()
             self._trade_stream = None
             return True
-        except Exception as exc:
+        except (RuntimeError, OSError) as exc:
             logger.warning(f"Failed to stop trade update stream cleanly: {exc}")
             return False
     
@@ -512,9 +531,16 @@ class AlpacaBroker(BrokerInterface):
         """
         # Handle both 'order_type' (newer) and 'type' (older) attributes
         if hasattr(order, 'order_type'):
-            order_type_value = order.order_type.value
+            raw_order_type = order.order_type
         else:
-            order_type_value = order.type.value
+            raw_order_type = order.type
+        order_type_value = self._map_from_alpaca_order_type(raw_order_type)
+
+        limit_price = getattr(order, "limit_price", None)
+        stop_price = getattr(order, "stop_price", None)
+        normalized_limit_price = self._safe_optional_float(limit_price)
+        normalized_stop_price = self._safe_optional_float(stop_price)
+        normalized_price = normalized_limit_price if normalized_limit_price is not None else normalized_stop_price
             
         return {
             "id": order.id,
@@ -524,12 +550,33 @@ class AlpacaBroker(BrokerInterface):
             "type": order_type_value,
             "quantity": float(order.qty),
             "filled_quantity": float(order.filled_qty) if order.filled_qty else 0.0,
-            "price": float(order.limit_price) if order.limit_price else None,
+            "price": normalized_price,
+            "stop_price": normalized_stop_price,
             "avg_fill_price": float(order.filled_avg_price) if order.filled_avg_price else None,
             "status": self._map_from_alpaca_status(order.status),
             "created_at": order.created_at.isoformat(),
             "updated_at": order.updated_at.isoformat() if order.updated_at else order.created_at.isoformat(),
         }
+
+    def _map_from_alpaca_order_type(self, alpaca_order_type: Any) -> str:
+        """Map Alpaca order type object/value to our normalized order-type string."""
+        raw = alpaca_order_type.value if hasattr(alpaca_order_type, "value") else str(alpaca_order_type)
+        mapping = {
+            AlpacaOrderType.MARKET.value: OrderType.MARKET.value,
+            AlpacaOrderType.LIMIT.value: OrderType.LIMIT.value,
+            AlpacaOrderType.STOP.value: OrderType.STOP.value,
+            AlpacaOrderType.STOP_LIMIT.value: OrderType.STOP_LIMIT.value,
+        }
+        return mapping.get(str(raw).lower(), str(raw).lower())
+
+    @staticmethod
+    def _safe_optional_float(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
     
     def _map_from_alpaca_status(self, alpaca_status: AlpacaOrderStatus) -> str:
         """Map Alpaca order status to our OrderStatus."""

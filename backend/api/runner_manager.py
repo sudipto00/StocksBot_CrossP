@@ -145,7 +145,7 @@ class RunnerManager:
                 if prefs_raw and prefs_raw.value:
                     try:
                         prefs = json.loads(prefs_raw.value)
-                    except Exception:
+                    except (TypeError, ValueError, json.JSONDecodeError):
                         prefs = {}
                 
                 if strategy_count == 0:
@@ -161,7 +161,7 @@ class RunnerManager:
                 account_info: Dict[str, Any] = {}
                 try:
                     account_info = runner.broker.get_account_info()
-                except Exception:
+                except (RuntimeError, ValueError, TypeError):
                     account_info = {}
                 account_equity = self._safe_float(account_info.get("equity", account_info.get("portfolio_value", 0.0)), 0.0)
                 account_buying_power = self._safe_float(account_info.get("buying_power", 0.0), 0.0)
@@ -425,7 +425,7 @@ class RunnerManager:
                         self.runner.broker.start_trade_update_stream(self.runner._on_broker_trade_update)  # noqa: SLF001
                     else:
                         self.runner.broker.stop_trade_update_stream()
-                except Exception:
+                except RuntimeError:
                     pass
     
     def get_status(self) -> Dict[str, Any]:
