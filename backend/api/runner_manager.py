@@ -49,6 +49,8 @@ class RunnerManager:
         broker: Optional[Any] = None,
         max_position_size: float = 10000.0,
         risk_limit_daily: float = 500.0,
+        tick_interval: float = 60.0,
+        streaming_enabled: bool = False,
     ) -> StrategyRunner:
         """
         Get the runner instance, creating it if necessary.
@@ -76,9 +78,16 @@ class RunnerManager:
             self.runner = StrategyRunner(
                 broker=active_broker,
                 storage_service=storage,
-                tick_interval=60.0,
+                tick_interval=tick_interval,
                 order_execution_service=execution_service,
+                streaming_enabled=streaming_enabled,
             )
+        else:
+            self.runner.tick_interval = tick_interval
+            self.runner.streaming_enabled = streaming_enabled
+            if self.runner.order_execution_service:
+                self.runner.order_execution_service.max_position_size = max_position_size
+                self.runner.order_execution_service.risk_limit_daily = risk_limit_daily
         
         return self.runner
     
@@ -88,6 +97,8 @@ class RunnerManager:
         broker: Optional[Any] = None,
         max_position_size: float = 10000.0,
         risk_limit_daily: float = 500.0,
+        tick_interval: float = 60.0,
+        streaming_enabled: bool = False,
     ) -> Dict[str, Any]:
         """
         Start the strategy runner.
@@ -107,12 +118,14 @@ class RunnerManager:
                 broker=broker,
                 max_position_size=max_position_size,
                 risk_limit_daily=risk_limit_daily,
+                tick_interval=tick_interval,
+                streaming_enabled=streaming_enabled,
             )
             
-            if runner.status == StrategyStatus.RUNNING:
+            if runner.status in (StrategyStatus.RUNNING, StrategyStatus.SLEEPING):
                 return {
                     "success": False,
-                    "message": "Runner already running",
+                    "message": f"Runner already active ({runner.status.value})",
                     "status": runner.status.value
                 }
 
@@ -301,6 +314,40 @@ class RunnerManager:
                     "message": "Failed to stop runner",
                     "status": self.runner.status.value
                 }
+
+    def remove_strategy_by_name(self, strategy_name: str) -> bool:
+        """
+        Remove a loaded strategy from in-memory runner state.
+        Safe to call whether runner exists or not.
+        """
+        with self._lock:
+            if self.runner is None:
+                return False
+            if strategy_name in self.runner.strategies:
+                del self.runner.strategies[strategy_name]
+                return True
+            return False
+
+    def set_tick_interval(self, tick_interval: float) -> None:
+        """Update runner polling interval when config changes."""
+        with self._lock:
+            if self.runner is not None:
+                self.runner.tick_interval = tick_interval
+
+    def set_streaming_enabled(self, enabled: bool) -> None:
+        """Enable/disable broker stream assist on an existing runner."""
+        with self._lock:
+            if self.runner is None:
+                return
+            self.runner.streaming_enabled = enabled
+            if self.runner.status == StrategyStatus.RUNNING:
+                try:
+                    if enabled:
+                        self.runner.broker.start_trade_update_stream(self.runner._on_broker_trade_update)  # noqa: SLF001
+                    else:
+                        self.runner.broker.stop_trade_update_stream()
+                except Exception:
+                    pass
     
     def get_status(self) -> Dict[str, Any]:
         """
@@ -314,7 +361,21 @@ class RunnerManager:
                 "status": "stopped",
                 "strategies": [],
                 "tick_interval": 60.0,
-                "broker_connected": False
+                "broker_connected": False,
+                "poll_success_count": 0,
+                "poll_error_count": 0,
+                "last_poll_error": "",
+                "last_poll_at": None,
+                "last_successful_poll_at": None,
+                "last_reconciliation_at": None,
+                "last_reconciliation_discrepancies": 0,
+                "sleeping": False,
+                "sleep_since": None,
+                "next_market_open_at": None,
+                "last_resume_at": None,
+                "last_catchup_at": None,
+                "resume_count": 0,
+                "market_session_open": None,
             }
         
         return self.runner.get_status()

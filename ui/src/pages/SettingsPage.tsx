@@ -7,11 +7,16 @@ import {
   updateConfig,
   getBrokerCredentialsStatus,
   setBrokerCredentials,
+  getMaintenanceStorage,
+  runMaintenanceCleanup,
   getTradingPreferences,
   updateTradingPreferences,
   getSummaryNotificationPreferences,
   updateSummaryNotificationPreferences,
   sendSummaryNotificationNow,
+  getSafetyStatus,
+  setKillSwitch,
+  runPanicStop,
 } from '../api/backend';
 import {
   AssetTypePreference,
@@ -21,6 +26,7 @@ import {
   EtfPresetPreference,
   SummaryNotificationFrequency,
   SummaryNotificationChannel,
+  MaintenanceStorageResponse,
 } from '../api/types';
 import HelpTooltip from '../components/HelpTooltip';
 import CollapsibleSection from '../components/CollapsibleSection';
@@ -47,6 +53,10 @@ const SETTINGS_LIMITS = {
   weeklyBudgetMax: 1_000_000,
   screenerLimitMin: 10,
   screenerLimitMax: 200,
+  tickIntervalMin: 5,
+  tickIntervalMax: 3600,
+  retentionDaysMin: 1,
+  retentionDaysMax: 3650,
 };
 
 const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
@@ -71,7 +81,15 @@ function SettingsPage() {
   const [paperTrading, setPaperTrading] = useState(true);
   const [maxPositionSize, setMaxPositionSize] = useState(10000);
   const [riskLimitDaily, setRiskLimitDaily] = useState(500);
+  const [tickIntervalSeconds, setTickIntervalSeconds] = useState(60);
+  const [streamingEnabled, setStreamingEnabled] = useState(false);
   const [broker, setBroker] = useState("paper");
+  const [logDirectory, setLogDirectory] = useState('./logs');
+  const [auditExportDirectory, setAuditExportDirectory] = useState('./audit_exports');
+  const [logRetentionDays, setLogRetentionDays] = useState(30);
+  const [auditRetentionDays, setAuditRetentionDays] = useState(90);
+  const [storageInfo, setStorageInfo] = useState<MaintenanceStorageResponse | null>(null);
+  const [cleanupLoading, setCleanupLoading] = useState(false);
   const [credentialMode, setCredentialMode] = useState<CredentialMode>('paper');
   const [alpacaApiKey, setAlpacaApiKey] = useState('');
   const [alpacaSecretKey, setAlpacaSecretKey] = useState('');
@@ -80,7 +98,7 @@ function SettingsPage() {
     paper_available: false,
     live_available: false,
   });
-  const [assetType, setAssetType] = useState<AssetTypePreference>('both');
+  const [assetType, setAssetType] = useState<AssetTypePreference>('stock');
   const [riskProfile, setRiskProfile] = useState<RiskProfilePreference>('balanced');
   const [weeklyBudget, setWeeklyBudget] = useState(200);
   const [screenerLimit, setScreenerLimit] = useState(50);
@@ -91,6 +109,8 @@ function SettingsPage() {
   const [summaryFrequency, setSummaryFrequency] = useState<SummaryNotificationFrequency>('daily');
   const [summaryChannel, setSummaryChannel] = useState<SummaryNotificationChannel>('email');
   const [summaryRecipient, setSummaryRecipient] = useState('');
+  const [killSwitchActive, setKillSwitchActive] = useState(false);
+  const [panicLoading, setPanicLoading] = useState(false);
   
   // Validation errors
   const [validationErrors, setValidationErrors] = useState<Record<string, string>>({});
@@ -110,11 +130,23 @@ function SettingsPage() {
     if (screenerLimit < SETTINGS_LIMITS.screenerLimitMin || screenerLimit > SETTINGS_LIMITS.screenerLimitMax) {
       errors.screenerLimit = `Most active count must be between ${SETTINGS_LIMITS.screenerLimitMin} and ${SETTINGS_LIMITS.screenerLimitMax}`;
     }
+    if (tickIntervalSeconds < SETTINGS_LIMITS.tickIntervalMin || tickIntervalSeconds > SETTINGS_LIMITS.tickIntervalMax) {
+      errors.tickIntervalSeconds = `Runner interval must be between ${SETTINGS_LIMITS.tickIntervalMin} and ${SETTINGS_LIMITS.tickIntervalMax} seconds`;
+    }
+    if (!logDirectory.trim()) {
+      errors.logDirectory = 'Log directory cannot be empty';
+    }
+    if (!auditExportDirectory.trim()) {
+      errors.auditExportDirectory = 'Audit export directory cannot be empty';
+    }
+    if (logRetentionDays < SETTINGS_LIMITS.retentionDaysMin || logRetentionDays > SETTINGS_LIMITS.retentionDaysMax) {
+      errors.logRetentionDays = `Log retention must be between ${SETTINGS_LIMITS.retentionDaysMin} and ${SETTINGS_LIMITS.retentionDaysMax} days`;
+    }
+    if (auditRetentionDays < SETTINGS_LIMITS.retentionDaysMin || auditRetentionDays > SETTINGS_LIMITS.retentionDaysMax) {
+      errors.auditRetentionDays = `Audit retention must be between ${SETTINGS_LIMITS.retentionDaysMin} and ${SETTINGS_LIMITS.retentionDaysMax} days`;
+    }
     if (assetType !== 'stock' && universeMode === 'most_active') {
       errors.universeMode = 'Most Active universe is available only for Stocks';
-    }
-    if (assetType === 'both' && universeMode === 'preset') {
-      errors.universeMode = 'Preset mode requires Stocks or ETFs only';
     }
     if (summaryEnabled) {
       const recipient = summaryRecipient.trim();
@@ -145,13 +177,22 @@ function SettingsPage() {
       setPaperTrading(config.paper_trading);
       setMaxPositionSize(config.max_position_size);
       setRiskLimitDaily(config.risk_limit_daily);
+      setTickIntervalSeconds(config.tick_interval_seconds || 60);
+      setStreamingEnabled(Boolean(config.streaming_enabled));
       setBroker(config.broker);
+      setLogDirectory(config.log_directory || './logs');
+      setAuditExportDirectory(config.audit_export_directory || './audit_exports');
+      setLogRetentionDays(config.log_retention_days || 30);
+      setAuditRetentionDays(config.audit_retention_days || 90);
       const prefs = await getTradingPreferences();
-      setAssetType(prefs.asset_type);
+      const normalizedAssetType: AssetTypePreference = prefs.asset_type === 'etf' ? 'etf' : 'stock';
+      const normalizedUniverseMode: ScreenerModePreference =
+        normalizedAssetType === 'stock' ? prefs.screener_mode : 'preset';
+      setAssetType(normalizedAssetType);
       setRiskProfile(prefs.risk_profile);
       setWeeklyBudget(prefs.weekly_budget);
       setScreenerLimit(prefs.screener_limit);
-      setUniverseMode(prefs.screener_mode);
+      setUniverseMode(normalizedUniverseMode);
       setStockPreset(prefs.stock_preset);
       setEtfPreset(prefs.etf_preset);
       const summaryPrefs = await getSummaryNotificationPreferences();
@@ -159,6 +200,14 @@ function SettingsPage() {
       setSummaryFrequency(summaryPrefs.frequency);
       setSummaryChannel(summaryPrefs.channel);
       setSummaryRecipient(summaryPrefs.recipient || '');
+      const safety = await getSafetyStatus().catch(() => ({ kill_switch_active: false, last_broker_sync_at: null }));
+      setKillSwitchActive(Boolean(safety.kill_switch_active));
+      try {
+        const storage = await getMaintenanceStorage();
+        setStorageInfo(storage);
+      } catch {
+        setStorageInfo(null);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load settings');
       await showErrorNotification('Settings Error', 'Failed to load settings');
@@ -187,17 +236,19 @@ function SettingsPage() {
       const effectiveRiskProfile: RiskProfilePreference =
         assetType === 'etf' ? (etfPreset as RiskProfilePreference) : riskProfile;
       const effectiveUniverseMode: ScreenerModePreference =
-        assetType === 'stock'
-          ? universeMode
-          : assetType === 'both'
-          ? 'most_active'
-          : 'preset';
+        assetType === 'stock' ? universeMode : 'preset';
       
       await updateConfig({
         trading_enabled: tradingEnabled,
         paper_trading: paperTrading,
         max_position_size: maxPositionSize,
         risk_limit_daily: riskLimitDaily,
+        tick_interval_seconds: tickIntervalSeconds,
+        streaming_enabled: streamingEnabled,
+        log_directory: logDirectory.trim(),
+        audit_export_directory: auditExportDirectory.trim(),
+        log_retention_days: logRetentionDays,
+        audit_retention_days: auditRetentionDays,
         broker,
       });
       await updateTradingPreferences({
@@ -215,6 +266,11 @@ function SettingsPage() {
         channel: summaryChannel,
         recipient: summaryRecipient.trim(),
       });
+      try {
+        setStorageInfo(await getMaintenanceStorage());
+      } catch {
+        setStorageInfo(null);
+      }
       
       await showSuccessNotification('Settings Saved', 'Your settings have been saved successfully');
     } catch (err) {
@@ -320,6 +376,57 @@ function SettingsPage() {
     }
   };
 
+  const handleRunCleanupNow = async () => {
+    try {
+      setCleanupLoading(true);
+      const result = await runMaintenanceCleanup();
+      await showSuccessNotification(
+        'Cleanup Complete',
+        `Deleted ${result.log_files_deleted} log files, ${result.audit_files_deleted} audit files, and ${result.audit_rows_deleted} audit rows`
+      );
+      setStorageInfo(await getMaintenanceStorage());
+    } catch (err) {
+      await showErrorNotification('Cleanup Failed', err instanceof Error ? err.message : 'Failed to run cleanup');
+    } finally {
+      setCleanupLoading(false);
+    }
+  };
+
+  const handleToggleKillSwitch = async () => {
+    try {
+      const next = !killSwitchActive;
+      const result = await setKillSwitch(next);
+      setKillSwitchActive(result.kill_switch_active);
+      await showSuccessNotification(
+        'Safety Updated',
+        `Kill switch ${result.kill_switch_active ? 'enabled' : 'disabled'}`
+      );
+    } catch (err) {
+      await showErrorNotification('Safety Update Failed', err instanceof Error ? err.message : 'Failed to update kill switch');
+    }
+  };
+
+  const handlePanicStop = async () => {
+    try {
+      setPanicLoading(true);
+      const result = await runPanicStop();
+      setKillSwitchActive(true);
+      await showSuccessNotification('Panic Stop Executed', result.message);
+    } catch (err) {
+      await showErrorNotification('Panic Stop Failed', err instanceof Error ? err.message : 'Failed to execute panic stop');
+    } finally {
+      setPanicLoading(false);
+    }
+  };
+
+  const handleRefreshStorageInfo = async () => {
+    try {
+      setStorageInfo(await getMaintenanceStorage());
+    } catch (err) {
+      await showErrorNotification('Storage Refresh Failed', err instanceof Error ? err.message : 'Failed to refresh storage info');
+    }
+  };
+
   if (loading) {
     return (
       <div className="p-8">
@@ -403,6 +510,25 @@ function SettingsPage() {
               />
             </button>
           </div>
+
+          <div className="flex items-center justify-between">
+            <div>
+              <label className="text-white font-medium flex items-center gap-1">Realtime Stream Assist <HelpTooltip text="Enable Alpaca websocket trade updates with polling fallback for faster order sync." /></label>
+              <p className="text-gray-400 text-sm">Hybrid mode: websocket updates + deterministic polling fallback</p>
+            </div>
+            <button
+              onClick={() => setStreamingEnabled(!streamingEnabled)}
+              className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                streamingEnabled ? 'bg-emerald-600' : 'bg-gray-600'
+              }`}
+            >
+              <span
+                className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                  streamingEnabled ? 'translate-x-6' : 'translate-x-1'
+                }`}
+              />
+            </button>
+          </div>
         </div>
       </CollapsibleSection>
 
@@ -455,6 +581,33 @@ function SettingsPage() {
             />
             {validationErrors.riskLimitDaily && (
               <p className="text-red-400 text-sm mt-1">{validationErrors.riskLimitDaily}</p>
+            )}
+          </div>
+
+          <div>
+            <label className="text-white font-medium block mb-2">Runner Poll Interval (seconds) <HelpTooltip text="How often strategies poll market data and evaluate signals." /></label>
+            <input
+              type="number"
+              value={tickIntervalSeconds}
+              onChange={(e) => setTickIntervalSeconds(parseFloat(e.target.value) || 0)}
+              onBlur={(e) => {
+                const parsed = Number.parseFloat(e.target.value);
+                setTickIntervalSeconds(
+                  Number.isFinite(parsed)
+                    ? clamp(parsed, SETTINGS_LIMITS.tickIntervalMin, SETTINGS_LIMITS.tickIntervalMax)
+                    : 60
+                );
+              }}
+              className={`bg-gray-700 text-white px-4 py-2 rounded border ${
+                validationErrors.tickIntervalSeconds ? 'border-red-500' : 'border-gray-600'
+              } w-full`}
+              min={SETTINGS_LIMITS.tickIntervalMin}
+              max={SETTINGS_LIMITS.tickIntervalMax}
+              step="1"
+            />
+            <p className="text-gray-500 text-xs mt-1">Lower intervals react faster but increase API load.</p>
+            {validationErrors.tickIntervalSeconds && (
+              <p className="text-red-400 text-sm mt-1">{validationErrors.tickIntervalSeconds}</p>
             )}
           </div>
         </div>
@@ -552,6 +705,141 @@ function SettingsPage() {
 
         <div className="mt-4 text-blue-400 text-sm">
           ℹ️ See ALPACA_SETUP.md for instructions on getting Alpaca paper/live keys
+        </div>
+      </CollapsibleSection>
+
+      <CollapsibleSection title="Storage & Retention" summary="Log and audit paths, retention, and cleanup">
+        <div className="space-y-4">
+          <div>
+            <label className="text-white font-medium block mb-2">Log Directory <HelpTooltip text="Folder used for backend rotating log files." /></label>
+            <input
+              type="text"
+              value={logDirectory}
+              onChange={(e) => setLogDirectory(e.target.value)}
+              className={`bg-gray-700 text-white px-4 py-2 rounded border ${
+                validationErrors.logDirectory ? 'border-red-500' : 'border-gray-600'
+              } w-full`}
+            />
+            {validationErrors.logDirectory && <p className="text-red-400 text-sm mt-1">{validationErrors.logDirectory}</p>}
+          </div>
+
+          <div>
+            <label className="text-white font-medium block mb-2">Audit Export Directory <HelpTooltip text="Folder used for CSV/PDF audit exports." /></label>
+            <input
+              type="text"
+              value={auditExportDirectory}
+              onChange={(e) => setAuditExportDirectory(e.target.value)}
+              className={`bg-gray-700 text-white px-4 py-2 rounded border ${
+                validationErrors.auditExportDirectory ? 'border-red-500' : 'border-gray-600'
+              } w-full`}
+            />
+            {validationErrors.auditExportDirectory && <p className="text-red-400 text-sm mt-1">{validationErrors.auditExportDirectory}</p>}
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <div>
+              <label className="text-white font-medium block mb-2">Log Retention (days)</label>
+              <input
+                type="number"
+                value={logRetentionDays}
+                min={SETTINGS_LIMITS.retentionDaysMin}
+                max={SETTINGS_LIMITS.retentionDaysMax}
+                onChange={(e) => setLogRetentionDays(parseInt(e.target.value || '0', 10) || 0)}
+                className={`bg-gray-700 text-white px-4 py-2 rounded border ${
+                  validationErrors.logRetentionDays ? 'border-red-500' : 'border-gray-600'
+                } w-full`}
+              />
+              {validationErrors.logRetentionDays && <p className="text-red-400 text-sm mt-1">{validationErrors.logRetentionDays}</p>}
+            </div>
+            <div>
+              <label className="text-white font-medium block mb-2">Audit Retention (days)</label>
+              <input
+                type="number"
+                value={auditRetentionDays}
+                min={SETTINGS_LIMITS.retentionDaysMin}
+                max={SETTINGS_LIMITS.retentionDaysMax}
+                onChange={(e) => setAuditRetentionDays(parseInt(e.target.value || '0', 10) || 0)}
+                className={`bg-gray-700 text-white px-4 py-2 rounded border ${
+                  validationErrors.auditRetentionDays ? 'border-red-500' : 'border-gray-600'
+                } w-full`}
+              />
+              {validationErrors.auditRetentionDays && <p className="text-red-400 text-sm mt-1">{validationErrors.auditRetentionDays}</p>}
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              onClick={handleRunCleanupNow}
+              disabled={cleanupLoading}
+              className="bg-amber-600 hover:bg-amber-700 disabled:bg-gray-600 text-white px-4 py-2 rounded font-medium"
+            >
+              {cleanupLoading ? 'Cleaning...' : 'Run Cleanup Now'}
+            </button>
+            <button
+              onClick={handleRefreshStorageInfo}
+              className="bg-gray-700 hover:bg-gray-600 text-gray-100 px-4 py-2 rounded font-medium"
+            >
+              Refresh File Inventory
+            </button>
+          </div>
+
+          {storageInfo && (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
+              <div className="rounded border border-gray-700 bg-gray-800/40 p-3">
+                <p className="text-gray-400 mb-2">Recent Log Files ({storageInfo.log_files.length})</p>
+                <div className="max-h-36 overflow-auto space-y-1">
+                  {storageInfo.log_files.map((f) => (
+                    <div key={`log-${f.name}`} className="text-gray-200">
+                      {f.name} <span className="text-gray-500">({Math.round(f.size_bytes / 1024)} KB)</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div className="rounded border border-gray-700 bg-gray-800/40 p-3">
+                <p className="text-gray-400 mb-2">Recent Audit Files ({storageInfo.audit_files.length})</p>
+                <div className="max-h-36 overflow-auto space-y-1">
+                  {storageInfo.audit_files.map((f) => (
+                    <div key={`audit-${f.name}`} className="text-gray-200">
+                      {f.name} <span className="text-gray-500">({Math.round(f.size_bytes / 1024)} KB)</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      </CollapsibleSection>
+
+      <CollapsibleSection title="Safety Controls" summary="Global kill switch and panic controls">
+        <div className="space-y-4">
+          <div className="flex items-center justify-between">
+            <div>
+              <label className="text-white font-medium flex items-center gap-1">Kill Switch <HelpTooltip text="Blocks all new order submissions while enabled." /></label>
+              <p className="text-gray-400 text-sm">Use for emergency trading freeze.</p>
+            </div>
+            <button
+              onClick={handleToggleKillSwitch}
+              className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                killSwitchActive ? 'bg-red-600' : 'bg-gray-600'
+              }`}
+            >
+              <span
+                className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                  killSwitchActive ? 'translate-x-6' : 'translate-x-1'
+                }`}
+              />
+            </button>
+          </div>
+          <div className="rounded border border-red-800 bg-red-900/20 p-3">
+            <p className="text-sm text-red-200">Panic Stop immediately enables kill switch, stops runner, and triggers selloff.</p>
+            <button
+              onClick={handlePanicStop}
+              disabled={panicLoading}
+              className="mt-2 bg-rose-700 hover:bg-rose-800 disabled:bg-gray-600 text-white px-4 py-2 rounded font-medium"
+            >
+              {panicLoading ? 'Executing...' : 'Run Panic Stop'}
+            </button>
+          </div>
         </div>
       </CollapsibleSection>
 
@@ -695,7 +983,7 @@ function SettingsPage() {
           <li>✓ Market Screener - View most actively traded stocks and ETFs</li>
           <li>✓ Risk Profiles - Conservative, Balanced, and Aggressive strategies</li>
           <li>✓ Weekly Budget Tracking - Manage up to $200/week trading budget</li>
-          <li>✓ Asset Type Preferences - Choose between stocks, ETFs, or both</li>
+          <li>✓ Asset Type Preferences - Choose stocks or ETFs</li>
         </ul>
         <p className="text-blue-200/60 text-sm mt-3">
           Visit the new Screener page to explore these features!

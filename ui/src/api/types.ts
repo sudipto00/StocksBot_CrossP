@@ -43,6 +43,7 @@ export enum NotificationSeverity {
 export enum RunnerStatus {
   STOPPED = "stopped",
   RUNNING = "running",
+  SLEEPING = "sleeping",
   PAUSED = "paused",
   ERROR = "error",
 }
@@ -63,6 +64,12 @@ export interface ConfigResponse {
   paper_trading: boolean;
   max_position_size: number;
   risk_limit_daily: number;
+  tick_interval_seconds: number;
+  streaming_enabled: boolean;
+  log_directory: string;
+  audit_export_directory: string;
+  log_retention_days: number;
+  audit_retention_days: number;
   broker: string;
 }
 
@@ -121,6 +128,12 @@ export interface ConfigUpdateRequest {
   paper_trading?: boolean;
   max_position_size?: number;
   risk_limit_daily?: number;
+  tick_interval_seconds?: number;
+  streaming_enabled?: boolean;
+  log_directory?: string;
+  audit_export_directory?: string;
+  log_retention_days?: number;
+  audit_retention_days?: number;
   broker?: string;
 }
 
@@ -277,19 +290,93 @@ export interface RunnerState {
   strategies: unknown[];
   tick_interval: number;
   broker_connected: boolean;
+  poll_success_count?: number;
+  poll_error_count?: number;
+  last_poll_error?: string;
+  last_poll_at?: string | null;
+  last_successful_poll_at?: string | null;
+  sleeping?: boolean;
+  sleep_since?: string | null;
+  next_market_open_at?: string | null;
+  last_resume_at?: string | null;
+  last_catchup_at?: string | null;
+  resume_count?: number;
+  market_session_open?: boolean | null;
 }
 
 export interface RunnerStatusResponse {
-  status: string; // stopped, running, paused, error
+  status: string; // stopped, running, sleeping, paused, error
   strategies: unknown[];
   tick_interval: number;
   broker_connected: boolean;
+  poll_success_count: number;
+  poll_error_count: number;
+  last_poll_error: string;
+  last_poll_at?: string | null;
+  last_successful_poll_at?: string | null;
+  last_reconciliation_at?: string | null;
+  last_reconciliation_discrepancies?: number;
+  sleeping?: boolean;
+  sleep_since?: string | null;
+  next_market_open_at?: string | null;
+  last_resume_at?: string | null;
+  last_catchup_at?: string | null;
+  resume_count?: number;
+  market_session_open?: boolean | null;
 }
 
 export interface RunnerActionResponse {
   success: boolean;
   message: string;
   status: string;
+}
+
+export interface SystemHealthSnapshot {
+  runner_status: string;
+  broker_connected: boolean;
+  poll_error_count: number;
+  last_poll_error: string;
+  critical_event_count: number;
+  last_successful_poll_at?: string | null;
+  sleeping?: boolean;
+  sleep_since?: string | null;
+  next_market_open_at?: string | null;
+  last_resume_at?: string | null;
+  market_session_open?: boolean | null;
+  kill_switch_active?: boolean;
+  last_broker_sync_at?: string | null;
+}
+
+export interface SafetyStatusResponse {
+  kill_switch_active: boolean;
+  last_broker_sync_at?: string | null;
+}
+
+export interface SafetyPreflightResponse {
+  allowed: boolean;
+  reason: string;
+}
+
+export interface StorageFileItem {
+  name: string;
+  size_bytes: number;
+  modified_at: string;
+}
+
+export interface MaintenanceStorageResponse {
+  log_directory: string;
+  audit_export_directory: string;
+  log_retention_days: number;
+  audit_retention_days: number;
+  log_files: StorageFileItem[];
+  audit_files: StorageFileItem[];
+}
+
+export interface MaintenanceCleanupResponse {
+  success: boolean;
+  audit_rows_deleted: number;
+  log_files_deleted: number;
+  audit_files_deleted: number;
 }
 
 // ============================================================================
@@ -443,7 +530,7 @@ export interface ParameterTuneResponse {
 // Trading Preferences Types
 // ============================================================================
 
-export type AssetTypePreference = 'stock' | 'etf' | 'both';
+export type AssetTypePreference = 'stock' | 'etf';
 export type RiskProfilePreference = 'conservative' | 'balanced' | 'aggressive';
 export type ScreenerModePreference = 'most_active' | 'preset';
 export type StockPresetPreference = 'weekly_optimized' | 'three_to_five_weekly' | 'monthly_optimized' | 'small_budget_weekly';

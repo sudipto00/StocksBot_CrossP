@@ -123,6 +123,16 @@ class OrderRepository:
     def get_recent(self, limit: int = 100) -> List[Order]:
         """Get recent orders."""
         return self.db.query(Order).order_by(Order.created_at.desc()).limit(limit).all()
+
+    def get_open_orders(self, limit: int = 500) -> List[Order]:
+        """Get orders that may still change status (pending/open/partially filled)."""
+        return (
+            self.db.query(Order)
+            .filter(Order.status.in_([OrderStatusEnum.PENDING, OrderStatusEnum.OPEN, OrderStatusEnum.PARTIALLY_FILLED]))
+            .order_by(Order.created_at.asc())
+            .limit(limit)
+            .all()
+        )
     
     def update_status(self, order: Order, status: OrderStatusEnum,
                      filled_quantity: Optional[float] = None,

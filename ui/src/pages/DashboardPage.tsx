@@ -1,6 +1,7 @@
-import { useState, useEffect } from 'react';
-import { getBackendStatus, getPositions, getRunnerStatus, startRunner, stopRunner, getEquityCurve, getPortfolioAnalytics, getBrokerAccount, getTradingPreferences, getScreenerAssets } from '../api/backend';
-import { StatusResponse, Position, RunnerState, RunnerStatus, EquityPoint, PortfolioAnalytics, BrokerAccountResponse, TradingPreferences } from '../api/types';
+import { useState, useEffect, useCallback } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { getBackendStatus, getPositions, getRunnerStatus, startRunner, stopRunner, getPortfolioAnalytics, getPortfolioSummary, getBrokerAccount, getTradingPreferences, getScreenerAssets, getSafetyStatus, runPanicStop, getSafetyPreflight } from '../api/backend';
+import { StatusResponse, Position, RunnerState, RunnerStatus, PortfolioAnalytics, PortfolioSummaryResponse, BrokerAccountResponse, TradingPreferences } from '../api/types';
 import EquityCurveChart from '../components/EquityCurveChart';
 import PnLChart from '../components/PnLChart';
 import HelpTooltip from '../components/HelpTooltip';
@@ -12,43 +13,66 @@ import GuidedFlowStrip from '../components/GuidedFlowStrip';
  * Shows backend status, current positions, portfolio summary, and runner controls.
  */
 function DashboardPage() {
+  const navigate = useNavigate();
   const [status, setStatus] = useState<StatusResponse | null>(null);
   const [positions, setPositions] = useState<Position[]>([]);
   const [runnerState, setRunnerState] = useState<RunnerState | null>(null);
-  const [equityCurve, setEquityCurve] = useState<EquityPoint[]>([]);
   const [analytics, setAnalytics] = useState<PortfolioAnalytics | null>(null);
+  const [summary, setSummary] = useState<PortfolioSummaryResponse | null>(null);
   const [brokerAccount, setBrokerAccount] = useState<BrokerAccountResponse | null>(null);
-  const [initialCapital, setInitialCapital] = useState<number>(100000);
+  const [analyticsDays, setAnalyticsDays] = useState<number | 'all'>(30);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [runnerLoading, setRunnerLoading] = useState(false);
   const [tradingPrefs, setTradingPrefs] = useState<TradingPreferences | null>(null);
   const [holdingFilter, setHoldingFilter] = useState<'all' | 'stock' | 'etf'>('all');
   const [knownEtfSymbols, setKnownEtfSymbols] = useState<Set<string>>(new Set());
+  const [killSwitchActive, setKillSwitchActive] = useState(false);
+  const [blockedReason, setBlockedReason] = useState<string>('');
 
-  useEffect(() => {
-    loadData();
-    // Poll runner status every 5 seconds
-    const interval = setInterval(loadRunnerStatus, 5000);
-    return () => clearInterval(interval);
+  const loadRunnerStatus = useCallback(async () => {
+    try {
+      const runnerData = await getRunnerStatus();
+      setRunnerState({
+        status: runnerData.status as RunnerStatus,
+        strategies: runnerData.strategies,
+        tick_interval: runnerData.tick_interval,
+        broker_connected: runnerData.broker_connected,
+        poll_success_count: runnerData.poll_success_count,
+        poll_error_count: runnerData.poll_error_count,
+        last_poll_error: runnerData.last_poll_error,
+        last_poll_at: runnerData.last_poll_at,
+        last_successful_poll_at: runnerData.last_successful_poll_at,
+        sleeping: runnerData.sleeping,
+        sleep_since: runnerData.sleep_since,
+        next_market_open_at: runnerData.next_market_open_at,
+        last_resume_at: runnerData.last_resume_at,
+        last_catchup_at: runnerData.last_catchup_at,
+        resume_count: runnerData.resume_count,
+        market_session_open: runnerData.market_session_open,
+      });
+    } catch (err) {
+      console.error('Failed to load runner status:', err);
+    }
   }, []);
 
-  const loadData = async () => {
+  const loadData = useCallback(async () => {
     try {
       setLoading(true);
       setError(null);
       
       // Fetch status, positions, runner state, and analytics in parallel
-      const [statusData, positionsData, runnerData, equityCurveData, analyticsData, brokerAccountData, prefsData, etfUniverse] = await Promise.all([
+      const [statusData, positionsData, runnerData, analyticsData, summaryData, brokerAccountData, prefsData, etfUniverse] = await Promise.all([
         getBackendStatus(),
         getPositions(),
         getRunnerStatus(),
-        getEquityCurve(100),
-        getPortfolioAnalytics(),
+        getPortfolioAnalytics(analyticsDays === 'all' ? undefined : analyticsDays),
+        getPortfolioSummary(),
         getBrokerAccount(),
         getTradingPreferences(),
         getScreenerAssets('etf', 200).catch(() => ({ assets: [] })),
       ]);
+      const safety = await getSafetyStatus().catch(() => ({ kill_switch_active: false, last_broker_sync_at: null }));
       
       setStatus(statusData);
       setPositions(positionsData.positions);
@@ -57,33 +81,44 @@ function DashboardPage() {
         strategies: runnerData.strategies,
         tick_interval: runnerData.tick_interval,
         broker_connected: runnerData.broker_connected,
+        poll_success_count: runnerData.poll_success_count,
+        poll_error_count: runnerData.poll_error_count,
+        last_poll_error: runnerData.last_poll_error,
+        last_poll_at: runnerData.last_poll_at,
+        last_successful_poll_at: runnerData.last_successful_poll_at,
+        sleeping: runnerData.sleeping,
+        sleep_since: runnerData.sleep_since,
+        next_market_open_at: runnerData.next_market_open_at,
+        last_resume_at: runnerData.last_resume_at,
+        last_catchup_at: runnerData.last_catchup_at,
+        resume_count: runnerData.resume_count,
+        market_session_open: runnerData.market_session_open,
       });
-      setEquityCurve(equityCurveData.data);
-      setInitialCapital(equityCurveData.initial_capital);
       setAnalytics(analyticsData);
+      setSummary(summaryData);
       setBrokerAccount(brokerAccountData);
       setTradingPrefs(prefsData);
       setKnownEtfSymbols(new Set((etfUniverse.assets || []).map((asset) => asset.symbol.toUpperCase())));
+      setKillSwitchActive(Boolean(safety.kill_switch_active));
+      const preflight = await getSafetyPreflight('AAPL').catch(() => ({ allowed: true, reason: '' }));
+      setBlockedReason(preflight.allowed ? '' : preflight.reason);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load data');
     } finally {
       setLoading(false);
     }
-  };
+  }, [analyticsDays]);
 
-  const loadRunnerStatus = async () => {
-    try {
-      const runnerData = await getRunnerStatus();
-      setRunnerState({
-        status: runnerData.status as RunnerStatus,
-        strategies: runnerData.strategies,
-        tick_interval: runnerData.tick_interval,
-        broker_connected: runnerData.broker_connected,
-      });
-    } catch (err) {
-      console.error('Failed to load runner status:', err);
-    }
-  };
+  useEffect(() => {
+    void loadData();
+  }, [loadData]);
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      void loadRunnerStatus();
+    }, 5000);
+    return () => clearInterval(interval);
+  }, [loadRunnerStatus]);
 
   const handleStartRunner = async () => {
     try {
@@ -119,16 +154,55 @@ function DashboardPage() {
     }
   };
 
+  const handlePanicStop = async () => {
+    try {
+      setRunnerLoading(true);
+      await runPanicStop();
+      setKillSwitchActive(true);
+      await loadData();
+    } catch (err) {
+      alert(err instanceof Error ? err.message : 'Failed to run panic stop');
+    } finally {
+      setRunnerLoading(false);
+    }
+  };
+
   const totalValue = positions.reduce((sum, pos) => sum + pos.market_value, 0);
   const totalPnl = positions.reduce((sum, pos) => sum + pos.unrealized_pnl, 0);
   const totalCost = positions.reduce((sum, pos) => sum + pos.cost_basis, 0);
   const totalPnlPercent = totalCost > 0 ? (totalPnl / totalCost) * 100 : 0;
   const classifySymbol = (symbol: string): 'stock' | 'etf' => (knownEtfSymbols.has(symbol.toUpperCase()) ? 'etf' : 'stock');
   const filteredPositions = positions.filter((pos) => (holdingFilter === 'all' ? true : classifySymbol(pos.symbol) === holdingFilter));
+  const equityCurve = analytics
+    ? analytics.equity_curve.map((point) => ({
+        timestamp: point.timestamp,
+        value: point.equity,
+      }))
+    : [];
+  const initialCapital = equityCurve.length > 0 ? equityCurve[0].value : 100000;
+  const performancePnl = summary?.total_pnl ?? analytics?.total_pnl ?? 0;
+  const performancePnlClass = performancePnl >= 0 ? 'text-green-400' : 'text-red-400';
   const runnerStatusLabel = (runnerState?.status || 'unknown').toUpperCase();
+  const startBlockedReason =
+    runnerLoading
+      ? 'Runner action is in progress.'
+      : runnerState?.status === RunnerStatus.RUNNING || runnerState?.status === RunnerStatus.SLEEPING
+      ? `Runner is already active (${String(runnerState?.status || '').toUpperCase()}).`
+      : killSwitchActive
+      ? 'Kill switch is active.'
+      : blockedReason || '';
+  const stopBlockedReason =
+    runnerLoading
+      ? 'Runner action is in progress.'
+      : runnerState?.status === RunnerStatus.STOPPED
+      ? 'Runner is already stopped.'
+      : '';
   const prefsSummary = tradingPrefs
     ? `${tradingPrefs.asset_type.toUpperCase()} | ${tradingPrefs.screener_mode === 'most_active' ? `Most Active (${tradingPrefs.screener_limit})` : `Preset ${tradingPrefs.asset_type === 'etf' ? tradingPrefs.etf_preset : tradingPrefs.stock_preset}`}`
     : 'Settings unavailable';
+  const nextMarketOpenLabel = runnerState?.next_market_open_at
+    ? new Date(runnerState.next_market_open_at).toLocaleString()
+    : '';
 
   return (
     <div className="p-8">
@@ -161,6 +235,21 @@ function DashboardPage() {
           <span className="font-semibold">Open Holdings {positions.length}</span>
         </p>
       </div>
+      {runnerState?.status === RunnerStatus.SLEEPING && (
+        <div className="mb-4 rounded-lg border border-amber-700 bg-amber-900/20 px-4 py-3">
+          <p className="text-sm text-amber-100">
+            Runner is in off-hours sleep mode.
+            {nextMarketOpenLabel ? (
+              <>
+                {' '}
+                Auto-resume at <span className="font-semibold">{nextMarketOpenLabel}</span>.
+              </>
+            ) : (
+              ' Auto-resume will occur at the next market open.'
+            )}
+          </p>
+        </div>
+      )}
 
       {loading && (
         <div className="text-gray-400">Loading dashboard data...</div>
@@ -234,21 +323,15 @@ function DashboardPage() {
             <div className="xl:col-span-3 bg-gray-800 rounded-lg p-6 border border-gray-700">
               <h3 className="text-lg font-semibold text-white mb-4">Control & Risk</h3>
               <div className="space-y-4">
-                <div>
-                  <p className="text-gray-400 text-sm">Runner State</p>
-                  <p className={`text-sm font-semibold mt-1 ${runnerState?.status === RunnerStatus.RUNNING ? 'text-green-400' : runnerState?.status === RunnerStatus.ERROR ? 'text-red-400' : 'text-gray-300'}`}>
-                    {(runnerState?.status || 'unknown').toUpperCase()}
-                  </p>
-                </div>
                 <div className="text-xs text-gray-400">
-                  <p>Strategies: {runnerState?.strategies?.length || 0}</p>
-                  <p>Tick Interval: {runnerState?.tick_interval || 0}s</p>
-                  <p>Broker: <span className={runnerState?.broker_connected ? 'text-green-400' : 'text-red-400'}>{runnerState?.broker_connected ? 'Connected' : 'Disconnected'}</span></p>
+                  <p>Loaded Strategies: {runnerState?.strategies?.length || 0}</p>
+                  <p>Use Start/Stop to control execution lifecycle.</p>
+                  <p>Use Settings/Screener to modify risk and guardrails.</p>
                 </div>
                 <div className="flex gap-2">
                   <button
                     onClick={handleStartRunner}
-                    disabled={runnerLoading || runnerState?.status === RunnerStatus.RUNNING}
+                    disabled={runnerLoading || runnerState?.status === RunnerStatus.RUNNING || runnerState?.status === RunnerStatus.SLEEPING}
                     className="flex-1 bg-green-600 hover:bg-green-700 disabled:bg-gray-600 text-white px-3 py-2 rounded text-sm font-medium"
                   >
                     Start
@@ -261,11 +344,73 @@ function DashboardPage() {
                     Stop
                   </button>
                 </div>
+                <div className="text-xs space-y-1">
+                  {startBlockedReason && <p className="text-amber-300">Start disabled when: {startBlockedReason}</p>}
+                  {stopBlockedReason && <p className="text-amber-300">Stop disabled when: {stopBlockedReason}</p>}
+                </div>
+                <button
+                  onClick={handlePanicStop}
+                  disabled={runnerLoading}
+                  className="w-full bg-rose-700 hover:bg-rose-800 disabled:bg-gray-600 text-white px-3 py-2 rounded text-sm font-medium"
+                >
+                  Panic Stop (Kill Switch + Selloff)
+                </button>
+                <div className="text-xs">
+                  {killSwitchActive && <p className="text-red-300">Blocked: kill switch is active. Disable it in Settings Safety.</p>}
+                  {!killSwitchActive && blockedReason && <p className="text-amber-300">Why blocked: {blockedReason}</p>}
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    onClick={() => navigate('/settings')}
+                    className="w-full rounded bg-gray-700 px-3 py-2 text-xs font-medium text-gray-200 hover:bg-gray-600"
+                  >
+                    Open Settings
+                  </button>
+                  <button
+                    onClick={() => navigate('/screener')}
+                    className="w-full rounded bg-gray-700 px-3 py-2 text-xs font-medium text-gray-200 hover:bg-gray-600"
+                  >
+                    Open Screener
+                  </button>
+                </div>
               </div>
             </div>
 
             <div className="xl:col-span-6 bg-gray-800 rounded-lg p-6 border border-gray-700">
-              <h3 className="text-lg font-semibold text-white mb-4">Equity & P&L Trends</h3>
+              <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+                <h3 className="text-lg font-semibold text-white">Performance</h3>
+                <div className="inline-flex rounded border border-gray-700 bg-gray-900 p-1 text-xs">
+                  {([7, 30, 90, 180, 'all'] as const).map((days) => (
+                    <button
+                      key={days}
+                      onClick={() => setAnalyticsDays(days)}
+                      className={`px-2 py-1 rounded ${analyticsDays === days ? 'bg-blue-600 text-white' : 'text-gray-300 hover:bg-gray-700'}`}
+                    >
+                      {days === 'all' ? 'All' : `${days}D`}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div className="mb-4 grid grid-cols-2 gap-2 text-xs md:grid-cols-4">
+                <div className="rounded border border-gray-700 bg-gray-900/50 p-2">
+                  <p className="text-gray-400">Total Trades</p>
+                  <p className="font-semibold text-gray-100">{summary?.total_trades ?? analytics?.total_trades ?? 0}</p>
+                </div>
+                <div className="rounded border border-gray-700 bg-gray-900/50 p-2">
+                  <p className="text-gray-400">Win Rate</p>
+                  <p className="font-semibold text-gray-100">{summary ? `${summary.win_rate.toFixed(1)}%` : '-'}</p>
+                </div>
+                <div className="rounded border border-gray-700 bg-gray-900/50 p-2">
+                  <p className="text-gray-400">Current Equity</p>
+                  <p className="font-semibold text-gray-100">${(summary?.equity ?? analytics?.current_equity ?? 0).toLocaleString()}</p>
+                </div>
+                <div className="rounded border border-gray-700 bg-gray-900/50 p-2">
+                  <p className="text-gray-400">Total P&L</p>
+                  <p className={`font-semibold ${performancePnlClass}`}>
+                    {performancePnl >= 0 ? '+' : ''}${performancePnl.toLocaleString()}
+                  </p>
+                </div>
+              </div>
               <div className="grid grid-cols-1 gap-6">
                 <EquityCurveChart data={equityCurve} initialCapital={initialCapital} />
                 {analytics && (
@@ -280,18 +425,42 @@ function DashboardPage() {
               </div>
             </div>
 
-            <div className="xl:col-span-3 bg-gray-800 rounded-lg p-6 border border-gray-700">
-              <h3 className="text-lg font-semibold text-white mb-4">System Health</h3>
-              <div className="space-y-4">
-                <div>
-                  <p className="text-xs text-gray-400">Backend</p>
-                  <p className="text-sm text-green-400">{status?.status || 'unknown'}</p>
-                  <p className="text-xs text-gray-500">{status?.service} {status?.version}</p>
+            <div className="xl:col-span-3 bg-gray-800 rounded-lg p-4 border border-gray-700">
+              <h3 className="text-base font-semibold text-white mb-3">System Health</h3>
+              <div className="grid grid-cols-2 gap-2 text-xs">
+                <div className="rounded border border-gray-700 bg-gray-900/50 p-2">
+                  <p className="text-gray-400">Runner</p>
+                  <p className={`font-semibold ${runnerState?.status === RunnerStatus.RUNNING ? 'text-green-400' : runnerState?.status === RunnerStatus.SLEEPING ? 'text-amber-300' : runnerState?.status === RunnerStatus.ERROR ? 'text-red-400' : 'text-gray-300'}`}>
+                    {(runnerState?.status || 'unknown').toUpperCase()}
+                  </p>
                 </div>
-                <div>
-                  <p className="text-xs text-gray-400">Market</p>
-                  <p className="text-sm text-green-400">Open</p>
+                <div className="rounded border border-gray-700 bg-gray-900/50 p-2">
+                  <p className="text-gray-400">Broker</p>
+                  <p className={`font-semibold ${(runnerState?.broker_connected && brokerAccount?.connected) ? 'text-green-400' : 'text-amber-400'}`}>
+                    {(runnerState?.broker_connected && brokerAccount?.connected) ? 'Connected' : 'Degraded'}
+                  </p>
                 </div>
+                <div className="rounded border border-gray-700 bg-gray-900/50 p-2">
+                  <p className="text-gray-400">Poll Success</p>
+                  <p className="font-semibold text-green-400">{runnerState?.poll_success_count || 0}</p>
+                </div>
+                <div className="rounded border border-gray-700 bg-gray-900/50 p-2">
+                  <p className="text-gray-400">Poll Errors</p>
+                  <p className="font-semibold text-red-400">{runnerState?.poll_error_count || 0}</p>
+                </div>
+              </div>
+              <div className="mt-2 text-[11px] text-gray-400">
+                <p>Backend: <span className="text-gray-200">{status?.status || 'unknown'}</span> ({status?.service} {status?.version})</p>
+                <p>Tick: <span className="text-gray-200">{runnerState?.tick_interval || 0}s</span></p>
+                <p>
+                  Last Success:{' '}
+                  <span className="text-gray-200">
+                    {runnerState?.last_successful_poll_at ? new Date(runnerState.last_successful_poll_at).toLocaleString() : '-'}
+                  </span>
+                </p>
+                <p className="text-red-300 truncate" title={runnerState?.last_poll_error || 'None'}>
+                  Last Error: {runnerState?.last_poll_error?.trim() ? runnerState.last_poll_error : 'None'}
+                </p>
               </div>
             </div>
           </div>

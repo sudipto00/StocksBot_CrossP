@@ -12,9 +12,10 @@ TODO: Full trading logic implementation
 - Streaming market data
 """
 
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Callable
 from datetime import datetime
 import logging
+import threading
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
@@ -67,6 +68,10 @@ class AlpacaBroker(BrokerInterface):
         self._connected = False
         self._trading_client: Optional[TradingClient] = None
         self._data_client: Optional[StockHistoricalDataClient] = None
+        self._trade_stream = None
+        self._trade_stream_thread: Optional[threading.Thread] = None
+        self._trade_stream_running = False
+        self._trade_update_callback: Optional[Callable[[Dict[str, Any]], None]] = None
     
     def connect(self) -> bool:
         """
@@ -109,6 +114,7 @@ class AlpacaBroker(BrokerInterface):
         Returns:
             True if disconnected successfully
         """
+        self.stop_trade_update_stream()
         self._connected = False
         self._trading_client = None
         self._data_client = None
@@ -149,6 +155,41 @@ class AlpacaBroker(BrokerInterface):
             "transfers_blocked": account.transfers_blocked,
             "account_blocked": account.account_blocked,
         }
+
+    def is_market_open(self) -> bool:
+        """Return Alpaca clock market-open state when available."""
+        if not self.is_connected():
+            return False
+        try:
+            clock = self._trading_client.get_clock()
+            return bool(getattr(clock, "is_open", False))
+        except Exception:
+            return False
+
+    def is_symbol_tradable(self, symbol: str) -> bool:
+        """Return whether Alpaca marks the asset as tradable."""
+        if not self.is_connected():
+            return False
+        try:
+            asset = self._trading_client.get_asset(symbol)
+            return bool(getattr(asset, "tradable", False))
+        except Exception:
+            return False
+
+    def get_next_market_open(self) -> Optional[datetime]:
+        """Return next market-open timestamp from Alpaca clock when available."""
+        if not self.is_connected():
+            return None
+        try:
+            clock = self._trading_client.get_clock()
+            next_open = getattr(clock, "next_open", None)
+            if next_open is None:
+                return None
+            if isinstance(next_open, datetime):
+                return next_open
+            return None
+        except Exception:
+            return None
     
     def get_positions(self) -> List[Dict[str, Any]]:
         """
@@ -335,10 +376,12 @@ class AlpacaBroker(BrokerInterface):
         
         return {
             "symbol": symbol,
+            "price": float((float(quote.ask_price) + float(quote.bid_price)) / 2.0),
             "ask_price": float(quote.ask_price),
             "bid_price": float(quote.bid_price),
             "ask_size": int(quote.ask_size),
             "bid_size": int(quote.bid_size),
+            "volume": 0,
             "timestamp": quote.timestamp.isoformat(),
         }
 
@@ -389,6 +432,70 @@ class AlpacaBroker(BrokerInterface):
             })
 
         return result
+
+    def start_trade_update_stream(self, on_update: Callable[[Dict[str, Any]], None]) -> bool:
+        """
+        Start Alpaca trading websocket stream for trade updates.
+        Safe to call multiple times.
+        """
+        if not self.is_connected():
+            logger.warning("Cannot start trade update stream: broker not connected")
+            return False
+        if self._trade_stream_running:
+            return True
+
+        self._trade_update_callback = on_update
+        self._trade_stream_running = True
+
+        def _run_stream() -> None:
+            try:
+                from alpaca.trading.stream import TradingStream
+            except Exception as exc:
+                logger.warning(f"TradingStream not available, streaming disabled: {exc}")
+                self._trade_stream_running = False
+                return
+
+            async def _handler(data: Any) -> None:
+                try:
+                    payload = {
+                        "event": str(getattr(data, "event", "")),
+                        "order_id": str(getattr(data, "order_id", "")),
+                        "symbol": str(getattr(data, "symbol", "")),
+                        "status": str(getattr(data, "order_status", "")),
+                    }
+                    if self._trade_update_callback:
+                        self._trade_update_callback(payload)
+                except Exception as callback_exc:
+                    logger.warning(f"Trade update callback error: {callback_exc}")
+
+            try:
+                self._trade_stream = TradingStream(self.api_key, self.secret_key, paper=self.paper)
+                self._trade_stream.subscribe_trade_updates(_handler)
+                self._trade_stream.run()
+            except Exception as stream_exc:
+                logger.warning(f"Trade update stream ended: {stream_exc}")
+            finally:
+                self._trade_stream_running = False
+                self._trade_stream = None
+
+        self._trade_stream_thread = threading.Thread(target=_run_stream, daemon=True)
+        self._trade_stream_thread.start()
+        logger.info("Alpaca trade update stream started")
+        return True
+
+    def stop_trade_update_stream(self) -> bool:
+        """Stop Alpaca trade update websocket stream."""
+        self._trade_stream_running = False
+        try:
+            if self._trade_stream is not None:
+                stop_ws = getattr(self._trade_stream, "stop_ws", None)
+                if callable(stop_ws):
+                    stop_ws()
+            self._trade_stream = None
+            return True
+        except Exception as exc:
+            logger.warning(f"Failed to stop trade update stream cleanly: {exc}")
+            return False
     
     def _map_alpaca_order(self, order) -> Dict[str, Any]:
         """

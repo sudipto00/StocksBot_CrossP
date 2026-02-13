@@ -1,15 +1,12 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::process::Child;
 use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
+use tauri::menu::{MenuBuilder, MenuItem, MenuItemBuilder, PredefinedMenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_notification::{NotificationExt, PermissionState};
-
-// State to manage the sidecar process
-struct SidecarState {
-    process: Mutex<Option<Child>>,
-}
 
 const KEYCHAIN_SERVICE: &str = "com.stocksbot.alpaca";
 
@@ -23,6 +20,122 @@ struct CredentialStatus {
 struct AlpacaCredentials {
     api_key: String,
     secret_key: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TraySummaryPayload {
+    runner_status: Option<String>,
+    broker_connected: Option<bool>,
+    poll_errors: Option<u64>,
+    open_positions: Option<u64>,
+    active_strategy: Option<String>,
+    universe: Option<String>,
+    last_update: Option<String>,
+}
+
+struct TrayState {
+    runner_item: Mutex<Option<MenuItem<tauri::Wry>>>,
+    broker_item: Mutex<Option<MenuItem<tauri::Wry>>>,
+    summary_item: Mutex<Option<MenuItem<tauri::Wry>>>,
+    toggle_runner_item: Mutex<Option<MenuItem<tauri::Wry>>>,
+    runner_running: Mutex<bool>,
+}
+
+impl Default for TrayState {
+    fn default() -> Self {
+        Self {
+            runner_item: Mutex::new(None),
+            broker_item: Mutex::new(None),
+            summary_item: Mutex::new(None),
+            toggle_runner_item: Mutex::new(None),
+            runner_running: Mutex::new(false),
+        }
+    }
+}
+
+const TRAY_ID: &str = "main-tray";
+const MENU_ID_SHOW: &str = "show_window";
+const MENU_ID_HIDE: &str = "hide_window";
+const MENU_ID_TOGGLE_RUNNER: &str = "toggle_runner";
+const MENU_ID_QUIT: &str = "quit_app";
+
+fn sanitize_short(value: Option<String>, fallback: &str, max_len: usize) -> String {
+    let cleaned = value.unwrap_or_else(|| fallback.to_string()).trim().to_string();
+    if cleaned.is_empty() {
+        return fallback.to_string();
+    }
+    let mut out = cleaned;
+    if out.len() > max_len {
+        out.truncate(max_len);
+    }
+    out
+}
+
+fn show_main_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
+fn hide_main_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.hide();
+    }
+}
+
+fn update_tray_status_ui(app: &AppHandle, payload: &TraySummaryPayload) -> Result<(), String> {
+    let runner = sanitize_short(payload.runner_status.clone(), "unknown", 24).to_uppercase();
+    let broker = if payload.broker_connected.unwrap_or(false) {
+        "Connected".to_string()
+    } else {
+        "Degraded".to_string()
+    };
+    let poll_errors = payload.poll_errors.unwrap_or(0);
+    let open_positions = payload.open_positions.unwrap_or(0);
+    let strategy = sanitize_short(payload.active_strategy.clone(), "None", 36);
+    let universe = sanitize_short(payload.universe.clone(), "N/A", 28);
+    let last_update = sanitize_short(payload.last_update.clone(), "-", 24);
+
+    if let Some(state) = app.try_state::<TrayState>() {
+        let is_running = runner == "RUNNING";
+        if let Ok(mut guard) = state.runner_running.lock() {
+            *guard = is_running;
+        }
+        if let Ok(guard) = state.runner_item.lock() {
+            if let Some(item) = &*guard {
+                let _ = item.set_text(format!("Runner: {}", runner));
+            }
+        }
+        if let Ok(guard) = state.broker_item.lock() {
+            if let Some(item) = &*guard {
+                let _ = item.set_text(format!(
+                    "Broker: {} | Poll Errors: {} | Open Positions: {}",
+                    broker, poll_errors, open_positions
+                ));
+            }
+        }
+        if let Ok(guard) = state.summary_item.lock() {
+            if let Some(item) = &*guard {
+                let _ = item.set_text(format!("Strategy: {} | Universe: {}", strategy, universe));
+            }
+        }
+        if let Ok(guard) = state.toggle_runner_item.lock() {
+            if let Some(item) = &*guard {
+                let label = if is_running { "Pause Runner" } else { "Resume Runner" };
+                let _ = item.set_text(label);
+            }
+        }
+    }
+
+    if let Some(tray) = app.tray_by_id(TRAY_ID) {
+        let _ = tray.set_tooltip(Some(format!(
+            "StocksBot | Runner {} | Broker {} | Errors {} | Positions {} | {}",
+            runner, broker, poll_errors, open_positions, last_update
+        )));
+    }
+    Ok(())
 }
 
 // TODO: Add custom commands for frontend-backend communication
@@ -199,11 +312,16 @@ fn clear_alpaca_credentials(mode: String) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+fn update_tray_summary(app: tauri::AppHandle, payload: TraySummaryPayload) -> Result<(), String> {
+    update_tray_status_ui(&app, &payload)
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_notification::init())
-        .setup(|_app| {
+        .setup(|app| {
             // TODO: Launch Python FastAPI sidecar on app startup
             // The sidecar executable should be bundled with the app
             // Example of how to start sidecar (to be implemented):
@@ -231,13 +349,94 @@ fn main() {
 
             println!("StocksBot is starting...");
             println!("Note: Run the Python backend separately for now using: cd backend && python app.py");
+
+            app.manage(TrayState::default());
+
+            let runner_item = MenuItemBuilder::new("Runner: STARTING")
+                .enabled(false)
+                .build(app)
+                .map_err(|e| e.to_string())?;
+            let broker_item = MenuItemBuilder::new("Broker: Unknown | Poll Errors: 0 | Open Positions: 0")
+                .enabled(false)
+                .build(app)
+                .map_err(|e| e.to_string())?;
+            let summary_item = MenuItemBuilder::new("Strategy: None | Universe: N/A")
+                .enabled(false)
+                .build(app)
+                .map_err(|e| e.to_string())?;
+            let show_item = MenuItemBuilder::with_id(MENU_ID_SHOW, "Show StocksBot")
+                .build(app)
+                .map_err(|e| e.to_string())?;
+            let hide_item = MenuItemBuilder::with_id(MENU_ID_HIDE, "Hide Window")
+                .build(app)
+                .map_err(|e| e.to_string())?;
+            let toggle_runner_item = MenuItemBuilder::with_id(MENU_ID_TOGGLE_RUNNER, "Resume Runner")
+                .build(app)
+                .map_err(|e| e.to_string())?;
+            let quit_item = MenuItemBuilder::with_id(MENU_ID_QUIT, "Quit")
+                .build(app)
+                .map_err(|e| e.to_string())?;
+            let separator_a = PredefinedMenuItem::separator(app).map_err(|e| e.to_string())?;
+            let separator_b = PredefinedMenuItem::separator(app).map_err(|e| e.to_string())?;
+            let tray_menu = MenuBuilder::new(app)
+                .items(&[
+                    &runner_item,
+                    &broker_item,
+                    &summary_item,
+                    &separator_a,
+                    &show_item,
+                    &hide_item,
+                    &toggle_runner_item,
+                    &separator_b,
+                    &quit_item,
+                ])
+                .build()
+                .map_err(|e| e.to_string())?;
+
+            let tray_state = app.state::<TrayState>();
+            if let Ok(mut guard) = tray_state.runner_item.lock() {
+                *guard = Some(runner_item.clone());
+            }
+            if let Ok(mut guard) = tray_state.broker_item.lock() {
+                *guard = Some(broker_item.clone());
+            }
+            if let Ok(mut guard) = tray_state.summary_item.lock() {
+                *guard = Some(summary_item.clone());
+            }
+            if let Ok(mut guard) = tray_state.toggle_runner_item.lock() {
+                *guard = Some(toggle_runner_item.clone());
+            }
+
+            TrayIconBuilder::with_id(TRAY_ID)
+                .menu(&tray_menu)
+                .show_menu_on_left_click(false)
+                .tooltip("StocksBot running in background")
+                .on_menu_event(|app, event| {
+                    match event.id().as_ref() {
+                        MENU_ID_SHOW => show_main_window(app),
+                        MENU_ID_HIDE => hide_main_window(app),
+                        MENU_ID_TOGGLE_RUNNER => {
+                            let _ = app.emit("tray-toggle-runner", "toggle");
+                        }
+                        MENU_ID_QUIT => app.exit(0),
+                        _ => {}
+                    }
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click { button, button_state, .. } = event {
+                        if button == MouseButton::Left && button_state == MouseButtonState::Up {
+                            show_main_window(&tray.app_handle().clone());
+                        }
+                    }
+                })
+                .build(app)
+                .map_err(|e| e.to_string())?;
             
             Ok(())
         })
         .on_window_event(|window, event| match event {
             tauri::WindowEvent::CloseRequested { api, .. } => {
-                // Hide to tray instead of closing (tray handling to be re-added for v2)
-                window.hide().unwrap();
+                let _ = window.hide();
                 api.prevent_close();
             }
             _ => {}
@@ -250,7 +449,8 @@ fn main() {
             save_alpaca_credentials,
             get_alpaca_credentials,
             get_alpaca_credentials_status,
-            clear_alpaca_credentials
+            clear_alpaca_credentials,
+            update_tray_summary
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

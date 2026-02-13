@@ -16,6 +16,8 @@ import {
   tuneParameter,
   getTradingPreferences,
   getScreenerAssets,
+  getSafetyPreflight,
+  getSafetyStatus,
 } from '../api/backend';
 import {
   Strategy,
@@ -30,7 +32,7 @@ import HelpTooltip from '../components/HelpTooltip';
 import PageHeader from '../components/PageHeader';
 import GuidedFlowStrip from '../components/GuidedFlowStrip';
 
-const SYMBOL_RE = /^[A-Z][A-Z0-9.\-]{0,9}$/;
+const SYMBOL_RE = /^[A-Z][A-Z0-9.-]{0,9}$/;
 const STRATEGY_LIMITS = {
   maxSymbols: 200,
   backtestCapitalMin: 100,
@@ -66,10 +68,13 @@ function StrategyPage() {
   const [strategies, setStrategies] = useState<Strategy[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [showCreateModal, setShowCreateModal] = useState(false);
+  const [deletingStrategyId, setDeletingStrategyId] = useState<string | null>(null);
 
   // Runner state
   const [runnerStatus, setRunnerStatus] = useState<string>('stopped');
   const [runnerLoading, setRunnerLoading] = useState(false);
+  const [runnerBlockedReason, setRunnerBlockedReason] = useState('');
+  const [killSwitchActive, setKillSwitchActive] = useState(false);
 
   // Form state
   const [formName, setFormName] = useState('');
@@ -98,6 +103,7 @@ function StrategyPage() {
   const [backtestCapital, setBacktestCapital] = useState('100000');
   const [detailTab, setDetailTab] = useState<'metrics' | 'config' | 'backtest'>('metrics');
   const activeStrategyCount = strategies.filter((s) => s.status === StrategyStatus.ACTIVE).length;
+  const runnerIsActive = runnerStatus === 'running' || runnerStatus === 'sleeping';
   const [settingsSummary, setSettingsSummary] = useState<string>('Loading trading preferences...');
   const [cleanupLoading, setCleanupLoading] = useState(false);
 
@@ -105,6 +111,13 @@ function StrategyPage() {
     loadStrategies();
     loadRunnerStatus();
     loadSettingsSummary();
+  }, []);
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      loadRunnerStatus();
+    }, 5000);
+    return () => clearInterval(interval);
   }, []);
 
   const loadStrategies = async () => {
@@ -125,6 +138,10 @@ function StrategyPage() {
     try {
       const status = await getRunnerStatus();
       setRunnerStatus(status.status);
+      const safety = await getSafetyStatus().catch(() => ({ kill_switch_active: false, last_broker_sync_at: null }));
+      setKillSwitchActive(Boolean(safety.kill_switch_active));
+      const preflight = await getSafetyPreflight('AAPL').catch(() => ({ allowed: true, reason: '' }));
+      setRunnerBlockedReason(preflight.allowed ? '' : preflight.reason);
     } catch (err) {
       console.error('Failed to load runner status:', err);
     }
@@ -351,17 +368,19 @@ function StrategyPage() {
       );
 
       await loadStrategies();
+      await loadRunnerStatus();
     } catch (err) {
       await showErrorNotification('Update Error', 'Failed to update strategy');
     }
   };
 
   const handleDelete = async (strategy: Strategy) => {
-    if (!confirm(`Delete strategy "${strategy.name}"?`)) {
-      return;
-    }
-
     try {
+      setDeletingStrategyId(strategy.id);
+      // Ensure strategy is not active before delete.
+      if (strategy.status === StrategyStatus.ACTIVE) {
+        await updateStrategy(strategy.id, { status: StrategyStatus.STOPPED });
+      }
       await deleteStrategy(strategy.id);
       await showSuccessNotification('Strategy Deleted', `Strategy "${strategy.name}" deleted`);
       if (selectedStrategy?.id === strategy.id) {
@@ -370,8 +389,11 @@ function StrategyPage() {
         setStrategyMetrics(null);
       }
       await loadStrategies();
+      await loadRunnerStatus();
     } catch (err) {
-      await showErrorNotification('Delete Error', 'Failed to delete strategy');
+      await showErrorNotification('Delete Error', err instanceof Error ? err.message : 'Failed to delete strategy');
+    } finally {
+      setDeletingStrategyId(null);
     }
   };
 
@@ -517,6 +539,26 @@ function StrategyPage() {
           {' | '}
           <span className="font-semibold">Selected {selectedStrategy?.name || 'None'}</span>
         </p>
+        <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
+          <span className={`rounded px-2 py-1 font-semibold ${killSwitchActive ? 'bg-red-900/70 text-red-200' : 'bg-emerald-800/60 text-emerald-100'}`}>
+            Safety: {killSwitchActive ? 'Kill Switch Active' : 'Normal'}
+          </span>
+          {!killSwitchActive && runnerBlockedReason && (
+            <span className="rounded bg-amber-900/70 px-2 py-1 text-amber-200">
+              Block reason: {runnerBlockedReason}
+            </span>
+          )}
+        </div>
+        {activeStrategyCount > 0 && !runnerIsActive && (
+          <p className="mt-1 text-xs text-amber-200">
+            One or more strategies are active, but execution is not running. Click Start Runner to execute trades.
+          </p>
+        )}
+        {runnerStatus === 'sleeping' && (
+          <p className="mt-1 text-xs text-amber-200">
+            Runner is sleeping for off-hours and will auto-resume at market open.
+          </p>
+        )}
       </div>
 
       {/* Runner Status Card */}
@@ -529,10 +571,10 @@ function StrategyPage() {
             </div>
             <div className="flex items-center gap-2">
               <div className={`w-3 h-3 rounded-full ${
-                runnerStatus === 'running' ? 'bg-green-500' : 'bg-gray-500'
+                runnerStatus === 'running' ? 'bg-green-500' : runnerStatus === 'sleeping' ? 'bg-amber-400' : 'bg-gray-500'
               }`}></div>
               <span className={`text-sm font-medium ${
-                runnerStatus === 'running' ? 'text-green-400' : 'text-gray-400'
+                runnerStatus === 'running' ? 'text-green-400' : runnerStatus === 'sleeping' ? 'text-amber-300' : 'text-gray-400'
               }`}>{runnerStatus.charAt(0).toUpperCase() + runnerStatus.slice(1)}</span>
             </div>
           </div>
@@ -540,9 +582,9 @@ function StrategyPage() {
           <div className="flex gap-2">
             <button
               onClick={handleStartRunner}
-              disabled={runnerLoading || runnerStatus === 'running' || activeStrategyCount === 0}
+              disabled={runnerLoading || runnerIsActive || activeStrategyCount === 0 || killSwitchActive}
               className={`px-4 py-2 rounded font-medium ${
-                runnerLoading || runnerStatus === 'running' || activeStrategyCount === 0
+                runnerLoading || runnerIsActive || activeStrategyCount === 0 || killSwitchActive
                   ? 'bg-gray-600 text-gray-400 cursor-not-allowed'
                   : 'bg-green-600 hover:bg-green-700 text-white'
               }`}
@@ -551,9 +593,9 @@ function StrategyPage() {
             </button>
             <button
               onClick={handleStopRunner}
-              disabled={runnerLoading || runnerStatus !== 'running'}
+              disabled={runnerLoading || runnerStatus === 'stopped'}
               className={`px-4 py-2 rounded font-medium ${
-                runnerLoading || runnerStatus !== 'running'
+                runnerLoading || runnerStatus === 'stopped'
                   ? 'bg-gray-600 text-gray-400 cursor-not-allowed'
                   : 'bg-red-600 hover:bg-red-700 text-white'
               }`}
@@ -586,6 +628,12 @@ function StrategyPage() {
           <p className="text-yellow-400 text-xs mt-3">
             Activate at least one strategy before starting the runner.
           </p>
+        )}
+        {killSwitchActive && (
+          <p className="text-red-300 text-xs mt-2">Runner start blocked: kill switch is active (disable in Settings).</p>
+        )}
+        {!killSwitchActive && runnerBlockedReason && (
+          <p className="text-amber-300 text-xs mt-2">Runner may be blocked: {runnerBlockedReason}</p>
         )}
       </div>
 
@@ -853,9 +901,10 @@ function StrategyPage() {
                         </button>
                         <button
                           onClick={() => handleDelete(selectedStrategy)}
-                          className="px-4 py-2 rounded font-medium bg-red-600 hover:bg-red-700 text-white"
+                          disabled={deletingStrategyId === selectedStrategy.id}
+                          className="px-4 py-2 rounded font-medium bg-red-600 hover:bg-red-700 disabled:bg-gray-600 text-white"
                         >
-                          Delete Strategy
+                          {deletingStrategyId === selectedStrategy.id ? 'Deleting...' : 'Delete Strategy'}
                         </button>
                       </div>
                     </div>

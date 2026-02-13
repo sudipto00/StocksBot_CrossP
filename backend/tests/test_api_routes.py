@@ -3,6 +3,9 @@ Tests for strategy CRUD operations and audit logs with database persistence.
 """
 
 import pytest
+import os
+import time
+from datetime import datetime, timedelta, timezone
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -10,6 +13,7 @@ from sqlalchemy.orm import sessionmaker
 from app import app
 from storage.database import Base, get_db
 from storage.service import StorageService
+from storage.models import OrderSideEnum, TradeTypeEnum
 
 # Create test database
 SQLALCHEMY_DATABASE_URL = "sqlite:///./test.db"
@@ -289,6 +293,18 @@ def test_get_runner_status():
     assert "broker_connected" in data
 
 
+def test_get_runner_status_includes_poll_telemetry():
+    """Runner status should always include poll telemetry fields."""
+    response = client.get("/runner/status")
+    assert response.status_code == 200
+    data = response.json()
+    assert "poll_success_count" in data
+    assert "poll_error_count" in data
+    assert "last_poll_error" in data
+    assert "last_poll_at" in data
+    assert "last_successful_poll_at" in data
+
+
 def test_start_runner_no_strategies():
     """Test starting runner with no strategies."""
     response = client.post("/runner/start")
@@ -330,6 +346,50 @@ def test_runner_idempotent_start():
     assert response2.status_code == 200
 
 
+def test_maintenance_storage_and_cleanup(tmp_path):
+    """Maintenance endpoints should expose storage config and perform cleanup."""
+    log_dir = tmp_path / "logs"
+    audit_dir = tmp_path / "audits"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    audit_dir.mkdir(parents=True, exist_ok=True)
+
+    old_log = log_dir / "old.log"
+    old_audit = audit_dir / "old.csv"
+    old_log.write_text("old log")
+    old_audit.write_text("old audit")
+    old_ts = time.time() - (3 * 24 * 60 * 60)
+    os.utime(old_log, (old_ts, old_ts))
+    os.utime(old_audit, (old_ts, old_ts))
+
+    cfg_response = client.post(
+        "/config",
+        json={
+            "log_directory": str(log_dir),
+            "audit_export_directory": str(audit_dir),
+            "log_retention_days": 1,
+            "audit_retention_days": 1,
+        },
+    )
+    assert cfg_response.status_code == 200
+
+    storage_response = client.get("/maintenance/storage")
+    assert storage_response.status_code == 200
+    storage_data = storage_response.json()
+    assert storage_data["log_directory"] == str(log_dir.resolve())
+    assert storage_data["audit_export_directory"] == str(audit_dir.resolve())
+    assert "log_files" in storage_data
+    assert "audit_files" in storage_data
+
+    cleanup_response = client.post("/maintenance/cleanup")
+    assert cleanup_response.status_code == 200
+    cleanup_data = cleanup_response.json()
+    assert cleanup_data["success"] is True
+    assert cleanup_data["log_files_deleted"] >= 0
+    assert cleanup_data["audit_files_deleted"] >= 0
+    assert not old_log.exists()
+    assert not old_audit.exists()
+
+
 # ============================================================================
 # Analytics Endpoint Tests
 # ============================================================================
@@ -362,3 +422,42 @@ def test_analytics_with_days_param():
     assert response.status_code == 200
     data = response.json()
     assert "time_series" in data
+
+
+def test_analytics_days_filters_old_trades():
+    """Ensure days parameter excludes older trades from curve and totals."""
+    db = TestingSessionLocal()
+    try:
+        storage = StorageService(db)
+        old_trade = storage.trades.create(
+            order_id=1,
+            symbol="AAPL",
+            side=OrderSideEnum.BUY,
+            type=TradeTypeEnum.OPEN,
+            quantity=1,
+            price=100.0,
+            executed_at=datetime.now(timezone.utc) - timedelta(days=20),
+        )
+        old_trade.realized_pnl = 50.0
+
+        new_trade = storage.trades.create(
+            order_id=2,
+            symbol="MSFT",
+            side=OrderSideEnum.SELL,
+            type=TradeTypeEnum.CLOSE,
+            quantity=1,
+            price=200.0,
+            executed_at=datetime.now(timezone.utc) - timedelta(days=2),
+        )
+        new_trade.realized_pnl = 25.0
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.get("/analytics/portfolio?days=7")
+    assert response.status_code == 200
+    data = response.json()
+
+    assert data["total_trades"] == 1
+    assert abs(data["total_pnl"] - 25.0) < 1e-6
+    assert len(data["time_series"]) == 1

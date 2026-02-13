@@ -1,6 +1,6 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from 'recharts';
-import { createStrategy, getBrokerAccount, getConfig, getPortfolioSummary, getStrategies, getStrategyConfig, updateConfig, updateStrategy } from '../api/backend';
+import { createStrategy, getBrokerAccount, getConfig, getPortfolioSummary, getStrategies, getStrategyConfig, getSafetyPreflight, getSafetyStatus, updateConfig, updateStrategy } from '../api/backend';
 import { BrokerAccountResponse, PortfolioSummaryResponse, Strategy, StrategyStatus } from '../api/types';
 import HelpTooltip from '../components/HelpTooltip';
 import PageHeader from '../components/PageHeader';
@@ -23,7 +23,7 @@ interface Asset {
 }
 
 interface Preferences {
-  asset_type: 'stock' | 'etf' | 'both';
+  asset_type: 'stock' | 'etf';
   risk_profile: 'conservative' | 'balanced' | 'aggressive';
   weekly_budget: number;
   screener_limit: number;
@@ -92,7 +92,7 @@ function clamp(value: number, min: number, max: number): number {
 const ScreenerPage: React.FC = () => {
   const [assets, setAssets] = useState<Asset[]>([]);
   const [preferences, setPreferences] = useState<Preferences>({
-    asset_type: 'both',
+    asset_type: 'stock',
     risk_profile: 'balanced',
     weekly_budget: 200,
     screener_limit: 50,
@@ -135,6 +135,8 @@ const ScreenerPage: React.FC = () => {
   const [maxSectorWeightPct, setMaxSectorWeightPct] = useState(45);
   const [autoRegimeAdjust, setAutoRegimeAdjust] = useState(true);
   const [workspaceValidationError, setWorkspaceValidationError] = useState<string | null>(null);
+  const [killSwitchActive, setKillSwitchActive] = useState(false);
+  const [blockedReason, setBlockedReason] = useState('');
   const chartSectionRef = useRef<HTMLDivElement | null>(null);
   const [strategySignalParams, setStrategySignalParams] = useState({
     take_profit_pct: 5.0,
@@ -144,37 +146,31 @@ const ScreenerPage: React.FC = () => {
     dip_buy_threshold_pct: 2.0,
   });
 
-  useEffect(() => {
-    fetchPreferences();
-    fetchBudgetStatus();
-    fetchStrategies();
-    fetchConfig();
-    fetchPortfolioSummary();
-    fetchBrokerAccount();
-  }, []);
-
-  useEffect(() => {
-    fetchAssets();
-  }, [preferences.asset_type, preferences.screener_limit, screenerMode, preset, currentPage, pageSize, minDollarVolume, maxSpreadBps, maxSectorWeightPct, autoRegimeAdjust]);
-
-  const fetchPreferences = async () => {
+  const fetchPreferences = useCallback(async () => {
     try {
       const response = await fetch(`${BACKEND_URL}/preferences`);
       if (!response.ok) throw new Error('Failed to fetch preferences');
       const data = await response.json();
-      setPreferences(data);
-      setScreenerMode(data.screener_mode || 'most_active');
-      if (data.asset_type === 'stock') {
+      const normalizedAssetType: Preferences['asset_type'] = data.asset_type === 'etf' ? 'etf' : 'stock';
+      const normalizedScreenerMode: ScreenerMode =
+        normalizedAssetType === 'stock' ? (data.screener_mode || 'most_active') : 'preset';
+      setPreferences({
+        ...data,
+        asset_type: normalizedAssetType,
+        screener_mode: normalizedScreenerMode,
+      });
+      setScreenerMode(normalizedScreenerMode);
+      if (normalizedAssetType === 'stock') {
         setPreset(data.stock_preset || 'weekly_optimized');
-      } else if (data.asset_type === 'etf') {
+      } else {
         setPreset(data.etf_preset || 'balanced');
       }
     } catch (err) {
       console.error('Error fetching preferences:', err);
     }
-  };
+  }, []);
 
-  const fetchBudgetStatus = async () => {
+  const fetchBudgetStatus = useCallback(async () => {
     try {
       const response = await fetch(`${BACKEND_URL}/budget/status`);
       if (!response.ok) throw new Error('Failed to fetch budget status');
@@ -183,9 +179,9 @@ const ScreenerPage: React.FC = () => {
     } catch (err) {
       console.error('Error fetching budget status:', err);
     }
-  };
+  }, []);
 
-  const fetchChart = async (symbol: string) => {
+  const fetchChart = useCallback(async (symbol: string) => {
     try {
       setChartLoading(true);
       setChartError(null);
@@ -211,27 +207,20 @@ const ScreenerPage: React.FC = () => {
     } finally {
       setChartLoading(false);
     }
-  };
-
-  useEffect(() => {
-    if (selectedSymbol) {
-      fetchChart(selectedSymbol);
-    }
   }, [chartRange, strategySignalParams]);
 
   const handleSelectSymbolChart = (symbol: string) => {
     setSelectedSymbol(symbol);
-    fetchChart(symbol);
     chartSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
   };
 
-  const fetchAssets = async () => {
+  const fetchAssets = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
       let url = `${BACKEND_URL}/screener/all?asset_type=${preferences.asset_type}&limit=${preferences.screener_limit}&screener_mode=${screenerMode}`;
       let dataSource: string = screenerMode;
-      if (screenerMode === 'preset' && preferences.asset_type !== 'both') {
+      if (screenerMode === 'preset') {
         url = `${BACKEND_URL}/screener/preset?asset_type=${preferences.asset_type}&preset=${preset}&limit=${preferences.screener_limit}`;
         dataSource = `${preferences.asset_type}_preset:${preset}`;
       }
@@ -246,12 +235,10 @@ const ScreenerPage: React.FC = () => {
       setLastDataSource(data.data_source || dataSource);
       setLastRefreshAt(new Date().toISOString());
       if (data.assets?.length > 0) {
-        const hasSelectedOnPage = selectedSymbol && data.assets.some((asset: Asset) => asset.symbol === selectedSymbol);
-        if (!hasSelectedOnPage) {
-          const first = data.assets[0].symbol;
-          setSelectedSymbol(first);
-          fetchChart(first);
-        }
+        setSelectedSymbol((prev) => {
+          const hasSelectedOnPage = prev && data.assets.some((asset: Asset) => asset.symbol === prev);
+          return hasSelectedOnPage ? prev : data.assets[0].symbol;
+        });
       } else {
         setSelectedSymbol(null);
         setChartData([]);
@@ -261,7 +248,7 @@ const ScreenerPage: React.FC = () => {
     } finally {
       setLoading(false);
     }
-  };
+  }, [preferences.asset_type, preferences.screener_limit, screenerMode, preset, currentPage, pageSize, minDollarVolume, maxSpreadBps, maxSectorWeightPct, autoRegimeAdjust]);
 
   const updatePreferences = async (updates: Partial<Preferences>) => {
     try {
@@ -281,7 +268,7 @@ const ScreenerPage: React.FC = () => {
     }
   };
 
-  const fetchConfig = async () => {
+  const fetchConfig = useCallback(async () => {
     try {
       const config = await getConfig();
       setMaxPositionSize(config.max_position_size);
@@ -290,25 +277,37 @@ const ScreenerPage: React.FC = () => {
     } catch (err) {
       console.error('Error fetching config:', err);
     }
-  };
+  }, []);
 
-  const fetchPortfolioSummary = async () => {
+  const fetchPortfolioSummary = useCallback(async () => {
     try {
       const summary = await getPortfolioSummary();
       setPortfolioSummary(summary);
     } catch (err) {
       console.error('Error fetching portfolio summary:', err);
     }
-  };
+  }, []);
 
-  const fetchBrokerAccount = async () => {
+  const fetchBrokerAccount = useCallback(async () => {
     try {
       const account = await getBrokerAccount();
       setBrokerAccount(account);
     } catch (err) {
       console.error('Error fetching broker account:', err);
     }
-  };
+  }, []);
+
+  const fetchSafety = useCallback(async () => {
+    try {
+      const safety = await getSafetyStatus();
+      setKillSwitchActive(Boolean(safety.kill_switch_active));
+      const preflight = await getSafetyPreflight(selectedSymbol || 'AAPL');
+      setBlockedReason(preflight.allowed ? '' : preflight.reason);
+    } catch {
+      setKillSwitchActive(false);
+      setBlockedReason('');
+    }
+  }, [selectedSymbol]);
 
   const handleApplyWorkspaceSettings = async () => {
     const validationErrors: string[] = [];
@@ -333,9 +332,6 @@ const ScreenerPage: React.FC = () => {
     if (preferences.asset_type !== 'stock' && screenerMode === 'most_active') {
       validationErrors.push('Most Active universe is only available for Stocks.');
     }
-    if (preferences.asset_type === 'both' && screenerMode === 'preset') {
-      validationErrors.push('Preset mode is available only for Stocks or ETFs.');
-    }
     if (validationErrors.length > 0) {
       setWorkspaceValidationError(validationErrors[0]);
       return;
@@ -348,11 +344,7 @@ const ScreenerPage: React.FC = () => {
       const effectiveRiskProfile: RiskProfile =
         preferences.asset_type === 'etf' ? preferences.etf_preset : preferences.risk_profile;
       const effectiveScreenerMode: ScreenerMode =
-        preferences.asset_type === 'stock'
-          ? screenerMode
-          : preferences.asset_type === 'both'
-          ? 'most_active'
-          : 'preset';
+        preferences.asset_type === 'stock' ? screenerMode : 'preset';
 
       await updatePreferences({
         asset_type: preferences.asset_type,
@@ -379,24 +371,42 @@ const ScreenerPage: React.FC = () => {
     }
   };
 
-  const fetchStrategies = async () => {
+  const fetchStrategies = useCallback(async () => {
     try {
       const response = await getStrategies();
       const allStrategies = response.strategies || [];
       setStrategies(allStrategies);
-      if (allStrategies.length > 0) {
+      setSelectedStrategyId((prev) => {
+        if (allStrategies.length === 0) return '__new__';
+        const hasExistingSelection = allStrategies.some((s) => s.id === prev);
+        if (hasExistingSelection && prev) return prev;
         const active = allStrategies.find((s) => s.status === StrategyStatus.ACTIVE);
-        const hasExistingSelection = allStrategies.some((s) => s.id === selectedStrategyId);
-        if (!hasExistingSelection || !selectedStrategyId) {
-          setSelectedStrategyId((active || allStrategies[0]).id);
-        }
-      } else {
-        setSelectedStrategyId('__new__');
-      }
+        return (active || allStrategies[0]).id;
+      });
     } catch (err) {
       console.error('Error fetching strategies:', err);
     }
-  };
+  }, []);
+
+  useEffect(() => {
+    fetchPreferences();
+    fetchBudgetStatus();
+    fetchStrategies();
+    fetchConfig();
+    fetchPortfolioSummary();
+    fetchBrokerAccount();
+    fetchSafety();
+  }, [fetchPreferences, fetchBudgetStatus, fetchStrategies, fetchConfig, fetchPortfolioSummary, fetchBrokerAccount, fetchSafety]);
+
+  useEffect(() => {
+    fetchAssets();
+  }, [fetchAssets]);
+
+  useEffect(() => {
+    if (selectedSymbol) {
+      fetchChart(selectedSymbol);
+    }
+  }, [selectedSymbol, fetchChart]);
 
   useEffect(() => {
     const loadStrategySignalParams = async () => {
@@ -471,7 +481,7 @@ const ScreenerPage: React.FC = () => {
         : `Stock Preset: ${activePresetLabel}`
       : preferences.asset_type === 'etf'
       ? `ETF Preset: ${activePresetLabel}`
-      : 'Combined Universe';
+      : `Stock Preset: ${activePresetLabel}`;
 
   const stockPresets: Array<{ value: StockPreset; label: string }> = [
     { value: 'weekly_optimized', label: 'Weekly Optimized' },
@@ -512,8 +522,7 @@ const ScreenerPage: React.FC = () => {
     maxSpreadBps > WORKSPACE_LIMITS.maxSpreadBpsMax ||
     maxSectorWeightPct < WORKSPACE_LIMITS.maxSectorWeightMin ||
     maxSectorWeightPct > WORKSPACE_LIMITS.maxSectorWeightMax ||
-    (preferences.asset_type !== 'stock' && screenerMode === 'most_active') ||
-    (preferences.asset_type === 'both' && screenerMode === 'preset');
+    (preferences.asset_type !== 'stock' && screenerMode === 'most_active');
 
   useEffect(() => {
     if (currentPage !== safePage) {
@@ -558,6 +567,14 @@ const ScreenerPage: React.FC = () => {
             {' | '}
             Chart Range: <span className="font-semibold">{chartRange.toUpperCase()}</span>
           </p>
+          <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
+            <span className={`rounded px-2 py-1 font-semibold ${killSwitchActive ? 'bg-red-900/70 text-red-200' : 'bg-emerald-800/60 text-emerald-100'}`}>
+              Safety: {killSwitchActive ? 'Kill Switch Active' : 'Normal'}
+            </span>
+            {!killSwitchActive && blockedReason && (
+              <span className="rounded bg-amber-900/70 px-2 py-1 text-amber-200">Block reason: {blockedReason}</span>
+            )}
+          </div>
           {lastDataSource !== 'alpaca' && (
             <p className="mt-2 text-xs text-amber-200">
               Screener is not fully Alpaca-backed right now. Check Alpaca credentials/runtime connectivity.
@@ -625,15 +642,13 @@ const ScreenerPage: React.FC = () => {
 
         <div className="bg-gray-800 rounded-lg p-6 border border-gray-700 mb-6">
           <h2 className="text-xl text-white font-semibold mb-4">Workspace Controls</h2>
-          {preferences.asset_type === 'stock' && (
-            <p className="mb-4 text-xs text-gray-400">
-              Stocks tip: Universe controls <span className="text-gray-300">what symbols are considered</span>; Risk Profile controls
-              <span className="text-gray-300"> position sizing and risk limits</span>.
-            </p>
-          )}
-          <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+          <div className="mb-4 rounded-lg border border-blue-800 bg-blue-900/20 px-3 py-2 text-xs text-blue-100">
+            Step 1: choose asset type. Step 2: choose universe source/preset. Step 3: set budget and guardrails, then apply.
+            Execution mode remains in Settings and is reflected in the banner.
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-3 xl:grid-cols-4 gap-4">
             <div>
-              <label className="block text-sm font-medium text-gray-200 mb-2">Asset Type <HelpTooltip text="Select whether to trade stocks, ETFs, or both universes." /></label>
+              <label className="block text-sm font-medium text-gray-200 mb-2">Step 1: Asset Type <HelpTooltip text="Select whether to trade Stocks or ETFs." /></label>
               <select
                 value={preferences.asset_type}
                 onChange={(e) => {
@@ -643,15 +658,10 @@ const ScreenerPage: React.FC = () => {
                   setChartData([]);
                   setChartError(null);
                   if (next === 'etf') {
-                    updatePreferences({ asset_type: next, risk_profile: preferences.etf_preset });
+                    updatePreferences({ asset_type: next, risk_profile: preferences.etf_preset, screener_mode: 'preset' });
                     setScreenerMode('preset');
-                    updatePreferences({ screener_mode: 'preset' });
-                  } else if (next === 'both') {
-                    updatePreferences({ asset_type: next });
-                    setScreenerMode('most_active');
-                    updatePreferences({ screener_mode: 'most_active' });
                   } else {
-                    updatePreferences({ asset_type: next });
+                    updatePreferences({ asset_type: next, screener_mode: screenerMode });
                   }
                   if (next === 'stock') {
                     const nextPreset = preferences.stock_preset || 'weekly_optimized';
@@ -663,7 +673,6 @@ const ScreenerPage: React.FC = () => {
                 }}
                 className="w-full px-3 py-2 bg-gray-700 text-white border border-gray-600 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
               >
-                <option value="both">Both</option>
                 <option value="stock">Stocks Only</option>
                 <option value="etf">ETFs Only</option>
               </select>
@@ -672,7 +681,7 @@ const ScreenerPage: React.FC = () => {
 
             {preferences.asset_type === 'stock' && (
               <div>
-                <label className="block text-sm font-medium text-gray-200 mb-2">Universe Source <HelpTooltip text="Most Active pulls liquid stocks; Preset uses strategy-curated lists." /></label>
+                <label className="block text-sm font-medium text-gray-200 mb-2">Step 2: Universe Source <HelpTooltip text="Most Active pulls liquid stocks; Preset uses strategy-curated lists." /></label>
                 <select
                   value={screenerMode}
                   onChange={(e) => {
@@ -695,7 +704,7 @@ const ScreenerPage: React.FC = () => {
 
             {((preferences.asset_type === 'stock' && screenerMode === 'preset') || preferences.asset_type === 'etf') && (
               <div>
-                <label className="block text-sm font-medium text-gray-200 mb-2">Preset <HelpTooltip text="Select prebuilt strategy baskets for stocks or ETFs." /></label>
+                <label className="block text-sm font-medium text-gray-200 mb-2">Step 2: Preset <HelpTooltip text="Select prebuilt strategy baskets for stocks or ETFs." /></label>
                 <select
                   value={preset}
                   onChange={(e) => {
@@ -728,7 +737,7 @@ const ScreenerPage: React.FC = () => {
 
             {preferences.asset_type === 'stock' && screenerMode === 'most_active' && (
               <div>
-                <label className="block text-sm font-medium text-gray-200 mb-2">Most Active Count <HelpTooltip text="Number of top active stock symbols to include." /></label>
+                <label className="block text-sm font-medium text-gray-200 mb-2">Step 2: Most Active Count <HelpTooltip text="Number of top active stock symbols to include." /></label>
                 <input
                   type="range"
                   min={10}
@@ -749,37 +758,8 @@ const ScreenerPage: React.FC = () => {
               </div>
             )}
 
-            {preferences.asset_type !== 'etf' && (
-              <div>
-                <label className="block text-sm font-medium text-gray-200 mb-2">Risk Profile <HelpTooltip text="Controls sizing behavior for strategy execution and risk guardrails." /></label>
-                <select
-                  value={preferences.risk_profile}
-                onChange={(e) => updatePreferences({ risk_profile: e.target.value as RiskProfile })}
-                  className="w-full px-3 py-2 bg-gray-700 text-white border border-gray-600 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-                >
-                  <option value="conservative">Conservative</option>
-                  <option value="balanced">Balanced</option>
-                  <option value="aggressive">Aggressive</option>
-                </select>
-                <p className="mt-1 text-xs text-gray-500">Controls execution aggressiveness and risk exposure.</p>
-              </div>
-            )}
-
-            {preferences.asset_type === 'etf' && (
-              <div>
-                <label className="block text-sm font-medium text-gray-200 mb-2">Risk Profile</label>
-                <input
-                  value={preferences.etf_preset}
-                  readOnly
-                  className="w-full px-3 py-2 bg-gray-800 text-gray-300 border border-gray-700 rounded-md"
-                />
-                <p className="text-xs text-gray-400 mt-1">ETF risk profile is driven by the ETF preset.</p>
-                <p className="text-xs text-gray-500">Preset and risk are intentionally unified to avoid conflicts.</p>
-              </div>
-            )}
-
             <div>
-              <label className="block text-sm font-medium text-gray-200 mb-2">Weekly Budget ($)</label>
+              <label className="block text-sm font-medium text-gray-200 mb-2">Step 3: Weekly Budget ($)</label>
               <input
                 type="number"
                 min={50}
@@ -798,7 +778,7 @@ const ScreenerPage: React.FC = () => {
             </div>
 
             <div>
-              <label className="block text-sm font-medium text-gray-200 mb-2">Max Position Size ($)</label>
+              <label className="block text-sm font-medium text-gray-200 mb-2">Step 3: Max Position Size ($)</label>
               <input
                 type="number"
                 value={maxPositionSize}
@@ -813,7 +793,7 @@ const ScreenerPage: React.FC = () => {
             </div>
 
             <div>
-              <label className="block text-sm font-medium text-gray-200 mb-2">Daily Loss Limit ($)</label>
+              <label className="block text-sm font-medium text-gray-200 mb-2">Step 3: Daily Loss Limit ($)</label>
               <input
                 type="number"
                 value={riskLimitDaily}
@@ -828,16 +808,7 @@ const ScreenerPage: React.FC = () => {
             </div>
 
             <div>
-              <label className="block text-sm font-medium text-gray-200 mb-2">Execution Mode</label>
-              <div className="w-full px-3 py-2 bg-gray-800 text-gray-200 border border-gray-700 rounded-md">
-                {paperTrading ? 'Paper (from Settings)' : 'Live (from Settings)'}
-              </div>
-              <p className="text-xs text-gray-400 mt-1">Change execution mode in Settings.</p>
-              <p className="text-xs text-gray-500">Screener reflects mode but cannot switch it directly.</p>
-            </div>
-
-            <div>
-              <label className="block text-sm font-medium text-gray-200 mb-2">Min Dollar Volume ($)</label>
+              <label className="block text-sm font-medium text-gray-200 mb-2">Step 3: Min Dollar Volume ($)</label>
               <input
                 type="number"
                 value={minDollarVolume}
@@ -859,7 +830,7 @@ const ScreenerPage: React.FC = () => {
             </div>
 
             <div>
-              <label className="block text-sm font-medium text-gray-200 mb-2">Max Spread (bps)</label>
+              <label className="block text-sm font-medium text-gray-200 mb-2">Step 3: Max Spread (bps)</label>
               <input
                 type="number"
                 value={maxSpreadBps}
@@ -881,7 +852,7 @@ const ScreenerPage: React.FC = () => {
             </div>
 
             <div>
-              <label className="block text-sm font-medium text-gray-200 mb-2">Max Sector Weight (%)</label>
+              <label className="block text-sm font-medium text-gray-200 mb-2">Step 3: Max Sector Weight (%)</label>
               <input
                 type="number"
                 min={20}
@@ -905,7 +876,7 @@ const ScreenerPage: React.FC = () => {
             </div>
 
             <div>
-              <label className="block text-sm font-medium text-gray-200 mb-2">Auto Regime Adjust</label>
+              <label className="block text-sm font-medium text-gray-200 mb-2">Step 3: Auto Regime Adjust</label>
               <select
                 value={autoRegimeAdjust ? 'on' : 'off'}
                 onChange={(e) => {
@@ -938,7 +909,7 @@ const ScreenerPage: React.FC = () => {
         <div className="min-w-0 2xl:col-span-7 bg-gray-800 rounded-lg border border-gray-700 overflow-hidden">
           <div className="px-6 py-4 border-b border-gray-200 flex justify-between items-center">
             <h2 className="text-xl font-semibold text-white">
-              Active {preferences.asset_type === 'stock' ? 'Stocks' : preferences.asset_type === 'etf' ? 'ETFs' : 'Securities'}
+              Active {preferences.asset_type === 'stock' ? 'Stocks' : 'ETFs'}
               <span className="ml-2 text-sm font-normal text-gray-400">({assets.length} loaded / {totalAssetCount} total)</span>
             </h2>
             <button

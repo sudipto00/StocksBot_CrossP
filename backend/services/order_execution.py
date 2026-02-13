@@ -8,6 +8,9 @@ Handles validation, broker integration, and storage persistence.
 from typing import Dict, Any, Optional
 from datetime import datetime
 import logging
+import threading
+import time
+from collections import deque
 
 from sqlalchemy.orm import Session
 
@@ -18,6 +21,21 @@ from services.budget_tracker import get_budget_tracker
 from config.risk_profiles import RiskProfile, validate_trade, get_position_size
 
 logger = logging.getLogger(__name__)
+_GLOBAL_KILL_SWITCH = False
+_GLOBAL_KILL_SWITCH_LOCK = threading.Lock()
+
+
+def set_global_kill_switch(active: bool) -> None:
+    """Enable/disable global kill switch for order submissions."""
+    global _GLOBAL_KILL_SWITCH
+    with _GLOBAL_KILL_SWITCH_LOCK:
+        _GLOBAL_KILL_SWITCH = bool(active)
+
+
+def get_global_kill_switch() -> bool:
+    """Read global kill switch state."""
+    with _GLOBAL_KILL_SWITCH_LOCK:
+        return _GLOBAL_KILL_SWITCH
 
 
 class OrderExecutionError(Exception):
@@ -54,7 +72,8 @@ class OrderExecutionService:
         max_position_size: float = 10000.0,
         risk_limit_daily: float = 500.0,
         enable_budget_tracking: bool = True,
-        risk_profile: Optional[RiskProfile] = None
+        risk_profile: Optional[RiskProfile] = None,
+        order_throttle_per_minute: int = 60,
     ):
         """
         Initialize order execution service.
@@ -73,6 +92,9 @@ class OrderExecutionService:
         self.risk_limit_daily = risk_limit_daily
         self.enable_budget_tracking = enable_budget_tracking
         self.risk_profile = risk_profile
+        self.order_throttle_per_minute = max(1, int(order_throttle_per_minute))
+        self._recent_order_timestamps: deque[float] = deque()
+        self._throttle_lock = threading.Lock()
         
         # Get budget tracker if enabled
         if self.enable_budget_tracking:
@@ -115,6 +137,15 @@ class OrderExecutionService:
         # Check broker connection
         if not self.broker.is_connected():
             raise BrokerError("Broker is not connected")
+
+        if get_global_kill_switch():
+            raise OrderValidationError("Trading is blocked: kill switch is active")
+
+        if not self.broker.is_symbol_tradable(symbol):
+            raise OrderValidationError(f"Symbol {symbol} is not tradable")
+
+        if not self.broker.is_market_open():
+            raise OrderValidationError("Market is closed")
         
         # Check account info
         try:
@@ -143,21 +174,42 @@ class OrderExecutionService:
                 estimated_price = price
             
             order_value = quantity * estimated_price
-            
-            # Check position size limit
-            if order_value > self.max_position_size:
-                raise OrderValidationError(
-                    f"Order value ${order_value:.2f} exceeds maximum position "
-                    f"size ${self.max_position_size:.2f}"
-                )
-            
-            # Check buying power
-            buying_power = account_info.get("buying_power", 0)
+            equity = float(account_info.get("equity", account_info.get("portfolio_value", 0)) or 0)
+            buying_power = float(account_info.get("buying_power", 0) or 0)
+
+            # Buying power should be surfaced as the primary insufficiency reason.
             if order_value > buying_power:
                 raise OrderValidationError(
                     f"Insufficient buying power: need ${order_value:.2f}, "
                     f"have ${buying_power:.2f}"
                 )
+
+            # Dynamic guardrails are clamped to account equity scale.
+            effective_max_position_size = float(self.max_position_size)
+            if equity > 0:
+                effective_max_position_size = min(effective_max_position_size, max(100.0, equity * 0.25))
+            effective_max_position_size = max(1.0, effective_max_position_size)
+            
+            # Check position size limit
+            if order_value > effective_max_position_size:
+                raise OrderValidationError(
+                    f"Order value ${order_value:.2f} exceeds maximum position "
+                    f"size ${effective_max_position_size:.2f} (balance-adjusted)"
+                )
+
+            # Clamp daily risk to account equity scale.
+            effective_risk_limit_daily = float(self.risk_limit_daily)
+            if equity > 0:
+                effective_risk_limit_daily = min(effective_risk_limit_daily, max(50.0, equity * 0.05))
+            effective_risk_limit_daily = max(1.0, effective_risk_limit_daily)
+            logger.debug(
+                "Dynamic limits for %s: max_position=%.2f daily_risk=%.2f equity=%.2f buying_power=%.2f",
+                symbol,
+                effective_max_position_size,
+                effective_risk_limit_daily,
+                equity,
+                buying_power,
+            )
             
             # Check weekly budget if enabled
             if self.enable_budget_tracking and self.budget_tracker:
@@ -226,6 +278,11 @@ class OrderExecutionService:
             OrderValidationError: If validation fails
             BrokerError: If broker submission fails
         """
+        if not self._acquire_throttle_slot():
+            raise OrderValidationError(
+                f"Order throttle exceeded: max {self.order_throttle_per_minute} orders/minute"
+            )
+
         # Validate order
         self.validate_order(symbol, side, order_type, quantity, price)
         
@@ -310,6 +367,18 @@ class OrderExecutionService:
             
             logger.error(f"Failed to submit order {order.id}: {e}")
             raise BrokerError(f"Failed to submit order to broker: {e}")
+
+    def _acquire_throttle_slot(self) -> bool:
+        """Rate-limit order submissions per rolling minute window."""
+        now = time.time()
+        window_start = now - 60.0
+        with self._throttle_lock:
+            while self._recent_order_timestamps and self._recent_order_timestamps[0] < window_start:
+                self._recent_order_timestamps.popleft()
+            if len(self._recent_order_timestamps) >= self.order_throttle_per_minute:
+                return False
+            self._recent_order_timestamps.append(now)
+            return True
     
     def update_order_status(self, order: Order) -> Order:
         """

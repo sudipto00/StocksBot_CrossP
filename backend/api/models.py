@@ -61,6 +61,12 @@ class ConfigResponse(BaseModel):
     paper_trading: bool = Field(default=True, description="Whether in paper trading mode")
     max_position_size: float = Field(default=10000.0, description="Maximum position size")
     risk_limit_daily: float = Field(default=500.0, description="Daily risk limit")
+    tick_interval_seconds: float = Field(default=60.0, description="Strategy runner polling interval in seconds")
+    streaming_enabled: bool = Field(default=False, description="Enable websocket trade-update streaming when broker supports it")
+    log_directory: str = Field(default="./logs", description="Directory for backend log files")
+    audit_export_directory: str = Field(default="./audit_exports", description="Directory for audit export artifacts")
+    log_retention_days: int = Field(default=30, description="Retention period for log files")
+    audit_retention_days: int = Field(default=90, description="Retention period for audit logs/files")
     broker: str = Field(default="paper", description="Broker name")
 
 
@@ -133,6 +139,12 @@ class ConfigUpdateRequest(BaseModel):
     paper_trading: Optional[bool] = Field(None, description="Enable/disable paper trading")
     max_position_size: Optional[float] = Field(None, description="Maximum position size", gt=0)
     risk_limit_daily: Optional[float] = Field(None, description="Daily risk limit", gt=0)
+    tick_interval_seconds: Optional[float] = Field(None, description="Runner polling interval in seconds", gt=0)
+    streaming_enabled: Optional[bool] = Field(None, description="Enable websocket trade-update streaming")
+    log_directory: Optional[str] = Field(None, description="Directory for backend log files")
+    audit_export_directory: Optional[str] = Field(None, description="Directory for audit exports")
+    log_retention_days: Optional[int] = Field(None, description="Retention days for logs", ge=1, le=3650)
+    audit_retention_days: Optional[int] = Field(None, description="Retention days for audit logs/files", ge=1, le=3650)
     broker: Optional[str] = Field(None, description="Broker name (paper/alpaca)")
 
 
@@ -352,10 +364,24 @@ class TradeHistoryResponse(BaseModel):
 
 class RunnerStatusResponse(BaseModel):
     """Runner status response."""
-    status: str = Field(..., description="Runner status (stopped, running, paused, error)")
+    status: str = Field(..., description="Runner status (stopped, running, sleeping, paused, error)")
     strategies: List[Dict[str, Any]] = Field(default_factory=list, description="Loaded strategies")
     tick_interval: float = Field(..., description="Tick interval in seconds")
     broker_connected: bool = Field(..., description="Whether broker is connected")
+    poll_success_count: int = Field(default=0, description="Successful poll cycles")
+    poll_error_count: int = Field(default=0, description="Poll cycles with errors")
+    last_poll_error: str = Field(default="", description="Most recent poll error summary")
+    last_poll_at: Optional[str] = Field(default=None, description="Last poll timestamp ISO string")
+    last_successful_poll_at: Optional[str] = Field(default=None, description="Last successful poll timestamp ISO string")
+    last_reconciliation_at: Optional[str] = Field(default=None, description="Last reconciliation timestamp ISO string")
+    last_reconciliation_discrepancies: int = Field(default=0, description="Last reconciliation discrepancy count")
+    sleeping: bool = Field(default=False, description="Whether runner is in off-hours sleep mode")
+    sleep_since: Optional[str] = Field(default=None, description="Sleep mode start timestamp ISO string")
+    next_market_open_at: Optional[str] = Field(default=None, description="Forecast market-open timestamp ISO string")
+    last_resume_at: Optional[str] = Field(default=None, description="Last resume timestamp ISO string")
+    last_catchup_at: Optional[str] = Field(default=None, description="Last catch-up cycle timestamp ISO string")
+    resume_count: int = Field(default=0, description="Number of sleep->resume transitions")
+    market_session_open: Optional[bool] = Field(default=None, description="Latest broker market-session flag")
 
 
 class RunnerActionResponse(BaseModel):

@@ -9,7 +9,7 @@ TODO: Implement concrete broker implementations
 """
 
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Callable
 from datetime import datetime
 from enum import Enum
 
@@ -178,6 +178,41 @@ class BrokerInterface(ABC):
         """
         pass
 
+    def start_trade_update_stream(self, on_update: Callable[[Dict[str, Any]], None]) -> bool:
+        """
+        Optional: start broker trade-update websocket stream.
+        Default implementation returns False for brokers that do not support streaming.
+        """
+        return False
+
+    def stop_trade_update_stream(self) -> bool:
+        """
+        Optional: stop broker trade-update websocket stream.
+        Default implementation returns False for brokers that do not support streaming.
+        """
+        return False
+
+    def is_market_open(self) -> bool:
+        """
+        Optional: whether regular market session is open.
+        Default True for non-market-aware brokers.
+        """
+        return True
+
+    def is_symbol_tradable(self, symbol: str) -> bool:
+        """
+        Optional: whether symbol is tradable.
+        Default True for non-market-aware brokers.
+        """
+        return True
+
+    def get_next_market_open(self) -> Optional[datetime]:
+        """
+        Optional: next regular market open time.
+        Default None for brokers that do not expose market clock metadata.
+        """
+        return None
+
 
 class PaperBroker(BrokerInterface):
     """
@@ -223,9 +258,10 @@ class PaperBroker(BrokerInterface):
         
         TODO: Calculate buying power and equity
         """
+        positions_value = sum(float(position.get("market_value", 0.0)) for position in self.positions.values())
         return {
             "cash": self.balance,
-            "equity": self.balance,  # TODO: Add positions value
+            "equity": self.balance + positions_value,
             "buying_power": self.balance,
         }
     
@@ -268,6 +304,45 @@ class PaperBroker(BrokerInterface):
             else:  # SELL
                 proceeds = filled_quantity * avg_fill_price
                 self.balance += proceeds
+
+            # Update paper positions so dashboard/holdings reflect actual state.
+            existing = self.positions.get(symbol)
+            existing_qty = float(existing.get("quantity", 0.0)) if existing else 0.0
+            existing_avg = float(existing.get("avg_entry_price", avg_fill_price)) if existing else avg_fill_price
+            if side == OrderSide.BUY:
+                new_qty = existing_qty + filled_quantity
+                new_avg = (
+                    ((existing_qty * existing_avg) + (filled_quantity * avg_fill_price)) / new_qty
+                    if new_qty > 0
+                    else avg_fill_price
+                )
+                self.positions[symbol] = {
+                    "symbol": symbol,
+                    "quantity": new_qty,
+                    "side": "long",
+                    "avg_entry_price": new_avg,
+                    "current_price": current_price,
+                    "market_value": new_qty * current_price,
+                    "cost_basis": new_qty * new_avg,
+                    "unrealized_pnl": (new_qty * current_price) - (new_qty * new_avg),
+                    "unrealized_pnl_percent": ((current_price - new_avg) / new_avg * 100.0) if new_avg > 0 else 0.0,
+                }
+            else:
+                new_qty = max(0.0, existing_qty - filled_quantity)
+                if new_qty <= 0:
+                    self.positions.pop(symbol, None)
+                else:
+                    self.positions[symbol] = {
+                        "symbol": symbol,
+                        "quantity": new_qty,
+                        "side": "long",
+                        "avg_entry_price": existing_avg,
+                        "current_price": current_price,
+                        "market_value": new_qty * current_price,
+                        "cost_basis": new_qty * existing_avg,
+                        "unrealized_pnl": (new_qty * current_price) - (new_qty * existing_avg),
+                        "unrealized_pnl_percent": ((current_price - existing_avg) / existing_avg * 100.0) if existing_avg > 0 else 0.0,
+                    }
         else:
             # Limit orders stay pending (TODO: implement fill simulation)
             status = OrderStatus.PENDING.value

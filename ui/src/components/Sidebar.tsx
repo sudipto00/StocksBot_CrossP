@@ -1,16 +1,73 @@
-import { NavLink } from 'react-router-dom';
+import { useEffect, useState } from 'react';
+import { NavLink, useNavigate } from 'react-router-dom';
+import { getSystemHealthSnapshot } from '../api/backend';
+import { RunnerStatus } from '../api/types';
 
 /**
  * Sidebar navigation component.
  * Provides navigation links to all main pages.
  */
 function Sidebar() {
+  const navigate = useNavigate();
+  const [runnerLabel, setRunnerLabel] = useState('loading');
+  const [brokerConnected, setBrokerConnected] = useState(false);
+  const [pollErrorCount, setPollErrorCount] = useState(0);
+  const [criticalEvents, setCriticalEvents] = useState(0);
+  const [killSwitchActive, setKillSwitchActive] = useState(false);
+  const [lastSync, setLastSync] = useState('');
+
   const navLinkClass = ({ isActive }: { isActive: boolean }) =>
     `flex items-center px-4 py-3 text-sm font-medium rounded-lg transition-colors ${
       isActive
         ? 'bg-blue-600 text-white'
         : 'text-gray-300 hover:bg-gray-700 hover:text-white'
     }`;
+
+  const healthColor =
+    runnerLabel === RunnerStatus.RUNNING
+      ? 'text-green-300'
+      : runnerLabel === RunnerStatus.ERROR
+      ? 'text-red-300'
+      : 'text-yellow-200';
+
+  useEffect(() => {
+    const sync = async () => {
+      try {
+        const snapshot = await getSystemHealthSnapshot();
+        setRunnerLabel(snapshot.runner_status);
+        setBrokerConnected(snapshot.broker_connected);
+        setPollErrorCount(snapshot.poll_error_count);
+        setCriticalEvents(snapshot.critical_event_count);
+        setKillSwitchActive(Boolean(snapshot.kill_switch_active));
+      } catch {
+        setRunnerLabel('error');
+        setBrokerConnected(false);
+        setPollErrorCount(0);
+        setCriticalEvents(0);
+        setKillSwitchActive(false);
+      } finally {
+        setLastSync(new Date().toLocaleTimeString());
+      }
+    };
+    const onHealth = (event: Event) => {
+      const custom = event as CustomEvent<Record<string, unknown>>;
+      const detail = custom.detail || {};
+      const runner = String(detail.runner_status || '');
+      if (runner) setRunnerLabel(runner);
+      if (typeof detail.broker_connected === 'boolean') setBrokerConnected(detail.broker_connected);
+      if (typeof detail.poll_error_count === 'number') setPollErrorCount(detail.poll_error_count);
+      if (typeof detail.kill_switch_active === 'boolean') setKillSwitchActive(detail.kill_switch_active);
+      setLastSync(new Date().toLocaleTimeString());
+    };
+
+    void sync();
+    window.addEventListener('system-health', onHealth as EventListener);
+    const id = setInterval(sync, 60000);
+    return () => {
+      clearInterval(id);
+      window.removeEventListener('system-health', onHealth as EventListener);
+    };
+  }, []);
 
   return (
     <div className="w-64 bg-gray-900 border-r border-gray-800 flex flex-col">
@@ -22,25 +79,23 @@ function Sidebar() {
 
       {/* Navigation */}
       <nav className="flex-1 p-4 space-y-2">
+        <p className="px-2 text-[11px] uppercase tracking-wide text-gray-500">Workspace</p>
         <NavLink to="/" className={navLinkClass} end>
           <span className="mr-3">📊</span>
           Dashboard
-        </NavLink>
-        
-        <NavLink to="/strategy" className={navLinkClass}>
-          <span className="mr-3">⚙️</span>
-          Strategy
-        </NavLink>
-        
-        <NavLink to="/analytics" className={navLinkClass}>
-          <span className="mr-3">📈</span>
-          Analytics
         </NavLink>
 
         <NavLink to="/screener" className={navLinkClass}>
           <span className="mr-3">🔍</span>
           Screener
         </NavLink>
+
+        <NavLink to="/strategy" className={navLinkClass}>
+          <span className="mr-3">⚙️</span>
+          Strategy
+        </NavLink>
+
+        <p className="px-2 pt-3 text-[11px] uppercase tracking-wide text-gray-500">Operations</p>
         
         <NavLink to="/audit" className={navLinkClass}>
           <span className="mr-3">📋</span>
@@ -57,6 +112,44 @@ function Sidebar() {
           Help
         </NavLink>
       </nav>
+
+      <div className="px-4 pb-3">
+        <button
+          onClick={() => navigate('/')}
+          className="w-full rounded-lg border border-gray-700 bg-gray-800 p-3 text-left hover:border-gray-600"
+          title="Open Dashboard System Health"
+        >
+          <p className="text-[11px] uppercase tracking-wide text-gray-400">System Health</p>
+          <p className={`mt-1 text-xs font-semibold ${healthColor}`}>Runner: {runnerLabel.toUpperCase()}</p>
+          <p className={`text-xs ${brokerConnected ? 'text-green-400' : 'text-amber-400'}`}>
+            Broker: {brokerConnected ? 'Connected' : 'Degraded'}
+          </p>
+          <p className="text-xs text-red-300">Poll Errors: {pollErrorCount}</p>
+          <p className="text-xs text-amber-300">Critical Events: {criticalEvents}</p>
+          {killSwitchActive && <p className="text-xs text-red-200 font-semibold">Kill Switch: ACTIVE</p>}
+          <p className="mt-1 text-[11px] text-gray-500">Sync: {lastSync || '...'}</p>
+          <div className="mt-2 flex gap-2">
+            <span
+              onClick={(e) => {
+                e.stopPropagation();
+                navigate('/');
+              }}
+              className="inline-block rounded bg-gray-700 px-2 py-1 text-[11px] text-gray-200"
+            >
+              Dashboard
+            </span>
+            <span
+              onClick={(e) => {
+                e.stopPropagation();
+                navigate('/audit');
+              }}
+              className="inline-block rounded bg-gray-700 px-2 py-1 text-[11px] text-gray-200"
+            >
+              Audit
+            </span>
+          </div>
+        </button>
+      </div>
 
       {/* Footer */}
       <div className="p-4 border-t border-gray-800">

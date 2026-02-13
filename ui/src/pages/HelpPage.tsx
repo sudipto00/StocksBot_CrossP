@@ -9,6 +9,8 @@ const sections = [
     points: [
       'Top banner summarizes active asset mode, runner state, broker mode, and open holdings.',
       'Summary cards show total value, unrealized P&L, open positions, and current equity.',
+      'Performance section contains the equity curve and cumulative P&L charts in one place.',
+      'Use 7D/30D/90D/180D/All to change chart range for both curves together.',
       'Strategy Runner card shows runner state, loaded strategy count, interval, and broker connectivity.',
       'Use Start/Stop controls to manage strategy execution engine status.',
       'Current Portfolio Holdings includes symbol type, market value, weight %, and Stock/ETF filtering.',
@@ -34,21 +36,11 @@ const sections = [
     description: 'Choose stock/ETF universe and inspect chart setups.',
     points: [
       'Top banner shows active setup, source/regime, selected symbol, and current chart range.',
-      'Asset Type selects Stocks, ETFs, or Both.',
+      'Asset Type selects Stocks or ETFs.',
       'Stocks support Most Active mode with a 10-200 symbol count slider.',
       'Preset mode supports Weekly Optimized, 3-5 Trades/Week, Monthly Optimized, Small Budget Weekly for stocks and Conservative/Balanced/Aggressive for ETFs.',
       'Workspace Controls now include one-line helper descriptions for every guardrail and input.',
       'Chart button loads symbol chart with SMA50 and SMA250 overlays, timeframe switches, and pin-to-strategy action.',
-    ],
-  },
-  {
-    id: 'analytics',
-    title: 'Analytics',
-    description: 'Performance and portfolio trend metrics.',
-    points: [
-      'Equity curve tracks portfolio value progression over time.',
-      'PnL trend and trade-level summaries help evaluate strategy behavior.',
-      'Metrics typically include total trades, win/loss split, drawdown, and cumulative P&L.',
     ],
   },
   {

@@ -29,6 +29,11 @@ import {
   // Runner types
   RunnerStatusResponse,
   RunnerActionResponse,
+  SystemHealthSnapshot,
+  SafetyStatusResponse,
+  SafetyPreflightResponse,
+  MaintenanceStorageResponse,
+  MaintenanceCleanupResponse,
   // Analytics types
   PortfolioAnalyticsResponse,
   PortfolioSummaryResponse,
@@ -330,7 +335,8 @@ export async function deleteStrategy(id: string): Promise<void> {
   });
   
   if (!response.ok) {
-    throw new Error(`Backend returned ${response.status}`);
+    const body = await response.json().catch(() => null);
+    throw new Error(body?.detail || `Backend returned ${response.status}`);
   }
 }
 
@@ -409,6 +415,96 @@ export async function stopRunner(): Promise<RunnerActionResponse> {
     throw new Error(`Backend returned ${response.status}`);
   }
   
+  return response.json();
+}
+
+/**
+ * Get a compact cross-section health snapshot used by top-level status UI.
+ */
+export async function getSystemHealthSnapshot(): Promise<SystemHealthSnapshot> {
+  const [runner, broker, criticalLogs, safety] = await Promise.all([
+    getRunnerStatus(),
+    getBrokerAccount(),
+    getAuditLogs(50, AuditEventType.ERROR),
+    getSafetyStatus().catch(() => ({ kill_switch_active: false, last_broker_sync_at: null })),
+  ]);
+
+  return {
+    runner_status: runner.status,
+    broker_connected: Boolean(runner.broker_connected && broker.connected),
+    poll_error_count: runner.poll_error_count || 0,
+    last_poll_error: runner.last_poll_error || '',
+    critical_event_count: criticalLogs.total_count || 0,
+    last_successful_poll_at: runner.last_successful_poll_at || null,
+    sleeping: Boolean(runner.sleeping),
+    sleep_since: runner.sleep_since || null,
+    next_market_open_at: runner.next_market_open_at || null,
+    last_resume_at: runner.last_resume_at || null,
+    market_session_open: typeof runner.market_session_open === 'boolean' ? runner.market_session_open : null,
+    last_broker_sync_at: safety.last_broker_sync_at || null,
+    kill_switch_active: Boolean(safety.kill_switch_active),
+  };
+}
+
+export async function getSafetyStatus(): Promise<SafetyStatusResponse> {
+  const response = await fetch(`${BACKEND_URL}/safety/status`);
+  if (!response.ok) {
+    throw new Error(`Backend returned ${response.status}`);
+  }
+  return response.json();
+}
+
+export async function setKillSwitch(active: boolean): Promise<{ success: boolean; kill_switch_active: boolean }> {
+  const response = await fetch(`${BACKEND_URL}/safety/kill-switch?active=${encodeURIComponent(String(active))}`, {
+    method: 'POST',
+  });
+  if (!response.ok) {
+    throw new Error(`Backend returned ${response.status}`);
+  }
+  return response.json();
+}
+
+export async function runPanicStop(): Promise<RunnerActionResponse> {
+  const response = await fetch(`${BACKEND_URL}/safety/panic-stop`, { method: 'POST' });
+  if (!response.ok) {
+    throw new Error(`Backend returned ${response.status}`);
+  }
+  return response.json();
+}
+
+export async function getSafetyPreflight(symbol: string): Promise<SafetyPreflightResponse> {
+  const response = await fetch(`${BACKEND_URL}/safety/preflight?symbol=${encodeURIComponent(symbol)}`);
+  if (!response.ok) {
+    throw new Error(`Backend returned ${response.status}`);
+  }
+  return response.json();
+}
+
+/**
+ * Get current storage paths, retention values, and recent files.
+ */
+export async function getMaintenanceStorage(): Promise<MaintenanceStorageResponse> {
+  const response = await fetch(`${BACKEND_URL}/maintenance/storage`);
+
+  if (!response.ok) {
+    throw new Error(`Backend returned ${response.status}`);
+  }
+
+  return response.json();
+}
+
+/**
+ * Run retention cleanup immediately.
+ */
+export async function runMaintenanceCleanup(): Promise<MaintenanceCleanupResponse> {
+  const response = await fetch(`${BACKEND_URL}/maintenance/cleanup`, {
+    method: 'POST',
+  });
+
+  if (!response.ok) {
+    throw new Error(`Backend returned ${response.status}`);
+  }
+
   return response.json();
 }
 
@@ -595,7 +691,13 @@ export async function getTradingPreferences(): Promise<TradingPreferences> {
     throw new Error(`Backend returned ${response.status}`);
   }
 
-  return response.json();
+  const raw = (await response.json()) as TradingPreferences;
+  const normalizedAssetType = raw.asset_type === 'etf' ? 'etf' : 'stock';
+  return {
+    ...raw,
+    asset_type: normalizedAssetType,
+    screener_mode: normalizedAssetType === 'stock' ? raw.screener_mode : 'preset',
+  };
 }
 
 /**
@@ -616,7 +718,13 @@ export async function updateTradingPreferences(
     throw new Error(`Backend returned ${response.status}`);
   }
 
-  return response.json();
+  const raw = (await response.json()) as TradingPreferences;
+  const normalizedAssetType = raw.asset_type === 'etf' ? 'etf' : 'stock';
+  return {
+    ...raw,
+    asset_type: normalizedAssetType,
+    screener_mode: normalizedAssetType === 'stock' ? raw.screener_mode : 'preset',
+  };
 }
 
 /**

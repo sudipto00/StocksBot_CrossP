@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
-import { getAuditLogs, getRunnerStatus, getStrategies, getTradingPreferences } from '../api/backend';
-import { AuditEventType, RunnerStatus, StrategyStatus } from '../api/types';
+import { getSystemHealthSnapshot, getStrategies, getTradingPreferences } from '../api/backend';
+import { RunnerStatus, StrategyStatus } from '../api/types';
 
 function AppTopBar() {
   const location = useLocation();
@@ -11,15 +11,25 @@ function AppTopBar() {
   const [runnerLabel, setRunnerLabel] = useState('loading');
   const [criticalCount, setCriticalCount] = useState(0);
   const [lastSync, setLastSync] = useState('');
+  const [lastBrokerSync, setLastBrokerSync] = useState('');
+  const [killSwitchActive, setKillSwitchActive] = useState(false);
+  const [sleeping, setSleeping] = useState(false);
+  const [nextMarketOpenAt, setNextMarketOpenAt] = useState<string | null>(null);
   const [query, setQuery] = useState('');
+
+  const formatNextOpen = (value: string | null): string => {
+    if (!value) return '';
+    const dt = new Date(value);
+    if (Number.isNaN(dt.getTime())) return '';
+    return dt.toLocaleString();
+  };
 
   const sync = async () => {
     try {
-      const [strategiesRes, prefs, runnerRes, auditRes] = await Promise.all([
+      const [strategiesRes, prefs, runnerRes] = await Promise.all([
         getStrategies(),
         getTradingPreferences(),
-        getRunnerStatus(),
-        getAuditLogs(100),
+        getSystemHealthSnapshot(),
       ]);
 
       const active = strategiesRes.strategies.filter((s) => s.status === StrategyStatus.ACTIVE);
@@ -30,11 +40,21 @@ function AppTopBar() {
       } else if (prefs.asset_type === 'etf') {
         setUniverseLabel(`ETFs | ${prefs.etf_preset}`);
       } else {
-        setUniverseLabel('Stocks + ETFs');
+        setUniverseLabel(prefs.screener_mode === 'most_active' ? `Stocks | Most Active (${prefs.screener_limit})` : `Stocks | ${prefs.stock_preset}`);
       }
 
-      setRunnerLabel(runnerRes.status);
-      setCriticalCount(auditRes.logs.filter((log) => log.event_type === AuditEventType.ERROR).length);
+      setRunnerLabel(runnerRes.runner_status);
+      setCriticalCount(runnerRes.critical_event_count);
+      setKillSwitchActive(Boolean(runnerRes.kill_switch_active));
+      setSleeping(Boolean(runnerRes.sleeping || runnerRes.runner_status === RunnerStatus.SLEEPING));
+      setNextMarketOpenAt(runnerRes.next_market_open_at || null);
+      setLastBrokerSync(
+        runnerRes.last_broker_sync_at
+          ? new Date(runnerRes.last_broker_sync_at).toLocaleTimeString()
+          : runnerRes.last_successful_poll_at
+          ? new Date(runnerRes.last_successful_poll_at).toLocaleTimeString()
+          : ''
+      );
       setLastSync(new Date().toLocaleTimeString());
     } catch {
       setRunnerLabel('error');
@@ -45,7 +65,38 @@ function AppTopBar() {
   useEffect(() => {
     sync();
     const id = setInterval(sync, 15000);
-    return () => clearInterval(id);
+    const onHealth = (event: Event) => {
+      const custom = event as CustomEvent<Record<string, unknown>>;
+      const detail = custom.detail || {};
+      const runner = String(detail.runner_status || '');
+      if (runner) setRunnerLabel(runner);
+      if (typeof detail.kill_switch_active === 'boolean') {
+        setKillSwitchActive(detail.kill_switch_active);
+      }
+      if (typeof detail.sleeping === 'boolean') {
+        setSleeping(detail.sleeping);
+      } else if (runner) {
+        setSleeping(runner.toLowerCase() === RunnerStatus.SLEEPING);
+      }
+      if (typeof detail.next_market_open_at === 'string' && detail.next_market_open_at) {
+        setNextMarketOpenAt(detail.next_market_open_at);
+      } else if (detail.next_market_open_at === null) {
+        setNextMarketOpenAt(null);
+      }
+      const syncAt = typeof detail.last_broker_sync_at === 'string' && detail.last_broker_sync_at
+        ? detail.last_broker_sync_at
+        : typeof detail.last_successful_poll_at === 'string'
+        ? detail.last_successful_poll_at
+        : '';
+      if (syncAt) {
+        setLastBrokerSync(new Date(syncAt).toLocaleTimeString());
+      }
+    };
+    window.addEventListener('system-health', onHealth as EventListener);
+    return () => {
+      clearInterval(id);
+      window.removeEventListener('system-health', onHealth as EventListener);
+    };
   }, [location.pathname]);
 
   const runnerColor =
@@ -58,7 +109,7 @@ function AppTopBar() {
     else if (q.includes('screener') || q.includes('stock') || q.includes('etf')) navigate('/screener');
     else if (q.includes('audit') || q.includes('log')) navigate('/audit');
     else if (q.includes('setting') || q.includes('config') || q.includes('key')) navigate('/settings');
-    else if (q.includes('analytic') || q.includes('equity') || q.includes('pnl')) navigate('/analytics');
+    else if (q.includes('analytic') || q.includes('equity') || q.includes('pnl')) navigate('/');
     else if (q.includes('help')) navigate('/help');
     setQuery('');
   };
@@ -69,6 +120,8 @@ function AppTopBar() {
         <div className="text-xs text-gray-200 bg-gray-800 rounded px-2 py-1">Strategy: <span className="font-semibold">{strategyLabel}</span></div>
         <div className="text-xs text-gray-200 bg-gray-800 rounded px-2 py-1">Universe: <span className="font-semibold">{universeLabel}</span></div>
         <div className="text-xs bg-gray-800 rounded px-2 py-1">Runner: <span className={`font-semibold ${runnerColor}`}>{runnerLabel.toUpperCase()}</span></div>
+        <div className="text-xs bg-gray-800 rounded px-2 py-1">Broker Sync: <span className="font-semibold">{lastBrokerSync || '-'}</span></div>
+        {killSwitchActive && <div className="text-xs bg-red-900/70 text-red-200 rounded px-2 py-1 font-semibold">KILL SWITCH ACTIVE</div>}
 
         <div className="ml-auto flex items-center gap-2">
           <div className="hidden md:flex items-center bg-gray-800 border border-gray-700 rounded px-2">
@@ -92,6 +145,21 @@ function AppTopBar() {
           <span className="text-xs text-gray-400">Sync: {lastSync || '...'}</span>
         </div>
       </div>
+      {sleeping && (
+        <div className="px-5 pb-3">
+          <div className="rounded border border-amber-700 bg-amber-900/30 px-3 py-2 text-xs text-amber-100">
+            Runner is in off-hours sleep mode.
+            {formatNextOpen(nextMarketOpenAt) ? (
+              <>
+                {' '}
+                Next market open: <span className="font-semibold">{formatNextOpen(nextMarketOpenAt)}</span>.
+              </>
+            ) : (
+              ' Waiting for market open.'
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

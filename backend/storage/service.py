@@ -109,6 +109,10 @@ class StorageService:
     def get_recent_orders(self, limit: int = 100) -> List[Order]:
         """Get recent orders."""
         return self.orders.get_recent(limit)
+
+    def get_open_orders(self, limit: int = 500) -> List[Order]:
+        """Get broker-submitted orders that are not terminal yet."""
+        return self.orders.get_open_orders(limit=limit)
     
     def update_order_status(self, order_id: int, status: str,
                            filled_quantity: Optional[float] = None,

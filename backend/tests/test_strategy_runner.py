@@ -4,6 +4,7 @@ Tests runner lifecycle, strategy execution, and paper trading.
 """
 import pytest
 import time
+from datetime import datetime, timedelta, timezone
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -194,6 +195,44 @@ def test_runner_stop_when_already_stopped(strategy_runner):
     """Test that stopping already stopped runner returns False."""
     result = strategy_runner.stop()
     assert result == False
+
+
+def test_runner_sleeps_off_hours_and_resumes(storage_service):
+    """Runner should enter sleep mode off-hours and auto-resume when market opens."""
+    class ToggleMarketBroker(PaperBroker):
+        def __init__(self):
+            super().__init__(starting_balance=100000.0)
+            self._market_open = False
+
+        def is_market_open(self) -> bool:
+            return self._market_open
+
+        def get_next_market_open(self):
+            return datetime.now(timezone.utc) + timedelta(hours=1)
+
+    broker = ToggleMarketBroker()
+    runner = StrategyRunner(
+        broker=broker,
+        storage_service=storage_service,
+        tick_interval=0.1,
+    )
+    runner.off_hours_poll_interval = 0.1
+    strategy = MovingAverageCrossoverStrategy({"name": "Sleep Test", "symbols": ["AAPL"]})
+    runner.load_strategy(strategy)
+
+    assert runner.start() is True
+    time.sleep(0.2)
+    assert runner.sleeping is True
+    assert runner.status == StrategyStatus.SLEEPING
+
+    broker._market_open = True
+    time.sleep(0.25)
+    assert runner.sleeping is False
+    assert runner.status == StrategyStatus.RUNNING
+    assert runner.resume_count >= 1
+    assert runner.last_resume_at is not None
+
+    runner.stop()
 
 
 # Strategy Execution Tests
@@ -399,4 +438,3 @@ def test_paper_execution_storage_integration(storage_service, paper_broker):
     
     assert trade.order_id == order.id
     assert trade.price == 150.0
-

@@ -2,19 +2,31 @@
 API Routes.
 Defines all REST API endpoints for StocksBot.
 """
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import json
 import math
 import re
-from fastapi import APIRouter, HTTPException, Depends, Query
-from typing import List, Optional
+import threading
+import time
+import asyncio
+from pathlib import Path
+from fastapi import APIRouter, HTTPException, Depends, Query, Header, WebSocket, WebSocketDisconnect
+from typing import List, Optional, Dict, Any
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import SQLAlchemyError
 
 from storage.database import get_db
 from storage.service import StorageService
 from services.broker import BrokerInterface, PaperBroker
-from services.order_execution import OrderExecutionService, OrderValidationError, BrokerError
+from services.order_execution import (
+    OrderExecutionService,
+    OrderValidationError,
+    BrokerError,
+    set_global_kill_switch,
+    get_global_kill_switch,
+)
 from config.settings import get_settings, has_alpaca_credentials
+from services.logging_service import configure_file_logging, cleanup_old_files
 
 from .models import (
     StatusResponse,
@@ -142,19 +154,28 @@ def get_order_execution_service(
     """
     broker = get_broker()
     storage = StorageService(db)
+    set_global_kill_switch(_load_kill_switch(storage))
     
     # Get config for risk limits
+    global _config
+    _config = _load_runtime_config(storage)
     config = _config
     
     # Keep budget checks opt-in at endpoint level to avoid global-state bleed
     # across tests and long-running UI sessions.
     enable_budget = False
+
+    max_position_size, risk_limit_daily = _balance_adjusted_limits(
+        broker=broker,
+        requested_max_position_size=config.max_position_size,
+        requested_risk_limit_daily=config.risk_limit_daily,
+    )
     
     return OrderExecutionService(
         broker=broker,
         storage=storage,
-        max_position_size=config.max_position_size,
-        risk_limit_daily=config.risk_limit_daily,
+        max_position_size=max_position_size,
+        risk_limit_daily=risk_limit_daily,
         enable_budget_tracking=enable_budget
     )
 
@@ -170,8 +191,22 @@ _config = ConfigResponse(
     paper_trading=True,
     max_position_size=10000.0,
     risk_limit_daily=500.0,
+    tick_interval_seconds=60.0,
+    streaming_enabled=False,
+    log_directory="./logs",
+    audit_export_directory="./audit_exports",
+    log_retention_days=30,
+    audit_retention_days=90,
     broker="paper",
 )
+configure_file_logging(_config.log_directory)
+_last_housekeeping_run: Optional[datetime] = None
+_CONFIG_KEY = "runtime_config"
+_KILL_SWITCH_KEY = "safety_kill_switch"
+_BROKER_SYNC_KEY = "last_broker_sync_at"
+_idempotency_cache: Dict[str, Dict[str, Any]] = {}
+_idempotency_lock = threading.Lock()
+_last_broker_sync_at: Optional[str] = None
 
 _SUMMARY_NOTIFICATION_PREFERENCES_KEY = "summary_notification_preferences"
 _summary_notification_preferences = SummaryNotificationPreferencesResponse(
@@ -183,6 +218,99 @@ _summary_notification_preferences = SummaryNotificationPreferencesResponse(
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _PHONE_RE = re.compile(r"^\+?[1-9]\d{7,14}$")
+
+
+def _idempotency_cache_get(endpoint: str, key: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not key:
+        return None
+    cache_key = f"{endpoint}:{key.strip()}"
+    now = time.time()
+    with _idempotency_lock:
+        entry = _idempotency_cache.get(cache_key)
+        if not entry:
+            return None
+        if entry["expires_at"] < now:
+            _idempotency_cache.pop(cache_key, None)
+            return None
+        return entry["payload"]
+
+
+def _idempotency_cache_set(endpoint: str, key: Optional[str], payload: Dict[str, Any], ttl_seconds: int = 300) -> None:
+    if not key:
+        return
+    cache_key = f"{endpoint}:{key.strip()}"
+    with _idempotency_lock:
+        _idempotency_cache[cache_key] = {
+            "payload": payload,
+            "expires_at": time.time() + ttl_seconds,
+        }
+
+
+def _load_runtime_config(storage: StorageService) -> ConfigResponse:
+    """Load runtime config from DB config store or fallback to defaults."""
+    entry = storage.config.get_by_key(_CONFIG_KEY)
+    if not entry or not entry.value:
+        return _config
+    try:
+        raw = json.loads(entry.value)
+        return ConfigResponse(**raw)
+    except Exception:
+        return _config
+
+
+def _save_runtime_config(storage: StorageService, cfg: ConfigResponse) -> None:
+    """Persist runtime config into DB config store."""
+    storage.config.upsert(
+        key=_CONFIG_KEY,
+        value=json.dumps(cfg.model_dump()),
+        value_type="json",
+        description="Runtime backend config persisted for restart consistency",
+    )
+
+
+def _load_kill_switch(storage: StorageService) -> bool:
+    entry = storage.config.get_by_key(_KILL_SWITCH_KEY)
+    if not entry:
+        return get_global_kill_switch()
+    return str(entry.value).strip().lower() == "true"
+
+
+def _save_kill_switch(storage: StorageService, active: bool) -> None:
+    storage.config.upsert(
+        key=_KILL_SWITCH_KEY,
+        value=str(bool(active)).lower(),
+        value_type="bool",
+        description="Global trading kill switch",
+    )
+
+
+def _set_last_broker_sync(ts_iso: Optional[str]) -> None:
+    global _last_broker_sync_at
+    _last_broker_sync_at = ts_iso
+
+
+def _balance_adjusted_limits(
+    broker: BrokerInterface,
+    requested_max_position_size: float,
+    requested_risk_limit_daily: float,
+) -> tuple[float, float]:
+    """Clamp configured guardrails against live account balance and buying power."""
+    try:
+        account = broker.get_account_info()
+        equity = float(account.get("equity", account.get("portfolio_value", 0.0)) or 0.0)
+        buying_power = float(account.get("buying_power", 0.0) or 0.0)
+    except Exception:
+        return requested_max_position_size, requested_risk_limit_daily
+
+    adjusted_max_position_size = float(requested_max_position_size)
+    adjusted_risk_limit_daily = float(requested_risk_limit_daily)
+    if buying_power > 0:
+        adjusted_max_position_size = min(adjusted_max_position_size, buying_power)
+    if equity > 0:
+        adjusted_max_position_size = min(adjusted_max_position_size, max(100.0, equity * 0.25))
+        adjusted_risk_limit_daily = min(adjusted_risk_limit_daily, max(50.0, equity * 0.05))
+
+    return max(1.0, adjusted_max_position_size), max(1.0, adjusted_risk_limit_daily)
 
 
 def _normalize_symbols(raw_symbols: List[str], max_symbols: int = 200) -> List[str]:
@@ -203,6 +331,19 @@ def _normalize_symbols(raw_symbols: List[str], max_symbols: int = 200) -> List[s
     return normalized_symbols
 
 
+def _execution_block_reason(symbol: str, broker: BrokerInterface) -> Optional[str]:
+    """Return first blocking safety reason for execution, if any."""
+    if get_global_kill_switch():
+        return "Trading is blocked: kill switch is active"
+    if not broker.is_connected():
+        return "Broker is not connected"
+    if not broker.is_symbol_tradable(symbol):
+        return f"Symbol {symbol} is not tradable"
+    if not broker.is_market_open():
+        return "Market is closed"
+    return None
+
+
 def _load_summary_notification_preferences(storage: StorageService) -> SummaryNotificationPreferencesResponse:
     """Load summary notification preferences from DB config."""
     config_entry = storage.config.get_by_key(_SUMMARY_NOTIFICATION_PREFERENCES_KEY)
@@ -212,6 +353,60 @@ def _load_summary_notification_preferences(storage: StorageService) -> SummaryNo
         return SummaryNotificationPreferencesResponse(**json.loads(config_entry.value))
     except Exception:
         return _summary_notification_preferences
+
+
+def _run_housekeeping(storage: StorageService, force: bool = False) -> Dict[str, int]:
+    """Periodic cleanup for audit rows and retained files."""
+    global _last_housekeeping_run
+    now = datetime.now(timezone.utc)
+    if not force and _last_housekeeping_run and (now - _last_housekeeping_run).total_seconds() < 3600:
+        return {"audit_rows_deleted": 0, "log_files_deleted": 0, "audit_files_deleted": 0}
+    _last_housekeeping_run = now
+    audit_rows_deleted = storage.audit_logs.delete_old_logs(days=_config.audit_retention_days)
+    log_files_deleted = cleanup_old_files(_config.log_directory, _config.log_retention_days)
+    audit_files_deleted = cleanup_old_files(_config.audit_export_directory, _config.audit_retention_days)
+    return {
+        "audit_rows_deleted": int(audit_rows_deleted),
+        "log_files_deleted": int(log_files_deleted),
+        "audit_files_deleted": int(audit_files_deleted),
+    }
+
+
+def _run_reconciliation(storage: StorageService, broker: BrokerInterface) -> Dict[str, Any]:
+    """Compare local open positions with broker positions and log discrepancies."""
+    broker_positions = broker.get_positions()
+    local_positions = storage.get_open_positions()
+    broker_qty: Dict[str, float] = {}
+    local_qty: Dict[str, float] = {}
+    for row in broker_positions:
+        sym = str(row.get("symbol", "")).upper()
+        if not sym:
+            continue
+        broker_qty[sym] = broker_qty.get(sym, 0.0) + float(row.get("quantity", 0.0))
+    for row in local_positions:
+        sym = str(row.symbol).upper()
+        local_qty[sym] = local_qty.get(sym, 0.0) + float(row.quantity or 0.0)
+
+    symbols = sorted(set(broker_qty.keys()) | set(local_qty.keys()))
+    discrepancies: List[Dict[str, Any]] = []
+    for sym in symbols:
+        bq = float(broker_qty.get(sym, 0.0))
+        lq = float(local_qty.get(sym, 0.0))
+        if abs(bq - lq) > 1e-6:
+            discrepancies.append({"symbol": sym, "broker_quantity": bq, "local_quantity": lq})
+
+    if discrepancies:
+        storage.create_audit_log(
+            event_type="error",
+            description=f"Reconciliation found {len(discrepancies)} discrepancy(ies)",
+            details={"source": "reconciliation", "discrepancies": discrepancies[:100]},
+        )
+    return {
+        "checked_symbols": len(symbols),
+        "discrepancy_count": len(discrepancies),
+        "discrepancies": discrepancies,
+        "reconciled_at": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 def _save_summary_notification_preferences(
@@ -228,21 +423,34 @@ def _save_summary_notification_preferences(
 
 
 @router.get("/config", response_model=ConfigResponse)
-async def get_config():
+async def get_config(db: Session = Depends(get_db)):
     """
     Get current configuration.
     TODO: Load from persistent storage.
     """
+    global _config
+    storage = StorageService(db)
+    _config = _load_runtime_config(storage)
     return _config
 
 
 @router.post("/config", response_model=ConfigResponse)
-async def update_config(request: ConfigUpdateRequest):
+async def update_config(
+    request: ConfigUpdateRequest,
+    db: Session = Depends(get_db),
+    x_idempotency_key: Optional[str] = Header(default=None),
+):
     """
     Update configuration.
     TODO: Persist to storage and validate changes.
     """
     global _config
+    cached = _idempotency_cache_get("/config", x_idempotency_key)
+    if cached is not None:
+        return ConfigResponse(**cached)
+
+    storage = StorageService(db)
+    _config = _load_runtime_config(storage)
 
     if request.trading_enabled is not None:
         _config.trading_enabled = request.trading_enabled
@@ -260,12 +468,41 @@ async def update_config(request: ConfigUpdateRequest):
         if request.risk_limit_daily < 1 or request.risk_limit_daily > 1_000_000:
             raise HTTPException(status_code=400, detail="risk_limit_daily must be within [1, 1000000]")
         _config.risk_limit_daily = request.risk_limit_daily
+    if request.tick_interval_seconds is not None:
+        if not math.isfinite(request.tick_interval_seconds):
+            raise HTTPException(status_code=400, detail="tick_interval_seconds must be a finite number")
+        if request.tick_interval_seconds < 5 or request.tick_interval_seconds > 3600:
+            raise HTTPException(status_code=400, detail="tick_interval_seconds must be within [5, 3600]")
+        _config.tick_interval_seconds = request.tick_interval_seconds
+        runner_manager.set_tick_interval(_config.tick_interval_seconds)
+    if request.streaming_enabled is not None:
+        _config.streaming_enabled = request.streaming_enabled
+        runner_manager.set_streaming_enabled(_config.streaming_enabled)
+    if request.log_directory is not None:
+        candidate = request.log_directory.strip()
+        if not candidate:
+            raise HTTPException(status_code=400, detail="log_directory cannot be empty")
+        _config.log_directory = str(configure_file_logging(candidate))
+    if request.audit_export_directory is not None:
+        candidate = request.audit_export_directory.strip()
+        if not candidate:
+            raise HTTPException(status_code=400, detail="audit_export_directory cannot be empty")
+        export_dir = Path(candidate).expanduser().resolve()
+        export_dir.mkdir(parents=True, exist_ok=True)
+        _config.audit_export_directory = str(export_dir)
+    if request.log_retention_days is not None:
+        _config.log_retention_days = int(request.log_retention_days)
+    if request.audit_retention_days is not None:
+        _config.audit_retention_days = int(request.audit_retention_days)
     if request.broker is not None:
         _config.broker = request.broker
 
     # Recreate broker on next use when mode changes.
     global _broker_instance
     _broker_instance = None
+    _run_housekeeping(storage, force=True)
+    _save_runtime_config(storage, _config)
+    _idempotency_cache_set("/config", x_idempotency_key, _config.model_dump())
 
     return _config
 
@@ -361,6 +598,8 @@ async def get_broker_account():
             buying_power=0.0,
             message=f"Broker account unavailable: {exc}",
         )
+    finally:
+        _set_last_broker_sync(datetime.now(timezone.utc).isoformat())
 
 
 # ============================================================================
@@ -368,45 +607,68 @@ async def get_broker_account():
 # ============================================================================
 
 @router.get("/positions", response_model=PositionsResponse)
-async def get_positions():
+async def get_positions(db: Session = Depends(get_db)):
     """
     Get current positions.
     TODO: Integrate with portfolio service and broker API.
     Returns stub data for now.
     """
-    # Stub data for development
-    stub_positions = [
-        Position(
-            symbol="AAPL",
-            side=PositionSide.LONG,
-            quantity=100,
-            avg_entry_price=150.00,
-            current_price=155.00,
-            unrealized_pnl=500.00,
-            unrealized_pnl_percent=3.33,
-            cost_basis=15000.00,
-            market_value=15500.00,
-        ),
-        Position(
-            symbol="MSFT",
-            side=PositionSide.LONG,
-            quantity=50,
-            avg_entry_price=300.00,
-            current_price=310.00,
-            unrealized_pnl=500.00,
-            unrealized_pnl_percent=3.33,
-            cost_basis=15000.00,
-            market_value=15500.00,
-        ),
-    ]
+    broker_positions: List[Dict[str, Any]] = []
+    try:
+        broker = get_broker()
+        broker_positions = broker.get_positions()
+    except Exception:
+        storage = StorageService(db)
+        local_positions = storage.get_open_positions()
+        for position in local_positions:
+            broker_positions.append({
+                "symbol": position.symbol,
+                "quantity": float(position.quantity),
+                "side": position.side.value if hasattr(position.side, "value") else str(position.side),
+                "avg_entry_price": float(position.avg_entry_price),
+                "current_price": float(position.avg_entry_price),
+                "market_value": float(position.cost_basis),
+                "cost_basis": float(position.cost_basis),
+                "unrealized_pnl": 0.0,
+                "unrealized_pnl_percent": 0.0,
+            })
+    positions: List[Position] = []
+    for raw in broker_positions:
+        qty = float(raw.get("quantity", 0.0))
+        current_price = float(raw.get("current_price", raw.get("price", 0.0)))
+        avg_entry_price = float(raw.get("avg_entry_price", 0.0))
+        cost_basis = float(raw.get("cost_basis", abs(qty) * avg_entry_price))
+        market_value = float(raw.get("market_value", abs(qty) * current_price))
+        unrealized_pnl = float(raw.get("unrealized_pnl", market_value - cost_basis))
+        unrealized_pnl_percent = float(
+            raw.get(
+                "unrealized_pnl_percent",
+                ((unrealized_pnl / cost_basis) * 100.0) if cost_basis > 0 else 0.0,
+            )
+        )
+        side_raw = str(raw.get("side", "long")).lower()
+        side = PositionSide.SHORT if side_raw == "short" else PositionSide.LONG
+        positions.append(
+            Position(
+                symbol=str(raw.get("symbol", "")).upper(),
+                side=side,
+                quantity=abs(qty),
+                avg_entry_price=avg_entry_price,
+                current_price=current_price,
+                unrealized_pnl=unrealized_pnl,
+                unrealized_pnl_percent=unrealized_pnl_percent,
+                cost_basis=cost_basis,
+                market_value=market_value,
+            )
+        )
 
-    total_value = sum(p.market_value for p in stub_positions)
-    total_pnl = sum(p.unrealized_pnl for p in stub_positions)
-    total_cost = sum(p.cost_basis for p in stub_positions)
+    total_value = sum(p.market_value for p in positions)
+    total_pnl = sum(p.unrealized_pnl for p in positions)
+    total_cost = sum(p.cost_basis for p in positions)
     total_pnl_percent = (total_pnl / total_cost * 100) if total_cost > 0 else 0.0
 
     return PositionsResponse(
-        positions=stub_positions,
+        positions=positions,
         total_value=total_value,
         total_pnl=total_pnl,
         total_pnl_percent=total_pnl_percent,
@@ -484,6 +746,10 @@ async def create_order(
         HTTPException: If validation fails or broker execution fails
     """
     try:
+        block_reason = _execution_block_reason(request.symbol, execution_service.broker)
+        if block_reason:
+            raise HTTPException(status_code=409, detail=block_reason)
+
         # Execute order
         order = execution_service.submit_order(
             symbol=request.symbol,
@@ -602,7 +868,7 @@ async def send_summary_notification_now(db: Session = Depends(get_db)):
         return NotificationResponse(success=False, message="Recipient is required")
 
     trades = storage.get_all_trades(limit=5000)
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     if prefs.frequency == SummaryNotificationFrequency.DAILY:
         start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     else:
@@ -793,13 +1059,24 @@ async def delete_strategy(strategy_id: str, db: Session = Depends(get_db)):
     if not db_strategy:
         raise HTTPException(status_code=404, detail="Strategy not found")
 
-    storage.create_audit_log(
-        event_type="strategy_stopped",
-        description=f"Strategy deleted: {db_strategy.name}",
-        details={"strategy_id": db_strategy.id},
-    )
+    try:
+        # Normalize to stopped state before delete to avoid stale active-state confusion.
+        if db_strategy.is_active:
+            db_strategy.is_active = False
+            storage.strategies.update(db_strategy)
 
-    storage.strategies.delete(strategy_id_int)
+        storage.create_audit_log(
+            event_type="strategy_stopped",
+            description=f"Strategy deleted: {db_strategy.name}",
+            details={"strategy_id": db_strategy.id},
+        )
+
+        storage.strategies.delete(strategy_id_int)
+
+        # Keep runner in-memory state in sync with DB.
+        runner_manager.remove_strategy_by_name(db_strategy.name)
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to delete strategy: {str(exc)}")
 
     return {"message": "Strategy deleted"}
 
@@ -818,6 +1095,7 @@ async def get_audit_logs(
     Get audit logs from database with filtering and pagination.
     """
     storage = StorageService(db)
+    _run_housekeeping(storage)
 
     event_type_str = event_type.value if event_type else None
     db_logs = storage.get_audit_logs(limit=limit, event_type=event_type_str)
@@ -889,41 +1167,220 @@ async def get_runner_status():
     return RunnerStatusResponse(**status)
 
 
+@router.get("/maintenance/storage")
+async def get_storage_settings():
+    """Get configured log/audit storage paths and a quick file inventory."""
+    log_dir = Path(_config.log_directory).expanduser().resolve()
+    audit_dir = Path(_config.audit_export_directory).expanduser().resolve()
+    log_files = []
+    audit_files = []
+    if log_dir.exists():
+        log_files = sorted(
+            [{"name": p.name, "size_bytes": p.stat().st_size, "modified_at": datetime.fromtimestamp(p.stat().st_mtime).isoformat()} for p in log_dir.iterdir() if p.is_file()],
+            key=lambda row: row["modified_at"],
+            reverse=True,
+        )[:50]
+    if audit_dir.exists():
+        audit_files = sorted(
+            [{"name": p.name, "size_bytes": p.stat().st_size, "modified_at": datetime.fromtimestamp(p.stat().st_mtime).isoformat()} for p in audit_dir.iterdir() if p.is_file()],
+            key=lambda row: row["modified_at"],
+            reverse=True,
+        )[:50]
+    return {
+        "log_directory": str(log_dir),
+        "audit_export_directory": str(audit_dir),
+        "log_retention_days": _config.log_retention_days,
+        "audit_retention_days": _config.audit_retention_days,
+        "log_files": log_files,
+        "audit_files": audit_files,
+    }
+
+
+@router.post("/maintenance/cleanup")
+async def run_maintenance_cleanup(db: Session = Depends(get_db)):
+    """Run immediate retention cleanup based on configured periods."""
+    storage = StorageService(db)
+    result = _run_housekeeping(storage, force=True)
+    return {"success": True, **result}
+
+
+@router.get("/safety/status")
+async def get_safety_status(db: Session = Depends(get_db)):
+    """Get trading safety controls status."""
+    storage = StorageService(db)
+    active = _load_kill_switch(storage)
+    set_global_kill_switch(active)
+    return {
+        "kill_switch_active": active,
+        "last_broker_sync_at": _last_broker_sync_at,
+    }
+
+
+@router.get("/safety/preflight")
+async def safety_preflight(symbol: str, db: Session = Depends(get_db)):
+    """Return execution block reason for a candidate symbol."""
+    storage = StorageService(db)
+    set_global_kill_switch(_load_kill_switch(storage))
+    broker = get_broker()
+    reason = _execution_block_reason(symbol.strip().upper(), broker)
+    return {"allowed": reason is None, "reason": reason or ""}
+
+
+@router.post("/safety/kill-switch")
+async def set_safety_kill_switch(
+    active: bool,
+    db: Session = Depends(get_db),
+    x_idempotency_key: Optional[str] = Header(default=None),
+):
+    """Enable or disable global kill switch."""
+    cached = _idempotency_cache_get("/safety/kill-switch", x_idempotency_key)
+    if cached is not None:
+        return cached
+    storage = StorageService(db)
+    set_global_kill_switch(active)
+    _save_kill_switch(storage, active)
+    storage.create_audit_log(
+        event_type="config_updated",
+        description=f"Kill switch {'enabled' if active else 'disabled'}",
+        details={"kill_switch_active": active},
+    )
+    payload = {"success": True, "kill_switch_active": active}
+    _idempotency_cache_set("/safety/kill-switch", x_idempotency_key, payload)
+    return payload
+
+
+@router.post("/safety/panic-stop", response_model=RunnerActionResponse)
+async def panic_stop(
+    db: Session = Depends(get_db),
+    x_idempotency_key: Optional[str] = Header(default=None),
+):
+    """
+    Emergency stop: enables kill switch, stops runner, and liquidates positions.
+    """
+    cached = _idempotency_cache_get("/safety/panic-stop", x_idempotency_key)
+    if cached is not None:
+        return RunnerActionResponse(**cached)
+
+    storage = StorageService(db)
+    set_global_kill_switch(True)
+    _save_kill_switch(storage, True)
+    _ = runner_manager.stop_runner(db=db)
+    selloff = await selloff_all_positions()
+    payload = {
+        "success": True,
+        "message": f"Panic stop executed. {selloff.message}",
+        "status": "stopped",
+    }
+    storage.create_audit_log(
+        event_type="error",
+        description="Panic stop executed",
+        details={"selloff_message": selloff.message},
+    )
+    _idempotency_cache_set("/safety/panic-stop", x_idempotency_key, payload)
+    return RunnerActionResponse(**payload)
+
+
+@router.post("/reconciliation/run")
+async def run_reconciliation(db: Session = Depends(get_db)):
+    """Run manual reconciliation against broker state."""
+    storage = StorageService(db)
+    broker = get_broker()
+    result = _run_reconciliation(storage, broker)
+    return {"success": True, **result}
+
+
+@router.websocket("/ws/system-health")
+async def ws_system_health(websocket: WebSocket):
+    """Realtime health snapshot stream for UI surfaces."""
+    await websocket.accept()
+    try:
+        while True:
+            status = runner_manager.get_status()
+            payload = {
+                "runner_status": status.get("status", "unknown"),
+                "broker_connected": bool(status.get("broker_connected", False)),
+                "poll_success_count": int(status.get("poll_success_count", 0)),
+                "poll_error_count": int(status.get("poll_error_count", 0)),
+                "last_poll_error": str(status.get("last_poll_error", "")),
+                "last_successful_poll_at": status.get("last_successful_poll_at"),
+                "sleeping": bool(status.get("sleeping", False)),
+                "sleep_since": status.get("sleep_since"),
+                "next_market_open_at": status.get("next_market_open_at"),
+                "last_resume_at": status.get("last_resume_at"),
+                "market_session_open": status.get("market_session_open"),
+                "kill_switch_active": get_global_kill_switch(),
+                "last_broker_sync_at": _last_broker_sync_at,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+            await websocket.send_json(payload)
+            await asyncio.sleep(5)
+    except WebSocketDisconnect:
+        return
+
+
 @router.post("/runner/start", response_model=RunnerActionResponse)
-async def start_runner(db: Session = Depends(get_db)):
+async def start_runner(
+    db: Session = Depends(get_db),
+    x_idempotency_key: Optional[str] = Header(default=None),
+):
     """
     Start the strategy runner.
     Loads active strategies and begins execution loop.
     Idempotent - safe to call multiple times.
     """
+    cached = _idempotency_cache_get("/runner/start", x_idempotency_key)
+    if cached is not None:
+        return RunnerActionResponse(**cached)
+
+    global _config
+    storage = StorageService(db)
+    _config = _load_runtime_config(storage)
     broker = get_broker()
+    max_position_size, risk_limit_daily = _balance_adjusted_limits(
+        broker=broker,
+        requested_max_position_size=_config.max_position_size,
+        requested_risk_limit_daily=_config.risk_limit_daily,
+    )
     result = runner_manager.start_runner(
         db=db,
         broker=broker,
-        max_position_size=_config.max_position_size,
-        risk_limit_daily=_config.risk_limit_daily,
+        max_position_size=max_position_size,
+        risk_limit_daily=risk_limit_daily,
+        tick_interval=_config.tick_interval_seconds,
+        streaming_enabled=_config.streaming_enabled,
     )
+    _idempotency_cache_set("/runner/start", x_idempotency_key, result)
     return RunnerActionResponse(**result)
 
 
 @router.post("/runner/stop", response_model=RunnerActionResponse)
-async def stop_runner(db: Session = Depends(get_db)):
+async def stop_runner(
+    db: Session = Depends(get_db),
+    x_idempotency_key: Optional[str] = Header(default=None),
+):
     """
     Stop the strategy runner.
     Stops all strategies and the execution loop.
     Idempotent - safe to call multiple times.
     """
+    cached = _idempotency_cache_get("/runner/stop", x_idempotency_key)
+    if cached is not None:
+        return RunnerActionResponse(**cached)
     result = runner_manager.stop_runner(db=db)
+    _idempotency_cache_set("/runner/stop", x_idempotency_key, result)
     return RunnerActionResponse(**result)
 
 
 @router.post("/portfolio/selloff", response_model=RunnerActionResponse)
-async def selloff_all_positions():
+async def selloff_all_positions(x_idempotency_key: Optional[str] = Header(default=None)):
     """
     Explicitly liquidate all open positions.
     This is opt-in and not triggered automatically on strategy switches.
     """
     try:
+        cached = _idempotency_cache_get("/portfolio/selloff", x_idempotency_key)
+        if cached is not None:
+            return RunnerActionResponse(**cached)
         broker = get_broker()
         positions = broker.get_positions()
         closed = 0
@@ -941,11 +1398,13 @@ async def selloff_all_positions():
             )
             closed += 1
 
-        return RunnerActionResponse(
+        response = RunnerActionResponse(
             success=True,
             message=f"Closed {closed} position(s)",
             status="stopped",
         )
+        _idempotency_cache_set("/portfolio/selloff", x_idempotency_key, response.model_dump())
+        return response
     except Exception as e:
         return RunnerActionResponse(
             success=False,
@@ -969,13 +1428,25 @@ async def get_portfolio_analytics(
     """
     storage = StorageService(db)
 
-    trades = storage.get_recent_trades(limit=1000)
+    trades = storage.get_recent_trades(limit=5000)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    scoped_trades = []
+    for trade in trades:
+        if not trade.executed_at:
+            continue
+        executed_at = (
+            trade.executed_at.replace(tzinfo=timezone.utc)
+            if trade.executed_at.tzinfo is None
+            else trade.executed_at.astimezone(timezone.utc)
+        )
+        if executed_at >= cutoff:
+            scoped_trades.append(trade)
 
     time_series = []
     cumulative_pnl = 0.0
     equity = 100000.0
 
-    for trade in reversed(trades):
+    for trade in reversed(scoped_trades):
         cumulative_pnl += trade.realized_pnl or 0.0
         equity += trade.realized_pnl or 0.0
 
@@ -989,7 +1460,7 @@ async def get_portfolio_analytics(
 
     return {
         'time_series': time_series,
-        'total_trades': len(trades),
+        'total_trades': len(scoped_trades),
         'current_equity': equity,
         'total_pnl': cumulative_pnl,
     }
