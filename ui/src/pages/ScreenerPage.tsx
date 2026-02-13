@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from 'recharts';
-import { createStrategy, getBrokerAccount, getConfig, getPortfolioSummary, getStrategies, getStrategyConfig, getSafetyPreflight, getSafetyStatus, updateConfig, updateStrategy } from '../api/backend';
+import { createStrategy, getBrokerAccount, getConfig, getPortfolioSummary, getPreferenceRecommendation, getStrategies, getStrategyConfig, getSafetyPreflight, getSafetyStatus, updateConfig, updateStrategy } from '../api/backend';
 import { BrokerAccountResponse, PortfolioSummaryResponse, Strategy, StrategyStatus } from '../api/types';
 import HelpTooltip from '../components/HelpTooltip';
 import PageHeader from '../components/PageHeader';
@@ -70,6 +70,15 @@ function formatDateTime(value: string): string {
   return new Date(value).toLocaleString();
 }
 
+const USD_FORMATTER = new Intl.NumberFormat('en-US', {
+  style: 'currency',
+  currency: 'USD',
+});
+
+function formatCurrency(value: number): string {
+  return USD_FORMATTER.format(value);
+}
+
 const WORKSPACE_LIMITS = {
   weeklyBudgetMin: 50,
   weeklyBudgetMax: 1_000_000,
@@ -137,7 +146,10 @@ const ScreenerPage: React.FC = () => {
   const [workspaceValidationError, setWorkspaceValidationError] = useState<string | null>(null);
   const [killSwitchActive, setKillSwitchActive] = useState(false);
   const [blockedReason, setBlockedReason] = useState('');
+  const [optimizingWorkspace, setOptimizingWorkspace] = useState(false);
+  const [portfolioOptimizationSummary, setPortfolioOptimizationSummary] = useState<string | null>(null);
   const chartSectionRef = useRef<HTMLDivElement | null>(null);
+  const optimizeRequestIdRef = useRef(0);
   const [strategySignalParams, setStrategySignalParams] = useState({
     take_profit_pct: 5.0,
     trailing_stop_pct: 2.5,
@@ -234,6 +246,13 @@ const ScreenerPage: React.FC = () => {
       setMarketRegime(data.market_regime || 'unknown');
       setLastDataSource(data.data_source || dataSource);
       setLastRefreshAt(new Date().toISOString());
+      const applied = data.applied_guardrails || {};
+      const holdingsCount = Number(applied.holdings_count || 0);
+      if (applied.portfolio_adjusted) {
+        setPortfolioOptimizationSummary(
+          `Portfolio-aware guardrails active (${holdingsCount} holding${holdingsCount === 1 ? '' : 's'}, buying power ${formatCurrency(Number(applied.buying_power || 0))}).`
+        );
+      }
       if (data.assets?.length > 0) {
         setSelectedSymbol((prev) => {
           const hasSelectedOnPage = prev && data.assets.some((asset: Asset) => asset.symbol === prev);
@@ -250,7 +269,7 @@ const ScreenerPage: React.FC = () => {
     }
   }, [preferences.asset_type, preferences.screener_limit, screenerMode, preset, currentPage, pageSize, minDollarVolume, maxSpreadBps, maxSectorWeightPct, autoRegimeAdjust]);
 
-  const updatePreferences = async (updates: Partial<Preferences>) => {
+  const updatePreferences = async (updates: Partial<Preferences>): Promise<Preferences | null> => {
     try {
       const response = await fetch(`${BACKEND_URL}/preferences`, {
         method: 'POST',
@@ -262,11 +281,91 @@ const ScreenerPage: React.FC = () => {
         throw new Error(body?.detail || 'Failed to update preferences');
       }
       const data = await response.json();
-      setPreferences(data);
+      const normalizedAssetType: Preferences['asset_type'] = data.asset_type === 'etf' ? 'etf' : 'stock';
+      const normalizedScreenerMode: ScreenerMode =
+        normalizedAssetType === 'stock' ? (data.screener_mode || 'most_active') : 'preset';
+      const normalized: Preferences = {
+        ...data,
+        asset_type: normalizedAssetType,
+        screener_mode: normalizedScreenerMode,
+      };
+      setPreferences(normalized);
+      return normalized;
     } catch (err) {
       console.error('Error updating preferences:', err);
+      return null;
     }
   };
+
+  const targetTradesPerWeek = (assetType: Preferences['asset_type'], mode: ScreenerMode, selectedPreset: PresetType): number => {
+    if (assetType === 'etf') return 4;
+    if (mode === 'most_active') return 6;
+    if (selectedPreset === 'monthly_optimized') return 2;
+    if (selectedPreset === 'three_to_five_weekly') return 4;
+    if (selectedPreset === 'small_budget_weekly') return 3;
+    return 6;
+  };
+
+  const applyAdaptiveOptimization = useCallback(async (overrides?: {
+    assetType?: Preferences['asset_type'];
+    mode?: ScreenerMode;
+    preset?: PresetType;
+  }) => {
+    const assetType = overrides?.assetType || preferences.asset_type;
+    const mode = overrides?.mode || (assetType === 'stock' ? screenerMode : 'preset');
+    const presetCandidate =
+      overrides?.preset ||
+      (assetType === 'etf' ? preferences.etf_preset : mode === 'preset' ? preferences.stock_preset : preferences.stock_preset);
+    const presetValue = presetCandidate as PresetType;
+    const requestId = ++optimizeRequestIdRef.current;
+    try {
+      setOptimizingWorkspace(true);
+      const recommendation = await getPreferenceRecommendation({
+        asset_type: assetType,
+        preset: presetValue,
+        weekly_budget: preferences.weekly_budget,
+        target_trades_per_week: targetTradesPerWeek(assetType, mode, presetValue),
+      });
+      if (requestId !== optimizeRequestIdRef.current) return;
+      const guardrails = recommendation.guardrails;
+      const nextMinDollar = Math.max(WORKSPACE_LIMITS.minDollarVolumeMin, Math.min(WORKSPACE_LIMITS.minDollarVolumeMax, Math.round(guardrails.min_dollar_volume)));
+      const nextSpread = Math.max(WORKSPACE_LIMITS.maxSpreadBpsMin, Math.min(WORKSPACE_LIMITS.maxSpreadBpsMax, Math.round(guardrails.max_spread_bps)));
+      const nextSector = Math.max(WORKSPACE_LIMITS.maxSectorWeightMin, Math.min(WORKSPACE_LIMITS.maxSectorWeightMax, Math.round(guardrails.max_sector_weight_pct)));
+      const nextMaxPosition = Math.max(WORKSPACE_LIMITS.maxPositionMin, Math.min(WORKSPACE_LIMITS.maxPositionMax, guardrails.max_position_size));
+      const nextRiskDaily = Math.max(WORKSPACE_LIMITS.riskDailyMin, Math.min(WORKSPACE_LIMITS.riskDailyMax, guardrails.risk_limit_daily));
+      const nextScreenerLimit = Math.max(10, Math.min(200, Math.round(guardrails.screener_limit)));
+
+      setMinDollarVolume(nextMinDollar);
+      setMaxSpreadBps(nextSpread);
+      setMaxSectorWeightPct(nextSector);
+      setMaxPositionSize(nextMaxPosition);
+      setRiskLimitDaily(nextRiskDaily);
+      await updateConfig({
+        max_position_size: nextMaxPosition,
+        risk_limit_daily: nextRiskDaily,
+      });
+      await updatePreferences({
+        asset_type: assetType,
+        risk_profile: recommendation.risk_profile,
+        screener_mode: assetType === 'stock' ? mode : 'preset',
+        stock_preset: assetType === 'stock' && mode === 'preset' ? (presetValue as StockPreset) : preferences.stock_preset,
+        etf_preset: assetType === 'etf' ? (presetValue as EtfPreset) : preferences.etf_preset,
+        screener_limit: assetType === 'stock' && mode === 'most_active'
+          ? Math.max(10, Math.min(200, Math.round((preferences.screener_limit + nextScreenerLimit) / 2)))
+          : preferences.screener_limit,
+      });
+      setPortfolioOptimizationSummary(
+        `Auto-optimized for ${recommendation.asset_type.toUpperCase()} ${recommendation.preset}: Equity ${formatCurrency(recommendation.portfolio_context.equity)}, Buying Power ${formatCurrency(recommendation.portfolio_context.buying_power)}, Holdings ${recommendation.portfolio_context.holdings_count}.`
+      );
+    } catch (err) {
+      if (requestId !== optimizeRequestIdRef.current) return;
+      setWorkspaceMessage(err instanceof Error ? err.message : 'Failed to auto-optimize from portfolio context.');
+    } finally {
+      if (requestId === optimizeRequestIdRef.current) {
+        setOptimizingWorkspace(false);
+      }
+    }
+  }, [preferences.asset_type, preferences.etf_preset, preferences.screener_limit, preferences.stock_preset, preferences.weekly_budget, screenerMode]);
 
   const fetchConfig = useCallback(async () => {
     try {
@@ -466,12 +565,6 @@ const ScreenerPage: React.FC = () => {
     }
   };
 
-  const formatCurrency = (value: number) =>
-    new Intl.NumberFormat('en-US', {
-      style: 'currency',
-      currency: 'USD',
-    }).format(value);
-
   const formatPercent = (value: number) => `${value >= 0 ? '+' : ''}${value.toFixed(2)}%`;
   const activePresetLabel = preferences.asset_type === 'etf' ? preferences.etf_preset : preferences.stock_preset;
   const activeUniverseLabel =
@@ -574,6 +667,9 @@ const ScreenerPage: React.FC = () => {
             {!killSwitchActive && blockedReason && (
               <span className="rounded bg-amber-900/70 px-2 py-1 text-amber-200">Block reason: {blockedReason}</span>
             )}
+            {portfolioOptimizationSummary && (
+              <span className="rounded bg-blue-900/60 px-2 py-1 text-blue-100">{portfolioOptimizationSummary}</span>
+            )}
           </div>
           {lastDataSource !== 'alpaca' && (
             <p className="mt-2 text-xs text-amber-200">
@@ -658,16 +754,17 @@ const ScreenerPage: React.FC = () => {
                   setChartData([]);
                   setChartError(null);
                   if (next === 'etf') {
-                    updatePreferences({ asset_type: next, risk_profile: preferences.etf_preset, screener_mode: 'preset' });
+                    const nextPreset = preferences.etf_preset || 'balanced';
+                    setPreset(nextPreset);
                     setScreenerMode('preset');
+                    updatePreferences({ asset_type: next, risk_profile: preferences.etf_preset, screener_mode: 'preset', etf_preset: nextPreset });
+                    void applyAdaptiveOptimization({ assetType: next, mode: 'preset', preset: nextPreset });
                   } else {
                     updatePreferences({ asset_type: next, screener_mode: screenerMode });
+                    void applyAdaptiveOptimization({ assetType: next, mode: screenerMode, preset: preferences.stock_preset });
                   }
                   if (next === 'stock') {
                     const nextPreset = preferences.stock_preset || 'weekly_optimized';
-                    setPreset(nextPreset);
-                  } else if (next === 'etf') {
-                    const nextPreset = preferences.etf_preset || 'balanced';
                     setPreset(nextPreset);
                   }
                 }}
@@ -692,6 +789,7 @@ const ScreenerPage: React.FC = () => {
                     setChartData([]);
                     setChartError(null);
                     updatePreferences({ screener_mode: nextMode });
+                    void applyAdaptiveOptimization({ assetType: 'stock', mode: nextMode, preset: nextMode === 'preset' ? preset : preferences.stock_preset });
                   }}
                   className="w-full px-3 py-2 bg-gray-700 text-white border border-gray-600 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
                 >
@@ -716,11 +814,13 @@ const ScreenerPage: React.FC = () => {
                     setChartError(null);
                     if (preferences.asset_type === 'stock') {
                       updatePreferences({ stock_preset: nextPreset as StockPreset });
+                      void applyAdaptiveOptimization({ assetType: 'stock', mode: 'preset', preset: nextPreset });
                     } else if (preferences.asset_type === 'etf') {
                       updatePreferences({
                         etf_preset: nextPreset as EtfPreset,
                         risk_profile: nextPreset as RiskProfile,
                       });
+                      void applyAdaptiveOptimization({ assetType: 'etf', mode: 'preset', preset: nextPreset });
                     }
                   }}
                   className="w-full px-3 py-2 bg-gray-700 text-white border border-gray-600 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
@@ -750,6 +850,7 @@ const ScreenerPage: React.FC = () => {
                     setChartData([]);
                     setChartError(null);
                     updatePreferences({ screener_limit: parseInt(e.target.value, 10) });
+                    void applyAdaptiveOptimization({ assetType: 'stock', mode: 'most_active', preset: preferences.stock_preset });
                   }}
                   className="w-full"
                 />
@@ -895,10 +996,17 @@ const ScreenerPage: React.FC = () => {
           <div className="mt-4 flex flex-wrap items-center gap-3">
             <button
               onClick={handleApplyWorkspaceSettings}
-              disabled={workspaceSaving || workspaceHasValidationError}
+              disabled={workspaceSaving || workspaceHasValidationError || optimizingWorkspace}
               className="px-4 py-2 rounded bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 text-white font-medium"
             >
               {workspaceSaving ? 'Applying...' : 'Apply Universe & Guardrails'}
+            </button>
+            <button
+              onClick={() => void applyAdaptiveOptimization()}
+              disabled={workspaceSaving || optimizingWorkspace}
+              className="px-4 py-2 rounded bg-emerald-700 hover:bg-emerald-600 disabled:bg-gray-600 text-white font-medium"
+            >
+              {optimizingWorkspace ? 'Optimizing...' : 'Auto-Optimize from Portfolio'}
             </button>
             {workspaceValidationError && <p className="text-sm text-amber-300">{workspaceValidationError}</p>}
             {workspaceMessage && <p className="text-sm text-gray-300">{workspaceMessage}</p>}

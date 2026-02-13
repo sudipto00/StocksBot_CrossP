@@ -710,6 +710,15 @@ function SettingsPage() {
 
       <CollapsibleSection title="Storage & Retention" summary="Log and audit paths, retention, and cleanup">
         <div className="space-y-4">
+          <div className="rounded border border-blue-800 bg-blue-900/20 p-3 text-sm text-blue-100 flex flex-wrap items-center justify-between gap-2">
+            <span>Use Audit page for one-click hard reset of audit/testing artifacts.</span>
+            <button
+              onClick={() => navigate('/audit')}
+              className="bg-blue-700 hover:bg-blue-600 text-white px-3 py-1.5 rounded font-medium text-xs"
+            >
+              Open Audit Reset
+            </button>
+          </div>
           <div>
             <label className="text-white font-medium block mb-2">Log Directory <HelpTooltip text="Folder used for backend rotating log files." /></label>
             <input

@@ -1,7 +1,11 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use std::net::{SocketAddr, TcpStream};
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
+use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tauri::menu::{MenuBuilder, MenuItem, MenuItemBuilder, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -39,6 +43,18 @@ struct TrayState {
     summary_item: Mutex<Option<MenuItem<tauri::Wry>>>,
     toggle_runner_item: Mutex<Option<MenuItem<tauri::Wry>>>,
     runner_running: Mutex<bool>,
+}
+
+struct SidecarState {
+    process: Mutex<Option<Child>>,
+}
+
+impl Default for SidecarState {
+    fn default() -> Self {
+        Self {
+            process: Mutex::new(None),
+        }
+    }
 }
 
 impl Default for TrayState {
@@ -136,6 +152,90 @@ fn update_tray_status_ui(app: &AppHandle, payload: &TraySummaryPayload) -> Resul
         )));
     }
     Ok(())
+}
+
+fn is_backend_reachable() -> bool {
+    let addr: SocketAddr = match "127.0.0.1:8000".parse() {
+        Ok(parsed) => parsed,
+        Err(_) => return false,
+    };
+    TcpStream::connect_timeout(&addr, Duration::from_millis(350)).is_ok()
+}
+
+fn find_backend_script(app: &AppHandle) -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join("../backend/app.py"));
+        candidates.push(cwd.join("backend/app.py"));
+    }
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        candidates.push(resource_dir.join("backend/app.py"));
+        candidates.push(resource_dir.join("app.py"));
+    }
+    for candidate in candidates {
+        if candidate.exists() && candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn launch_backend_sidecar(app: &AppHandle) -> Option<Child> {
+    if is_backend_reachable() {
+        println!("Backend already reachable at 127.0.0.1:8000; skipping sidecar launch.");
+        return None;
+    }
+    let script = match find_backend_script(app) {
+        Some(path) => path,
+        None => {
+            println!("Backend sidecar script not found. Run backend manually if needed.");
+            return None;
+        }
+    };
+
+    let mut last_error = String::new();
+    for interpreter in ["python3", "python"] {
+        let mut cmd = Command::new(interpreter);
+        cmd.arg(&script);
+        if let Some(parent) = script.parent() {
+            cmd.current_dir(parent);
+        }
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::null());
+        cmd.stderr(Stdio::null());
+        match cmd.spawn() {
+            Ok(child) => {
+                println!(
+                    "Launched backend sidecar using {} {}",
+                    interpreter,
+                    script.display()
+                );
+                return Some(child);
+            }
+            Err(e) => {
+                last_error = e.to_string();
+            }
+        }
+    }
+
+    println!(
+        "Failed to launch backend sidecar for {}: {}",
+        script.display(),
+        last_error
+    );
+    None
+}
+
+fn stop_backend_sidecar(app: &AppHandle) {
+    if let Some(state) = app.try_state::<SidecarState>() {
+        if let Ok(mut guard) = state.process.lock() {
+            if let Some(mut child) = guard.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+                println!("Stopped backend sidecar process");
+            }
+        }
+    }
 }
 
 // TODO: Add custom commands for frontend-backend communication
@@ -322,33 +422,19 @@ fn main() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
-            // TODO: Launch Python FastAPI sidecar on app startup
-            // The sidecar executable should be bundled with the app
-            // Example of how to start sidecar (to be implemented):
-            /*
-            #[cfg(target_os = "windows")]
-            let sidecar_path = app
-                .path_resolver()
-                .resolve_resource("backend/app.exe")
-                .expect("failed to resolve sidecar");
-
-            #[cfg(not(target_os = "windows"))]
-            let sidecar_path = app
-                .path_resolver()
-                .resolve_resource("backend/app")
-                .expect("failed to resolve sidecar");
-
-            let child = Command::new(sidecar_path)
-                .spawn()
-                .expect("failed to spawn sidecar");
-
-            app.manage(SidecarState {
-                process: Mutex::new(Some(child)),
-            });
-            */
-
             println!("StocksBot is starting...");
-            println!("Note: Run the Python backend separately for now using: cd backend && python app.py");
+            app.manage(SidecarState::default());
+            if let Some(child) = launch_backend_sidecar(&app.handle().clone()) {
+                let sidecar_state = app.state::<SidecarState>();
+                match sidecar_state.process.lock() {
+                    Ok(mut guard) => {
+                        *guard = Some(child);
+                    }
+                    Err(_) => {}
+                };
+            } else {
+                println!("Note: if backend is not running, start it manually: cd backend && python app.py");
+            }
 
             app.manage(TrayState::default());
 
@@ -452,6 +538,11 @@ fn main() {
             clear_alpaca_credentials,
             update_tray_summary
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            if matches!(event, tauri::RunEvent::Exit) {
+                stop_backend_sidecar(app);
+            }
+        });
 }

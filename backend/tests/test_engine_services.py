@@ -130,6 +130,48 @@ def test_risk_manager_get_metrics():
     assert "daily_loss_limit" in metrics
     assert "circuit_breaker_active" in metrics
     assert "max_position_size" in metrics
+    assert "max_portfolio_exposure" in metrics
+    assert "max_symbol_concentration_pct" in metrics
+    assert "max_open_positions" in metrics
+    assert "daily_loss_remaining" in metrics
+
+
+def test_risk_manager_validate_order_exposure_limit():
+    """Reject orders that breach portfolio exposure cap."""
+    risk_mgr = RiskManager(max_position_size=50_000, max_portfolio_exposure=15_000)
+    current_positions = {
+        "MSFT": {"market_value": 10_000},
+    }
+    is_valid, error = risk_mgr.validate_order("AAPL", 60, 100.0, current_positions)  # +$6,000 => $16,000 total
+    assert is_valid is False
+    assert error is not None
+    assert "exposure" in error.lower()
+
+
+def test_risk_manager_validate_order_symbol_concentration_limit():
+    """Reject orders that over-concentrate a single symbol."""
+    risk_mgr = RiskManager(max_position_size=50_000, max_symbol_concentration_pct=55.0)
+    current_positions = {
+        "MSFT": {"market_value": 5_000},
+    }
+    # Adding $10k AAPL => projected concentration 66.67%
+    is_valid, error = risk_mgr.validate_order("AAPL", 100, 100.0, current_positions)
+    assert is_valid is False
+    assert error is not None
+    assert "concentration" in error.lower()
+
+
+def test_risk_manager_validate_order_max_open_positions():
+    """Reject new symbol orders once max open positions is reached."""
+    risk_mgr = RiskManager(max_position_size=50_000, max_open_positions=2)
+    current_positions = {
+        "AAPL": {"market_value": 3_000},
+        "MSFT": {"market_value": 3_000},
+    }
+    is_valid, error = risk_mgr.validate_order("NVDA", 10, 100.0, current_positions)
+    assert is_valid is False
+    assert error is not None
+    assert "max open positions" in error.lower()
 
 
 # ============================================================================
@@ -194,6 +236,21 @@ def test_portfolio_service_get_summary():
     assert "cash_balance" in summary
     assert "unrealized_pnl" in summary
     assert "total_return" in summary
+
+
+def test_portfolio_service_prefers_broker_account_snapshot_for_value():
+    """Portfolio valuation should use broker account equity/cash when available."""
+    broker = PaperBroker(starting_balance=100000.0)
+    broker.connect()
+    broker.submit_order("AAPL", OrderSide.BUY, OrderType.MARKET, 10)
+    account = broker.get_account_info()
+
+    portfolio = PortfolioService(broker=broker)
+    total_value = portfolio.calculate_portfolio_value({})
+    summary = portfolio.get_portfolio_summary({})
+
+    assert total_value == pytest.approx(account["equity"])
+    assert summary["cash_balance"] == pytest.approx(account["cash"])
 
 
 def test_paper_broker_instantiation():

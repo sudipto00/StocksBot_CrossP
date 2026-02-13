@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
-import { getAuditLogs, getAuditTrades } from '../api/backend';
+import { getAuditLogs, getAuditTrades, resetAuditData } from '../api/backend';
 import { AuditLog, AuditEventType, TradeHistoryItem } from '../api/types';
 import HelpTooltip from '../components/HelpTooltip';
 import PageHeader from '../components/PageHeader';
@@ -32,6 +32,9 @@ function AuditPage() {
   const [dateTo, setDateTo] = useState('');
   const [savedPresets, setSavedPresets] = useState<string[]>([]);
   const [selectedLog, setSelectedLog] = useState<AuditLog | null>(null);
+  const [resetLoading, setResetLoading] = useState(false);
+  const [resetSummary, setResetSummary] = useState<string | null>(null);
+  const [resetConfirmOpen, setResetConfirmOpen] = useState(false);
 
   const loadAuditData = useCallback(async () => {
     try {
@@ -242,6 +245,25 @@ function AuditPage() {
     win.print();
   };
 
+  const executeResetAuditData = async () => {
+    try {
+      setResetLoading(true);
+      setError(null);
+      setResetSummary(null);
+      const result = await resetAuditData();
+      setSelectedLog(null);
+      setResetConfirmOpen(false);
+      await loadAuditData();
+      setResetSummary(
+        `Reset complete: removed ${result.audit_rows_deleted} event rows, ${result.trade_rows_deleted} trade rows, ${result.log_files_deleted} log files, and ${result.audit_files_deleted} audit export files.`
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to reset audit data');
+    } finally {
+      setResetLoading(false);
+    }
+  };
+
   const getEventTypeColor = (eventType: AuditEventType): string => {
     switch (eventType) {
       case AuditEventType.ORDER_FILLED:
@@ -268,14 +290,63 @@ function AuditPage() {
         description="Complete trade history, monitoring, and system event trail"
         helpSection="audit"
         actions={(
-          <button
-            onClick={loadAuditData}
-            className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded font-medium"
-          >
-            Refresh
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={loadAuditData}
+              className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded font-medium"
+            >
+              Refresh
+            </button>
+            <button
+              onClick={() => {
+                setError(null);
+                setResetSummary(null);
+                setResetConfirmOpen((current) => !current);
+              }}
+              disabled={resetLoading}
+              className="bg-rose-700 hover:bg-rose-800 disabled:bg-gray-600 text-white px-4 py-2 rounded font-medium"
+              title="Hard reset audit/testing artifacts"
+            >
+              {resetLoading ? 'Resetting...' : resetConfirmOpen ? 'Cancel Reset' : 'Reset Audit Data'}
+            </button>
+          </div>
         )}
       />
+
+      <div className="mb-4 rounded border border-amber-800 bg-amber-900/20 px-3 py-2 text-xs text-amber-100">
+        Hard reset for testing lives here in Audit. Storage paths and retention policy remain in Settings.
+      </div>
+
+      {resetSummary && (
+        <div className="mb-4 rounded border border-emerald-800 bg-emerald-900/20 px-3 py-2 text-sm text-emerald-100">
+          {resetSummary}
+        </div>
+      )}
+
+      {resetConfirmOpen && (
+        <div className="mb-4 rounded border border-rose-800 bg-rose-900/20 px-4 py-3">
+          <p className="text-sm text-rose-100">
+            Confirm hard reset for testing. This permanently deletes audit event logs, trade history rows, backend log files, and audit export files.
+            Runner must be stopped.
+          </p>
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            <button
+              onClick={executeResetAuditData}
+              disabled={resetLoading}
+              className="bg-rose-700 hover:bg-rose-800 disabled:bg-gray-600 text-white px-3 py-1.5 rounded font-medium text-sm"
+            >
+              {resetLoading ? 'Resetting...' : 'Confirm Reset Now'}
+            </button>
+            <button
+              onClick={() => setResetConfirmOpen(false)}
+              disabled={resetLoading}
+              className="bg-gray-700 hover:bg-gray-600 disabled:bg-gray-600 text-gray-100 px-3 py-1.5 rounded font-medium text-sm"
+            >
+              Keep Existing Data
+            </button>
+          </div>
+        </div>
+      )}
 
       <div className="mb-4 inline-flex rounded-lg border border-gray-700 bg-gray-800 p-1">
         {(['events', 'trades', 'exports'] as AuditView[]).map((tab) => (

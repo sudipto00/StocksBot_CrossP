@@ -17,6 +17,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from storage.database import get_db
 from storage.service import StorageService
+from storage.models import AuditLog as DBAuditLog, Trade as DBTrade
 from services.broker import BrokerInterface, PaperBroker
 from services.order_execution import (
     OrderExecutionService,
@@ -313,6 +314,81 @@ def _balance_adjusted_limits(
     return max(1.0, adjusted_max_position_size), max(1.0, adjusted_risk_limit_daily)
 
 
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    """Best-effort float parsing."""
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(parsed):
+        return default
+    return parsed
+
+
+def _load_account_snapshot(broker: Optional[BrokerInterface]) -> Dict[str, float]:
+    """Load account equity/buying-power snapshot without raising."""
+    if broker is None:
+        return {"equity": 0.0, "buying_power": 0.0, "cash": 0.0}
+    try:
+        info = broker.get_account_info()
+    except Exception:
+        return {"equity": 0.0, "buying_power": 0.0, "cash": 0.0}
+    return {
+        "equity": _safe_float(info.get("equity", info.get("portfolio_value", 0.0)), 0.0),
+        "buying_power": _safe_float(info.get("buying_power", 0.0), 0.0),
+        "cash": _safe_float(info.get("cash", 0.0), 0.0),
+    }
+
+
+def _load_holdings_snapshot(storage: StorageService, broker: Optional[BrokerInterface]) -> List[Dict[str, Any]]:
+    """
+    Load current holdings with market values, preferring broker truth and falling back to local positions.
+    """
+    holdings: List[Dict[str, Any]] = []
+    if broker is not None:
+        try:
+            broker_positions = broker.get_positions()
+            for raw in broker_positions:
+                symbol = str(raw.get("symbol", "")).strip().upper()
+                if not symbol:
+                    continue
+                quantity = abs(_safe_float(raw.get("quantity", 0.0), 0.0))
+                current_price = _safe_float(raw.get("current_price", raw.get("price", 0.0)), 0.0)
+                avg_entry_price = _safe_float(raw.get("avg_entry_price", 0.0), 0.0)
+                market_value = _safe_float(raw.get("market_value", 0.0), 0.0)
+                if market_value <= 0 and quantity > 0:
+                    market_value = quantity * (current_price if current_price > 0 else avg_entry_price)
+                holdings.append({
+                    "symbol": symbol,
+                    "quantity": quantity,
+                    "current_price": current_price,
+                    "avg_entry_price": avg_entry_price,
+                    "market_value": max(0.0, market_value),
+                    "asset_type": str(raw.get("asset_type", "")).lower(),
+                })
+            if holdings:
+                return holdings
+        except Exception:
+            holdings = []
+
+    # Fallback to local stored positions.
+    local_positions = storage.get_open_positions()
+    for position in local_positions:
+        symbol = str(position.symbol).strip().upper()
+        quantity = abs(_safe_float(position.quantity, 0.0))
+        avg_entry_price = _safe_float(position.avg_entry_price, 0.0)
+        cost_basis = _safe_float(position.cost_basis, 0.0)
+        holdings.append({
+            "symbol": symbol,
+            "quantity": quantity,
+            "current_price": avg_entry_price,
+            "avg_entry_price": avg_entry_price,
+            "market_value": max(0.0, cost_basis),
+            "asset_type": "",
+        })
+    return holdings
+
+
 def _normalize_symbols(raw_symbols: List[str], max_symbols: int = 200) -> List[str]:
     """Normalize and validate a list of symbols."""
     normalized_symbols: List[str] = []
@@ -370,6 +446,22 @@ def _run_housekeeping(storage: StorageService, force: bool = False) -> Dict[str,
         "log_files_deleted": int(log_files_deleted),
         "audit_files_deleted": int(audit_files_deleted),
     }
+
+
+def _delete_all_files(directory: str) -> int:
+    """Delete all files/symlinks in a directory (non-recursive)."""
+    path = Path(directory).expanduser().resolve()
+    if not path.exists() or not path.is_dir():
+        return 0
+    deleted = 0
+    for child in path.iterdir():
+        try:
+            if child.is_file() or child.is_symlink():
+                child.unlink()
+                deleted += 1
+        except OSError:
+            continue
+    return deleted
 
 
 def _run_reconciliation(storage: StorageService, broker: BrokerInterface) -> Dict[str, Any]:
@@ -1204,6 +1296,62 @@ async def run_maintenance_cleanup(db: Session = Depends(get_db)):
     return {"success": True, **result}
 
 
+@router.post("/maintenance/reset-audit-data")
+async def reset_audit_data(
+    clear_event_logs: bool = Query(default=True),
+    clear_trade_history: bool = Query(default=True),
+    clear_log_files: bool = Query(default=True),
+    clear_audit_export_files: bool = Query(default=True),
+    db: Session = Depends(get_db),
+):
+    """
+    Hard reset audit/testing artifacts.
+
+    Intended for repeated test cycles. Refuses to run while strategy runner
+    is active to avoid races while new events are still being written.
+    """
+    status = runner_manager.get_status()
+    runner_status = str(status.get("status", "stopped")).lower()
+    if runner_status in {"running", "sleeping"}:
+        raise HTTPException(status_code=409, detail="Stop runner before resetting audit data")
+    if not any([clear_event_logs, clear_trade_history, clear_log_files, clear_audit_export_files]):
+        raise HTTPException(status_code=400, detail="At least one reset option must be enabled")
+
+    audit_rows_deleted = 0
+    trade_rows_deleted = 0
+    log_files_deleted = 0
+    audit_files_deleted = 0
+    try:
+        if clear_event_logs:
+            audit_rows_deleted = int(db.query(DBAuditLog).delete(synchronize_session=False) or 0)
+        if clear_trade_history:
+            trade_rows_deleted = int(db.query(DBTrade).delete(synchronize_session=False) or 0)
+        db.commit()
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to reset audit database rows: {exc}")
+
+    if clear_log_files:
+        log_files_deleted = _delete_all_files(_config.log_directory)
+    if clear_audit_export_files:
+        audit_files_deleted = _delete_all_files(_config.audit_export_directory)
+
+    return {
+        "success": True,
+        "runner_status": runner_status,
+        "audit_rows_deleted": int(audit_rows_deleted),
+        "trade_rows_deleted": int(trade_rows_deleted),
+        "log_files_deleted": int(log_files_deleted),
+        "audit_files_deleted": int(audit_files_deleted),
+        "cleared": {
+            "event_logs": bool(clear_event_logs),
+            "trade_history": bool(clear_trade_history),
+            "log_files": bool(clear_log_files),
+            "audit_export_files": bool(clear_audit_export_files),
+        },
+    }
+
+
 @router.get("/safety/status")
 async def get_safety_status(db: Session = Depends(get_db)):
     """Get trading safety controls status."""
@@ -1997,6 +2145,13 @@ async def get_screener_results(
     """
     storage = StorageService(db)
     prefs = _load_trading_preferences(storage)
+    broker: Optional[BrokerInterface] = None
+    try:
+        broker = get_broker()
+    except Exception:
+        broker = None
+    account_snapshot = _load_account_snapshot(broker)
+    holdings_snapshot = _load_holdings_snapshot(storage, broker)
 
     # Use preferences if not overridden
     final_asset_type = asset_type or prefs.asset_type
@@ -2033,6 +2188,10 @@ async def get_screener_results(
         max_sector_weight_pct=max_sector_weight_pct,
         regime=regime,
         auto_regime_adjust=auto_regime_adjust,
+        current_holdings=holdings_snapshot,
+        buying_power=account_snapshot.get("buying_power", 0.0),
+        equity=account_snapshot.get("equity", 0.0),
+        weekly_budget=prefs.weekly_budget,
     )
     
     assets, total_count, total_pages = _paginate_assets(optimized, page, page_size)
@@ -2052,6 +2211,10 @@ async def get_screener_results(
             "max_spread_bps": max_spread_bps,
             "max_sector_weight_pct": max_sector_weight_pct,
             "auto_regime_adjust": auto_regime_adjust,
+            "portfolio_adjusted": True,
+            "holdings_count": len(holdings_snapshot),
+            "equity": account_snapshot.get("equity", 0.0),
+            "buying_power": account_snapshot.get("buying_power", 0.0),
         },
     )
 
@@ -2067,6 +2230,7 @@ async def get_screener_preset(
     max_spread_bps: float = Query(default=50, ge=1, le=2000),
     max_sector_weight_pct: float = Query(default=45, ge=5, le=100),
     auto_regime_adjust: bool = True,
+    db: Session = Depends(get_db),
 ):
     """
     Get curated screener assets by strategy preset.
@@ -2087,6 +2251,15 @@ async def get_screener_preset(
 
     if not math.isfinite(min_dollar_volume) or not math.isfinite(max_spread_bps) or not math.isfinite(max_sector_weight_pct):
         raise HTTPException(status_code=400, detail="Guardrail values must be finite numbers")
+    storage = StorageService(db)
+    broker: Optional[BrokerInterface] = None
+    try:
+        broker = get_broker()
+    except Exception:
+        broker = None
+    account_snapshot = _load_account_snapshot(broker)
+    holdings_snapshot = _load_holdings_snapshot(storage, broker)
+    prefs = _load_trading_preferences(storage)
     screener = _create_market_screener()
     preset_guardrails = screener.get_preset_guardrails(asset_type.value, preset.value)
     min_dollar_volume = max(min_dollar_volume, float(preset_guardrails["min_dollar_volume"]))
@@ -2105,6 +2278,10 @@ async def get_screener_preset(
         max_sector_weight_pct=max_sector_weight_pct,
         regime=regime,
         auto_regime_adjust=auto_regime_adjust,
+        current_holdings=holdings_snapshot,
+        buying_power=account_snapshot.get("buying_power", 0.0),
+        equity=account_snapshot.get("equity", 0.0),
+        weekly_budget=prefs.weekly_budget,
     )
     assets, total_count, total_pages = _paginate_assets(optimized, page, page_size)
 
@@ -2123,6 +2300,10 @@ async def get_screener_preset(
             "max_spread_bps": max_spread_bps,
             "max_sector_weight_pct": max_sector_weight_pct,
             "auto_regime_adjust": auto_regime_adjust,
+            "portfolio_adjusted": True,
+            "holdings_count": len(holdings_snapshot),
+            "equity": account_snapshot.get("equity", 0.0),
+            "buying_power": account_snapshot.get("buying_power", 0.0),
         },
     )
 
@@ -2235,39 +2416,165 @@ async def update_trading_preferences(request: TradingPreferencesRequest, db: Ses
 
 @router.get("/preferences/recommendation")
 async def get_preference_recommendation(
-    equity: float = Query(default=10000.0, ge=100, le=100_000_000),
-    weekly_budget: float = Query(default=200.0, ge=25, le=5_000_000),
+    equity: Optional[float] = Query(default=None, ge=100, le=100_000_000),
+    weekly_budget: Optional[float] = Query(default=None, ge=25, le=5_000_000),
     target_trades_per_week: int = Query(default=4, ge=1, le=10),
+    asset_type: Optional[AssetType] = Query(default=None),
+    preset: Optional[ScreenerPreset] = Query(default=None),
+    db: Session = Depends(get_db),
 ):
-    """Get tailored recommendation for strategy preset and guardrails."""
-    if not math.isfinite(equity) or not math.isfinite(weekly_budget):
-        raise HTTPException(status_code=400, detail="equity and weekly_budget must be finite numbers")
-    if weekly_budget < 250 or equity < 5000:
-        stock_preset = "small_budget_weekly"
-        risk_profile = "conservative"
-    elif target_trades_per_week <= 3:
-        stock_preset = "monthly_optimized"
-        risk_profile = "balanced"
-    elif target_trades_per_week <= 5:
-        stock_preset = "three_to_five_weekly"
-        risk_profile = "balanced"
+    """Get tailored recommendation using current balance, holdings, and selected universe/preset."""
+    storage = StorageService(db)
+    prefs = _load_trading_preferences(storage)
+    screener = _create_market_screener()
+
+    normalized_asset_type = asset_type or prefs.asset_type
+    if normalized_asset_type == AssetType.BOTH:
+        normalized_asset_type = AssetType.STOCK
+
+    broker: Optional[BrokerInterface] = None
+    try:
+        broker = get_broker()
+    except Exception:
+        broker = None
+    account_snapshot = _load_account_snapshot(broker)
+    holdings_snapshot = _load_holdings_snapshot(storage, broker)
+
+    effective_equity = (
+        _safe_float(equity, 0.0)
+        if equity is not None
+        else _safe_float(account_snapshot.get("equity", 0.0), 0.0)
+    )
+    if effective_equity <= 0:
+        effective_equity = 10_000.0
+    effective_buying_power = _safe_float(account_snapshot.get("buying_power", 0.0), 0.0)
+    effective_weekly_budget = (
+        _safe_float(weekly_budget, 0.0)
+        if weekly_budget is not None
+        else _safe_float(prefs.weekly_budget, 200.0)
+    )
+    if effective_weekly_budget <= 0:
+        effective_weekly_budget = 200.0
+
+    stock_presets = {"weekly_optimized", "three_to_five_weekly", "monthly_optimized", "small_budget_weekly"}
+    etf_presets = {"conservative", "balanced", "aggressive"}
+    requested_preset = preset.value if preset is not None else None
+
+    if normalized_asset_type == AssetType.ETF:
+        effective_preset = requested_preset if requested_preset in etf_presets else prefs.etf_preset.value
+        if effective_preset not in etf_presets:
+            effective_preset = "balanced"
+        risk_profile = effective_preset
     else:
-        stock_preset = "weekly_optimized"
-        risk_profile = "aggressive"
+        if requested_preset in stock_presets:
+            effective_preset = requested_preset
+        elif target_trades_per_week <= 3:
+            effective_preset = "monthly_optimized"
+        elif target_trades_per_week <= 5:
+            effective_preset = "three_to_five_weekly"
+        elif effective_weekly_budget < 250 or effective_equity < 5_000:
+            effective_preset = "small_budget_weekly"
+        else:
+            effective_preset = prefs.stock_preset.value
+        if effective_preset not in stock_presets:
+            effective_preset = "weekly_optimized"
+        risk_profile_by_preset = {
+            "small_budget_weekly": "conservative",
+            "monthly_optimized": "balanced",
+            "three_to_five_weekly": "balanced",
+            "weekly_optimized": "aggressive",
+        }
+        risk_profile = risk_profile_by_preset.get(effective_preset, "balanced")
+
+    preset_guardrails = screener.get_preset_guardrails(normalized_asset_type.value, effective_preset)
+
+    holding_sector_values: Dict[str, float] = {}
+    total_holding_value = 0.0
+    for h in holdings_snapshot:
+        symbol = str(h.get("symbol", "")).upper()
+        asset_kind = str(h.get("asset_type", "")).lower()
+        if asset_kind not in {"stock", "etf"}:
+            asset_kind = "etf" if symbol.startswith("XL") or symbol in {
+                "SPY", "VOO", "IVV", "QQQ", "IWM", "DIA", "VTI", "VEA", "VWO", "AGG", "TLT", "IEF", "BND",
+                "XLF", "XLK", "XLE", "XLI", "XLP", "XLV", "XLY", "EEM"
+            } else "stock"
+        sector = screener._infer_sector(symbol, asset_kind)  # type: ignore[attr-defined]
+        value = _safe_float(h.get("market_value", 0.0), 0.0)
+        holding_sector_values[sector] = holding_sector_values.get(sector, 0.0) + value
+        total_holding_value += value
+    max_sector_exposure_pct = (
+        (max(holding_sector_values.values()) / total_holding_value) * 100.0
+        if total_holding_value > 0 and holding_sector_values
+        else 0.0
+    )
+
+    min_dollar_volume = float(preset_guardrails["min_dollar_volume"])
+    max_spread_bps = float(preset_guardrails["max_spread_bps"])
+    max_sector_weight_pct = float(preset_guardrails["max_sector_weight_pct"])
+    if effective_buying_power < 2_500:
+        min_dollar_volume = max(min_dollar_volume, 15_000_000)
+        max_spread_bps = min(max_spread_bps, 40)
+    elif effective_buying_power < 10_000:
+        min_dollar_volume = max(min_dollar_volume, 12_000_000)
+        max_spread_bps = min(max_spread_bps, 45)
+    if max_sector_exposure_pct >= 45:
+        max_sector_weight_pct = min(max_sector_weight_pct, 35)
+    elif max_sector_exposure_pct >= 35:
+        max_sector_weight_pct = min(max_sector_weight_pct, 40)
+
+    base_position_size = min(
+        max(effective_weekly_budget * 0.60, 100.0),
+        max(effective_equity * 0.10, 150.0),
+    )
+    if effective_buying_power > 0:
+        base_position_size = min(base_position_size, max(100.0, effective_buying_power * 0.25))
+    if holdings_snapshot:
+        concentration_discount = max(0.55, 1.0 - (len(holdings_snapshot) * 0.04))
+        base_position_size *= concentration_discount
+    recommended_max_position_size = max(50.0, base_position_size)
+
+    recommended_risk_limit_daily = min(
+        max(effective_weekly_budget * 0.30, 75.0),
+        max(effective_equity * 0.03, 100.0),
+        max(recommended_max_position_size * 0.9, 75.0),
+    )
+    if effective_buying_power > 0:
+        recommended_risk_limit_daily = min(recommended_risk_limit_daily, max(50.0, effective_buying_power * 0.12))
+    recommended_risk_limit_daily = max(50.0, recommended_risk_limit_daily)
+
+    estimated_ticket = max(100.0, recommended_max_position_size * 0.75)
+    if effective_buying_power > 0:
+        affordable_slots = max(1, int(effective_buying_power / estimated_ticket))
+        recommended_screener_limit = int(max(10, min(200, max(affordable_slots * 4, 25))))
+    else:
+        recommended_screener_limit = int(max(10, min(200, prefs.screener_limit)))
 
     guardrails = {
-        "min_dollar_volume": 8_000_000 if risk_profile == "conservative" else 12_000_000,
-        "max_spread_bps": 35 if risk_profile == "conservative" else 50,
-        "max_sector_weight_pct": 35 if risk_profile == "conservative" else 45,
-        "max_position_size": min(max(weekly_budget * 0.35, 300.0), max(equity * 0.08, 500.0)),
-        "risk_limit_daily": min(max(weekly_budget * 0.25, 150.0), max(equity * 0.02, 250.0)),
+        "min_dollar_volume": float(min_dollar_volume),
+        "max_spread_bps": float(max_spread_bps),
+        "max_sector_weight_pct": float(max_sector_weight_pct),
+        "max_position_size": float(round(recommended_max_position_size, 2)),
+        "risk_limit_daily": float(round(recommended_risk_limit_daily, 2)),
+        "screener_limit": int(recommended_screener_limit),
     }
     return {
-        "asset_type": "stock",
-        "stock_preset": stock_preset,
+        "asset_type": normalized_asset_type.value,
+        "stock_preset": effective_preset if normalized_asset_type == AssetType.STOCK else prefs.stock_preset.value,
+        "etf_preset": effective_preset if normalized_asset_type == AssetType.ETF else prefs.etf_preset.value,
+        "preset": effective_preset,
         "risk_profile": risk_profile,
         "guardrails": guardrails,
-        "notes": "Recommendation is based on budget, equity, and trade cadence.",
+        "portfolio_context": {
+            "equity": effective_equity,
+            "buying_power": effective_buying_power,
+            "cash": _safe_float(account_snapshot.get("cash", 0.0), 0.0),
+            "holdings_count": len(holdings_snapshot),
+            "max_sector_exposure_pct": round(max_sector_exposure_pct, 2),
+        },
+        "notes": (
+            "Recommendation blends preset defaults with live account buying power, "
+            "equity, and current holdings concentration."
+        ),
     }
 
 

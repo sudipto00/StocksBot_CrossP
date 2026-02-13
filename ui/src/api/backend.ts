@@ -34,6 +34,7 @@ import {
   SafetyPreflightResponse,
   MaintenanceStorageResponse,
   MaintenanceCleanupResponse,
+  MaintenanceResetAuditResponse,
   // Analytics types
   PortfolioAnalyticsResponse,
   PortfolioSummaryResponse,
@@ -49,6 +50,7 @@ import {
   ParameterTuneResponse,
   TradingPreferences,
   TradingPreferencesUpdateRequest,
+  PreferenceRecommendationResponse,
   SymbolChartResponse,
   AssetTypePreference,
 } from './types';
@@ -509,6 +511,35 @@ export async function runMaintenanceCleanup(): Promise<MaintenanceCleanupRespons
 }
 
 /**
+ * Hard reset audit/testing artifacts.
+ */
+export async function resetAuditData(
+  request: {
+    clear_event_logs?: boolean;
+    clear_trade_history?: boolean;
+    clear_log_files?: boolean;
+    clear_audit_export_files?: boolean;
+  } = {}
+): Promise<MaintenanceResetAuditResponse> {
+  const params = new URLSearchParams();
+  if (typeof request.clear_event_logs === 'boolean') params.append('clear_event_logs', String(request.clear_event_logs));
+  if (typeof request.clear_trade_history === 'boolean') params.append('clear_trade_history', String(request.clear_trade_history));
+  if (typeof request.clear_log_files === 'boolean') params.append('clear_log_files', String(request.clear_log_files));
+  if (typeof request.clear_audit_export_files === 'boolean') params.append('clear_audit_export_files', String(request.clear_audit_export_files));
+  const response = await fetch(`${BACKEND_URL}/maintenance/reset-audit-data${params.toString() ? `?${params.toString()}` : ''}`, {
+    method: 'POST',
+  });
+  if (!response.ok) {
+    const body = await response.json().catch(() => null);
+    if (response.status === 404) {
+      throw new Error('Reset endpoint unavailable (404). Restart backend to load the latest API routes.');
+    }
+    throw new Error(body?.detail || `Backend returned ${response.status}`);
+  }
+  return response.json();
+}
+
+/**
  * Explicitly liquidate all open positions.
  */
 export async function selloffPortfolio(): Promise<RunnerActionResponse> {
@@ -725,6 +756,34 @@ export async function updateTradingPreferences(
     asset_type: normalizedAssetType,
     screener_mode: normalizedAssetType === 'stock' ? raw.screener_mode : 'preset',
   };
+}
+
+/**
+ * Get portfolio-aware recommendation for presets and guardrails.
+ */
+export async function getPreferenceRecommendation(
+  request: {
+    asset_type?: AssetTypePreference;
+    preset?: string;
+    weekly_budget?: number;
+    target_trades_per_week?: number;
+  } = {}
+): Promise<PreferenceRecommendationResponse> {
+  const params = new URLSearchParams();
+  if (request.asset_type) params.append('asset_type', request.asset_type);
+  if (request.preset) params.append('preset', request.preset);
+  if (typeof request.weekly_budget === 'number' && Number.isFinite(request.weekly_budget)) {
+    params.append('weekly_budget', String(request.weekly_budget));
+  }
+  if (typeof request.target_trades_per_week === 'number' && Number.isFinite(request.target_trades_per_week)) {
+    params.append('target_trades_per_week', String(Math.max(1, Math.round(request.target_trades_per_week))));
+  }
+  const response = await fetch(`${BACKEND_URL}/preferences/recommendation${params.toString() ? `?${params.toString()}` : ''}`);
+  if (!response.ok) {
+    const body = await response.json().catch(() => null);
+    throw new Error(body?.detail || `Backend returned ${response.status}`);
+  }
+  return response.json();
 }
 
 /**

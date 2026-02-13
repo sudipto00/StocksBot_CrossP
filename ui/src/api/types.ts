@@ -379,6 +379,21 @@ export interface MaintenanceCleanupResponse {
   audit_files_deleted: number;
 }
 
+export interface MaintenanceResetAuditResponse {
+  success: boolean;
+  runner_status: string;
+  audit_rows_deleted: number;
+  trade_rows_deleted: number;
+  log_files_deleted: number;
+  audit_files_deleted: number;
+  cleared: {
+    event_logs: boolean;
+    trade_history: boolean;
+    log_files: boolean;
+    audit_export_files: boolean;
+  };
+}
+
 // ============================================================================
 // Analytics Types
 // ============================================================================
@@ -554,6 +569,34 @@ export interface TradingPreferencesUpdateRequest {
   screener_mode?: ScreenerModePreference;
   stock_preset?: StockPresetPreference;
   etf_preset?: EtfPresetPreference;
+}
+
+export interface PreferenceRecommendationGuardrails {
+  min_dollar_volume: number;
+  max_spread_bps: number;
+  max_sector_weight_pct: number;
+  max_position_size: number;
+  risk_limit_daily: number;
+  screener_limit: number;
+}
+
+export interface PreferenceRecommendationContext {
+  equity: number;
+  buying_power: number;
+  cash: number;
+  holdings_count: number;
+  max_sector_exposure_pct: number;
+}
+
+export interface PreferenceRecommendationResponse {
+  asset_type: AssetTypePreference;
+  stock_preset: StockPresetPreference;
+  etf_preset: EtfPresetPreference;
+  preset: StockPresetPreference | EtfPresetPreference;
+  risk_profile: RiskProfilePreference;
+  guardrails: PreferenceRecommendationGuardrails;
+  portfolio_context: PreferenceRecommendationContext;
+  notes: string;
 }
 
 export interface SymbolChartPoint {

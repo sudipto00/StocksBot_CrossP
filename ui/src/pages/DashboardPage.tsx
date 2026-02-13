@@ -7,6 +7,7 @@ import PnLChart from '../components/PnLChart';
 import HelpTooltip from '../components/HelpTooltip';
 import PageHeader from '../components/PageHeader';
 import GuidedFlowStrip from '../components/GuidedFlowStrip';
+import { showErrorNotification, showSuccessNotification } from '../utils/notifications';
 
 /**
  * Dashboard page component.
@@ -127,11 +128,12 @@ function DashboardPage() {
       if (response.success) {
         // Reload runner status to get full state
         await loadRunnerStatus();
+        await showSuccessNotification('Runner Started', response.message || 'Strategy runner started successfully.');
       } else {
-        alert(response.message || 'Failed to start runner');
+        await showErrorNotification('Runner Start Failed', response.message || 'Failed to start runner');
       }
     } catch (err) {
-      alert(err instanceof Error ? err.message : 'Failed to start runner');
+      await showErrorNotification('Runner Start Failed', err instanceof Error ? err.message : 'Failed to start runner');
     } finally {
       setRunnerLoading(false);
     }
@@ -144,11 +146,12 @@ function DashboardPage() {
       if (response.success) {
         // Reload runner status to get full state
         await loadRunnerStatus();
+        await showSuccessNotification('Runner Stopped', response.message || 'Strategy runner stopped.');
       } else {
-        alert(response.message || 'Failed to stop runner');
+        await showErrorNotification('Runner Stop Failed', response.message || 'Failed to stop runner');
       }
     } catch (err) {
-      alert(err instanceof Error ? err.message : 'Failed to stop runner');
+      await showErrorNotification('Runner Stop Failed', err instanceof Error ? err.message : 'Failed to stop runner');
     } finally {
       setRunnerLoading(false);
     }
@@ -160,8 +163,9 @@ function DashboardPage() {
       await runPanicStop();
       setKillSwitchActive(true);
       await loadData();
+      await showSuccessNotification('Panic Stop Complete', 'Kill switch enabled, runner stopped, and liquidation attempted.');
     } catch (err) {
-      alert(err instanceof Error ? err.message : 'Failed to run panic stop');
+      await showErrorNotification('Panic Stop Failed', err instanceof Error ? err.message : 'Failed to run panic stop');
     } finally {
       setRunnerLoading(false);
     }

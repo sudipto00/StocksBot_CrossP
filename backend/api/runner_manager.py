@@ -11,6 +11,7 @@ from engine.strategy_runner import StrategyRunner, StrategyStatus
 from engine.strategies import MetricsDrivenStrategy
 from services.broker import PaperBroker
 from services.order_execution import OrderExecutionService
+from services.budget_tracker import get_budget_tracker
 from storage.database import SessionLocal
 from storage.service import StorageService
 import json
@@ -157,6 +158,22 @@ class RunnerManager:
                 # Load active DB strategies into runner before start using metrics-driven logic.
                 skipped_invalid = []
                 allowed_params = set(self._strategy_param_defaults_from_prefs({"asset_type": "stock", "stock_preset": "weekly_optimized"}).keys())
+                account_info: Dict[str, Any] = {}
+                try:
+                    account_info = runner.broker.get_account_info()
+                except Exception:
+                    account_info = {}
+                account_equity = self._safe_float(account_info.get("equity", account_info.get("portfolio_value", 0.0)), 0.0)
+                account_buying_power = self._safe_float(account_info.get("buying_power", 0.0), 0.0)
+                weekly_budget = self._safe_float(prefs.get("weekly_budget", 200.0), 200.0)
+                budget_tracker = get_budget_tracker(weekly_budget)
+                budget_tracker.set_weekly_budget(weekly_budget)
+                remaining_weekly_budget = self._safe_float(
+                    budget_tracker.get_budget_status().get("remaining_budget", weekly_budget),
+                    weekly_budget,
+                )
+                existing_positions = storage.get_open_positions()
+                existing_position_count = len(existing_positions)
                 for db_strategy in active_strategies:
                     config = db_strategy.config or {}
                     raw_symbols = config.get("symbols", [])
@@ -177,11 +194,19 @@ class RunnerManager:
                         if math.isfinite(numeric):
                             validated_params[key] = numeric
                     merged_params = {**preset_defaults, **validated_params}
+                    dynamic_position_size = self._dynamic_position_size(
+                        requested_position_size=float(merged_params.get("position_size", 1000.0)),
+                        symbol_count=max(1, len(symbols)),
+                        existing_position_count=existing_position_count,
+                        remaining_weekly_budget=remaining_weekly_budget,
+                        buying_power=account_buying_power,
+                        equity=account_equity,
+                    )
                     strategy = MetricsDrivenStrategy({
                         "name": db_strategy.name,
                         "strategy_id": db_strategy.id,
                         "symbols": symbols,
-                        "position_size": float(merged_params.get("position_size", 1000.0)),
+                        "position_size": dynamic_position_size,
                         "stop_loss_pct": float(merged_params.get("stop_loss_pct", 2.0)),
                         "take_profit_pct": float(merged_params.get("take_profit_pct", 5.0)),
                         "trailing_stop_pct": float(merged_params.get("trailing_stop_pct", 2.5)),
@@ -202,7 +227,15 @@ class RunnerManager:
                 storage.create_audit_log(
                     event_type='runner_started',
                     description=f'Strategy runner started with {strategy_count} strategies',
-                    details={'strategy_count': strategy_count, 'loaded_count': len(runner.strategies), 'skipped_invalid': skipped_invalid}
+                    details={
+                        'strategy_count': strategy_count,
+                        'loaded_count': len(runner.strategies),
+                        'skipped_invalid': skipped_invalid,
+                        'account_equity': account_equity,
+                        'account_buying_power': account_buying_power,
+                        'remaining_weekly_budget': remaining_weekly_budget,
+                        'existing_position_count': existing_position_count,
+                    }
                 )
             finally:
                 if owns_session:
@@ -260,6 +293,52 @@ class RunnerManager:
             normalized.append(symbol)
             seen.add(symbol)
         return normalized
+
+    def _safe_float(self, value: Any, default: float = 0.0) -> float:
+        """Best-effort finite float conversion."""
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return default
+        if not math.isfinite(parsed):
+            return default
+        return parsed
+
+    def _dynamic_position_size(
+        self,
+        requested_position_size: float,
+        symbol_count: int,
+        existing_position_count: int,
+        remaining_weekly_budget: float,
+        buying_power: float,
+        equity: float,
+    ) -> float:
+        """
+        Compute portfolio-adaptive per-trade position size.
+
+        The goal is to keep strategy defaults intact while preventing oversizing
+        relative to available buying power, equity, and remaining weekly budget.
+        """
+        position_size = max(25.0, self._safe_float(requested_position_size, 1000.0))
+        planned_slots = max(1, int(symbol_count))
+        active_slots = max(0, int(existing_position_count))
+        slots_denominator = max(1, planned_slots + min(active_slots, planned_slots))
+
+        caps: list[float] = [position_size]
+        if remaining_weekly_budget > 0:
+            caps.append(max(50.0, remaining_weekly_budget / slots_denominator))
+        if buying_power > 0:
+            caps.append(max(75.0, buying_power * 0.25))
+        if equity > 0:
+            caps.append(max(75.0, equity * 0.10))
+
+        sized = min(caps)
+        if active_slots >= 6:
+            sized *= 0.85
+        elif active_slots >= 3:
+            sized *= 0.93
+
+        return max(50.0, round(sized, 2))
     
     def stop_runner(self, db: Optional[Session] = None) -> Dict[str, Any]:
         """

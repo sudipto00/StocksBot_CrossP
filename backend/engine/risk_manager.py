@@ -1,17 +1,14 @@
 """
 Risk Manager Module.
 Manages trading risk and position limits.
-
-TODO: Implement comprehensive risk management
-- Position sizing
-- Exposure limits
-- Drawdown monitoring
-- Risk metrics calculation
-- Circuit breakers
 """
 
-from typing import Dict, Optional, Any
-from datetime import datetime, timedelta
+from __future__ import annotations
+
+import math
+import re
+from datetime import datetime
+from typing import Any, Dict, Mapping, Optional
 
 
 class RiskManager:
@@ -25,7 +22,6 @@ class RiskManager:
     - Enforcing position limits
     - Emergency shutdown (circuit breaker)
     
-    TODO: Implement actual risk calculations and limits
     """
     
     def __init__(
@@ -33,6 +29,8 @@ class RiskManager:
         max_position_size: float = 10000.0,
         daily_loss_limit: float = 500.0,
         max_portfolio_exposure: float = 100000.0,
+        max_symbol_concentration_pct: float = 45.0,
+        max_open_positions: int = 25,
     ):
         """
         Initialize risk manager.
@@ -41,10 +39,14 @@ class RiskManager:
             max_position_size: Maximum position size in dollars
             daily_loss_limit: Maximum daily loss allowed
             max_portfolio_exposure: Maximum total portfolio exposure
+            max_symbol_concentration_pct: Max single-symbol concentration (% of exposure)
+            max_open_positions: Max unique symbols allowed
         """
-        self.max_position_size = max_position_size
-        self.daily_loss_limit = daily_loss_limit
-        self.max_portfolio_exposure = max_portfolio_exposure
+        self.max_position_size = max(1.0, float(max_position_size))
+        self.daily_loss_limit = max(1.0, float(daily_loss_limit))
+        self.max_portfolio_exposure = max(1.0, float(max_portfolio_exposure))
+        self.max_symbol_concentration_pct = min(100.0, max(1.0, float(max_symbol_concentration_pct)))
+        self.max_open_positions = max(1, int(max_open_positions))
         
         # Track daily stats
         self.daily_pnl: float = 0.0
@@ -71,11 +73,6 @@ class RiskManager:
             
         Returns:
             (is_valid, error_message)
-            
-        TODO: Implement comprehensive order validation
-        TODO: Check position limits
-        TODO: Check portfolio exposure
-        TODO: Validate against daily loss limits
         """
         # Reset daily stats if needed
         self._reset_daily_stats_if_needed()
@@ -84,8 +81,20 @@ class RiskManager:
         if self.circuit_breaker_active:
             return False, "Circuit breaker is active - trading halted"
         
+        normalized_symbol = str(symbol or "").strip().upper()
+        if not re.match(r"^[A-Z][A-Z0-9.\-]{0,9}$", normalized_symbol):
+            return False, "Invalid symbol format"
+
+        try:
+            qty = float(quantity)
+            px = float(price)
+        except (TypeError, ValueError):
+            return False, "Quantity and price must be numeric"
+        if not math.isfinite(qty) or not math.isfinite(px) or qty <= 0 or px <= 0:
+            return False, "Quantity and price must be positive finite numbers"
+
         # Calculate order value
-        order_value = quantity * price
+        order_value = qty * px
         
         # Check max position size
         if order_value > self.max_position_size:
@@ -94,12 +103,33 @@ class RiskManager:
         # Check daily loss limit
         if self.daily_pnl < -self.daily_loss_limit:
             return False, f"Daily loss limit reached ({self.daily_loss_limit})"
-        
-        # TODO: Add more validations
-        # - Check total portfolio exposure
-        # - Check concentration limits
-        # - Check volatility-based position sizing
-        
+
+        positions = self._normalize_positions(current_positions)
+        current_exposure = sum(max(0.0, float(pos.get("market_value", 0.0))) for pos in positions.values())
+        projected_exposure = current_exposure + order_value
+        if projected_exposure > self.max_portfolio_exposure:
+            return (
+                False,
+                f"Portfolio exposure limit exceeded: projected ${projected_exposure:.2f} > "
+                f"${self.max_portfolio_exposure:.2f}",
+            )
+
+        is_new_symbol = normalized_symbol not in positions
+        if is_new_symbol and len(positions) >= self.max_open_positions:
+            return False, f"Max open positions reached ({self.max_open_positions})"
+
+        # Concentration checks are meaningful only once portfolio already has exposure.
+        if current_exposure > 0:
+            existing_symbol_value = max(0.0, float(positions.get(normalized_symbol, {}).get("market_value", 0.0)))
+            projected_symbol_value = existing_symbol_value + order_value
+            projected_concentration_pct = (projected_symbol_value / projected_exposure) * 100.0 if projected_exposure > 0 else 0.0
+            if projected_concentration_pct > self.max_symbol_concentration_pct:
+                return (
+                    False,
+                    f"Symbol concentration limit exceeded: projected {projected_concentration_pct:.2f}% > "
+                    f"{self.max_symbol_concentration_pct:.2f}%",
+                )
+
         return True, None
     
     def update_daily_pnl(self, pnl: float) -> None:
@@ -149,11 +179,6 @@ class RiskManager:
         Returns:
             Dictionary of risk metrics
             
-        TODO: Calculate real risk metrics
-        - Sharpe ratio
-        - Max drawdown
-        - Value at Risk (VaR)
-        - Portfolio beta
         """
         self._reset_daily_stats_if_needed()
         
@@ -161,9 +186,12 @@ class RiskManager:
             "daily_pnl": self.daily_pnl,
             "daily_loss_limit": self.daily_loss_limit,
             "daily_pnl_percent": (self.daily_pnl / self.daily_loss_limit * 100) if self.daily_loss_limit > 0 else 0,
+            "daily_loss_remaining": max(0.0, self.daily_loss_limit + self.daily_pnl),
             "circuit_breaker_active": self.circuit_breaker_active,
             "max_position_size": self.max_position_size,
             "max_portfolio_exposure": self.max_portfolio_exposure,
+            "max_symbol_concentration_pct": self.max_symbol_concentration_pct,
+            "max_open_positions": self.max_open_positions,
         }
     
     def _reset_daily_stats_if_needed(self) -> None:
@@ -174,3 +202,60 @@ class RiskManager:
         if today_start > self.daily_reset_time:
             self.daily_pnl = 0.0
             self.daily_reset_time = today_start
+
+    def _normalize_positions(self, current_positions: Any) -> Dict[str, Dict[str, float]]:
+        """
+        Normalize supported position shapes into a symbol-keyed map.
+
+        Supports:
+        - dict[symbol] -> dict
+        - list[dict] with `symbol` fields
+        """
+        normalized: Dict[str, Dict[str, float]] = {}
+        if current_positions is None:
+            return normalized
+
+        if isinstance(current_positions, Mapping):
+            for key, value in current_positions.items():
+                if isinstance(value, Mapping):
+                    row = dict(value)
+                    row.setdefault("symbol", str(key))
+                    self._append_normalized_position(normalized, row)
+                else:
+                    row = {"symbol": str(key), "market_value": float(value) if isinstance(value, (int, float)) else 0.0}
+                    self._append_normalized_position(normalized, row)
+            return normalized
+        elif isinstance(current_positions, list):
+            for raw in current_positions:
+                self._append_normalized_position(normalized, raw)
+            return normalized
+        else:
+            return normalized
+
+    def _append_normalized_position(self, normalized: Dict[str, Dict[str, float]], raw: Any) -> None:
+        """Parse and append one raw position row into normalized map."""
+        if not isinstance(raw, Mapping):
+            return
+        symbol = str(raw.get("symbol", "")).strip().upper()
+        if not symbol:
+            return
+        quantity = self._safe_float(raw.get("quantity", 0.0), 0.0)
+        current_price = self._safe_float(raw.get("current_price", raw.get("price", 0.0)), 0.0)
+        avg_entry_price = self._safe_float(raw.get("avg_entry_price", 0.0), 0.0)
+        market_value = self._safe_float(raw.get("market_value", raw.get("cost_basis", 0.0)), 0.0)
+        if market_value <= 0 and quantity > 0:
+            market_value = quantity * (current_price if current_price > 0 else avg_entry_price)
+        normalized[symbol] = {
+            "quantity": max(0.0, quantity),
+            "market_value": max(0.0, market_value),
+        }
+
+    @staticmethod
+    def _safe_float(value: Any, default: float) -> float:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return default
+        if not math.isfinite(parsed):
+            return default
+        return parsed
