@@ -12,8 +12,11 @@ import {
   ConfigUpdateRequest,
   BrokerCredentialsRequest,
   BrokerCredentialsStatusResponse,
+  BrokerAccountResponse,
   NotificationRequest,
   NotificationResponse,
+  SummaryNotificationPreferences,
+  SummaryNotificationPreferencesUpdateRequest,
   // Strategy types
   Strategy,
   StrategyCreateRequest,
@@ -22,6 +25,7 @@ import {
   // Audit types
   AuditLogsResponse,
   AuditEventType,
+  TradeHistoryResponse,
   // Runner types
   RunnerStatusResponse,
   RunnerActionResponse,
@@ -38,6 +42,10 @@ import {
   BacktestResult,
   ParameterTuneRequest,
   ParameterTuneResponse,
+  TradingPreferences,
+  TradingPreferencesUpdateRequest,
+  SymbolChartResponse,
+  AssetTypePreference,
 } from './types';
 
 // Access environment variables via import.meta.env in Vite
@@ -124,6 +132,19 @@ export async function getBrokerCredentialsStatus(): Promise<BrokerCredentialsSta
 }
 
 /**
+ * Get active broker account snapshot (cash/equity/buying power).
+ */
+export async function getBrokerAccount(): Promise<BrokerAccountResponse> {
+  const response = await fetch(`${BACKEND_URL}/broker/account`);
+
+  if (!response.ok) {
+    throw new Error(`Backend returned ${response.status}`);
+  }
+
+  return response.json();
+}
+
+/**
  * Get current positions.
  */
 export async function getPositions(): Promise<PositionsResponse> {
@@ -184,6 +205,55 @@ export async function requestNotification(notification: NotificationRequest): Pr
     throw new Error(`Backend returned ${response.status}`);
   }
   
+  return response.json();
+}
+
+/**
+ * Get daily/weekly transaction summary notification preferences.
+ */
+export async function getSummaryNotificationPreferences(): Promise<SummaryNotificationPreferences> {
+  const response = await fetch(`${BACKEND_URL}/notifications/summary/preferences`);
+
+  if (!response.ok) {
+    throw new Error(`Backend returned ${response.status}`);
+  }
+
+  return response.json();
+}
+
+/**
+ * Update daily/weekly transaction summary notification preferences.
+ */
+export async function updateSummaryNotificationPreferences(
+  request: SummaryNotificationPreferencesUpdateRequest
+): Promise<SummaryNotificationPreferences> {
+  const response = await fetch(`${BACKEND_URL}/notifications/summary/preferences`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(request),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Backend returned ${response.status}`);
+  }
+
+  return response.json();
+}
+
+/**
+ * Send summary notification immediately using configured preferences.
+ */
+export async function sendSummaryNotificationNow(): Promise<NotificationResponse> {
+  const response = await fetch(`${BACKEND_URL}/notifications/summary/send-now`, {
+    method: 'POST',
+  });
+
+  if (!response.ok) {
+    throw new Error(`Backend returned ${response.status}`);
+  }
+
   return response.json();
 }
 
@@ -283,6 +353,23 @@ export async function getAuditLogs(limit?: number, eventType?: AuditEventType): 
 }
 
 /**
+ * Get complete trade history for audit mode.
+ */
+export async function getAuditTrades(limit?: number): Promise<TradeHistoryResponse> {
+  const params = new URLSearchParams();
+  if (limit) params.append('limit', limit.toString());
+
+  const url = `${BACKEND_URL}/audit/trades${params.toString() ? '?' + params.toString() : ''}`;
+  const response = await fetch(url);
+
+  if (!response.ok) {
+    throw new Error(`Backend returned ${response.status}`);
+  }
+
+  return response.json();
+}
+
+/**
  * Get strategy runner status.
  */
 export async function getRunnerStatus(): Promise<RunnerStatusResponse> {
@@ -322,6 +409,21 @@ export async function stopRunner(): Promise<RunnerActionResponse> {
     throw new Error(`Backend returned ${response.status}`);
   }
   
+  return response.json();
+}
+
+/**
+ * Explicitly liquidate all open positions.
+ */
+export async function selloffPortfolio(): Promise<RunnerActionResponse> {
+  const response = await fetch(`${BACKEND_URL}/portfolio/selloff`, {
+    method: 'POST',
+  });
+
+  if (!response.ok) {
+    throw new Error(`Backend returned ${response.status}`);
+  }
+
   return response.json();
 }
 
@@ -480,5 +582,70 @@ export async function tuneParameter(
     throw new Error(`Backend returned ${response.status}`);
   }
   
+  return response.json();
+}
+
+/**
+ * Get trading preferences used by screener and risk controls.
+ */
+export async function getTradingPreferences(): Promise<TradingPreferences> {
+  const response = await fetch(`${BACKEND_URL}/preferences`);
+
+  if (!response.ok) {
+    throw new Error(`Backend returned ${response.status}`);
+  }
+
+  return response.json();
+}
+
+/**
+ * Update trading preferences.
+ */
+export async function updateTradingPreferences(
+  request: TradingPreferencesUpdateRequest
+): Promise<TradingPreferences> {
+  const response = await fetch(`${BACKEND_URL}/preferences`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(request),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Backend returned ${response.status}`);
+  }
+
+  return response.json();
+}
+
+/**
+ * Get symbol chart data with SMA overlays.
+ */
+export async function getSymbolChart(symbol: string, days = 320): Promise<SymbolChartResponse> {
+  const response = await fetch(`${BACKEND_URL}/screener/chart/${symbol}?days=${days}`);
+
+  if (!response.ok) {
+    throw new Error(`Backend returned ${response.status}`);
+  }
+
+  return response.json();
+}
+
+/**
+ * Get screener assets using current preferences or overrides.
+ */
+export async function getScreenerAssets(
+  assetType?: AssetTypePreference,
+  limit?: number
+): Promise<{ assets: Array<{ symbol: string }> }> {
+  const params = new URLSearchParams();
+  if (assetType) params.append('asset_type', assetType);
+  if (limit) params.append('limit', String(limit));
+  const url = `${BACKEND_URL}/screener/all${params.toString() ? `?${params.toString()}` : ''}`;
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`Backend returned ${response.status}`);
+  }
   return response.json();
 }

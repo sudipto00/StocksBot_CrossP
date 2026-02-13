@@ -125,4 +125,36 @@ def get_default_parameters() -> List[StrategyParameter]:
             step=0.1,
             description="Risk per trade as percentage of capital"
         ),
+        StrategyParameter(
+            name="trailing_stop_pct",
+            value=2.5,
+            min_value=0.5,
+            max_value=15.0,
+            step=0.5,
+            description="Trailing stop percentage from local high"
+        ),
+        StrategyParameter(
+            name="atr_stop_mult",
+            value=1.8,
+            min_value=0.5,
+            max_value=5.0,
+            step=0.1,
+            description="ATR multiplier used for volatility stop"
+        ),
+        StrategyParameter(
+            name="zscore_entry_threshold",
+            value=-1.5,
+            min_value=-4.0,
+            max_value=-0.2,
+            step=0.1,
+            description="Z-score entry threshold for mean-reversion dip buys"
+        ),
+        StrategyParameter(
+            name="dip_buy_threshold_pct",
+            value=2.0,
+            min_value=0.5,
+            max_value=10.0,
+            step=0.5,
+            description="Percent below SMA50 required to consider dip buy"
+        ),
     ]

@@ -36,6 +36,11 @@ function Sidebar() {
           <span className="mr-3">📈</span>
           Analytics
         </NavLink>
+
+        <NavLink to="/screener" className={navLinkClass}>
+          <span className="mr-3">🔍</span>
+          Screener
+        </NavLink>
         
         <NavLink to="/audit" className={navLinkClass}>
           <span className="mr-3">📋</span>
@@ -45,6 +50,11 @@ function Sidebar() {
         <NavLink to="/settings" className={navLinkClass}>
           <span className="mr-3">🔧</span>
           Settings
+        </NavLink>
+
+        <NavLink to="/help" className={navLinkClass}>
+          <span className="mr-3">❓</span>
+          Help
         </NavLink>
       </nav>
 

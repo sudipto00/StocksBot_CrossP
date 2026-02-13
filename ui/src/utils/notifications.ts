@@ -28,8 +28,16 @@ export async function showNotification(
   severity: NotificationSeverity = NotificationSeverity.INFO
 ): Promise<void> {
   try {
+    const permission = await getNotificationPermission();
+    if (permission !== 'granted') {
+      const granted = await requestNotificationPermission();
+      if (!granted) {
+        console.warn('Notification permission not granted');
+        return;
+      }
+    }
+
     // Call Tauri command to show notification
-    // TODO: Pass severity to Tauri for different notification styles
     await invoke('show_notification', { title, body, severity });
     console.log(`[Notification] ${severity}: ${title} - ${body}`);
   } catch (error) {
@@ -53,15 +61,16 @@ export async function getNotificationPermission(): Promise<string> {
 }
 
 /**
- * Request notification permission (placeholder).
- * 
- * TODO: Implement actual permission request flow per OS
+ * Request notification permission.
  */
 export async function requestNotificationPermission(): Promise<boolean> {
-  // TODO: Implement OS-specific permission request
-  // For now, assume granted
-  console.log('[Notifications] Permission request (not implemented)');
-  return true;
+  try {
+    const permission = await invoke<string>('request_notification_permission');
+    return permission === 'granted';
+  } catch (error) {
+    console.error('Failed to request notification permission:', error);
+    return false;
+  }
 }
 
 /**

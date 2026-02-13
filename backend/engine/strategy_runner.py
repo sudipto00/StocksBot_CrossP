@@ -11,6 +11,7 @@ import time
 
 from engine.strategy_interface import StrategyInterface
 from services.broker import BrokerInterface, OrderSide, OrderType
+from services.order_execution import OrderExecutionService
 
 
 class StrategyStatus(Enum):
@@ -38,7 +39,8 @@ class StrategyRunner:
         self,
         broker: BrokerInterface,
         storage_service: Optional[Any] = None,
-        tick_interval: float = 60.0
+        tick_interval: float = 60.0,
+        order_execution_service: Optional[OrderExecutionService] = None,
     ):
         """
         Initialize strategy runner.
@@ -51,6 +53,7 @@ class StrategyRunner:
         self.broker = broker
         self.storage = storage_service
         self.tick_interval = tick_interval
+        self.order_execution_service = order_execution_service
         
         self.strategies: Dict[str, StrategyInterface] = {}
         self.status = StrategyStatus.STOPPED
@@ -245,18 +248,36 @@ class StrategyRunner:
                     otype = OrderType.MARKET
                 
                 # Submit order through broker
-                order = self.broker.submit_order(
-                    symbol=symbol,
-                    side=side,
-                    order_type=otype,
-                    quantity=quantity,
-                    price=price
-                )
+                if self.order_execution_service:
+                    strategy_id = strategy.config.get("strategy_id")
+                    submitted = self.order_execution_service.submit_order(
+                        symbol=symbol,
+                        side=side.value,
+                        order_type=otype.value,
+                        quantity=quantity,
+                        price=price,
+                        strategy_id=strategy_id,
+                    )
+                    order = {
+                        "id": submitted.external_id or str(submitted.id),
+                        "status": submitted.status.value,
+                        "symbol": submitted.symbol,
+                        "filled_quantity": submitted.filled_quantity,
+                        "avg_fill_price": submitted.avg_fill_price,
+                    }
+                else:
+                    order = self.broker.submit_order(
+                        symbol=symbol,
+                        side=side,
+                        order_type=otype,
+                        quantity=quantity,
+                        price=price
+                    )
                 
                 print(f"[StrategyRunner] Executed {signal.value} order for {symbol}: {order}")
                 
-                # Record in storage if available
-                if self.storage:
+                # Record in storage if available and execution service is not used.
+                if self.storage and not self.order_execution_service:
                     try:
                         fill_price = price or order.get("avg_fill_price") or order.get("price") or 100.0
                         db_order = self.storage.create_order(

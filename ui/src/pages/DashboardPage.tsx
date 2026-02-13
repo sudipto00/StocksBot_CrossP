@@ -1,8 +1,11 @@
 import { useState, useEffect } from 'react';
-import { getBackendStatus, getPositions, getRunnerStatus, startRunner, stopRunner, getEquityCurve, getPortfolioAnalytics } from '../api/backend';
-import { StatusResponse, Position, RunnerState, RunnerStatus, EquityPoint, PortfolioAnalytics } from '../api/types';
+import { getBackendStatus, getPositions, getRunnerStatus, startRunner, stopRunner, getEquityCurve, getPortfolioAnalytics, getBrokerAccount, getTradingPreferences, getScreenerAssets } from '../api/backend';
+import { StatusResponse, Position, RunnerState, RunnerStatus, EquityPoint, PortfolioAnalytics, BrokerAccountResponse, TradingPreferences } from '../api/types';
 import EquityCurveChart from '../components/EquityCurveChart';
 import PnLChart from '../components/PnLChart';
+import HelpTooltip from '../components/HelpTooltip';
+import PageHeader from '../components/PageHeader';
+import GuidedFlowStrip from '../components/GuidedFlowStrip';
 
 /**
  * Dashboard page component.
@@ -14,10 +17,14 @@ function DashboardPage() {
   const [runnerState, setRunnerState] = useState<RunnerState | null>(null);
   const [equityCurve, setEquityCurve] = useState<EquityPoint[]>([]);
   const [analytics, setAnalytics] = useState<PortfolioAnalytics | null>(null);
+  const [brokerAccount, setBrokerAccount] = useState<BrokerAccountResponse | null>(null);
   const [initialCapital, setInitialCapital] = useState<number>(100000);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [runnerLoading, setRunnerLoading] = useState(false);
+  const [tradingPrefs, setTradingPrefs] = useState<TradingPreferences | null>(null);
+  const [holdingFilter, setHoldingFilter] = useState<'all' | 'stock' | 'etf'>('all');
+  const [knownEtfSymbols, setKnownEtfSymbols] = useState<Set<string>>(new Set());
 
   useEffect(() => {
     loadData();
@@ -32,12 +39,15 @@ function DashboardPage() {
       setError(null);
       
       // Fetch status, positions, runner state, and analytics in parallel
-      const [statusData, positionsData, runnerData, equityCurveData, analyticsData] = await Promise.all([
+      const [statusData, positionsData, runnerData, equityCurveData, analyticsData, brokerAccountData, prefsData, etfUniverse] = await Promise.all([
         getBackendStatus(),
         getPositions(),
         getRunnerStatus(),
         getEquityCurve(100),
         getPortfolioAnalytics(),
+        getBrokerAccount(),
+        getTradingPreferences(),
+        getScreenerAssets('etf', 200).catch(() => ({ assets: [] })),
       ]);
       
       setStatus(statusData);
@@ -51,6 +61,9 @@ function DashboardPage() {
       setEquityCurve(equityCurveData.data);
       setInitialCapital(equityCurveData.initial_capital);
       setAnalytics(analyticsData);
+      setBrokerAccount(brokerAccountData);
+      setTradingPrefs(prefsData);
+      setKnownEtfSymbols(new Set((etfUniverse.assets || []).map((asset) => asset.symbol.toUpperCase())));
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load data');
     } finally {
@@ -110,23 +123,43 @@ function DashboardPage() {
   const totalPnl = positions.reduce((sum, pos) => sum + pos.unrealized_pnl, 0);
   const totalCost = positions.reduce((sum, pos) => sum + pos.cost_basis, 0);
   const totalPnlPercent = totalCost > 0 ? (totalPnl / totalCost) * 100 : 0;
+  const classifySymbol = (symbol: string): 'stock' | 'etf' => (knownEtfSymbols.has(symbol.toUpperCase()) ? 'etf' : 'stock');
+  const filteredPositions = positions.filter((pos) => (holdingFilter === 'all' ? true : classifySymbol(pos.symbol) === holdingFilter));
+  const runnerStatusLabel = (runnerState?.status || 'unknown').toUpperCase();
+  const prefsSummary = tradingPrefs
+    ? `${tradingPrefs.asset_type.toUpperCase()} | ${tradingPrefs.screener_mode === 'most_active' ? `Most Active (${tradingPrefs.screener_limit})` : `Preset ${tradingPrefs.asset_type === 'etf' ? tradingPrefs.etf_preset : tradingPrefs.stock_preset}`}`
+    : 'Settings unavailable';
 
   return (
     <div className="p-8">
-      <div className="mb-8 flex items-center justify-between">
-        <div>
-          <h2 className="text-3xl font-bold text-white mb-2">Dashboard</h2>
-          <p className="text-gray-400">Portfolio overview and system status</p>
-        </div>
-        
-        <button
-          onClick={loadData}
-          disabled={loading}
-          className="bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 text-white px-4 py-2 rounded font-medium transition-colors flex items-center gap-2"
-        >
-          <span>🔄</span>
-          {loading ? 'Refreshing...' : 'Refresh'}
-        </button>
+      <PageHeader
+        title="Dashboard"
+        description="Portfolio overview and system status"
+        helpSection="dashboard"
+        actions={(
+          <button
+            onClick={loadData}
+            disabled={loading}
+            className="bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 text-white px-4 py-2 rounded font-medium transition-colors flex items-center gap-2"
+          >
+            <span>🔄</span>
+            {loading ? 'Refreshing...' : 'Refresh'}
+          </button>
+        )}
+      />
+      <GuidedFlowStrip />
+      <div className="mb-4 rounded-lg border border-emerald-700 bg-emerald-900/20 px-4 py-3">
+        <p className="text-sm text-emerald-100">
+          Active Trading Summary:
+          {' '}
+          <span className="font-semibold">{prefsSummary}</span>
+          {' | '}
+          <span className="font-semibold">Runner {runnerStatusLabel}</span>
+          {' | '}
+          <span className="font-semibold">Broker {(brokerAccount?.mode || 'paper').toUpperCase()}</span>
+          {' | '}
+          <span className="font-semibold">Open Holdings {positions.length}</span>
+        </p>
       </div>
 
       {loading && (
@@ -147,119 +180,140 @@ function DashboardPage() {
 
       {!loading && !error && (
         <>
-          <div className="mb-8 grid grid-cols-1 lg:grid-cols-3 gap-6">
-            <div className="lg:col-span-2 bg-gray-800 rounded-lg p-6 border border-gray-700">
-              <div className="flex items-center justify-between">
-                <h3 className="text-lg font-semibold text-white">Summary</h3>
-                <span className="text-gray-400 text-sm">Updated just now</span>
-              </div>
-              <div className="mt-4 grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
-                <div>
-                  <p className="text-gray-400">Total Value</p>
-                  <p className="text-white text-lg font-semibold">${totalValue.toLocaleString()}</p>
-                </div>
-                <div>
-                  <p className="text-gray-400">Unrealized P&L</p>
-                  <p className={`text-lg font-semibold ${totalPnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>  
-                    {totalPnl >= 0 ? '+' : ''}${totalPnl.toLocaleString()}
-                  </p>
-                  <p className="text-xs text-gray-500">{totalPnlPercent.toFixed(2)}%</p>
-                </div>
-                <div>
-                  <p className="text-gray-400">Positions</p>
-                  <p className="text-white text-lg font-semibold">{positions.length}</p>
-                </div>
-                <div>
-                  <p className="text-gray-400">Equity</p>
-                  <p className="text-white text-lg font-semibold">
-                    ${analytics?.current_equity?.toLocaleString() ?? totalValue.toLocaleString()}
-                  </p>
-                </div>
-              </div>
+          <div className="mb-6 grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
+            <div className="bg-gray-800 rounded-lg p-5 border border-gray-700">
+              <p className="text-gray-400 text-sm flex items-center gap-1">Total Value <HelpTooltip text="Current market value of open positions." /></p>
+              <p className="text-white text-2xl font-semibold">${totalValue.toLocaleString()}</p>
             </div>
-            <div className="bg-gray-800 rounded-lg p-6 border border-gray-700">
-              <h3 className="text-lg font-semibold text-white mb-4">Strategy Runner</h3>
-              {runnerState ? (
-                <div className="space-y-3">
-                  <div className="flex items-center">
-                    <div className={`w-3 h-3 rounded-full mr-2 ${
-                      runnerState.status === RunnerStatus.RUNNING ? 'bg-green-500' :
-                      runnerState.status === RunnerStatus.ERROR ? 'bg-red-500' :
-                      'bg-gray-500'
-                    }`}></div>
-                    <span className={`font-medium ${
-                      runnerState.status === RunnerStatus.RUNNING ? 'text-green-400' :
-                      runnerState.status === RunnerStatus.ERROR ? 'text-red-400' :
-                      'text-gray-400'
-                    }`}>
-                      {runnerState.status.toUpperCase()}
-                    </span>
-                  </div>
-                  <div className="space-y-1 text-xs">
-                    <p className="text-gray-400">
-                      Strategies: {runnerState.strategies?.length || 0}
-                    </p>
-                    <p className="text-gray-400">
-                      Interval: {runnerState.tick_interval}s
-                    </p>
-                    <p className={`${runnerState.broker_connected ? 'text-green-400' : 'text-red-400'}`}>  
-                      Broker: {runnerState.broker_connected ? 'Connected' : 'Disconnected'}
-                    </p>
-                  </div>
-                  <div className="flex gap-2 mt-3">
-                    <button
-                      onClick={handleStartRunner}
-                      disabled={runnerLoading || runnerState.status === RunnerStatus.RUNNING}
-                      className="flex-1 bg-green-600 hover:bg-green-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white px-3 py-1 rounded text-sm font-medium transition-colors"
-                    >
-                      ▶ Start
-                    </button>
-                    <button
-                      onClick={handleStopRunner}
-                      disabled={runnerLoading || runnerState.status === RunnerStatus.STOPPED}
-                      className="flex-1 bg-red-600 hover:bg-red-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white px-3 py-1 rounded text-sm font-medium transition-colors"
-                    >
-                      ⏹ Stop
-                    </button>
-                  </div>
-                </div>
-              ) : (
-                <p className="text-gray-400 text-sm">Loading...</p>
-              )}
+            <div className="bg-gray-800 rounded-lg p-5 border border-gray-700">
+              <p className="text-gray-400 text-sm flex items-center gap-1">Unrealized P&L <HelpTooltip text="Open-position profit/loss based on latest prices." /></p>
+              <p className={`text-2xl font-semibold ${totalPnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>  
+                {totalPnl >= 0 ? '+' : ''}${totalPnl.toLocaleString()}
+              </p>
+              <p className="text-xs text-gray-500">{totalPnlPercent.toFixed(2)}%</p>
+            </div>
+            <div className="bg-gray-800 rounded-lg p-5 border border-gray-700">
+              <p className="text-gray-400 text-sm flex items-center gap-1">Positions <HelpTooltip text="Count of open holdings in portfolio." /></p>
+              <p className="text-white text-2xl font-semibold">{positions.length}</p>
+            </div>
+            <div className="bg-gray-800 rounded-lg p-5 border border-gray-700">
+              <p className="text-gray-400 text-sm flex items-center gap-1">Equity <HelpTooltip text="Portfolio equity value tracked by analytics." /></p>
+              <p className="text-white text-2xl font-semibold">
+                ${analytics?.current_equity?.toLocaleString() ?? totalValue.toLocaleString()}
+              </p>
             </div>
           </div>
 
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-8">
-            <div className="bg-gray-800 rounded-lg p-6 border border-gray-700">
-              <h3 className="text-lg font-semibold text-white mb-4">Backend Status</h3>
-              {status && (
-                <div className="space-y-2">
-                  <div className="flex items-center">
-                    <div className="w-3 h-3 bg-green-500 rounded-full mr-2"></div>
-                    <span className="text-green-400 font-medium">{status.status}</span>
-                  </div>
-                  <p className="text-gray-300 text-sm">{status.service}</p>
-                  <p className="text-gray-400 text-xs">Version: {status.version}</p>
+          <div className="mb-6 bg-gray-800 rounded-lg p-5 border border-gray-700">
+            <div className="flex items-center justify-between gap-4">
+              <h3 className="text-lg font-semibold text-white">Broker Account ({brokerAccount?.mode?.toUpperCase() || 'PAPER'})</h3>
+              <span className={`text-sm font-medium ${brokerAccount?.connected ? 'text-green-400' : 'text-amber-400'}`}>
+                {brokerAccount?.connected ? 'Connected' : 'Unavailable'}
+              </span>
+            </div>
+            <div className="mt-3 grid grid-cols-1 md:grid-cols-3 gap-4">
+              <div>
+                <p className="text-xs text-gray-400">Cash</p>
+                <p className="text-xl text-white font-semibold">${(brokerAccount?.cash || 0).toLocaleString()}</p>
+              </div>
+              <div>
+                <p className="text-xs text-gray-400">Equity</p>
+                <p className="text-xl text-white font-semibold">${(brokerAccount?.equity || 0).toLocaleString()}</p>
+              </div>
+              <div>
+                <p className="text-xs text-gray-400">Buying Power</p>
+                <p className="text-xl text-white font-semibold">${(brokerAccount?.buying_power || 0).toLocaleString()}</p>
+              </div>
+            </div>
+            {brokerAccount && !brokerAccount.connected && (
+              <p className="mt-3 text-xs text-amber-300">{brokerAccount.message}</p>
+            )}
+          </div>
+
+          <div className="mb-8 grid grid-cols-1 xl:grid-cols-12 gap-6">
+            <div className="xl:col-span-3 bg-gray-800 rounded-lg p-6 border border-gray-700">
+              <h3 className="text-lg font-semibold text-white mb-4">Control & Risk</h3>
+              <div className="space-y-4">
+                <div>
+                  <p className="text-gray-400 text-sm">Runner State</p>
+                  <p className={`text-sm font-semibold mt-1 ${runnerState?.status === RunnerStatus.RUNNING ? 'text-green-400' : runnerState?.status === RunnerStatus.ERROR ? 'text-red-400' : 'text-gray-300'}`}>
+                    {(runnerState?.status || 'unknown').toUpperCase()}
+                  </p>
                 </div>
-              )}
+                <div className="text-xs text-gray-400">
+                  <p>Strategies: {runnerState?.strategies?.length || 0}</p>
+                  <p>Tick Interval: {runnerState?.tick_interval || 0}s</p>
+                  <p>Broker: <span className={runnerState?.broker_connected ? 'text-green-400' : 'text-red-400'}>{runnerState?.broker_connected ? 'Connected' : 'Disconnected'}</span></p>
+                </div>
+                <div className="flex gap-2">
+                  <button
+                    onClick={handleStartRunner}
+                    disabled={runnerLoading || runnerState?.status === RunnerStatus.RUNNING}
+                    className="flex-1 bg-green-600 hover:bg-green-700 disabled:bg-gray-600 text-white px-3 py-2 rounded text-sm font-medium"
+                  >
+                    Start
+                  </button>
+                  <button
+                    onClick={handleStopRunner}
+                    disabled={runnerLoading || runnerState?.status === RunnerStatus.STOPPED}
+                    className="flex-1 bg-red-600 hover:bg-red-700 disabled:bg-gray-600 text-white px-3 py-2 rounded text-sm font-medium"
+                  >
+                    Stop
+                  </button>
+                </div>
+              </div>
             </div>
 
-            <div className="bg-gray-800 rounded-lg p-6 border border-gray-700">
-              <h3 className="text-lg font-semibold text-white mb-4">Market Status</h3>
-              <div className="space-y-2">
-                <div className="flex items-center">
-                  <div className="w-3 h-3 bg-green-500 rounded-full mr-2"></div>
-                  <span className="text-green-400 font-medium">Market Open</span>
+            <div className="xl:col-span-6 bg-gray-800 rounded-lg p-6 border border-gray-700">
+              <h3 className="text-lg font-semibold text-white mb-4">Equity & P&L Trends</h3>
+              <div className="grid grid-cols-1 gap-6">
+                <EquityCurveChart data={equityCurve} initialCapital={initialCapital} />
+                {analytics && (
+                  <PnLChart
+                    data={analytics.equity_curve.map(point => ({
+                      timestamp: point.timestamp,
+                      pnl: point.trade_pnl,
+                      cumulative_pnl: point.cumulative_pnl
+                    }))}
+                  />
+                )}
+              </div>
+            </div>
+
+            <div className="xl:col-span-3 bg-gray-800 rounded-lg p-6 border border-gray-700">
+              <h3 className="text-lg font-semibold text-white mb-4">System Health</h3>
+              <div className="space-y-4">
+                <div>
+                  <p className="text-xs text-gray-400">Backend</p>
+                  <p className="text-sm text-green-400">{status?.status || 'unknown'}</p>
+                  <p className="text-xs text-gray-500">{status?.service} {status?.version}</p>
                 </div>
-                <p className="text-gray-400 text-xs">TODO: Real market hours</p>
+                <div>
+                  <p className="text-xs text-gray-400">Market</p>
+                  <p className="text-sm text-green-400">Open</p>
+                </div>
               </div>
             </div>
           </div>
 
           <div className="bg-gray-800 rounded-lg p-6 border border-gray-700">
-            <h3 className="text-lg font-semibold text-white mb-4">Current Positions</h3>
-            
-            {positions.length === 0 ? (
+            <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+              <h3 className="text-lg font-semibold text-white">Current Portfolio Holdings</h3>
+              <div className="inline-flex rounded border border-gray-700 bg-gray-900 p-1 text-xs">
+                {(['all', 'stock', 'etf'] as const).map((filter) => (
+                  <button
+                    key={filter}
+                    onClick={() => setHoldingFilter(filter)}
+                    className={`px-3 py-1 rounded ${holdingFilter === filter ? 'bg-blue-600 text-white' : 'text-gray-300 hover:bg-gray-700'}`}
+                  >
+                    {filter === 'all' ? 'All' : filter === 'stock' ? 'Stocks' : 'ETFs'}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <p className="mb-3 text-xs text-gray-400">Shows current holdings with market value and portfolio weight. ETF filtering is based on current ETF universe classification.</p>
+
+            {filteredPositions.length === 0 ? (
               <p className="text-gray-400 text-sm">No positions</p>
             ) : (
               <div className="overflow-x-auto">
@@ -267,45 +321,40 @@ function DashboardPage() {
                   <thead>
                     <tr className="text-left text-gray-400 text-sm border-b border-gray-700">
                       <th className="pb-2">Symbol</th>
+                      <th className="pb-2">Type</th>
                       <th className="pb-2">Quantity</th>
                       <th className="pb-2">Avg Price</th>
                       <th className="pb-2">Current Price</th>
+                      <th className="pb-2">Market Value</th>
+                      <th className="pb-2">Weight</th>
                       <th className="pb-2">P&L</th>
                       <th className="pb-2">P&L %</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {positions.map((pos) => (
+                    {filteredPositions.map((pos) => {
+                      const type = classifySymbol(pos.symbol);
+                      const weightPct = totalValue > 0 ? (pos.market_value / totalValue) * 100 : 0;
+                      return (
                       <tr key={pos.symbol} className="text-white border-b border-gray-700/50">
                         <td className="py-3 font-medium">{pos.symbol}</td>
+                        <td className="py-3 uppercase text-xs text-gray-300">{type}</td>
                         <td className="py-3">{pos.quantity}</td>
                         <td className="py-3">${pos.avg_entry_price.toFixed(2)}</td>
                         <td className="py-3">${pos.current_price.toFixed(2)}</td>
-                        <td className={`py-3 ${pos.unrealized_pnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>  
+                        <td className="py-3">${pos.market_value.toLocaleString(undefined, { maximumFractionDigits: 2 })}</td>
+                        <td className="py-3">{weightPct.toFixed(2)}%</td>
+                        <td className={`py-3 ${pos.unrealized_pnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
                           {pos.unrealized_pnl >= 0 ? '+' : ''}${pos.unrealized_pnl.toFixed(2)}
                         </td>
-                        <td className={`py-3 ${pos.unrealized_pnl_percent >= 0 ? 'text-green-400' : 'text-red-400'}`}>  
+                        <td className={`py-3 ${pos.unrealized_pnl_percent >= 0 ? 'text-green-400' : 'text-red-400'}`}>
                           {pos.unrealized_pnl_percent >= 0 ? '+' : ''}{pos.unrealized_pnl_percent.toFixed(2)}%
                         </td>
                       </tr>
-                    ))}
+                    )})}
                   </tbody>
                 </table>
               </div>
-            )}
-          </div>
-
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mt-8">
-            <EquityCurveChart data={equityCurve} initialCapital={initialCapital} />
-            
-            {analytics && (
-              <PnLChart 
-                data={analytics.equity_curve.map(point => ({
-                  timestamp: point.timestamp,
-                  pnl: point.trade_pnl,
-                  cumulative_pnl: point.cumulative_pnl
-                }))}
-              />
             )}
           </div>
         </>

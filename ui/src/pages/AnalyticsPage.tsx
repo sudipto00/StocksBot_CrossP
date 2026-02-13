@@ -2,6 +2,8 @@ import { useState, useEffect } from 'react';
 import { LineChart, Line, AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
 import { getPortfolioAnalytics, getPortfolioSummary } from '../api/backend';
 import { PortfolioAnalytics, PortfolioSummaryResponse } from '../api/types';
+import HelpTooltip from '../components/HelpTooltip';
+import PageHeader from '../components/PageHeader';
 
 /**
  * Analytics page component.
@@ -52,19 +54,19 @@ function AnalyticsPage() {
 
   return (
     <div className="p-8">
-      <div className="mb-8 flex items-center justify-between">
-        <div>
-          <h2 className="text-3xl font-bold text-white mb-2">Portfolio Analytics</h2>
-          <p className="text-gray-400">Track your portfolio performance and statistics</p>
-        </div>
-        
-        <button
-          onClick={loadData}
-          className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded font-medium"
-        >
-          🔄 Refresh
-        </button>
-      </div>
+      <PageHeader
+        title="Portfolio Analytics"
+        description="Track your portfolio performance and statistics"
+        helpSection="analytics"
+        actions={(
+          <button
+            onClick={loadData}
+            className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded font-medium"
+          >
+            🔄 Refresh
+          </button>
+        )}
+      />
 
       {error && (
         <div className="bg-red-900/20 border border-red-700 rounded-lg p-4 mb-6">
@@ -95,7 +97,7 @@ function AnalyticsPage() {
           {/* Summary Cards */}
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
             <div className="bg-gray-800 rounded-lg p-6 border border-gray-700">
-              <h3 className="text-gray-400 text-sm mb-2">Total Equity</h3>
+              <h3 className="text-gray-400 text-sm mb-2 flex items-center gap-1">Total Equity <HelpTooltip text="Current portfolio equity value." /></h3>
               <p className="text-3xl font-bold text-white">{formatCurrency(summary.equity)}</p>
               <p className={`text-sm mt-2 ${summary.total_pnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
                 {summary.total_pnl >= 0 ? '+' : ''}{formatCurrency(summary.total_pnl)} Total P&L
@@ -111,7 +113,7 @@ function AnalyticsPage() {
             </div>
             
             <div className="bg-gray-800 rounded-lg p-6 border border-gray-700">
-              <h3 className="text-gray-400 text-sm mb-2">Win Rate</h3>
+              <h3 className="text-gray-400 text-sm mb-2 flex items-center gap-1">Win Rate <HelpTooltip text="Percent of profitable closed trades." /></h3>
               <p className="text-3xl font-bold text-white">{summary.win_rate.toFixed(1)}%</p>
               <p className="text-sm text-gray-400 mt-2">
                 {summary.winning_trades}W / {summary.losing_trades}L

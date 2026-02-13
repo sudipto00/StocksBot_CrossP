@@ -9,6 +9,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app import app
 from storage.database import Base, get_db
+from storage.service import StorageService
 
 # Create test database
 SQLALCHEMY_DATABASE_URL = "sqlite:///./test.db"
@@ -223,6 +224,54 @@ def test_audit_log_limit():
     assert response.status_code == 200
     data = response.json()
     assert len(data["logs"]) <= 3
+
+
+def test_audit_logs_accept_runner_events():
+    """Audit logs endpoint should support runner_* events."""
+    db = TestingSessionLocal()
+    try:
+        storage = StorageService(db)
+        storage.create_audit_log(
+            event_type="runner_started",
+            description="Runner started from test",
+            details={"source": "test"},
+        )
+    finally:
+        db.close()
+
+    response = client.get("/audit/logs")
+    assert response.status_code == 200
+    data = response.json()
+    assert any(log["event_type"] == "runner_started" for log in data["logs"])
+
+
+def test_get_audit_trades():
+    """Test getting complete trade history for audit mode."""
+    db = TestingSessionLocal()
+    try:
+        storage = StorageService(db)
+        order = storage.create_order(
+            symbol="AAPL",
+            side="buy",
+            order_type="market",
+            quantity=1.0,
+        )
+        storage.record_trade(
+            order_id=order.id,
+            symbol="AAPL",
+            side="buy",
+            quantity=1.0,
+            price=190.0,
+        )
+    finally:
+        db.close()
+
+    response = client.get("/audit/trades")
+    assert response.status_code == 200
+    data = response.json()
+    assert "trades" in data
+    assert data["total_count"] >= 1
+    assert any(t["symbol"] == "AAPL" for t in data["trades"])
 
 
 # ============================================================================

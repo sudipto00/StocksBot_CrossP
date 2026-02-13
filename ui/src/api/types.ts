@@ -137,6 +137,18 @@ export interface BrokerCredentialsStatusResponse {
   using_runtime_credentials: boolean;
 }
 
+export interface BrokerAccountResponse {
+  broker: string;
+  mode: 'paper' | 'live';
+  connected: boolean;
+  using_runtime_credentials: boolean;
+  currency: string;
+  cash: number;
+  equity: number;
+  buying_power: number;
+  message: string;
+}
+
 // ============================================================================
 // Notification Types
 // ============================================================================
@@ -150,6 +162,23 @@ export interface NotificationRequest {
 export interface NotificationResponse {
   success: boolean;
   message: string;
+}
+
+export type SummaryNotificationFrequency = 'daily' | 'weekly';
+export type SummaryNotificationChannel = 'email' | 'sms';
+
+export interface SummaryNotificationPreferences {
+  enabled: boolean;
+  frequency: SummaryNotificationFrequency;
+  channel: SummaryNotificationChannel;
+  recipient: string;
+}
+
+export interface SummaryNotificationPreferencesUpdateRequest {
+  enabled?: boolean;
+  frequency?: SummaryNotificationFrequency;
+  channel?: SummaryNotificationChannel;
+  recipient?: string;
 }
 
 // ============================================================================
@@ -218,6 +247,24 @@ export interface AuditLog {
 
 export interface AuditLogsResponse {
   logs: AuditLog[];
+  total_count: number;
+}
+
+export interface TradeHistoryItem {
+  id: string;
+  order_id: string;
+  symbol: string;
+  side: OrderSide;
+  quantity: number;
+  price: number;
+  commission: number;
+  fees: number;
+  executed_at: string;
+  realized_pnl?: number;
+}
+
+export interface TradeHistoryResponse {
+  trades: TradeHistoryItem[];
   total_count: number;
 }
 
@@ -390,4 +437,47 @@ export interface ParameterTuneResponse {
   new_value: number;
   success: boolean;
   message: string;
+}
+
+// ============================================================================
+// Trading Preferences Types
+// ============================================================================
+
+export type AssetTypePreference = 'stock' | 'etf' | 'both';
+export type RiskProfilePreference = 'conservative' | 'balanced' | 'aggressive';
+export type ScreenerModePreference = 'most_active' | 'preset';
+export type StockPresetPreference = 'weekly_optimized' | 'three_to_five_weekly' | 'monthly_optimized' | 'small_budget_weekly';
+export type EtfPresetPreference = 'conservative' | 'balanced' | 'aggressive';
+
+export interface TradingPreferences {
+  asset_type: AssetTypePreference;
+  risk_profile: RiskProfilePreference;
+  weekly_budget: number;
+  screener_limit: number;
+  screener_mode: ScreenerModePreference;
+  stock_preset: StockPresetPreference;
+  etf_preset: EtfPresetPreference;
+}
+
+export interface TradingPreferencesUpdateRequest {
+  asset_type?: AssetTypePreference;
+  risk_profile?: RiskProfilePreference;
+  weekly_budget?: number;
+  screener_limit?: number;
+  screener_mode?: ScreenerModePreference;
+  stock_preset?: StockPresetPreference;
+  etf_preset?: EtfPresetPreference;
+}
+
+export interface SymbolChartPoint {
+  timestamp: string;
+  close: number;
+  sma50?: number | null;
+  sma250?: number | null;
+}
+
+export interface SymbolChartResponse {
+  symbol: string;
+  points: SymbolChartPoint[];
+  indicators?: Record<string, number | boolean | null>;
 }

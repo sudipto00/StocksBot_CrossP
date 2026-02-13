@@ -4,6 +4,7 @@
 use std::process::Child;
 use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
+use tauri_plugin_notification::{NotificationExt, PermissionState};
 
 // State to manage the sidecar process
 struct SidecarState {
@@ -32,33 +33,90 @@ fn greet(name: &str) -> String {
 
 // Command to show a system notification
 #[tauri::command]
-fn show_notification(_app: tauri::AppHandle, title: String, body: String, severity: Option<String>) -> Result<(), String> {
-    // TODO: Implement cross-platform notification with severity-based styling
-    // For now, just print to console
-    let severity_str = severity.unwrap_or_else(|| "info".to_string());
-    println!("[NOTIFICATION] {}: {} - {}", severity_str.to_uppercase(), title, body);
-    
-    // Future implementation:
-    // app.notification()
-    //     .builder()
-    //     .title(&title)
-    //     .body(&body)
-    //     .show()
-    //     .map_err(|e| e.to_string())?;
-    
+fn show_notification(app: tauri::AppHandle, title: String, body: String, severity: Option<String>) -> Result<(), String> {
+    let trimmed_title = title.trim();
+    let trimmed_body = body.trim();
+    if trimmed_title.is_empty() {
+        return Err("title is required".to_string());
+    }
+    if trimmed_body.is_empty() {
+        return Err("body is required".to_string());
+    }
+    if trimmed_title.len() > 120 {
+        return Err("title is too long".to_string());
+    }
+    if trimmed_body.len() > 1000 {
+        return Err("body is too long".to_string());
+    }
+
+    let severity_str = severity
+        .unwrap_or_else(|| "info".to_string())
+        .trim()
+        .to_lowercase();
+    if severity_str != "info" && severity_str != "warning" && severity_str != "error" && severity_str != "success" {
+        return Err("severity must be one of: info, warning, error, success".to_string());
+    }
+    let tagged_title = match severity_str.as_str() {
+        "error" => format!("[ERROR] {}", trimmed_title),
+        "warning" => format!("[WARNING] {}", trimmed_title),
+        "success" => format!("[SUCCESS] {}", trimmed_title),
+        _ => trimmed_title.to_string(),
+    };
+
+    app.notification()
+        .builder()
+        .title(&tagged_title)
+        .body(trimmed_body)
+        .show()
+        .map_err(|e| e.to_string())?;
+
     Ok(())
 }
 
 // Command to get notification permission status
 #[tauri::command]
-fn get_notification_permission() -> Result<String, String> {
-    // TODO: Check actual OS notification permissions
-    // For now, return placeholder
-    Ok("granted".to_string())
+fn get_notification_permission(app: tauri::AppHandle) -> Result<String, String> {
+    let value = match app.notification().permission_state() {
+        Ok(PermissionState::Granted) => "granted",
+        Ok(PermissionState::Denied) => "denied",
+        Ok(PermissionState::Prompt) => "default",
+        Ok(_) => "default",
+        Err(_) => "default",
+    };
+    Ok(value.to_string())
+}
+
+#[tauri::command]
+fn request_notification_permission(app: tauri::AppHandle) -> Result<String, String> {
+    let value = match app.notification().request_permission() {
+        Ok(PermissionState::Granted) => "granted",
+        Ok(PermissionState::Denied) => "denied",
+        Ok(PermissionState::Prompt) => "default",
+        Ok(_) => "default",
+        Err(e) => return Err(e.to_string()),
+    };
+    Ok(value.to_string())
 }
 
 fn credential_username(mode: &str, field: &str) -> String {
     format!("{}_{}", mode, field)
+}
+
+fn validate_key_material(value: &str, field: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{} is required", field));
+    }
+    if trimmed.len() < 8 {
+        return Err(format!("{} appears too short", field));
+    }
+    if trimmed.len() > 512 {
+        return Err(format!("{} is too long", field));
+    }
+    if trimmed.chars().any(|c| c.is_whitespace()) {
+        return Err(format!("{} cannot contain whitespace", field));
+    }
+    Ok(trimmed.to_string())
 }
 
 #[tauri::command]
@@ -67,17 +125,16 @@ fn save_alpaca_credentials(mode: String, api_key: String, secret_key: String) ->
     if normalized_mode != "paper" && normalized_mode != "live" {
         return Err("mode must be paper or live".to_string());
     }
-    if api_key.trim().is_empty() || secret_key.trim().is_empty() {
-        return Err("api_key and secret_key are required".to_string());
-    }
+    let sanitized_api_key = validate_key_material(&api_key, "api_key")?;
+    let sanitized_secret_key = validate_key_material(&secret_key, "secret_key")?;
 
     let api_entry = keyring::Entry::new(KEYCHAIN_SERVICE, &credential_username(&normalized_mode, "api_key"))
         .map_err(|e| e.to_string())?;
     let secret_entry = keyring::Entry::new(KEYCHAIN_SERVICE, &credential_username(&normalized_mode, "secret_key"))
         .map_err(|e| e.to_string())?;
 
-    api_entry.set_password(api_key.trim()).map_err(|e| e.to_string())?;
-    secret_entry.set_password(secret_key.trim()).map_err(|e| e.to_string())?;
+    api_entry.set_password(&sanitized_api_key).map_err(|e| e.to_string())?;
+    secret_entry.set_password(&sanitized_secret_key).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -137,14 +194,15 @@ fn clear_alpaca_credentials(mode: String) -> Result<(), String> {
     let secret_entry = keyring::Entry::new(KEYCHAIN_SERVICE, &credential_username(&normalized_mode, "secret_key"))
         .map_err(|e| e.to_string())?;
 
-    let _ = api_entry.delete_credential();
-    let _ = secret_entry.delete_credential();
+    let _ = api_entry.delete_password();
+    let _ = secret_entry.delete_password();
     Ok(())
 }
 
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_notification::init())
         .setup(|_app| {
             // TODO: Launch Python FastAPI sidecar on app startup
             // The sidecar executable should be bundled with the app
@@ -188,6 +246,7 @@ fn main() {
             greet,
             show_notification,
             get_notification_permission,
+            request_notification_permission,
             save_alpaca_credentials,
             get_alpaca_credentials,
             get_alpaca_credentials_status,

@@ -5,7 +5,8 @@ Defines Pydantic models for request/response validation.
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 from enum import Enum
-from pydantic import BaseModel, Field
+import re
+from pydantic import BaseModel, Field, field_validator
 
 
 # ============================================================================
@@ -117,6 +118,14 @@ class OrderRequest(BaseModel):
     quantity: float = Field(..., description="Order quantity", gt=0)
     price: Optional[float] = Field(None, description="Limit/stop price", gt=0)
 
+    @field_validator("symbol")
+    @classmethod
+    def validate_symbol(cls, value: str) -> str:
+        symbol = value.strip().upper()
+        if not re.match(r"^[A-Z][A-Z0-9.\-]{0,9}$", symbol):
+            raise ValueError("Invalid symbol format")
+        return symbol
+
 
 class ConfigUpdateRequest(BaseModel):
     """Configuration update request."""
@@ -133,6 +142,14 @@ class BrokerCredentialsRequest(BaseModel):
     api_key: str = Field(..., description="Alpaca API key", min_length=1)
     secret_key: str = Field(..., description="Alpaca secret key", min_length=1)
 
+    @field_validator("mode")
+    @classmethod
+    def validate_mode(cls, value: str) -> str:
+        mode = value.strip().lower()
+        if mode not in {"paper", "live"}:
+            raise ValueError("mode must be either 'paper' or 'live'")
+        return mode
+
 
 class BrokerCredentialsStatusResponse(BaseModel):
     """Runtime broker credentials status."""
@@ -140,6 +157,19 @@ class BrokerCredentialsStatusResponse(BaseModel):
     live_available: bool = Field(..., description="Live credentials are available")
     active_mode: str = Field(..., description="Current runtime mode in use")
     using_runtime_credentials: bool = Field(..., description="Whether runtime credentials are active")
+
+
+class BrokerAccountResponse(BaseModel):
+    """Active broker account snapshot."""
+    broker: str = Field(..., description="Active broker provider")
+    mode: str = Field(..., description="paper or live")
+    connected: bool = Field(..., description="Whether broker account was fetched successfully")
+    using_runtime_credentials: bool = Field(..., description="Whether runtime credentials are in use")
+    currency: str = Field(default="USD", description="Account currency")
+    cash: float = Field(default=0.0, description="Cash balance")
+    equity: float = Field(default=0.0, description="Account equity")
+    buying_power: float = Field(default=0.0, description="Available buying power")
+    message: str = Field(default="", description="Status message")
 
 
 # ============================================================================
@@ -165,6 +195,34 @@ class NotificationResponse(BaseModel):
     """Notification response."""
     success: bool = Field(..., description="Whether notification was queued")
     message: str = Field(..., description="Response message")
+
+
+class SummaryNotificationChannel(str, Enum):
+    """Summary notification delivery channel."""
+    EMAIL = "email"
+    SMS = "sms"
+
+
+class SummaryNotificationFrequency(str, Enum):
+    """Summary notification frequency."""
+    DAILY = "daily"
+    WEEKLY = "weekly"
+
+
+class SummaryNotificationPreferencesRequest(BaseModel):
+    """Summary notification preferences update request."""
+    enabled: Optional[bool] = Field(None, description="Enable daily/weekly transaction summaries")
+    frequency: Optional[SummaryNotificationFrequency] = Field(None, description="Summary cadence")
+    channel: Optional[SummaryNotificationChannel] = Field(None, description="Delivery channel")
+    recipient: Optional[str] = Field(None, description="Email address or phone number")
+
+
+class SummaryNotificationPreferencesResponse(BaseModel):
+    """Summary notification preferences response."""
+    enabled: bool = Field(default=False, description="Whether summary notifications are enabled")
+    frequency: SummaryNotificationFrequency = Field(default=SummaryNotificationFrequency.DAILY, description="Summary cadence")
+    channel: SummaryNotificationChannel = Field(default=SummaryNotificationChannel.EMAIL, description="Delivery channel")
+    recipient: str = Field(default="", description="Email address or phone number")
 
 
 # ============================================================================
@@ -195,6 +253,17 @@ class StrategyCreateRequest(BaseModel):
     description: Optional[str] = Field(None, description="Strategy description", max_length=500)
     symbols: List[str] = Field(default_factory=list, description="Symbols to trade")
 
+    @field_validator("symbols")
+    @classmethod
+    def validate_symbols(cls, symbols: List[str]) -> List[str]:
+        if len(symbols) > 200:
+            raise ValueError("symbols cannot exceed 200 entries")
+        for symbol in symbols:
+            clean = (symbol or "").strip().upper()
+            if clean and not re.match(r"^[A-Z][A-Z0-9.\-]{0,9}$", clean):
+                raise ValueError(f"Invalid symbol format: {symbol}")
+        return symbols
+
 
 class StrategyUpdateRequest(BaseModel):
     """Strategy update request."""
@@ -202,6 +271,19 @@ class StrategyUpdateRequest(BaseModel):
     description: Optional[str] = Field(None, description="Strategy description", max_length=500)
     symbols: Optional[List[str]] = Field(None, description="Symbols to trade")
     status: Optional[StrategyStatus] = Field(None, description="Strategy status")
+
+    @field_validator("symbols")
+    @classmethod
+    def validate_symbols(cls, symbols: Optional[List[str]]) -> Optional[List[str]]:
+        if symbols is None:
+            return symbols
+        if len(symbols) > 200:
+            raise ValueError("symbols cannot exceed 200 entries")
+        for symbol in symbols:
+            clean = (symbol or "").strip().upper()
+            if clean and not re.match(r"^[A-Z][A-Z0-9.\-]{0,9}$", clean):
+                raise ValueError(f"Invalid symbol format: {symbol}")
+        return symbols
 
 
 class StrategiesResponse(BaseModel):
@@ -224,6 +306,8 @@ class AuditEventType(str, Enum):
     POSITION_OPENED = "position_opened"
     POSITION_CLOSED = "position_closed"
     CONFIG_UPDATED = "config_updated"
+    RUNNER_STARTED = "runner_started"
+    RUNNER_STOPPED = "runner_stopped"
     ERROR = "error"
 
 
@@ -240,6 +324,26 @@ class AuditLogsResponse(BaseModel):
     """Audit logs list response."""
     logs: List[AuditLog] = Field(default_factory=list, description="List of audit log entries")
     total_count: int = Field(default=0, description="Total log count")
+
+
+class TradeHistoryItem(BaseModel):
+    """Trade history entry for audit mode."""
+    id: str = Field(..., description="Trade ID")
+    order_id: str = Field(..., description="Associated order ID")
+    symbol: str = Field(..., description="Traded symbol")
+    side: OrderSide = Field(..., description="Trade side")
+    quantity: float = Field(..., description="Executed quantity")
+    price: float = Field(..., description="Execution price")
+    commission: float = Field(default=0.0, description="Commission paid")
+    fees: float = Field(default=0.0, description="Fees paid")
+    executed_at: datetime = Field(..., description="Execution timestamp")
+    realized_pnl: Optional[float] = Field(None, description="Realized P&L if available")
+
+
+class TradeHistoryResponse(BaseModel):
+    """Trade history list response."""
+    trades: List[TradeHistoryItem] = Field(default_factory=list, description="Trade history entries")
+    total_count: int = Field(default=0, description="Total trade count")
 
 
 # ============================================================================
@@ -372,6 +476,27 @@ class ScreenerPreset(str, Enum):
     AGGRESSIVE = "aggressive"
 
 
+class ScreenerMode(str, Enum):
+    """Screener mode enumeration."""
+    MOST_ACTIVE = "most_active"
+    PRESET = "preset"
+
+
+class StockPreset(str, Enum):
+    """Stock strategy presets."""
+    WEEKLY_OPTIMIZED = "weekly_optimized"
+    THREE_TO_FIVE_WEEKLY = "three_to_five_weekly"
+    MONTHLY_OPTIMIZED = "monthly_optimized"
+    SMALL_BUDGET_WEEKLY = "small_budget_weekly"
+
+
+class EtfPreset(str, Enum):
+    """ETF strategy presets."""
+    CONSERVATIVE = "conservative"
+    BALANCED = "balanced"
+    AGGRESSIVE = "aggressive"
+
+
 class ScreenerAsset(BaseModel):
     """Screener asset model."""
     symbol: str = Field(..., description="Asset symbol")
@@ -381,6 +506,12 @@ class ScreenerAsset(BaseModel):
     price: float = Field(..., description="Current price")
     change_percent: float = Field(..., description="Price change percentage")
     last_updated: str = Field(..., description="Last update timestamp")
+    sector: Optional[str] = Field(default=None, description="Mapped sector classification")
+    score: Optional[float] = Field(default=None, description="Composite symbol score")
+    dollar_volume: Optional[float] = Field(default=None, description="Estimated dollar volume")
+    spread_bps: Optional[float] = Field(default=None, description="Estimated spread in basis points")
+    tradable: Optional[bool] = Field(default=True, description="Whether symbol passed execution guardrails")
+    selection_reason: Optional[str] = Field(default=None, description="Explainability note for selection")
 
 
 class ScreenerResponse(BaseModel):
@@ -389,6 +520,27 @@ class ScreenerResponse(BaseModel):
     total_count: int = Field(..., description="Total count")
     asset_type: str = Field(..., description="Asset type filter applied")
     limit: int = Field(..., description="Limit applied")
+    page: int = Field(default=1, description="Current result page")
+    page_size: int = Field(default=25, description="Page size")
+    total_pages: int = Field(default=1, description="Total available pages")
+    data_source: str = Field(default="fallback", description="Source used: alpaca, fallback, or mixed")
+    market_regime: str = Field(default="unknown", description="Detected market regime")
+    applied_guardrails: Dict[str, Any] = Field(default_factory=dict, description="Applied screener filters/guardrails")
+
+
+class SymbolChartPoint(BaseModel):
+    """Symbol chart point with SMA overlays."""
+    timestamp: str
+    close: float
+    sma50: Optional[float] = None
+    sma250: Optional[float] = None
+
+
+class SymbolChartResponse(BaseModel):
+    """Symbol chart response."""
+    symbol: str
+    points: List[SymbolChartPoint]
+    indicators: Dict[str, Any] = Field(default_factory=dict)
 
 
 # ============================================================================
@@ -425,6 +577,9 @@ class TradingPreferencesRequest(BaseModel):
     risk_profile: Optional[RiskProfile] = Field(None, description="Risk profile")
     weekly_budget: Optional[float] = Field(None, description="Weekly budget", gt=0)
     screener_limit: Optional[int] = Field(None, description="Screener result limit", ge=10, le=200)
+    screener_mode: Optional[ScreenerMode] = Field(None, description="Screener mode")
+    stock_preset: Optional[StockPreset] = Field(None, description="Stock preset")
+    etf_preset: Optional[EtfPreset] = Field(None, description="ETF preset")
 
 
 class TradingPreferencesResponse(BaseModel):
@@ -433,6 +588,9 @@ class TradingPreferencesResponse(BaseModel):
     risk_profile: RiskProfile = Field(..., description="Current risk profile")
     weekly_budget: float = Field(..., description="Weekly trading budget")
     screener_limit: int = Field(..., description="Screener result limit")
+    screener_mode: ScreenerMode = Field(..., description="Screener mode")
+    stock_preset: StockPreset = Field(..., description="Stock strategy preset")
+    etf_preset: EtfPreset = Field(..., description="ETF strategy preset")
 
 
 # ============================================================================

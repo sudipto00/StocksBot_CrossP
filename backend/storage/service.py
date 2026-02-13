@@ -141,6 +141,10 @@ class StorageService:
     def get_recent_trades(self, limit: int = 100) -> List[Trade]:
         """Get recent trades."""
         return self.trades.get_recent(limit)
+
+    def get_all_trades(self, limit: int = 5000) -> List[Trade]:
+        """Get full trade history ordered by execution time."""
+        return self.trades.get_all(limit=limit)
     
     # Strategy operations
     

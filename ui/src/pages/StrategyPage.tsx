@@ -8,11 +8,14 @@ import {
   getRunnerStatus,
   startRunner,
   stopRunner,
+  selloffPortfolio,
   getStrategyConfig,
   updateStrategyConfig,
   getStrategyMetrics,
   runBacktest,
   tuneParameter,
+  getTradingPreferences,
+  getScreenerAssets,
 } from '../api/backend';
 import {
   Strategy,
@@ -21,7 +24,38 @@ import {
   StrategyMetrics,
   BacktestResult,
   StrategyParameter,
+  AssetTypePreference,
 } from '../api/types';
+import HelpTooltip from '../components/HelpTooltip';
+import PageHeader from '../components/PageHeader';
+import GuidedFlowStrip from '../components/GuidedFlowStrip';
+
+const SYMBOL_RE = /^[A-Z][A-Z0-9.\-]{0,9}$/;
+const STRATEGY_LIMITS = {
+  maxSymbols: 200,
+  backtestCapitalMin: 100,
+  backtestCapitalMax: 100_000_000,
+};
+
+function normalizeSymbols(raw: string): string[] {
+  const result: string[] = [];
+  const seen = new Set<string>();
+  raw
+    .split(',')
+    .map((s) => s.trim().toUpperCase())
+    .filter((s) => s.length > 0)
+    .forEach((symbol) => {
+      if (!seen.has(symbol)) {
+        seen.add(symbol);
+        result.push(symbol);
+      }
+    });
+  return result;
+}
+
+function isIsoDate(value: string): boolean {
+  return /^\d{4}-\d{2}-\d{2}$/.test(value);
+}
 
 /**
  * Strategy page component.
@@ -42,6 +76,8 @@ function StrategyPage() {
   const [formDescription, setFormDescription] = useState('');
   const [formSymbols, setFormSymbols] = useState('');
   const [formErrors, setFormErrors] = useState<Record<string, string>>({});
+  const [configErrors, setConfigErrors] = useState<Record<string, string>>({});
+  const [backtestError, setBacktestError] = useState<string | null>(null);
 
   // Selected strategy for detailed view
   const [selectedStrategy, setSelectedStrategy] = useState<Strategy | null>(null);
@@ -60,11 +96,15 @@ function StrategyPage() {
   const [backtestStartDate, setBacktestStartDate] = useState('2024-01-01');
   const [backtestEndDate, setBacktestEndDate] = useState('2024-12-31');
   const [backtestCapital, setBacktestCapital] = useState('100000');
+  const [detailTab, setDetailTab] = useState<'metrics' | 'config' | 'backtest'>('metrics');
   const activeStrategyCount = strategies.filter((s) => s.status === StrategyStatus.ACTIVE).length;
+  const [settingsSummary, setSettingsSummary] = useState<string>('Loading trading preferences...');
+  const [cleanupLoading, setCleanupLoading] = useState(false);
 
   useEffect(() => {
     loadStrategies();
     loadRunnerStatus();
+    loadSettingsSummary();
   }, []);
 
   const loadStrategies = async () => {
@@ -87,6 +127,17 @@ function StrategyPage() {
       setRunnerStatus(status.status);
     } catch (err) {
       console.error('Failed to load runner status:', err);
+    }
+  };
+
+  const loadSettingsSummary = async () => {
+    try {
+      const prefs = await getTradingPreferences();
+      setSettingsSummary(
+        `Settings: ${prefs.asset_type.toUpperCase()} | ${prefs.screener_mode === 'most_active' ? `Most Active (${prefs.screener_limit})` : 'Preset'} | Risk: ${prefs.risk_profile}`
+      );
+    } catch {
+      setSettingsSummary('Settings not available');
     }
   };
 
@@ -133,6 +184,7 @@ function StrategyPage() {
 
   const handleSelectStrategy = async (strategy: Strategy) => {
     setSelectedStrategy(strategy);
+    setDetailTab('metrics');
     setStrategyConfig(null);
     setStrategyMetrics(null);
     setBacktestResult(null);
@@ -177,16 +229,82 @@ function StrategyPage() {
     }
   };
 
+  const handleSelloff = async () => {
+    try {
+      const result = await selloffPortfolio();
+      if (result.success) {
+        await showSuccessNotification('Selloff Complete', result.message);
+      } else {
+        await showErrorNotification('Selloff Failed', result.message);
+      }
+    } catch {
+      await showErrorNotification('Selloff Error', 'Failed to liquidate positions');
+    }
+  };
+
+  const handleCleanupDefunctStrategies = async (selloffFirst: boolean) => {
+    const removable = strategies.filter(
+      (strategy) =>
+        strategy.status !== StrategyStatus.ACTIVE ||
+        !strategy.symbols ||
+        strategy.symbols.length === 0 ||
+        strategy.name.toLowerCase().includes('deprecated') ||
+        strategy.name.toLowerCase().includes('defunct')
+    );
+    if (removable.length === 0) {
+      await showSuccessNotification('Cleanup', 'No defunct or inactive strategies found');
+      return;
+    }
+    const confirmMessage = selloffFirst
+      ? `Sell off holdings and remove ${removable.length} defunct/inactive strategies?`
+      : `Remove ${removable.length} defunct/inactive strategies?`;
+    if (!confirm(confirmMessage)) return;
+
+    try {
+      setCleanupLoading(true);
+      if (selloffFirst) {
+        const selloff = await selloffPortfolio();
+        if (!selloff.success) {
+          await showErrorNotification('Cleanup Error', selloff.message || 'Selloff failed');
+          return;
+        }
+      }
+      await Promise.all(removable.map((strategy) => deleteStrategy(strategy.id)));
+      await showSuccessNotification('Cleanup Complete', `Removed ${removable.length} defunct/inactive strategies`);
+      if (selectedStrategy && removable.some((strategy) => strategy.id === selectedStrategy.id)) {
+        setSelectedStrategy(null);
+        setStrategyConfig(null);
+        setStrategyMetrics(null);
+      }
+      await loadStrategies();
+      await loadRunnerStatus();
+    } catch {
+      await showErrorNotification('Cleanup Error', 'Failed to remove defunct strategies');
+    } finally {
+      setCleanupLoading(false);
+    }
+  };
+
   const validateForm = (): boolean => {
     const errors: Record<string, string> = {};
 
     if (!formName.trim()) {
       errors.name = 'Strategy name is required';
     }
+    if (formName.trim().length > 100) {
+      errors.name = 'Strategy name must be 100 characters or fewer';
+    }
+    if (formDescription.length > 500) {
+      errors.description = 'Description must be 500 characters or fewer';
+    }
 
-    const symbols = formSymbols.split(',').map((s) => s.trim()).filter((s) => s);
+    const symbols = normalizeSymbols(formSymbols);
     if (symbols.length === 0) {
       errors.symbols = 'At least one symbol is required';
+    } else if (symbols.length > STRATEGY_LIMITS.maxSymbols) {
+      errors.symbols = `No more than ${STRATEGY_LIMITS.maxSymbols} symbols are allowed`;
+    } else if (symbols.some((symbol) => !SYMBOL_RE.test(symbol))) {
+      errors.symbols = 'One or more symbols are invalid';
     }
 
     setFormErrors(errors);
@@ -199,11 +317,11 @@ function StrategyPage() {
     }
 
     try {
-      const symbols = formSymbols.split(',').map((s) => s.trim().toUpperCase()).filter((s) => s);
+      const symbols = normalizeSymbols(formSymbols);
 
       await createStrategy({
-        name: formName,
-        description: formDescription || undefined,
+        name: formName.trim(),
+        description: formDescription.trim() || undefined,
         symbols,
       });
 
@@ -262,7 +380,20 @@ function StrategyPage() {
 
     try {
       setConfigSaving(true);
-      const symbols = configSymbols.split(',').map((s) => s.trim().toUpperCase()).filter((s) => s);
+      setConfigErrors({});
+      const symbols = normalizeSymbols(configSymbols);
+      const errors: Record<string, string> = {};
+      if (symbols.length === 0) {
+        errors.symbols = 'At least one symbol is required';
+      } else if (symbols.length > STRATEGY_LIMITS.maxSymbols) {
+        errors.symbols = `No more than ${STRATEGY_LIMITS.maxSymbols} symbols are allowed`;
+      } else if (symbols.some((symbol) => !SYMBOL_RE.test(symbol))) {
+        errors.symbols = 'One or more symbols are invalid';
+      }
+      if (Object.keys(errors).length > 0) {
+        setConfigErrors(errors);
+        return;
+      }
       await updateStrategyConfig(selectedStrategy.id, {
         symbols,
         enabled: configEnabled,
@@ -277,9 +408,10 @@ function StrategyPage() {
   };
 
   const handleParameterChange = (param: StrategyParameter, value: number) => {
+    const bounded = Math.min(param.max_value, Math.max(param.min_value, value));
     setParameterDrafts((prev) => ({
       ...prev,
-      [param.name]: value,
+      [param.name]: bounded,
     }));
   };
 
@@ -288,7 +420,7 @@ function StrategyPage() {
 
     try {
       setParameterSaving((prev) => ({ ...prev, [param.name]: true }));
-      const value = parameterDrafts[param.name] ?? param.value;
+      const value = Math.min(param.max_value, Math.max(param.min_value, parameterDrafts[param.name] ?? param.value));
       await tuneParameter(selectedStrategy.id, {
         parameter_name: param.name,
         value,
@@ -307,10 +439,24 @@ function StrategyPage() {
 
     try {
       setBacktestLoading(true);
+      setBacktestError(null);
+      if (!isIsoDate(backtestStartDate) || !isIsoDate(backtestEndDate)) {
+        setBacktestError('Start and end dates must be valid ISO dates');
+        return;
+      }
+      if (new Date(backtestStartDate) > new Date(backtestEndDate)) {
+        setBacktestError('Start date must be on or before end date');
+        return;
+      }
+      const initialCapital = Number.parseFloat(backtestCapital);
+      if (!Number.isFinite(initialCapital) || initialCapital < STRATEGY_LIMITS.backtestCapitalMin || initialCapital > STRATEGY_LIMITS.backtestCapitalMax) {
+        setBacktestError(`Initial capital must be between ${STRATEGY_LIMITS.backtestCapitalMin} and ${STRATEGY_LIMITS.backtestCapitalMax}`);
+        return;
+      }
       const result = await runBacktest(selectedStrategy.id, {
         start_date: backtestStartDate,
         end_date: backtestEndDate,
-        initial_capital: parseFloat(backtestCapital),
+        initial_capital: initialCapital,
       });
       setBacktestResult(result);
       await showSuccessNotification('Backtest Complete', `Completed ${result.total_trades} trades`);
@@ -327,22 +473,50 @@ function StrategyPage() {
     setFormSymbols('');
     setFormErrors({});
     setShowCreateModal(true);
+    prefillSymbolsFromSettings();
+  };
+
+  const prefillSymbolsFromSettings = async () => {
+    try {
+      const prefs = await getTradingPreferences();
+      const response = await getScreenerAssets(prefs.asset_type as AssetTypePreference, prefs.screener_limit);
+      const symbols = (response.assets || []).slice(0, Math.min(20, prefs.screener_limit)).map((a) => a.symbol);
+      if (symbols.length > 0) {
+        setFormSymbols(symbols.join(', '));
+      }
+    } catch {
+      // Keep form empty on errors.
+    }
   };
 
   return (
     <div className="p-8">
-      <div className="mb-8 flex items-center justify-between">
-        <div>
-          <h2 className="text-3xl font-bold text-white mb-2">Trading Strategies</h2>
-          <p className="text-gray-400">Manage and monitor your trading strategies</p>
-        </div>
-
-        <button
-          onClick={openCreateModal}
-          className="bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded font-medium"
-        >
-          + New Strategy
-        </button>
+      <PageHeader
+        title="Trading Strategies"
+        description="Manage and monitor your trading strategies"
+        helpSection="strategy"
+        actions={(
+          <button
+            onClick={openCreateModal}
+            className="bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded font-medium"
+          >
+            + New Strategy
+          </button>
+        )}
+      />
+      <GuidedFlowStrip />
+      <div className="mb-4 rounded-lg border border-emerald-700 bg-emerald-900/20 px-4 py-3">
+        <p className="text-sm text-emerald-100">
+          Active Strategy Summary:
+          {' '}
+          <span className="font-semibold">{settingsSummary.replace('Settings: ', '')}</span>
+          {' | '}
+          <span className="font-semibold">Runner {runnerStatus.toUpperCase()}</span>
+          {' | '}
+          <span className="font-semibold">Active Strategies {activeStrategyCount}</span>
+          {' | '}
+          <span className="font-semibold">Selected {selectedStrategy?.name || 'None'}</span>
+        </p>
       </div>
 
       {/* Runner Status Card */}
@@ -350,7 +524,7 @@ function StrategyPage() {
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-4">
             <div>
-              <h3 className="text-lg font-semibold text-white mb-1">Strategy Runner</h3>
+              <h3 className="text-lg font-semibold text-white mb-1 flex items-center gap-1">Strategy Runner <HelpTooltip text="Controls the execution engine for active strategies." /></h3>
               <p className="text-gray-400 text-sm">Control the strategy execution engine</p>
             </div>
             <div className="flex items-center gap-2">
@@ -385,6 +559,26 @@ function StrategyPage() {
               }`}
             >
               {runnerLoading ? 'Stopping...' : 'Stop Runner'}
+            </button>
+            <button
+              onClick={handleSelloff}
+              className="px-4 py-2 rounded font-medium bg-orange-600 hover:bg-orange-700 text-white"
+            >
+              Sell Off All Holdings
+            </button>
+            <button
+              onClick={() => handleCleanupDefunctStrategies(false)}
+              disabled={cleanupLoading}
+              className="px-4 py-2 rounded font-medium bg-gray-700 hover:bg-gray-600 text-white disabled:bg-gray-600"
+            >
+              {cleanupLoading ? 'Cleaning...' : 'Remove Defunct Strategies'}
+            </button>
+            <button
+              onClick={() => handleCleanupDefunctStrategies(true)}
+              disabled={cleanupLoading}
+              className="px-4 py-2 rounded font-medium bg-red-700 hover:bg-red-600 text-white disabled:bg-gray-600"
+            >
+              Cleanup + Selloff
             </button>
           </div>
         </div>
@@ -473,7 +667,22 @@ function StrategyPage() {
           <div className="col-span-8">
             {selectedStrategy ? (
               <div className="space-y-6">
+                <div className="inline-flex rounded-lg border border-gray-700 bg-gray-800 p-1">
+                  {(['metrics', 'config', 'backtest'] as const).map((tab) => (
+                    <button
+                      key={tab}
+                      onClick={() => setDetailTab(tab)}
+                      className={`px-3 py-1.5 text-sm capitalize rounded ${
+                        detailTab === tab ? 'bg-blue-600 text-white' : 'text-gray-300 hover:bg-gray-700'
+                      }`}
+                    >
+                      {tab}
+                    </button>
+                  ))}
+                </div>
+
                 {/* Performance Metrics Card */}
+                {detailTab === 'metrics' && (
                 <div className="bg-gray-800 rounded-lg border border-gray-700 p-6">
                   <div className="flex items-center justify-between mb-4">
                     <h3 className="text-lg font-semibold text-white">Performance Metrics</h3>
@@ -488,19 +697,19 @@ function StrategyPage() {
                   {strategyMetrics ? (
                     <div className="grid grid-cols-3 gap-4">
                       <div className="bg-gray-900 rounded p-4">
-                        <div className="text-gray-400 text-sm mb-1">Win Rate</div>
+                        <div className="text-gray-400 text-sm mb-1 flex items-center gap-1">Win Rate <HelpTooltip text="Percent of winning closed trades." /></div>
                         <div className="text-2xl font-bold text-white">
                           {strategyMetrics.win_rate.toFixed(1)}%
                         </div>
                       </div>
                       <div className="bg-gray-900 rounded p-4">
-                        <div className="text-gray-400 text-sm mb-1">Volatility</div>
+                        <div className="text-gray-400 text-sm mb-1 flex items-center gap-1">Volatility <HelpTooltip text="Magnitude of return fluctuations." /></div>
                         <div className="text-2xl font-bold text-white">
                           {strategyMetrics.volatility.toFixed(2)}
                         </div>
                       </div>
                       <div className="bg-gray-900 rounded p-4">
-                        <div className="text-gray-400 text-sm mb-1">Max Drawdown</div>
+                        <div className="text-gray-400 text-sm mb-1 flex items-center gap-1">Max Drawdown <HelpTooltip text="Largest peak-to-trough decline." /></div>
                         <div className="text-2xl font-bold text-red-400">
                           {strategyMetrics.drawdown.toFixed(2)}%
                         </div>
@@ -518,7 +727,7 @@ function StrategyPage() {
                         </div>
                       </div>
                       <div className="bg-gray-900 rounded p-4">
-                        <div className="text-gray-400 text-sm mb-1">Total P&L</div>
+                        <div className="text-gray-400 text-sm mb-1 flex items-center gap-1">Total P&L <HelpTooltip text="Cumulative realized and unrealized strategy result." /></div>
                         <div className={`text-2xl font-bold ${
                           strategyMetrics.total_pnl >= 0 ? 'text-green-400' : 'text-red-400'
                         }`}>$ {strategyMetrics.total_pnl.toFixed(2)}</div>
@@ -528,9 +737,10 @@ function StrategyPage() {
                     <div className="text-gray-400">Loading metrics...</div>
                   )}
                 </div>
+                )}
 
                 {/* Configuration Card */}
-                {strategyConfig && (
+                {detailTab === 'config' && strategyConfig && (
                   <div className="bg-gray-800 rounded-lg border border-gray-700 p-6">
                     <h3 className="text-lg font-semibold text-white mb-4">Configuration</h3>
 
@@ -541,10 +751,14 @@ function StrategyPage() {
                           type="text"
                           value={configSymbols}
                           onChange={(e) => setConfigSymbols(e.target.value)}
-                          className="bg-gray-700 text-white px-4 py-2 rounded border border-gray-600 w-full"
+                          className={`bg-gray-700 text-white px-4 py-2 rounded border ${
+                            configErrors.symbols ? 'border-red-500' : 'border-gray-600'
+                          } w-full`}
                           placeholder="AAPL, MSFT, GOOGL"
                         />
                         <p className="text-gray-400 text-xs mt-1">Comma-separated list of symbols</p>
+                        <p className="text-gray-500 text-xs">Defines the universe this strategy can trade.</p>
+                        {configErrors.symbols && <p className="text-red-400 text-xs mt-1">{configErrors.symbols}</p>}
                       </div>
 
                       <div className="flex items-center gap-2">
@@ -555,6 +769,7 @@ function StrategyPage() {
                           className="h-4 w-4 text-blue-600"
                         />
                         <span className="text-gray-300 text-sm">Enable strategy</span>
+                        <span className="text-gray-500 text-xs">When disabled, runner will skip this strategy.</span>
                       </div>
 
                       <div>
@@ -568,6 +783,16 @@ function StrategyPage() {
                                   <span className="text-white text-sm">{param.description || param.name}</span>
                                   <span className="text-blue-400 font-mono">{value.toFixed(2)}</span>
                                 </div>
+                                <p className="text-[11px] text-gray-500 mb-2">
+                                  {param.name === 'position_size' && 'Per-trade dollar allocation target.'}
+                                  {param.name === 'stop_loss_pct' && 'Max tolerated downside before forced exit.'}
+                                  {param.name === 'take_profit_pct' && 'Profit target that can trigger exits.'}
+                                  {param.name === 'risk_per_trade' && 'Percent capital risked on each position.'}
+                                  {param.name === 'trailing_stop_pct' && 'Dynamic stop that rises with favorable price moves.'}
+                                  {param.name === 'atr_stop_mult' && 'Volatility-adjusted stop distance using ATR.'}
+                                  {param.name === 'zscore_entry_threshold' && 'Mean-reversion entry trigger based on z-score.'}
+                                  {param.name === 'dip_buy_threshold_pct' && 'Minimum dip below SMA for dip-buy setup.'}
+                                </p>
                                 <input
                                   type="range"
                                   min={param.min_value}
@@ -638,6 +863,7 @@ function StrategyPage() {
                 )}
 
                 {/* Backtesting Card */}
+                {detailTab === 'backtest' && (
                 <div className="bg-gray-800 rounded-lg border border-gray-700 p-6">
                   <h3 className="text-lg font-semibold text-white mb-4">Backtesting</h3>
 
@@ -674,6 +900,7 @@ function StrategyPage() {
                           placeholder="100000"
                         />
                       </div>
+                      {backtestError && <p className="text-red-400 text-sm">{backtestError}</p>}
 
                       <button
                         onClick={handleRunBacktest}
@@ -755,6 +982,7 @@ function StrategyPage() {
                     </div>
                   )}
                 </div>
+                )}
               </div>
             ) : (
               <div className="bg-gray-800 rounded-lg border border-gray-700 p-12 text-center">
@@ -798,6 +1026,9 @@ function StrategyPage() {
                   rows={3}
                   placeholder="Optional description..."
                 />
+                {formErrors.description && (
+                  <p className="text-red-400 text-sm mt-1">{formErrors.description}</p>
+                )}
               </div>
 
               <div>

@@ -2,8 +2,11 @@
 API Routes.
 Defines all REST API endpoints for StocksBot.
 """
-from datetime import datetime
-from fastapi import APIRouter, HTTPException, Depends
+from datetime import datetime, timedelta
+import json
+import math
+import re
+from fastapi import APIRouter, HTTPException, Depends, Query
 from typing import List, Optional
 from sqlalchemy.orm import Session
 
@@ -29,8 +32,13 @@ from .models import (
     NotificationRequest,
     NotificationResponse,
     NotificationSeverity,
+    SummaryNotificationPreferencesRequest,
+    SummaryNotificationPreferencesResponse,
+    SummaryNotificationFrequency,
+    SummaryNotificationChannel,
     BrokerCredentialsRequest,
     BrokerCredentialsStatusResponse,
+    BrokerAccountResponse,
     # Strategy models
     Strategy,
     StrategyStatus,
@@ -41,6 +49,8 @@ from .models import (
     AuditLog,
     AuditEventType,
     AuditLogsResponse,
+    TradeHistoryItem,
+    TradeHistoryResponse,
     # Runner models
     RunnerStatusResponse,
     RunnerActionResponse,
@@ -163,6 +173,59 @@ _config = ConfigResponse(
     broker="paper",
 )
 
+_SUMMARY_NOTIFICATION_PREFERENCES_KEY = "summary_notification_preferences"
+_summary_notification_preferences = SummaryNotificationPreferencesResponse(
+    enabled=False,
+    frequency=SummaryNotificationFrequency.DAILY,
+    channel=SummaryNotificationChannel.EMAIL,
+    recipient="",
+)
+
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_PHONE_RE = re.compile(r"^\+?[1-9]\d{7,14}$")
+
+
+def _normalize_symbols(raw_symbols: List[str], max_symbols: int = 200) -> List[str]:
+    """Normalize and validate a list of symbols."""
+    normalized_symbols: List[str] = []
+    seen = set()
+    for raw_symbol in raw_symbols:
+        symbol = str(raw_symbol).strip().upper()
+        if not symbol:
+            continue
+        if not re.match(r"^[A-Z][A-Z0-9.\-]{0,9}$", symbol):
+            raise HTTPException(status_code=400, detail=f"Invalid symbol format: {raw_symbol}")
+        if symbol not in seen:
+            normalized_symbols.append(symbol)
+            seen.add(symbol)
+    if len(normalized_symbols) > max_symbols:
+        raise HTTPException(status_code=400, detail=f"Symbol list cannot exceed {max_symbols} symbols")
+    return normalized_symbols
+
+
+def _load_summary_notification_preferences(storage: StorageService) -> SummaryNotificationPreferencesResponse:
+    """Load summary notification preferences from DB config."""
+    config_entry = storage.config.get_by_key(_SUMMARY_NOTIFICATION_PREFERENCES_KEY)
+    if not config_entry:
+        return _summary_notification_preferences
+    try:
+        return SummaryNotificationPreferencesResponse(**json.loads(config_entry.value))
+    except Exception:
+        return _summary_notification_preferences
+
+
+def _save_summary_notification_preferences(
+    storage: StorageService,
+    preferences: SummaryNotificationPreferencesResponse,
+) -> None:
+    """Persist summary notification preferences to DB config."""
+    storage.config.upsert(
+        key=_SUMMARY_NOTIFICATION_PREFERENCES_KEY,
+        value=json.dumps(preferences.model_dump()),
+        value_type="json",
+        description="Daily/weekly transaction summary notification preferences",
+    )
+
 
 @router.get("/config", response_model=ConfigResponse)
 async def get_config():
@@ -186,8 +249,16 @@ async def update_config(request: ConfigUpdateRequest):
     if request.paper_trading is not None:
         _config.paper_trading = request.paper_trading
     if request.max_position_size is not None:
+        if not math.isfinite(request.max_position_size):
+            raise HTTPException(status_code=400, detail="max_position_size must be a finite number")
+        if request.max_position_size < 1 or request.max_position_size > 10_000_000:
+            raise HTTPException(status_code=400, detail="max_position_size must be within [1, 10000000]")
         _config.max_position_size = request.max_position_size
     if request.risk_limit_daily is not None:
+        if not math.isfinite(request.risk_limit_daily):
+            raise HTTPException(status_code=400, detail="risk_limit_daily must be a finite number")
+        if request.risk_limit_daily < 1 or request.risk_limit_daily > 1_000_000:
+            raise HTTPException(status_code=400, detail="risk_limit_daily must be within [1, 1000000]")
         _config.risk_limit_daily = request.risk_limit_daily
     if request.broker is not None:
         _config.broker = request.broker
@@ -233,14 +304,63 @@ async def set_broker_credentials(request: BrokerCredentialsRequest):
     if mode not in ("paper", "live"):
         raise HTTPException(status_code=400, detail="Mode must be 'paper' or 'live'")
 
-    _runtime_broker_credentials[mode]["api_key"] = request.api_key.strip()
-    _runtime_broker_credentials[mode]["secret_key"] = request.secret_key.strip()
+    api_key = request.api_key.strip()
+    secret_key = request.secret_key.strip()
+    if len(api_key) < 8 or len(secret_key) < 8:
+        raise HTTPException(status_code=400, detail="API key and secret key appear too short")
+    if len(api_key) > 512 or len(secret_key) > 512:
+        raise HTTPException(status_code=400, detail="API key and secret key are too long")
+    if any(ch.isspace() for ch in api_key) or any(ch.isspace() for ch in secret_key):
+        raise HTTPException(status_code=400, detail="API key and secret key cannot contain whitespace")
+
+    _runtime_broker_credentials[mode]["api_key"] = api_key
+    _runtime_broker_credentials[mode]["secret_key"] = secret_key
 
     # Ensure broker instance is recreated with latest credentials.
     global _broker_instance
     _broker_instance = None
 
     return await get_broker_credentials_status()
+
+
+@router.get("/broker/account", response_model=BrokerAccountResponse)
+async def get_broker_account():
+    """
+    Get active broker account balances (cash/equity/buying power).
+    Returns an informative disconnected payload if unavailable.
+    """
+    status = await get_broker_credentials_status()
+    mode = "paper" if _config.paper_trading else "live"
+    try:
+        broker = get_broker()
+        info = broker.get_account_info()
+        cash = float(info.get("cash", 0.0))
+        equity = float(info.get("equity", info.get("portfolio_value", 0.0)))
+        buying_power = float(info.get("buying_power", 0.0))
+        currency = str(info.get("currency", "USD"))
+        return BrokerAccountResponse(
+            broker=_config.broker,
+            mode=mode,
+            connected=True,
+            using_runtime_credentials=status.using_runtime_credentials,
+            currency=currency,
+            cash=cash,
+            equity=equity,
+            buying_power=buying_power,
+            message="Account fetched successfully",
+        )
+    except Exception as exc:
+        return BrokerAccountResponse(
+            broker=_config.broker,
+            mode=mode,
+            connected=False,
+            using_runtime_credentials=status.using_runtime_credentials,
+            currency="USD",
+            cash=0.0,
+            equity=0.0,
+            buying_power=0.0,
+            message=f"Broker account unavailable: {exc}",
+        )
 
 
 # ============================================================================
@@ -407,12 +527,113 @@ async def request_notification(request: NotificationRequest):
     TODO: Integrate with notification service and system tray.
     This is a placeholder.
     """
+    title = request.title.strip()
+    message = request.message.strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="title is required")
+    if not message:
+        raise HTTPException(status_code=400, detail="message is required")
+
     # Placeholder - just log for now
-    print(f"[NOTIFICATION] {request.severity.upper()}: {request.title} - {request.message}")
+    print(f"[NOTIFICATION] {request.severity.upper()}: {title} - {message}")
 
     return NotificationResponse(
         success=True,
         message="Notification queued (placeholder)",
+    )
+
+
+@router.get("/notifications/summary/preferences", response_model=SummaryNotificationPreferencesResponse)
+async def get_summary_notification_preferences(db: Session = Depends(get_db)):
+    """Get daily/weekly summary notification preferences."""
+    storage = StorageService(db)
+    return _load_summary_notification_preferences(storage)
+
+
+@router.post("/notifications/summary/preferences", response_model=SummaryNotificationPreferencesResponse)
+async def update_summary_notification_preferences(
+    request: SummaryNotificationPreferencesRequest,
+    db: Session = Depends(get_db),
+):
+    """Update summary notification preferences."""
+    global _summary_notification_preferences
+    storage = StorageService(db)
+    current = _load_summary_notification_preferences(storage)
+
+    if request.enabled is not None:
+        current.enabled = request.enabled
+    if request.frequency is not None:
+        current.frequency = request.frequency
+    if request.channel is not None:
+        current.channel = request.channel
+    if request.recipient is not None:
+        current.recipient = request.recipient.strip()
+
+    if current.enabled:
+        if not current.recipient:
+            raise HTTPException(status_code=400, detail="Recipient is required when summary notifications are enabled")
+        if current.channel == SummaryNotificationChannel.EMAIL and not _EMAIL_RE.match(current.recipient):
+            raise HTTPException(status_code=400, detail="Recipient must be a valid email address for email notifications")
+        if current.channel == SummaryNotificationChannel.SMS and not _PHONE_RE.match(current.recipient):
+            raise HTTPException(status_code=400, detail="Recipient must be an E.164-like phone number for SMS notifications")
+
+    _summary_notification_preferences = current
+    _save_summary_notification_preferences(storage, current)
+    storage.create_audit_log(
+        event_type="config_updated",
+        description="Summary notification preferences updated",
+        details=current.model_dump(),
+    )
+    return current
+
+
+@router.post("/notifications/summary/send-now", response_model=NotificationResponse)
+async def send_summary_notification_now(db: Session = Depends(get_db)):
+    """
+    Generate and queue a summary notification immediately.
+    This prepares the payload for email/SMS delivery.
+    """
+    storage = StorageService(db)
+    prefs = _load_summary_notification_preferences(storage)
+
+    if not prefs.enabled:
+        return NotificationResponse(success=False, message="Summary notifications are disabled")
+    if not prefs.recipient:
+        return NotificationResponse(success=False, message="Recipient is required")
+
+    trades = storage.get_all_trades(limit=5000)
+    now = datetime.utcnow()
+    if prefs.frequency == SummaryNotificationFrequency.DAILY:
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    else:
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        start = start - timedelta(days=start.weekday())
+
+    scoped = [t for t in trades if t.executed_at and t.executed_at >= start]
+    trade_count = len(scoped)
+    gross_notional = sum(float(t.quantity or 0) * float(t.price or 0) for t in scoped)
+    realized_pnl = sum(float(t.realized_pnl or 0) for t in scoped if t.realized_pnl is not None)
+    summary = (
+        f"{prefs.frequency.value.title()} summary: {trade_count} trade(s), "
+        f"gross ${gross_notional:.2f}, realized P&L ${realized_pnl:.2f}"
+    )
+
+    # Placeholder transport hook for email/SMS integration.
+    print(f"[SUMMARY:{prefs.channel.value}] to {prefs.recipient} -> {summary}")
+    storage.create_audit_log(
+        event_type="config_updated",
+        description=f"Queued {prefs.frequency.value} {prefs.channel.value} summary notification",
+        details={
+            "recipient": prefs.recipient,
+            "trade_count": trade_count,
+            "gross_notional": gross_notional,
+            "realized_pnl": realized_pnl,
+        },
+    )
+
+    return NotificationResponse(
+        success=True,
+        message=f"Queued {prefs.channel.value} summary to {prefs.recipient}: {summary}",
     )
 
 
@@ -456,18 +677,19 @@ async def create_strategy(request: StrategyCreateRequest, db: Session = Depends(
     existing = storage.strategies.get_by_name(request.name)
     if existing:
         raise HTTPException(status_code=400, detail="Strategy with this name already exists")
+    symbols = _normalize_symbols(request.symbols or [])
 
     db_strategy = storage.strategies.create(
         name=request.name,
         description=request.description or "",
         strategy_type="custom",
-        config={"symbols": request.symbols},
+        config={"symbols": symbols},
     )
 
     storage.create_audit_log(
         event_type="strategy_started",
         description=f"Strategy created: {request.name}",
-        details={"strategy_id": db_strategy.id, "symbols": request.symbols},
+        details={"strategy_id": db_strategy.id, "symbols": symbols},
     )
 
     return Strategy(
@@ -475,7 +697,7 @@ async def create_strategy(request: StrategyCreateRequest, db: Session = Depends(
         name=db_strategy.name,
         description=db_strategy.description or "",
         status=StrategyStatus.STOPPED,
-        symbols=request.symbols,
+        symbols=symbols,
         created_at=db_strategy.created_at,
         updated_at=db_strategy.updated_at,
     )
@@ -531,7 +753,7 @@ async def update_strategy(strategy_id: str, request: StrategyUpdateRequest, db: 
     if request.symbols is not None:
         if not db_strategy.config:
             db_strategy.config = {}
-        db_strategy.config["symbols"] = request.symbols
+        db_strategy.config["symbols"] = _normalize_symbols(request.symbols)
         from sqlalchemy.orm.attributes import flag_modified
         flag_modified(db_strategy, "config")
     if request.status is not None:
@@ -606,7 +828,9 @@ async def get_audit_logs(
         logs.append(AuditLog(
             id=str(db_log.id),
             timestamp=db_log.timestamp,
-            event_type=AuditEventType(db_log.event_type),
+            event_type=AuditEventType(
+                db_log.event_type.value if hasattr(db_log.event_type, "value") else str(db_log.event_type)
+            ),
             description=db_log.description,
             details=db_log.details or {},
         ))
@@ -614,6 +838,40 @@ async def get_audit_logs(
     return AuditLogsResponse(
         logs=logs,
         total_count=total_count,
+    )
+
+
+@router.get("/audit/trades", response_model=TradeHistoryResponse)
+async def get_audit_trades(
+    limit: int = Query(default=5000, ge=1, le=10000),
+    db: Session = Depends(get_db)
+):
+    """
+    Get complete trade history for audit mode.
+    """
+    storage = StorageService(db)
+    db_trades = storage.get_all_trades(limit=limit)
+
+    trades = []
+    for trade in db_trades:
+        trades.append(
+            TradeHistoryItem(
+                id=str(trade.id),
+                order_id=str(trade.order_id),
+                symbol=trade.symbol,
+                side=OrderSide(trade.side.value if hasattr(trade.side, "value") else str(trade.side)),
+                quantity=trade.quantity,
+                price=trade.price,
+                commission=trade.commission or 0.0,
+                fees=trade.fees or 0.0,
+                executed_at=trade.executed_at,
+                realized_pnl=trade.realized_pnl,
+            )
+        )
+
+    return TradeHistoryResponse(
+        trades=trades,
+        total_count=len(trades),
     )
 
 
@@ -638,7 +896,13 @@ async def start_runner(db: Session = Depends(get_db)):
     Loads active strategies and begins execution loop.
     Idempotent - safe to call multiple times.
     """
-    result = runner_manager.start_runner(db=db)
+    broker = get_broker()
+    result = runner_manager.start_runner(
+        db=db,
+        broker=broker,
+        max_position_size=_config.max_position_size,
+        risk_limit_daily=_config.risk_limit_daily,
+    )
     return RunnerActionResponse(**result)
 
 
@@ -653,13 +917,50 @@ async def stop_runner(db: Session = Depends(get_db)):
     return RunnerActionResponse(**result)
 
 
+@router.post("/portfolio/selloff", response_model=RunnerActionResponse)
+async def selloff_all_positions():
+    """
+    Explicitly liquidate all open positions.
+    This is opt-in and not triggered automatically on strategy switches.
+    """
+    try:
+        broker = get_broker()
+        positions = broker.get_positions()
+        closed = 0
+        for pos in positions:
+            qty = float(pos.get("quantity", 0))
+            if qty == 0:
+                continue
+            side = "sell" if qty > 0 else "buy"
+            broker.submit_order(
+                symbol=pos.get("symbol"),
+                side=OrderSide.BUY if side == "buy" else OrderSide.SELL,
+                order_type=OrderType.MARKET,
+                quantity=abs(qty),
+                price=None,
+            )
+            closed += 1
+
+        return RunnerActionResponse(
+            success=True,
+            message=f"Closed {closed} position(s)",
+            status="stopped",
+        )
+    except Exception as e:
+        return RunnerActionResponse(
+            success=False,
+            message=f"Selloff failed: {str(e)}",
+            status="error",
+        )
+
+
 # ============================================================================
 # Portfolio Analytics Endpoints
 # ============================================================================
 
 @router.get("/analytics/portfolio")
 async def get_portfolio_analytics(
-    days: int = 30,
+    days: int = Query(default=30, ge=1, le=3650),
     db: Session = Depends(get_db)
 ):
     """
@@ -795,6 +1096,9 @@ async def update_strategy_config(
     db_strategy = storage.strategies.get_by_id(strategy_id_int)
     if not db_strategy:
         raise HTTPException(status_code=404, detail="Strategy not found")
+
+    default_params = get_default_parameters()
+    param_defs = {param.name: param for param in default_params}
     
     # Update config
     if not db_strategy.config:
@@ -802,13 +1106,25 @@ async def update_strategy_config(
     
     config_changed = False
     if request.symbols is not None:
-        db_strategy.config['symbols'] = request.symbols
+        normalized_symbols = _normalize_symbols(request.symbols)
+        db_strategy.config['symbols'] = normalized_symbols
         config_changed = True
     
     if request.parameters is not None:
         if 'parameters' not in db_strategy.config:
             db_strategy.config['parameters'] = {}
-        db_strategy.config['parameters'].update(request.parameters)
+        for param_name, param_value in request.parameters.items():
+            if param_name not in param_defs:
+                raise HTTPException(status_code=400, detail=f"Unknown strategy parameter: {param_name}")
+            if not math.isfinite(param_value):
+                raise HTTPException(status_code=400, detail=f"Parameter {param_name} must be finite")
+            param_def = param_defs[param_name]
+            if not (param_def.min_value <= param_value <= param_def.max_value):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Parameter {param_name} must be within [{param_def.min_value}, {param_def.max_value}]",
+                )
+            db_strategy.config['parameters'][param_name] = param_value
         config_changed = True
     
     if request.enabled is not None:
@@ -893,10 +1209,26 @@ async def run_strategy_backtest(
     db_strategy = storage.strategies.get_by_id(strategy_id_int)
     if not db_strategy:
         raise HTTPException(status_code=404, detail="Strategy not found")
+
+    try:
+        start_dt = datetime.fromisoformat(request.start_date)
+        end_dt = datetime.fromisoformat(request.end_date)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="start_date and end_date must be ISO date/time strings")
+    if start_dt > end_dt:
+        raise HTTPException(status_code=400, detail="start_date must be before or equal to end_date")
+    if not math.isfinite(request.initial_capital):
+        raise HTTPException(status_code=400, detail="initial_capital must be a finite number")
+    if request.initial_capital < 100 or request.initial_capital > 100_000_000:
+        raise HTTPException(status_code=400, detail="initial_capital must be within [100, 100000000]")
     
     # Use strategy symbols if not provided in request
     if not request.symbols and db_strategy.config:
         request.symbols = db_strategy.config.get('symbols', ['AAPL', 'MSFT'])
+    if request.symbols:
+        request.symbols = _normalize_symbols(request.symbols)
+        if not request.symbols:
+            raise HTTPException(status_code=400, detail="At least one valid symbol is required for backtest")
     
     # Run backtest
     analytics = StrategyAnalyticsService(db)
@@ -1028,6 +1360,8 @@ async def tune_strategy_parameter(
 
 from .models import (
     AssetType, ScreenerAsset, ScreenerResponse,
+    SymbolChartResponse, SymbolChartPoint,
+    ScreenerMode, StockPreset, EtfPreset,
     RiskProfile, RiskProfileInfo, RiskProfilesResponse,
     TradingPreferencesRequest, TradingPreferencesResponse,
     BudgetStatus, BudgetUpdateRequest,
@@ -1042,11 +1376,67 @@ _trading_preferences = TradingPreferencesResponse(
     risk_profile=RiskProfile.BALANCED,
     weekly_budget=200.0,
     screener_limit=50,
+    screener_mode=ScreenerMode.MOST_ACTIVE,
+    stock_preset=StockPreset.WEEKLY_OPTIMIZED,
+    etf_preset=EtfPreset.BALANCED,
 )
+
+_TRADING_PREFERENCES_KEY = "trading_preferences"
+
+
+def _load_trading_preferences(storage: StorageService) -> TradingPreferencesResponse:
+    """Load trading preferences from DB config, fallback to in-memory defaults."""
+    config_entry = storage.config.get_by_key(_TRADING_PREFERENCES_KEY)
+    if not config_entry:
+        return _trading_preferences
+
+    try:
+        raw = json.loads(config_entry.value)
+        return TradingPreferencesResponse(**raw)
+    except Exception:
+        return _trading_preferences
+
+
+def _save_trading_preferences(storage: StorageService, preferences: TradingPreferencesResponse) -> None:
+    """Persist trading preferences to DB config."""
+    storage.config.upsert(
+        key=_TRADING_PREFERENCES_KEY,
+        value=json.dumps(preferences.model_dump()),
+        value_type="json",
+        description="User trading preferences",
+    )
+
+
+def _create_market_screener() -> MarketScreener:
+    """Create market screener with runtime keychain credentials when available."""
+    mode = "paper" if _config.paper_trading else "live"
+    runtime_creds = _runtime_broker_credentials.get(mode, {})
+    api_key = (runtime_creds.get("api_key") or "").strip()
+    secret_key = (runtime_creds.get("secret_key") or "").strip()
+    if api_key and secret_key:
+        return MarketScreener(alpaca_client={"api_key": api_key, "secret_key": secret_key})
+    return MarketScreener()
+
+
+def _paginate_assets(assets_raw: List[dict], page: int, page_size: int) -> tuple[List[ScreenerAsset], int, int]:
+    """Paginate raw screener assets and return typed assets + counts."""
+    page = max(1, page)
+    page_size = max(10, min(100, page_size))
+    total_count = len(assets_raw)
+    total_pages = max(1, (total_count + page_size - 1) // page_size)
+    start = (page - 1) * page_size
+    end = start + page_size
+    paged_raw = assets_raw[start:end]
+    assets = [ScreenerAsset(**asset) for asset in paged_raw]
+    return assets, total_count, total_pages
 
 
 @router.get("/screener/stocks", response_model=ScreenerResponse)
-async def get_active_stocks(limit: int = 50):
+async def get_active_stocks(
+    limit: int = Query(default=50, ge=10, le=200),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=25, ge=10, le=100),
+):
     """
     Get most actively traded stocks.
     
@@ -1056,23 +1446,32 @@ async def get_active_stocks(limit: int = 50):
     Returns:
         List of actively traded stocks
     """
-    limit = max(10, min(200, limit))
-    
-    screener = MarketScreener()
+    screener = _create_market_screener()
     stocks = screener.get_active_stocks(limit)
+    regime = screener.detect_market_regime()
     
-    assets = [ScreenerAsset(**stock) for stock in stocks]
+    assets, total_count, total_pages = _paginate_assets(stocks, page, page_size)
     
     return ScreenerResponse(
         assets=assets,
-        total_count=len(assets),
+        total_count=total_count,
         asset_type="stock",
         limit=limit,
+        page=page,
+        page_size=page_size,
+        total_pages=total_pages,
+        data_source=screener.get_last_source(),
+        market_regime=regime,
+        applied_guardrails={},
     )
 
 
 @router.get("/screener/etfs", response_model=ScreenerResponse)
-async def get_active_etfs(limit: int = 50):
+async def get_active_etfs(
+    limit: int = Query(default=50, ge=10, le=200),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=25, ge=10, le=100),
+):
     """
     Get most actively traded ETFs.
     
@@ -1082,25 +1481,38 @@ async def get_active_etfs(limit: int = 50):
     Returns:
         List of actively traded ETFs
     """
-    limit = max(10, min(200, limit))
-    
-    screener = MarketScreener()
+    screener = _create_market_screener()
     etfs = screener.get_active_etfs(limit)
+    regime = screener.detect_market_regime()
     
-    assets = [ScreenerAsset(**etf) for etf in etfs]
+    assets, total_count, total_pages = _paginate_assets(etfs, page, page_size)
     
     return ScreenerResponse(
         assets=assets,
-        total_count=len(assets),
+        total_count=total_count,
         asset_type="etf",
         limit=limit,
+        page=page,
+        page_size=page_size,
+        total_pages=total_pages,
+        data_source=screener.get_last_source(),
+        market_regime=regime,
+        applied_guardrails={},
     )
 
 
 @router.get("/screener/all", response_model=ScreenerResponse)
 async def get_screener_results(
     asset_type: Optional[AssetType] = None,
-    limit: Optional[int] = None
+    limit: Optional[int] = Query(default=None, ge=10, le=200),
+    screener_mode: Optional[ScreenerMode] = None,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=25, ge=10, le=100),
+    min_dollar_volume: float = Query(default=10_000_000, ge=0, le=1_000_000_000_000),
+    max_spread_bps: float = Query(default=50, ge=1, le=2000),
+    max_sector_weight_pct: float = Query(default=45, ge=5, le=100),
+    auto_regime_adjust: bool = True,
+    db: Session = Depends(get_db)
 ):
     """
     Get screener results based on user preferences or provided filters.
@@ -1112,26 +1524,64 @@ async def get_screener_results(
     Returns:
         List of assets based on filters
     """
+    storage = StorageService(db)
+    prefs = _load_trading_preferences(storage)
+
     # Use preferences if not overridden
-    final_asset_type = asset_type or _trading_preferences.asset_type
-    final_limit = limit or _trading_preferences.screener_limit
+    final_asset_type = asset_type or prefs.asset_type
+    final_limit = limit or prefs.screener_limit
+    final_mode = screener_mode or prefs.screener_mode
     final_limit = max(10, min(200, final_limit))
+    if not math.isfinite(min_dollar_volume) or not math.isfinite(max_spread_bps) or not math.isfinite(max_sector_weight_pct):
+        raise HTTPException(status_code=400, detail="Guardrail values must be finite numbers")
     
-    screener = MarketScreener()
+    screener = _create_market_screener()
     
-    # Import AssetType from market_screener
-    from services.market_screener import AssetType as ScreenerAssetType
-    screener_asset_type = ScreenerAssetType(final_asset_type.value)
+    if final_mode == ScreenerMode.PRESET and final_asset_type in (AssetType.STOCK, AssetType.ETF):
+        preset = (
+            prefs.stock_preset.value
+            if final_asset_type == AssetType.STOCK
+            else prefs.etf_preset.value
+        )
+        preset_guardrails = screener.get_preset_guardrails(final_asset_type.value, preset)
+        min_dollar_volume = max(min_dollar_volume, float(preset_guardrails["min_dollar_volume"]))
+        max_spread_bps = min(max_spread_bps, float(preset_guardrails["max_spread_bps"]))
+        max_sector_weight_pct = min(max_sector_weight_pct, float(preset_guardrails["max_sector_weight_pct"]))
+        results = screener.get_preset_assets(final_asset_type.value, preset, final_limit)
+    else:
+        # Import AssetType from market_screener
+        from services.market_screener import AssetType as ScreenerAssetType
+        screener_asset_type = ScreenerAssetType(final_asset_type.value)
+        results = screener.get_screener_results(screener_asset_type, final_limit)
+    regime = screener.detect_market_regime()
+    optimized = screener.optimize_assets(
+        results,
+        limit=final_limit,
+        min_dollar_volume=min_dollar_volume,
+        max_spread_bps=max_spread_bps,
+        max_sector_weight_pct=max_sector_weight_pct,
+        regime=regime,
+        auto_regime_adjust=auto_regime_adjust,
+    )
     
-    results = screener.get_screener_results(screener_asset_type, final_limit)
-    
-    assets = [ScreenerAsset(**asset) for asset in results]
+    assets, total_count, total_pages = _paginate_assets(optimized, page, page_size)
     
     return ScreenerResponse(
         assets=assets,
-        total_count=len(assets),
+        total_count=total_count,
         asset_type=final_asset_type.value,
         limit=final_limit,
+        page=page,
+        page_size=page_size,
+        total_pages=total_pages,
+        data_source=screener.get_last_source(),
+        market_regime=regime,
+        applied_guardrails={
+            "min_dollar_volume": min_dollar_volume,
+            "max_spread_bps": max_spread_bps,
+            "max_sector_weight_pct": max_sector_weight_pct,
+            "auto_regime_adjust": auto_regime_adjust,
+        },
     )
 
 
@@ -1139,7 +1589,13 @@ async def get_screener_results(
 async def get_screener_preset(
     asset_type: AssetType,
     preset: ScreenerPreset,
-    limit: int = 50
+    limit: int = Query(default=50, ge=10, le=200),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=25, ge=10, le=100),
+    min_dollar_volume: float = Query(default=10_000_000, ge=0, le=1_000_000_000_000),
+    max_spread_bps: float = Query(default=50, ge=1, le=2000),
+    max_sector_weight_pct: float = Query(default=45, ge=5, le=100),
+    auto_regime_adjust: bool = True,
 ):
     """
     Get curated screener assets by strategy preset.
@@ -1158,19 +1614,45 @@ async def get_screener_preset(
     if asset_type == AssetType.BOTH:
         raise HTTPException(status_code=400, detail="Preset screener requires asset_type stock or etf")
 
-    limit = max(10, min(200, limit))
-    screener = MarketScreener()
+    if not math.isfinite(min_dollar_volume) or not math.isfinite(max_spread_bps) or not math.isfinite(max_sector_weight_pct):
+        raise HTTPException(status_code=400, detail="Guardrail values must be finite numbers")
+    screener = _create_market_screener()
+    preset_guardrails = screener.get_preset_guardrails(asset_type.value, preset.value)
+    min_dollar_volume = max(min_dollar_volume, float(preset_guardrails["min_dollar_volume"]))
+    max_spread_bps = min(max_spread_bps, float(preset_guardrails["max_spread_bps"]))
+    max_sector_weight_pct = min(max_sector_weight_pct, float(preset_guardrails["max_sector_weight_pct"]))
     try:
         assets_raw = screener.get_preset_assets(asset_type.value, preset.value, limit)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-    assets = [ScreenerAsset(**asset) for asset in assets_raw]
+    regime = screener.detect_market_regime()
+    optimized = screener.optimize_assets(
+        assets_raw,
+        limit=limit,
+        min_dollar_volume=min_dollar_volume,
+        max_spread_bps=max_spread_bps,
+        max_sector_weight_pct=max_sector_weight_pct,
+        regime=regime,
+        auto_regime_adjust=auto_regime_adjust,
+    )
+    assets, total_count, total_pages = _paginate_assets(optimized, page, page_size)
 
     return ScreenerResponse(
         assets=assets,
-        total_count=len(assets),
+        total_count=total_count,
         asset_type=asset_type.value,
         limit=limit,
+        page=page,
+        page_size=page_size,
+        total_pages=total_pages,
+        data_source=screener.get_last_source(),
+        market_regime=regime,
+        applied_guardrails={
+            "min_dollar_volume": min_dollar_volume,
+            "max_spread_bps": max_spread_bps,
+            "max_sector_weight_pct": max_sector_weight_pct,
+            "auto_regime_adjust": auto_regime_adjust,
+        },
     )
 
 
@@ -1209,18 +1691,19 @@ async def get_risk_profiles():
 # ============================================================================
 
 @router.get("/preferences", response_model=TradingPreferencesResponse)
-async def get_trading_preferences():
+async def get_trading_preferences(db: Session = Depends(get_db)):
     """
     Get current trading preferences.
     
     Returns:
         Current trading preferences including asset type, risk profile, and budget
     """
-    return _trading_preferences
+    storage = StorageService(db)
+    return _load_trading_preferences(storage)
 
 
 @router.post("/preferences", response_model=TradingPreferencesResponse)
-async def update_trading_preferences(request: TradingPreferencesRequest):
+async def update_trading_preferences(request: TradingPreferencesRequest, db: Session = Depends(get_db)):
     """
     Update trading preferences.
     
@@ -1231,23 +1714,124 @@ async def update_trading_preferences(request: TradingPreferencesRequest):
         Updated preferences
     """
     global _trading_preferences
-    
+    storage = StorageService(db)
+    current = _load_trading_preferences(storage)
+
+    if request.weekly_budget is not None:
+        if not math.isfinite(request.weekly_budget):
+            raise HTTPException(status_code=400, detail="weekly_budget must be a finite number")
+        if request.weekly_budget < 50 or request.weekly_budget > 1_000_000:
+            raise HTTPException(status_code=400, detail="weekly_budget must be within [50, 1000000]")
+    if request.screener_limit is not None and (request.screener_limit < 10 or request.screener_limit > 200):
+        raise HTTPException(status_code=400, detail="screener_limit must be within [10, 200]")
+
     if request.asset_type is not None:
-        _trading_preferences.asset_type = request.asset_type
+        current.asset_type = request.asset_type
     
     if request.risk_profile is not None:
-        _trading_preferences.risk_profile = request.risk_profile
+        current.risk_profile = request.risk_profile
     
     if request.weekly_budget is not None:
-        _trading_preferences.weekly_budget = request.weekly_budget
+        current.weekly_budget = request.weekly_budget
         # Update budget tracker
         tracker = get_budget_tracker()
         tracker.set_weekly_budget(request.weekly_budget)
     
     if request.screener_limit is not None:
-        _trading_preferences.screener_limit = request.screener_limit
-    
-    return _trading_preferences
+        current.screener_limit = request.screener_limit
+    if request.screener_mode is not None:
+        current.screener_mode = request.screener_mode
+    if request.stock_preset is not None:
+        current.stock_preset = request.stock_preset
+    if request.etf_preset is not None:
+        current.etf_preset = request.etf_preset
+
+    # Conflict prevention and normalization.
+    if current.asset_type == AssetType.ETF:
+        current.screener_mode = ScreenerMode.PRESET
+        current.risk_profile = RiskProfile(current.etf_preset.value)
+    if current.asset_type == AssetType.BOTH and current.screener_mode == ScreenerMode.PRESET:
+        raise HTTPException(status_code=400, detail="Preset mode requires asset_type stock or etf")
+    if current.asset_type != AssetType.STOCK and current.screener_mode == ScreenerMode.MOST_ACTIVE:
+        raise HTTPException(status_code=400, detail="Most active mode is available only for stock asset_type")
+    if current.asset_type == AssetType.STOCK and current.screener_mode == ScreenerMode.PRESET and current.stock_preset is None:
+        raise HTTPException(status_code=400, detail="Stock preset is required for stock preset mode")
+
+    _trading_preferences = current
+    _save_trading_preferences(storage, current)
+    return current
+
+
+@router.get("/preferences/recommendation")
+async def get_preference_recommendation(
+    equity: float = Query(default=10000.0, ge=100, le=100_000_000),
+    weekly_budget: float = Query(default=200.0, ge=25, le=5_000_000),
+    target_trades_per_week: int = Query(default=4, ge=1, le=10),
+):
+    """Get tailored recommendation for strategy preset and guardrails."""
+    if not math.isfinite(equity) or not math.isfinite(weekly_budget):
+        raise HTTPException(status_code=400, detail="equity and weekly_budget must be finite numbers")
+    if weekly_budget < 250 or equity < 5000:
+        stock_preset = "small_budget_weekly"
+        risk_profile = "conservative"
+    elif target_trades_per_week <= 3:
+        stock_preset = "monthly_optimized"
+        risk_profile = "balanced"
+    elif target_trades_per_week <= 5:
+        stock_preset = "three_to_five_weekly"
+        risk_profile = "balanced"
+    else:
+        stock_preset = "weekly_optimized"
+        risk_profile = "aggressive"
+
+    guardrails = {
+        "min_dollar_volume": 8_000_000 if risk_profile == "conservative" else 12_000_000,
+        "max_spread_bps": 35 if risk_profile == "conservative" else 50,
+        "max_sector_weight_pct": 35 if risk_profile == "conservative" else 45,
+        "max_position_size": min(max(weekly_budget * 0.35, 300.0), max(equity * 0.08, 500.0)),
+        "risk_limit_daily": min(max(weekly_budget * 0.25, 150.0), max(equity * 0.02, 250.0)),
+    }
+    return {
+        "asset_type": "stock",
+        "stock_preset": stock_preset,
+        "risk_profile": risk_profile,
+        "guardrails": guardrails,
+        "notes": "Recommendation is based on budget, equity, and trade cadence.",
+    }
+
+
+@router.get("/screener/chart/{symbol}", response_model=SymbolChartResponse)
+async def get_symbol_chart(
+    symbol: str,
+    days: int = Query(default=320, ge=30, le=1000),
+    take_profit_pct: float = Query(default=5.0, ge=0.1, le=50.0),
+    trailing_stop_pct: float = Query(default=2.5, ge=0.1, le=30.0),
+    atr_stop_mult: float = Query(default=1.8, ge=0.1, le=10.0),
+    zscore_entry_threshold: float = Query(default=-1.5, ge=-10.0, le=-0.01),
+    dip_buy_threshold_pct: float = Query(default=2.0, ge=0.1, le=30.0),
+):
+    """Get historical price chart with SMA50/SMA250 overlays for a symbol."""
+    symbol = symbol.strip().upper()
+    if not re.match(r"^[A-Z][A-Z0-9.\-]{0,9}$", symbol):
+        raise HTTPException(status_code=400, detail="Invalid symbol format")
+    numeric_values = [take_profit_pct, trailing_stop_pct, atr_stop_mult, zscore_entry_threshold, dip_buy_threshold_pct]
+    if any(not math.isfinite(value) for value in numeric_values):
+        raise HTTPException(status_code=400, detail="Chart indicator values must be finite numbers")
+    screener = _create_market_screener()
+    points = screener.get_symbol_chart(symbol=symbol, days=days)
+    indicators = screener.get_chart_indicators(
+        points=points,
+        take_profit_pct=take_profit_pct,
+        trailing_stop_pct=trailing_stop_pct,
+        atr_stop_mult=atr_stop_mult,
+        zscore_entry_threshold=zscore_entry_threshold,
+        dip_buy_threshold_pct=dip_buy_threshold_pct,
+    )
+    return SymbolChartResponse(
+        symbol=symbol.upper(),
+        points=[SymbolChartPoint(**p) for p in points],
+        indicators=indicators,
+    )
 
 
 # ============================================================================
@@ -1255,21 +1839,23 @@ async def update_trading_preferences(request: TradingPreferencesRequest):
 # ============================================================================
 
 @router.get("/budget/status", response_model=BudgetStatus)
-async def get_budget_status():
+async def get_budget_status(db: Session = Depends(get_db)):
     """
     Get current weekly budget status.
     
     Returns:
         Budget status including usage, remaining, and P&L
     """
-    tracker = get_budget_tracker(_trading_preferences.weekly_budget)
+    storage = StorageService(db)
+    prefs = _load_trading_preferences(storage)
+    tracker = get_budget_tracker(prefs.weekly_budget)
     status = tracker.get_budget_status()
     
     return BudgetStatus(**status)
 
 
 @router.post("/budget/update", response_model=BudgetStatus)
-async def update_weekly_budget(request: BudgetUpdateRequest):
+async def update_weekly_budget(request: BudgetUpdateRequest, db: Session = Depends(get_db)):
     """
     Update the weekly budget amount.
     
@@ -1286,6 +1872,8 @@ async def update_weekly_budget(request: BudgetUpdateRequest):
     
     # Also update preferences
     _trading_preferences.weekly_budget = request.weekly_budget
+    storage = StorageService(db)
+    _save_trading_preferences(storage, _trading_preferences)
     
     status = tracker.get_budget_status()
     return BudgetStatus(**status)
