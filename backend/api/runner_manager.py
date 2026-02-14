@@ -100,6 +100,8 @@ class RunnerManager:
         risk_limit_daily: float = 500.0,
         tick_interval: float = 60.0,
         streaming_enabled: bool = False,
+        alpaca_client: Optional[Dict[str, str]] = None,
+        require_real_data: bool = False,
     ) -> Dict[str, Any]:
         """
         Start the strategy runner.
@@ -201,19 +203,29 @@ class RunnerManager:
                         remaining_weekly_budget=remaining_weekly_budget,
                         buying_power=account_buying_power,
                         equity=account_equity,
+                        risk_per_trade_pct=float(merged_params.get("risk_per_trade", 1.0)),
+                        stop_loss_pct=float(merged_params.get("stop_loss_pct", 2.0)),
                     )
-                    strategy = MetricsDrivenStrategy({
-                        "name": db_strategy.name,
-                        "strategy_id": db_strategy.id,
-                        "symbols": symbols,
-                        "position_size": dynamic_position_size,
-                        "stop_loss_pct": float(merged_params.get("stop_loss_pct", 2.0)),
-                        "take_profit_pct": float(merged_params.get("take_profit_pct", 5.0)),
-                        "trailing_stop_pct": float(merged_params.get("trailing_stop_pct", 2.5)),
-                        "atr_stop_mult": float(merged_params.get("atr_stop_mult", 1.8)),
-                        "zscore_entry_threshold": float(merged_params.get("zscore_entry_threshold", -1.5)),
-                        "dip_buy_threshold_pct": float(merged_params.get("dip_buy_threshold_pct", 2.0)),
-                    })
+                    try:
+                        strategy = MetricsDrivenStrategy({
+                            "name": db_strategy.name,
+                            "strategy_id": db_strategy.id,
+                            "symbols": symbols,
+                            "position_size": dynamic_position_size,
+                            "risk_per_trade": float(merged_params.get("risk_per_trade", 1.0)),
+                            "stop_loss_pct": float(merged_params.get("stop_loss_pct", 2.0)),
+                            "take_profit_pct": float(merged_params.get("take_profit_pct", 5.0)),
+                            "trailing_stop_pct": float(merged_params.get("trailing_stop_pct", 2.5)),
+                            "atr_stop_mult": float(merged_params.get("atr_stop_mult", 2.0)),
+                            "zscore_entry_threshold": float(merged_params.get("zscore_entry_threshold", -1.2)),
+                            "dip_buy_threshold_pct": float(merged_params.get("dip_buy_threshold_pct", 1.5)),
+                            "max_hold_days": int(merged_params.get("max_hold_days", 10)),
+                            "alpaca_client": alpaca_client,
+                            "require_real_data": require_real_data,
+                        })
+                    except RuntimeError:
+                        skipped_invalid.append(f"{db_strategy.name} (market data unavailable)")
+                        continue
                     runner.load_strategy(strategy)
 
                 if not runner.strategies:
@@ -263,16 +275,21 @@ class RunnerManager:
         stock_preset = str(prefs.get("stock_preset", "weekly_optimized"))
         etf_preset = str(prefs.get("etf_preset", "balanced"))
 
+        # Stock presets — all enforce TP:SL >= 2.0:1 for positive expected value.
+        # trailing_stop_pct >= stop_loss_pct to avoid redundancy.
+        # max_hold_days caps holding period for timely exits.
         stock_defaults = {
-            "weekly_optimized": {"position_size": 1200, "stop_loss_pct": 2.5, "take_profit_pct": 6.0, "trailing_stop_pct": 2.0, "atr_stop_mult": 1.7, "zscore_entry_threshold": -1.4, "dip_buy_threshold_pct": 1.8},
-            "three_to_five_weekly": {"position_size": 1000, "stop_loss_pct": 3.0, "take_profit_pct": 5.5, "trailing_stop_pct": 2.5, "atr_stop_mult": 1.9, "zscore_entry_threshold": -1.5, "dip_buy_threshold_pct": 2.2},
-            "monthly_optimized": {"position_size": 900, "stop_loss_pct": 4.0, "take_profit_pct": 8.0, "trailing_stop_pct": 3.2, "atr_stop_mult": 2.2, "zscore_entry_threshold": -1.8, "dip_buy_threshold_pct": 2.8},
-            "small_budget_weekly": {"position_size": 500, "stop_loss_pct": 3.2, "take_profit_pct": 4.8, "trailing_stop_pct": 2.2, "atr_stop_mult": 1.6, "zscore_entry_threshold": -1.4, "dip_buy_threshold_pct": 2.0},
+            "weekly_optimized": {"position_size": 1200, "risk_per_trade": 1.5, "stop_loss_pct": 2.0, "take_profit_pct": 5.0, "trailing_stop_pct": 2.5, "atr_stop_mult": 2.0, "zscore_entry_threshold": -1.2, "dip_buy_threshold_pct": 1.5, "max_hold_days": 10},
+            "three_to_five_weekly": {"position_size": 1000, "risk_per_trade": 1.2, "stop_loss_pct": 2.5, "take_profit_pct": 6.0, "trailing_stop_pct": 2.8, "atr_stop_mult": 1.9, "zscore_entry_threshold": -1.3, "dip_buy_threshold_pct": 2.0, "max_hold_days": 7},
+            "monthly_optimized": {"position_size": 900, "risk_per_trade": 1.0, "stop_loss_pct": 3.5, "take_profit_pct": 8.0, "trailing_stop_pct": 3.5, "atr_stop_mult": 2.2, "zscore_entry_threshold": -1.5, "dip_buy_threshold_pct": 2.5, "max_hold_days": 30},
+            "small_budget_weekly": {"position_size": 500, "risk_per_trade": 0.8, "stop_loss_pct": 2.0, "take_profit_pct": 5.0, "trailing_stop_pct": 2.5, "atr_stop_mult": 1.8, "zscore_entry_threshold": -1.2, "dip_buy_threshold_pct": 1.5, "max_hold_days": 10},
         }
+        # ETF presets — relaxed z-score/dip thresholds (ETFs move less than stocks).
+        # Tighter stops with higher TP for better reward:risk.
         etf_defaults = {
-            "conservative": {"position_size": 800, "stop_loss_pct": 2.5, "take_profit_pct": 4.0, "trailing_stop_pct": 2.0, "atr_stop_mult": 1.4, "zscore_entry_threshold": -1.3, "dip_buy_threshold_pct": 1.6},
-            "balanced": {"position_size": 1000, "stop_loss_pct": 3.0, "take_profit_pct": 5.0, "trailing_stop_pct": 2.4, "atr_stop_mult": 1.7, "zscore_entry_threshold": -1.5, "dip_buy_threshold_pct": 2.0},
-            "aggressive": {"position_size": 1300, "stop_loss_pct": 4.0, "take_profit_pct": 7.0, "trailing_stop_pct": 3.0, "atr_stop_mult": 2.0, "zscore_entry_threshold": -1.8, "dip_buy_threshold_pct": 2.6},
+            "conservative": {"position_size": 1000, "risk_per_trade": 0.8, "stop_loss_pct": 2.0, "take_profit_pct": 5.0, "trailing_stop_pct": 2.5, "atr_stop_mult": 1.6, "zscore_entry_threshold": -1.0, "dip_buy_threshold_pct": 1.2, "max_hold_days": 12},
+            "balanced": {"position_size": 1000, "risk_per_trade": 1.0, "stop_loss_pct": 2.5, "take_profit_pct": 6.0, "trailing_stop_pct": 2.8, "atr_stop_mult": 1.9, "zscore_entry_threshold": -1.2, "dip_buy_threshold_pct": 1.5, "max_hold_days": 10},
+            "aggressive": {"position_size": 1300, "risk_per_trade": 1.4, "stop_loss_pct": 3.5, "take_profit_pct": 8.0, "trailing_stop_pct": 3.5, "atr_stop_mult": 2.0, "zscore_entry_threshold": -1.5, "dip_buy_threshold_pct": 2.0, "max_hold_days": 8},
         }
         if asset_type == "etf":
             return etf_defaults.get(etf_preset, etf_defaults["balanced"])
@@ -312,10 +329,13 @@ class RunnerManager:
         remaining_weekly_budget: float,
         buying_power: float,
         equity: float,
+        risk_per_trade_pct: float = 1.0,
+        stop_loss_pct: float = 2.0,
     ) -> float:
         """
         Compute portfolio-adaptive per-trade position size.
 
+        Uses proper risk-based sizing: position = (equity × risk%) / stop_loss%.
         The goal is to keep strategy defaults intact while preventing oversizing
         relative to available buying power, equity, and remaining weekly budget.
         """
@@ -331,6 +351,14 @@ class RunnerManager:
             caps.append(max(75.0, buying_power * 0.25))
         if equity > 0:
             caps.append(max(75.0, equity * 0.10))
+            # Risk-based position sizing: position = risk_dollars / stop_loss_pct.
+            # This sizes positions so that a full stop-loss hit equals the
+            # intended risk-per-trade dollar amount.
+            risk_pct = max(0.1, min(5.0, self._safe_float(risk_per_trade_pct, 1.0)))
+            sl_pct = max(0.5, min(10.0, self._safe_float(stop_loss_pct, 2.0)))
+            risk_dollars = equity * (risk_pct / 100.0)
+            position_from_risk = risk_dollars / (sl_pct / 100.0)
+            caps.append(max(50.0, position_from_risk))
 
         sized = min(caps)
         if active_slots >= 6:

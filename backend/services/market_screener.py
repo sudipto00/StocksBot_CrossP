@@ -40,14 +40,16 @@ class MarketScreener:
     and provides filtering capabilities.
     """
     
-    def __init__(self, alpaca_client=None):
+    def __init__(self, alpaca_client=None, require_real_data: bool = False):
         """
         Initialize market screener.
         
         Args:
             alpaca_client: Optional Alpaca trading client for real data
+            require_real_data: If true, raise when Alpaca data is unavailable instead of using fallback data
         """
         self.alpaca_client = alpaca_client
+        self.require_real_data = bool(require_real_data)
         self._cache: Dict[str, Any] = {}
         self._cache_timeout = 300  # 5 minutes
         self._data_client = None
@@ -70,6 +72,10 @@ class MarketScreener:
                     api_key=settings.alpaca_api_key,
                     secret_key=settings.alpaca_secret_key
                 )
+        if self.require_real_data and self._data_client is None:
+            raise RuntimeError(
+                "Strict Alpaca data mode is enabled but Alpaca data client could not be initialized"
+            )
     
     def get_active_stocks(self, limit: int = 100) -> List[Dict[str, Any]]:
         """
@@ -95,10 +101,14 @@ class MarketScreener:
                 stocks = self._fetch_active_from_data_client("stock", limit)
                 self._last_source = "alpaca"
             except Exception as e:
+                if self.require_real_data:
+                    raise RuntimeError(f"Failed to fetch active stocks from Alpaca: {e}") from e
                 logger.warning(f"Failed to fetch from Alpaca: {e}, using fallback")
                 stocks = self._get_fallback_stocks(limit)
                 self._last_source = "fallback"
         else:
+            if self.require_real_data:
+                raise RuntimeError("Strict Alpaca data mode is enabled but no Alpaca data client is available")
             stocks = self._get_fallback_stocks(limit)
             self._last_source = "fallback"
         
@@ -136,10 +146,14 @@ class MarketScreener:
                 etfs = self._fetch_active_from_data_client("etf", limit)
                 self._last_source = "alpaca"
             except Exception as e:
+                if self.require_real_data:
+                    raise RuntimeError(f"Failed to fetch active ETFs from Alpaca: {e}") from e
                 logger.warning(f"Failed to fetch from Alpaca: {e}, using fallback")
                 etfs = self._get_fallback_etfs(limit)
                 self._last_source = "fallback"
         else:
+            if self.require_real_data:
+                raise RuntimeError("Strict Alpaca data mode is enabled but no Alpaca data client is available")
             etfs = self._get_fallback_etfs(limit)
             self._last_source = "fallback"
         
@@ -538,11 +552,19 @@ class MarketScreener:
                         "low": low,
                     })
                 if prices:
+                    self._last_source = "alpaca"
                     return self._with_sma(prices)
+                if self.require_real_data:
+                    raise RuntimeError(f"No Alpaca chart data returned for {symbol.upper()}")
             except Exception as e:
+                if self.require_real_data:
+                    raise RuntimeError(f"Failed to fetch chart from Alpaca for {symbol.upper()}: {e}") from e
                 logger.warning(f"Failed to fetch chart from Alpaca for {symbol}: {e}, using fallback")
+        elif self.require_real_data:
+            raise RuntimeError("Strict Alpaca data mode is enabled but no Alpaca data client is available")
 
         # Fallback synthetic series
+        self._last_source = "fallback"
         base_price = 100.0
         for item in self._get_fallback_stocks(200) + self._get_fallback_etfs(200):
             if item["symbol"].upper() == symbol.upper():

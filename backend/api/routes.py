@@ -32,6 +32,8 @@ from services.order_execution import (
 from config.settings import get_settings, has_alpaca_credentials
 from services.logging_service import configure_file_logging, cleanup_old_files
 from services.notification_delivery import NotificationDeliveryService
+from services.budget_tracker import get_budget_tracker
+from config.risk_profiles import get_all_profiles
 
 from .models import (
     StatusResponse,
@@ -131,6 +133,22 @@ def _set_runtime_credentials(mode: str, api_key: str, secret_key: str) -> None:
         _runtime_broker_credentials[mode]["secret_key"] = secret_key
 
 
+def _resolve_alpaca_credentials_for_mode(mode: str) -> Optional[Dict[str, str]]:
+    """Resolve runtime-keychain credentials first, then environment credentials."""
+    runtime_creds = _get_runtime_credentials(mode)
+    runtime_api_key = (runtime_creds.get("api_key") or "").strip()
+    runtime_secret_key = (runtime_creds.get("secret_key") or "").strip()
+    if runtime_api_key and runtime_secret_key:
+        return {"api_key": runtime_api_key, "secret_key": runtime_secret_key}
+    if has_alpaca_credentials():
+        settings = get_settings()
+        env_api_key = (settings.alpaca_api_key or "").strip()
+        env_secret_key = (settings.alpaca_secret_key or "").strip()
+        if env_api_key and env_secret_key:
+            return {"api_key": env_api_key, "secret_key": env_secret_key}
+    return None
+
+
 def _invalidate_broker_instance() -> None:
     """Invalidate cached broker instance and disconnect previous instance safely."""
     global _broker_instance
@@ -157,29 +175,23 @@ def get_broker() -> BrokerInterface:
         if _broker_instance is not None:
             return _broker_instance
 
-        settings = get_settings()
         config = _config.model_copy(deep=True)
         mode = "paper" if config.paper_trading else "live"
-        runtime_creds = _runtime_broker_credentials.get(mode, {})
-        runtime_has_credentials = bool(
-            runtime_creds.get("api_key") and runtime_creds.get("secret_key")
-        )
+        broker_preference = str(config.broker or "paper").strip().lower()
+        if broker_preference not in {"paper", "alpaca"}:
+            broker_preference = "paper"
 
-        # Prefer runtime credentials provided by desktop keychain flow.
-        # Fallback to env credentials, and finally the in-process paper broker.
-        if runtime_has_credentials:
+        if broker_preference == "alpaca":
+            creds = _resolve_alpaca_credentials_for_mode(mode)
+            if not creds:
+                raise RuntimeError(
+                    f"Broker is set to alpaca ({mode}) but no Alpaca credentials are loaded. "
+                    "Load keys from Keychain in Settings."
+                )
             from integrations.alpaca_broker import AlpacaBroker
             broker = AlpacaBroker(
-                api_key=runtime_creds["api_key"],
-                secret_key=runtime_creds["secret_key"],
-                paper=config.paper_trading,
-            )
-            broker_name = "alpaca"
-        elif has_alpaca_credentials():
-            from integrations.alpaca_broker import AlpacaBroker
-            broker = AlpacaBroker(
-                api_key=settings.alpaca_api_key,
-                secret_key=settings.alpaca_secret_key,
+                api_key=creds["api_key"],
+                secret_key=creds["secret_key"],
                 paper=config.paper_trading,
             )
             broker_name = "alpaca"
@@ -246,6 +258,7 @@ _config = ConfigResponse(
     risk_limit_daily=500.0,
     tick_interval_seconds=60.0,
     streaming_enabled=False,
+    strict_alpaca_data=True,
     log_directory="./logs",
     audit_export_directory="./audit_exports",
     log_retention_days=30,
@@ -1017,6 +1030,8 @@ async def update_config(
     if request.streaming_enabled is not None:
         config.streaming_enabled = request.streaming_enabled
         runner_manager.set_streaming_enabled(config.streaming_enabled)
+    if request.strict_alpaca_data is not None:
+        config.strict_alpaca_data = bool(request.strict_alpaca_data)
     if request.log_directory is not None:
         candidate = request.log_directory.strip()
         if not candidate:
@@ -1034,7 +1049,10 @@ async def update_config(
     if request.audit_retention_days is not None:
         config.audit_retention_days = int(request.audit_retention_days)
     if request.broker is not None:
-        config.broker = request.broker
+        broker_value = str(request.broker).strip().lower()
+        if broker_value not in {"paper", "alpaca"}:
+            raise HTTPException(status_code=400, detail="broker must be either 'paper' or 'alpaca'")
+        config.broker = broker_value
 
     # Recreate broker on next use when mode changes.
     _set_config_snapshot(config)
@@ -1920,12 +1938,26 @@ async def start_runner(
     storage = StorageService(db)
     config = _load_runtime_config(storage)
     _set_config_snapshot(config)
-    broker = get_broker()
+    try:
+        broker = get_broker()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     max_position_size, risk_limit_daily = _balance_adjusted_limits(
         broker=broker,
         requested_max_position_size=config.max_position_size,
         requested_risk_limit_daily=config.risk_limit_daily,
     )
+    mode = "paper" if config.paper_trading else "live"
+    require_real_data = bool(config.strict_alpaca_data and str(config.broker).lower() == "alpaca")
+    alpaca_creds = _resolve_alpaca_credentials_for_mode(mode) if str(config.broker).lower() == "alpaca" else None
+    if require_real_data and not alpaca_creds:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Strict Alpaca data mode is enabled for {mode} but Alpaca credentials are unavailable. "
+                "Load/save Alpaca keys in Settings before starting runner."
+            ),
+        )
     result = runner_manager.start_runner(
         db=db,
         broker=broker,
@@ -1933,6 +1965,8 @@ async def start_runner(
         risk_limit_daily=risk_limit_daily,
         tick_interval=config.tick_interval_seconds,
         streaming_enabled=config.streaming_enabled,
+        alpaca_client=alpaca_creds,
+        require_real_data=require_real_data,
     )
     _idempotency_cache_set("/runner/start", x_idempotency_key, result)
     return RunnerActionResponse(**result)
@@ -2193,6 +2227,55 @@ async def get_portfolio_summary(db: Session = Depends(get_db)):
 # Strategy Configuration Endpoints
 # ============================================================================
 
+def _adaptive_strategy_parameter_defaults(
+    storage: StorageService,
+    symbol_count: int,
+) -> Dict[str, float]:
+    """
+    Compute portfolio-aware default parameter values for Strategy UI.
+
+    These defaults are used when a strategy parameter has not been explicitly
+    saved yet, so Strategy config forms reflect the current preset + account
+    context.
+    """
+    prefs = _load_trading_preferences(storage)
+    prefs_payload = {
+        "asset_type": prefs.asset_type.value,
+        "stock_preset": prefs.stock_preset.value,
+        "etf_preset": prefs.etf_preset.value,
+    }
+    defaults = runner_manager._strategy_param_defaults_from_prefs(prefs_payload)
+
+    broker: Optional[BrokerInterface]
+    try:
+        broker = get_broker()
+    except (RuntimeError, ValueError, TypeError, KeyError):
+        broker = None
+    account_snapshot = _load_account_snapshot(broker)
+    equity = _safe_float(account_snapshot.get("equity", 0.0), 0.0)
+    buying_power = _safe_float(account_snapshot.get("buying_power", 0.0), 0.0)
+    weekly_budget = _safe_float(prefs.weekly_budget, 200.0)
+    budget_tracker = get_budget_tracker(weekly_budget)
+    budget_tracker.set_weekly_budget(weekly_budget)
+    remaining_weekly_budget = _safe_float(
+        budget_tracker.get_budget_status().get("remaining_budget", weekly_budget),
+        weekly_budget,
+    )
+    existing_position_count = len(storage.get_open_positions())
+
+    adaptive_position_size = runner_manager._dynamic_position_size(
+        requested_position_size=_safe_float(defaults.get("position_size", 1000.0), 1000.0),
+        symbol_count=max(1, int(symbol_count)),
+        existing_position_count=existing_position_count,
+        remaining_weekly_budget=remaining_weekly_budget,
+        buying_power=buying_power,
+        equity=equity,
+        risk_per_trade_pct=_safe_float(defaults.get("risk_per_trade", 1.0), 1.0),
+    )
+    defaults["position_size"] = adaptive_position_size
+    return defaults
+
+
 @router.get("/strategies/{strategy_id}/config", response_model=StrategyConfigResponse)
 async def get_strategy_config(strategy_id: str, db: Session = Depends(get_db)):
     """
@@ -2210,15 +2293,20 @@ async def get_strategy_config(strategy_id: str, db: Session = Depends(get_db)):
     if not db_strategy:
         raise HTTPException(status_code=404, detail="Strategy not found")
     
-    # Get parameters from config or use defaults
+    symbols = db_strategy.config.get('symbols', []) if db_strategy.config else []
+    normalized_symbols = _normalize_symbols(symbols if isinstance(symbols, list) else [])
+    # Get parameters from config or use adaptive defaults
     config_params = db_strategy.config.get('parameters', {}) if db_strategy.config else {}
+    adaptive_defaults = _adaptive_strategy_parameter_defaults(storage, symbol_count=len(normalized_symbols))
     default_params = get_default_parameters()
     
     # Merge with stored values and convert to API models
     parameters = []
     for param in default_params:
+        if param.name in adaptive_defaults:
+            param.value = _safe_float(adaptive_defaults[param.name], param.value)
         if param.name in config_params:
-            param.value = config_params[param.name]
+            param.value = _safe_float(config_params[param.name], param.value)
         # Convert to API model
         parameters.append(StrategyParameter(
             name=param.name,
@@ -2233,7 +2321,7 @@ async def get_strategy_config(strategy_id: str, db: Session = Depends(get_db)):
         strategy_id=str(db_strategy.id),
         name=db_strategy.name,
         description=db_strategy.description or "",
-        symbols=db_strategy.config.get('symbols', []) if db_strategy.config else [],
+        symbols=normalized_symbols,
         parameters=parameters,
         enabled=db_strategy.is_enabled,
     )
@@ -2291,6 +2379,13 @@ async def update_strategy_config(
     
     if request.enabled is not None:
         db_strategy.is_enabled = request.enabled
+        if request.enabled is False and db_strategy.is_active:
+            db_strategy.is_active = False
+            storage.create_audit_log(
+                event_type="strategy_stopped",
+                description=f"Strategy auto-stopped because it was disabled: {db_strategy.name}",
+                details={"strategy_id": db_strategy.id},
+            )
     
     # Mark config as modified if changed (needed for SQLAlchemy JSON fields)
     if config_changed:
@@ -2391,9 +2486,59 @@ async def run_strategy_backtest(
         request.symbols = _normalize_symbols(request.symbols)
         if not request.symbols:
             raise HTTPException(status_code=400, detail="At least one valid symbol is required for backtest")
+
+    # Resolve parameter set: strategy-saved parameters with request overrides.
+    default_params = get_default_parameters()
+    param_defs = {param.name: param for param in default_params}
+    resolved_parameters: Dict[str, float] = {}
+    if db_strategy.config and isinstance(db_strategy.config.get("parameters"), dict):
+        for name, value in db_strategy.config.get("parameters", {}).items():
+            if name not in param_defs:
+                continue
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(numeric):
+                continue
+            pdef = param_defs[name]
+            resolved_parameters[name] = max(pdef.min_value, min(pdef.max_value, numeric))
+    if request.parameters:
+        for name, value in request.parameters.items():
+            if name not in param_defs:
+                raise HTTPException(status_code=400, detail=f"Unknown backtest parameter: {name}")
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail=f"Backtest parameter {name} must be numeric")
+            if not math.isfinite(numeric):
+                raise HTTPException(status_code=400, detail=f"Backtest parameter {name} must be finite")
+            pdef = param_defs[name]
+            if not (pdef.min_value <= numeric <= pdef.max_value):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Backtest parameter {name} must be within [{pdef.min_value}, {pdef.max_value}]",
+                )
+            resolved_parameters[name] = numeric
     
-    # Run backtest
-    analytics = StrategyAnalyticsService(db)
+    # Run backtest with strict Alpaca-data enforcement when configured.
+    _bt_config = _get_config_snapshot()
+    _bt_mode = "paper" if _bt_config.paper_trading else "live"
+    _bt_require_real_data = bool(_bt_config.strict_alpaca_data and str(_bt_config.broker).lower() == "alpaca")
+    _bt_creds = _resolve_alpaca_credentials_for_mode(_bt_mode)
+    if _bt_require_real_data and not _bt_creds:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Strict Alpaca data mode is enabled for {_bt_mode} but credentials are unavailable. "
+                "Load/save Alpaca keys in Settings before running backtests."
+            ),
+        )
+    analytics = StrategyAnalyticsService(
+        db,
+        alpaca_creds=_bt_creds,
+        require_real_data=_bt_require_real_data,
+    )
     from config.strategy_config import BacktestRequest as BacktestReq
     
     backtest_req = BacktestReq(
@@ -2402,10 +2547,13 @@ async def run_strategy_backtest(
         end_date=request.end_date,
         initial_capital=request.initial_capital,
         symbols=request.symbols,
-        parameters=request.parameters,
+        parameters=resolved_parameters or None,
     )
     
-    result = analytics.run_backtest(backtest_req)
+    try:
+        result = analytics.run_backtest(backtest_req)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
     
     storage.create_audit_log(
         event_type="strategy_started",
@@ -2435,6 +2583,7 @@ async def run_strategy_backtest(
         volatility=result.volatility,
         trades=result.trades,
         equity_curve=result.equity_curve,
+        diagnostics=result.diagnostics,
     )
 
 
@@ -2529,9 +2678,6 @@ from .models import (
     BudgetStatus, BudgetUpdateRequest,
 )
 from services.market_screener import MarketScreener
-from services.budget_tracker import get_budget_tracker
-from config.risk_profiles import get_risk_profile, get_all_profiles
-
 # In-memory trading preferences (would be persisted in production)
 _trading_preferences = TradingPreferencesResponse(
     asset_type=AssetType.BOTH,
@@ -2573,12 +2719,19 @@ def _create_market_screener() -> MarketScreener:
     """Create market screener with runtime keychain credentials when available."""
     config = _get_config_snapshot()
     mode = "paper" if config.paper_trading else "live"
-    runtime_creds = _get_runtime_credentials(mode)
-    api_key = (runtime_creds.get("api_key") or "").strip()
-    secret_key = (runtime_creds.get("secret_key") or "").strip()
-    if api_key and secret_key:
-        return MarketScreener(alpaca_client={"api_key": api_key, "secret_key": secret_key})
-    return MarketScreener()
+    require_real_data = bool(config.strict_alpaca_data and str(config.broker).lower() == "alpaca")
+    creds = _resolve_alpaca_credentials_for_mode(mode)
+    if require_real_data and not creds:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Strict Alpaca data mode is enabled for {mode} but Alpaca credentials are not loaded. "
+                "Open Settings and load/save Alpaca keys for this mode."
+            ),
+        )
+    if creds:
+        return MarketScreener(alpaca_client=creds, require_real_data=require_real_data)
+    return MarketScreener(require_real_data=False)
 
 
 def _paginate_assets(assets_raw: List[dict], page: int, page_size: int) -> tuple[List[ScreenerAsset], int, int]:
@@ -2610,8 +2763,11 @@ async def get_active_stocks(
         List of actively traded stocks
     """
     screener = _create_market_screener()
-    stocks = screener.get_active_stocks(limit)
-    regime = screener.detect_market_regime()
+    try:
+        stocks = screener.get_active_stocks(limit)
+        regime = screener.detect_market_regime()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
     
     assets, total_count, total_pages = _paginate_assets(stocks, page, page_size)
     
@@ -2645,8 +2801,11 @@ async def get_active_etfs(
         List of actively traded ETFs
     """
     screener = _create_market_screener()
-    etfs = screener.get_active_etfs(limit)
-    regime = screener.detect_market_regime()
+    try:
+        etfs = screener.get_active_etfs(limit)
+        regime = screener.detect_market_regime()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
     
     assets, total_count, total_pages = _paginate_assets(etfs, page, page_size)
     
@@ -2707,23 +2866,26 @@ async def get_screener_results(
     
     screener = _create_market_screener()
     
-    if final_mode == ScreenerMode.PRESET and final_asset_type in (AssetType.STOCK, AssetType.ETF):
-        preset = (
-            prefs.stock_preset.value
-            if final_asset_type == AssetType.STOCK
-            else prefs.etf_preset.value
-        )
-        preset_guardrails = screener.get_preset_guardrails(final_asset_type.value, preset)
-        min_dollar_volume = max(min_dollar_volume, float(preset_guardrails["min_dollar_volume"]))
-        max_spread_bps = min(max_spread_bps, float(preset_guardrails["max_spread_bps"]))
-        max_sector_weight_pct = min(max_sector_weight_pct, float(preset_guardrails["max_sector_weight_pct"]))
-        results = screener.get_preset_assets(final_asset_type.value, preset, final_limit)
-    else:
-        # Import AssetType from market_screener
-        from services.market_screener import AssetType as ScreenerAssetType
-        screener_asset_type = ScreenerAssetType(final_asset_type.value)
-        results = screener.get_screener_results(screener_asset_type, final_limit)
-    regime = screener.detect_market_regime()
+    try:
+        if final_mode == ScreenerMode.PRESET and final_asset_type in (AssetType.STOCK, AssetType.ETF):
+            preset = (
+                prefs.stock_preset.value
+                if final_asset_type == AssetType.STOCK
+                else prefs.etf_preset.value
+            )
+            preset_guardrails = screener.get_preset_guardrails(final_asset_type.value, preset)
+            min_dollar_volume = max(min_dollar_volume, float(preset_guardrails["min_dollar_volume"]))
+            max_spread_bps = min(max_spread_bps, float(preset_guardrails["max_spread_bps"]))
+            max_sector_weight_pct = min(max_sector_weight_pct, float(preset_guardrails["max_sector_weight_pct"]))
+            results = screener.get_preset_assets(final_asset_type.value, preset, final_limit)
+        else:
+            # Import AssetType from market_screener
+            from services.market_screener import AssetType as ScreenerAssetType
+            screener_asset_type = ScreenerAssetType(final_asset_type.value)
+            results = screener.get_screener_results(screener_asset_type, final_limit)
+        regime = screener.detect_market_regime()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
     optimized = screener.optimize_assets(
         results,
         limit=final_limit,
@@ -2811,9 +2973,11 @@ async def get_screener_preset(
     max_sector_weight_pct = min(max_sector_weight_pct, float(preset_guardrails["max_sector_weight_pct"]))
     try:
         assets_raw = screener.get_preset_assets(asset_type.value, preset.value, limit)
+        regime = screener.detect_market_regime()
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-    regime = screener.detect_market_regime()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
     optimized = screener.optimize_assets(
         assets_raw,
         limit=limit,
@@ -3143,15 +3307,18 @@ async def get_symbol_chart(
     if any(not math.isfinite(value) for value in numeric_values):
         raise HTTPException(status_code=400, detail="Chart indicator values must be finite numbers")
     screener = _create_market_screener()
-    points = screener.get_symbol_chart(symbol=symbol, days=days)
-    indicators = screener.get_chart_indicators(
-        points=points,
-        take_profit_pct=take_profit_pct,
-        trailing_stop_pct=trailing_stop_pct,
-        atr_stop_mult=atr_stop_mult,
-        zscore_entry_threshold=zscore_entry_threshold,
-        dip_buy_threshold_pct=dip_buy_threshold_pct,
-    )
+    try:
+        points = screener.get_symbol_chart(symbol=symbol, days=days)
+        indicators = screener.get_chart_indicators(
+            points=points,
+            take_profit_pct=take_profit_pct,
+            trailing_stop_pct=trailing_stop_pct,
+            atr_stop_mult=atr_stop_mult,
+            zscore_entry_threshold=zscore_entry_threshold,
+            dip_buy_threshold_pct=dip_buy_threshold_pct,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
     return SymbolChartResponse(
         symbol=symbol.upper(),
         points=[SymbolChartPoint(**p) for p in points],

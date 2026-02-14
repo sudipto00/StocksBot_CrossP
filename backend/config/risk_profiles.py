@@ -18,52 +18,57 @@ class RiskProfile(str, Enum):
     AGGRESSIVE = "aggressive"
 
 
-# Risk profile configurations for weekly trading with $200 budget
+# Risk profile configurations for weekly trading with $200 budget.
+# All profiles enforce TP:SL >= 2.5:1 for positive expected value.
+# Minimum position size raised to avoid spread/slippage eating profits.
 RISK_PROFILES: Dict[str, Dict[str, Any]] = {
     "conservative": {
         "name": "Conservative",
         "description": "Low-risk strategy focusing on stable, established securities",
-        "max_position_size": 50.0,  # Max $50 per position
+        "max_position_size": 100.0,  # Min $100 to overcome spread costs
         "max_positions": 3,  # Max 3 positions at once
-        "position_size_percent": 0.20,  # 20% of weekly budget per trade
-        "stop_loss_percent": 0.03,  # 3% stop loss
-        "take_profit_percent": 0.05,  # 5% take profit
+        "position_size_percent": 0.25,  # 25% of weekly budget per trade
+        "stop_loss_percent": 0.02,  # 2% stop loss (tight)
+        "take_profit_percent": 0.05,  # 5% take profit (TP:SL = 2.5:1)
         "max_weekly_loss": 0.15,  # Max 15% of weekly budget loss
-        "preferred_assets": ["etf", "large_cap_stocks"],  # Prefer ETFs and large caps
-        "min_volume": 1000000,  # Minimum daily volume
-        "volatility_threshold": "low",  # Prefer low volatility
-        "diversification_required": True,  # Must diversify across sectors
-        "hold_period_days": 7,  # Typical hold period
+        "preferred_assets": ["etf", "large_cap_stocks"],
+        "min_volume": 1000000,
+        "volatility_threshold": "low",
+        "diversification_required": True,
+        "hold_period_days": 10,
+        "max_hold_days": 12,
     },
     "balanced": {
         "name": "Balanced",
         "description": "Moderate risk strategy balancing growth and stability",
-        "max_position_size": 80.0,  # Max $80 per position
+        "max_position_size": 150.0,  # Min $150 for meaningful gains
         "max_positions": 4,  # Max 4 positions at once
         "position_size_percent": 0.30,  # 30% of weekly budget per trade
-        "stop_loss_percent": 0.05,  # 5% stop loss
-        "take_profit_percent": 0.08,  # 8% take profit
+        "stop_loss_percent": 0.025,  # 2.5% stop loss
+        "take_profit_percent": 0.06,  # 6% take profit (TP:SL = 2.4:1)
         "max_weekly_loss": 0.25,  # Max 25% of weekly budget loss
-        "preferred_assets": ["both"],  # Mix of stocks and ETFs
-        "min_volume": 500000,  # Minimum daily volume
-        "volatility_threshold": "medium",  # Moderate volatility acceptable
-        "diversification_required": True,  # Should diversify
-        "hold_period_days": 5,  # Typical hold period
+        "preferred_assets": ["both"],
+        "min_volume": 500000,
+        "volatility_threshold": "medium",
+        "diversification_required": True,
+        "hold_period_days": 7,
+        "max_hold_days": 10,
     },
     "aggressive": {
         "name": "Aggressive",
         "description": "Higher-risk strategy seeking maximum growth potential",
-        "max_position_size": 120.0,  # Max $120 per position
+        "max_position_size": 200.0,  # Raised from $120 for better reward capture
         "max_positions": 5,  # Max 5 positions at once
         "position_size_percent": 0.40,  # 40% of weekly budget per trade
-        "stop_loss_percent": 0.08,  # 8% stop loss (wider)
-        "take_profit_percent": 0.15,  # 15% take profit (higher target)
-        "max_weekly_loss": 0.40,  # Max 40% of weekly budget loss
-        "preferred_assets": ["stock", "both"],  # Prefer individual stocks
-        "min_volume": 100000,  # Lower minimum volume (more opportunities)
-        "volatility_threshold": "high",  # Accept high volatility
-        "diversification_required": False,  # Can concentrate positions
-        "hold_period_days": 3,  # Shorter hold period
+        "stop_loss_percent": 0.035,  # 3.5% stop loss
+        "take_profit_percent": 0.08,  # 8% take profit (TP:SL = 2.3:1)
+        "max_weekly_loss": 0.35,  # Max 35% of weekly budget loss (lowered from 40%)
+        "preferred_assets": ["stock", "both"],
+        "min_volume": 100000,
+        "volatility_threshold": "high",
+        "diversification_required": False,
+        "hold_period_days": 5,
+        "max_hold_days": 8,
     },
 }
 

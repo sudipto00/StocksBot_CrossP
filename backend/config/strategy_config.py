@@ -71,6 +71,7 @@ class BacktestResult(BaseModel):
     volatility: float
     trades: List[Dict[str, Any]] = Field(default_factory=list)
     equity_curve: List[Dict[str, Any]] = Field(default_factory=list)
+    diagnostics: Dict[str, Any] = Field(default_factory=dict)
 
 
 class ParameterTuneRequest(BaseModel):
@@ -91,7 +92,11 @@ class ParameterTuneResponse(BaseModel):
 
 
 def get_default_parameters() -> List[StrategyParameter]:
-    """Get default strategy parameters for new strategies."""
+    """Get default strategy parameters for new strategies.
+
+    Defaults enforce a TP:SL ratio >= 2.5:1 and trailing_stop >= stop_loss
+    so every preset has positive expected value at realistic win rates.
+    """
     return [
         StrategyParameter(
             name="position_size",
@@ -106,7 +111,7 @@ def get_default_parameters() -> List[StrategyParameter]:
             value=2.0,
             min_value=0.5,
             max_value=10.0,
-            step=0.5,
+            step=0.25,
             description="Stop loss percentage"
         ),
         StrategyParameter(
@@ -115,7 +120,7 @@ def get_default_parameters() -> List[StrategyParameter]:
             min_value=1.0,
             max_value=20.0,
             step=0.5,
-            description="Take profit percentage"
+            description="Take profit percentage (should be >= 2x stop_loss_pct)"
         ),
         StrategyParameter(
             name="risk_per_trade",
@@ -123,38 +128,46 @@ def get_default_parameters() -> List[StrategyParameter]:
             min_value=0.1,
             max_value=5.0,
             step=0.1,
-            description="Risk per trade as percentage of capital"
+            description="Risk per trade as percentage of capital (used for position sizing via stop_loss_pct)"
         ),
         StrategyParameter(
             name="trailing_stop_pct",
             value=2.5,
             min_value=0.5,
             max_value=15.0,
-            step=0.5,
-            description="Trailing stop percentage from local high"
+            step=0.25,
+            description="Trailing stop percentage from local high (should be >= stop_loss_pct)"
         ),
         StrategyParameter(
             name="atr_stop_mult",
-            value=1.8,
+            value=2.0,
             min_value=0.5,
             max_value=5.0,
             step=0.1,
-            description="ATR multiplier used for volatility stop"
+            description="ATR multiplier used for dynamic volatility stop"
         ),
         StrategyParameter(
             name="zscore_entry_threshold",
-            value=-1.5,
+            value=-1.2,
             min_value=-4.0,
             max_value=-0.2,
             step=0.1,
-            description="Z-score entry threshold for mean-reversion dip buys"
+            description="Z-score entry threshold for mean-reversion dip buys (50-period)"
         ),
         StrategyParameter(
             name="dip_buy_threshold_pct",
-            value=2.0,
-            min_value=0.5,
+            value=1.5,
+            min_value=0.3,
             max_value=10.0,
-            step=0.5,
+            step=0.25,
             description="Percent below SMA50 required to consider dip buy"
+        ),
+        StrategyParameter(
+            name="max_hold_days",
+            value=10.0,
+            min_value=1.0,
+            max_value=60.0,
+            step=1.0,
+            description="Maximum days to hold a position before forced exit"
         ),
     ]

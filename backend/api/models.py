@@ -63,6 +63,10 @@ class ConfigResponse(BaseModel):
     risk_limit_daily: float = Field(default=500.0, description="Daily risk limit")
     tick_interval_seconds: float = Field(default=60.0, description="Strategy runner polling interval in seconds")
     streaming_enabled: bool = Field(default=False, description="Enable websocket trade-update streaming when broker supports it")
+    strict_alpaca_data: bool = Field(
+        default=True,
+        description="When true and broker is alpaca, fail instead of using fallback market data",
+    )
     log_directory: str = Field(default="./logs", description="Directory for backend log files")
     audit_export_directory: str = Field(default="./audit_exports", description="Directory for audit export artifacts")
     log_retention_days: int = Field(default=30, description="Retention period for log files")
@@ -141,6 +145,10 @@ class ConfigUpdateRequest(BaseModel):
     risk_limit_daily: Optional[float] = Field(None, description="Daily risk limit", gt=0)
     tick_interval_seconds: Optional[float] = Field(None, description="Runner polling interval in seconds", gt=0)
     streaming_enabled: Optional[bool] = Field(None, description="Enable websocket trade-update streaming")
+    strict_alpaca_data: Optional[bool] = Field(
+        None,
+        description="Require real Alpaca-backed data when broker is alpaca",
+    )
     log_directory: Optional[str] = Field(None, description="Directory for backend log files")
     audit_export_directory: Optional[str] = Field(None, description="Directory for audit exports")
     log_retention_days: Optional[int] = Field(None, description="Retention days for logs", ge=1, le=3650)
@@ -462,6 +470,7 @@ class BacktestResponse(BaseModel):
     volatility: float = Field(..., description="Returns volatility")
     trades: List[Dict[str, Any]] = Field(default_factory=list, description="Trade history")
     equity_curve: List[Dict[str, Any]] = Field(default_factory=list, description="Equity curve data")
+    diagnostics: Dict[str, Any] = Field(default_factory=dict, description="Signal and blocker diagnostics")
 
 
 class ParameterTuneRequest(BaseModel):

@@ -129,6 +129,69 @@ class TestStrategyConfiguration:
         data = response.json()
         assert data["enabled"] is False
 
+    def test_update_strategy_config_disable_auto_stops_active(self, test_strategy):
+        """Disabling config should also stop an active strategy."""
+        activate = client.put(
+            f"/strategies/{test_strategy.id}",
+            json={"status": "active"},
+        )
+        assert activate.status_code == 200
+        assert activate.json()["status"] == "active"
+
+        disable = client.put(
+            f"/strategies/{test_strategy.id}/config",
+            json={"enabled": False},
+        )
+        assert disable.status_code == 200
+        assert disable.json()["enabled"] is False
+
+        strategy = client.get(f"/strategies/{test_strategy.id}")
+        assert strategy.status_code == 200
+        assert strategy.json()["status"] == "stopped"
+
+    def test_get_strategy_config_uses_adaptive_defaults_when_missing_params(self):
+        """Config response should provide adaptive defaults for unset parameters."""
+        prefs = client.post(
+            "/preferences",
+            json={
+                "asset_type": "stock",
+                "screener_mode": "preset",
+                "stock_preset": "weekly_optimized",
+                "weekly_budget": 200.0,
+            },
+        )
+        assert prefs.status_code == 200
+
+        create = client.post(
+            "/strategies",
+            json={
+                "name": "Adaptive Defaults Strategy",
+                "symbols": ["AAPL", "MSFT"],
+            },
+        )
+        assert create.status_code == 200
+        strategy_id = create.json()["id"]
+
+        response = client.get(f"/strategies/{strategy_id}/config")
+        assert response.status_code == 200
+        data = response.json()
+        position_size = next(
+            p["value"] for p in data["parameters"] if p["name"] == "position_size"
+        )
+        risk_per_trade = next(
+            p["value"] for p in data["parameters"] if p["name"] == "risk_per_trade"
+        )
+        # weekly_optimized preset defaults to 1200 position size.
+        assert position_size <= 1200.0
+        assert risk_per_trade >= 0.1
+        # Verify max_hold_days is present in defaults.
+        max_hold_days = next(
+            (p["value"] for p in data["parameters"] if p["name"] == "max_hold_days"),
+            None,
+        )
+        assert max_hold_days is not None
+        assert max_hold_days >= 1
+
 
 class TestStrategyMetrics:
     """Tests for strategy metrics endpoints."""
@@ -196,6 +259,9 @@ class TestStrategyBacktesting:
         assert "sharpe_ratio" in data
         assert "trades" in data
         assert "equity_curve" in data
+        assert "diagnostics" in data
+        assert "blocked_reasons" in data["diagnostics"]
+        assert "top_blockers" in data["diagnostics"]
     
     def test_run_backtest_with_custom_capital(self, test_strategy):
         """Test backtest with custom initial capital."""
@@ -249,6 +315,61 @@ class TestStrategyBacktesting:
             trade = data["trades"][0]
             assert "symbol" in trade
             assert "pnl" in trade
+
+    def test_backtest_with_parameter_overrides(self, test_strategy):
+        """Backtest should accept supported parameter overrides including max_hold_days."""
+        response = client.post(
+            f"/strategies/{test_strategy.id}/backtest",
+            json={
+                "start_date": "2024-01-01",
+                "end_date": "2024-03-31",
+                "initial_capital": 100000.0,
+                "symbols": ["AAPL", "MSFT"],
+                "parameters": {
+                    "position_size": 1200.0,
+                    "risk_per_trade": 1.2,
+                    "stop_loss_pct": 2.5,
+                    "take_profit_pct": 6.0,
+                    "trailing_stop_pct": 2.8,
+                    "atr_stop_mult": 1.9,
+                    "zscore_entry_threshold": -1.3,
+                    "dip_buy_threshold_pct": 2.0,
+                    "max_hold_days": 10.0,
+                },
+            }
+        )
+        assert response.status_code == 200
+        payload = response.json()
+        assert isinstance(payload["total_trades"], int)
+        assert isinstance(payload["final_capital"], (int, float))
+        assert isinstance(payload["diagnostics"].get("parameters_used"), dict)
+        # Verify advanced metrics are included in diagnostics.
+        advanced = payload["diagnostics"].get("advanced_metrics")
+        assert advanced is not None
+        assert "profit_factor" in advanced
+        assert "sortino_ratio" in advanced
+        assert "expectancy_per_trade" in advanced
+        assert "max_consecutive_losses" in advanced
+        assert "calmar_ratio" in advanced
+        assert "avg_hold_days" in advanced
+        assert "slippage_bps_applied" in advanced
+        # Verify time_exit is tracked in exit_reasons.
+        assert "time_exit" in payload["diagnostics"]["exit_reasons"]
+
+    def test_backtest_rejects_unknown_parameter(self, test_strategy):
+        """Backtest should reject unknown parameters."""
+        response = client.post(
+            f"/strategies/{test_strategy.id}/backtest",
+            json={
+                "start_date": "2024-01-01",
+                "end_date": "2024-03-31",
+                "initial_capital": 100000.0,
+                "parameters": {
+                    "unknown_param": 1.0,
+                },
+            }
+        )
+        assert response.status_code == 400
 
 
 class TestParameterTuning:

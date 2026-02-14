@@ -1,0 +1,459 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>StocksBot Help &amp; Guide</title>
+  <style>
+    @page { margin: 0.6in; size: letter; }
+    * { box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; color: #111827; padding: 24px; line-height: 1.5; font-size: 11px; background: #ffffff; }
+    h1 { font-size: 22px; margin: 0 0 4px; }
+    .subtitle { color: #6b7280; font-size: 12px; margin-bottom: 20px; }
+    .section { page-break-inside: avoid; margin-bottom: 20px; border: 1px solid #d1d5db; border-radius: 6px; padding: 14px 16px; }
+    h2 { font-size: 15px; margin: 0 0 8px; color: #1e40af; border-bottom: 1px solid #e5e7eb; padding-bottom: 4px; }
+    h3 { font-size: 12px; margin: 10px 0 4px; color: #374151; }
+    p { margin: 4px 0; }
+    .small { font-size: 10px; color: #6b7280; }
+    table { width: 100%; border-collapse: collapse; font-size: 10px; margin: 6px 0 10px; }
+    th, td { border: 1px solid #d1d5db; padding: 4px 6px; text-align: left; vertical-align: top; }
+    th { background: #f3f4f6; font-weight: 600; }
+    tr:nth-child(even) td { background: #f9fafb; }
+    ul, ol { margin: 4px 0; padding-left: 20px; }
+    li { margin: 2px 0; }
+    .callout { background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 4px; padding: 6px 10px; margin: 8px 0; font-size: 10px; }
+    .mono { font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 10px; }
+    .faq { margin-bottom: 8px; }
+    .faq-q { font-weight: 600; margin-bottom: 2px; }
+    .footer { text-align: center; color: #9ca3af; font-size: 9px; margin-top: 16px; padding-top: 8px; border-top: 1px solid #e5e7eb; }
+  </style>
+</head>
+<body>
+  <h1>StocksBot Help &amp; Guide</h1>
+  <p class="subtitle">Complete reference for trading stocks and ETFs &middot; February 14, 2026</p>
+
+  <!-- ════════════════════════════════════════════════════════════════════
+       1. WELCOME
+       ════════════════════════════════════════════════════════════════════ -->
+  <div class="section"><h2>Welcome to StocksBot</h2>
+    <p>StocksBot is an automated trading assistant that scans for stocks and ETFs experiencing temporary price dips, buys them at a discount, and sells when prices recover. This &quot;dip-buy&quot; or mean-reversion approach works well for building wealth gradually with small, regular investments.</p>
+    <p><strong>Step 1: Screen</strong> &mdash; The Screener finds liquid stocks/ETFs that match your risk profile and budget.<br/>
+    <strong>Step 2: Strategize</strong> &mdash; Create strategies with your chosen symbols and tune entry/exit parameters.<br/>
+    <strong>Step 3: Automate</strong> &mdash; Start the Runner. It monitors markets, enters dip-buy trades, and manages exits automatically.</p>
+    <div class="callout"><strong>Tip:</strong> New to trading? Start with paper trading (simulated money) and a small budget preset.</div>
+  </div>
+
+  <!-- ════════════════════════════════════════════════════════════════════
+       2. SMALL-BUDGET TRADING GUIDE
+       ════════════════════════════════════════════════════════════════════ -->
+  <div class="section"><h2>Small-Budget Trading Guide ($100 - $500)</h2>
+    <p>You do not need thousands of dollars to start. With as little as $100 initial capital and $30-$100 per week, StocksBot can build positions gradually.</p>
+    <h3>Recommended Setups by Budget</h3>
+    <table>
+      <thead><tr><th>Profile</th><th>Initial</th><th>Weekly</th><th>Type</th><th>Preset</th><th>Position Size</th><th>Trades/Wk</th></tr></thead>
+      <tbody>
+        <tr><td>Starter</td><td>$100</td><td>$30</td><td>Stocks</td><td>Small Budget Weekly</td><td>$50 - $80</td><td>1 - 2 / week</td></tr>
+        <tr><td>Budget Builder</td><td>$250</td><td>$50</td><td>Stocks</td><td>Small Budget Weekly</td><td>$80 - $150</td><td>2 - 3 / week</td></tr>
+        <tr><td>Moderate Start</td><td>$500</td><td>$75</td><td>Stocks</td><td>3-5 Trades/Week</td><td>$100 - $200</td><td>3 - 5 / week</td></tr>
+        <tr><td>ETF Conservative</td><td>$300</td><td>$50</td><td>ETFs</td><td>Conservative</td><td>$100 - $200</td><td>1 - 2 / week</td></tr>
+        <tr><td>ETF Growth</td><td>$500</td><td>$100</td><td>ETFs</td><td>Balanced</td><td>$150 - $300</td><td>2 - 3 / week</td></tr>
+      </tbody>
+    </table>
+    <h3>Details &amp; Tips</h3>
+    <p><strong>Starter ($100 + $30/wk):</strong> Focus on lower-priced large caps (INTC, PFE, CSCO). Keep position sizes small so one bad trade does not wipe out your seed. Start with paper trading for at least 2 weeks.</p>
+    <p><strong>Budget Builder ($250 + $50/wk):</strong> Same preset as Starter but larger sizing headroom. Consider bumping to 3-5 Trades/Week preset once your account reaches $500+.</p>
+    <p><strong>Moderate Start ($500 + $75/wk):</strong> Enough capital for diversified positions across multiple sectors. Good balance of activity and risk. Suitable for learning the strategy without being overexposed.</p>
+    <p><strong>ETF Conservative ($300 + $50/wk):</strong> ETFs like SPY and VOO are inherently diversified. Lower volatility means fewer signals but smoother equity curve. Great for hands-off investors who want exposure to broad markets.</p>
+    <p><strong>ETF Growth ($500 + $100/wk):</strong> Mix of broad-market and sector ETFs. Balanced preset gives exposure to QQQ, IWM, and sector rotators alongside SPY core. Good for growing capital steadily.</p>
+    <h3>Golden Rules for Small Accounts</h3>
+    <ol>
+      <li><strong>Paper trade first.</strong> Run for 1-2 weeks with simulated money to validate your setup.</li>
+      <li><strong>Keep position sizes under 30% of capital.</strong> With $200, do not put more than $60 in a single stock.</li>
+      <li><strong>Use Conservative risk profile.</strong> Smaller accounts cannot absorb large drawdowns.</li>
+      <li><strong>Set weekly budget honestly.</strong> Only invest money you will not need for bills or emergencies.</li>
+      <li><strong>Reinvest gains.</strong> Let winning trades compound. Even $5 of profit adds to your buying power.</li>
+      <li><strong>Be patient.</strong> Dip-buy strategies need pullbacks to generate signals. Some weeks will have zero trades.</li>
+      <li><strong>Scale up gradually.</strong> Move to Balanced profile and larger presets as your account grows past $500.</li>
+    </ol>
+    <div class="callout"><strong>Important:</strong> All trading involves risk. Past backtest results do not guarantee future performance. Never invest money you cannot afford to lose.</div>
+  </div>
+
+  <!-- ════════════════════════════════════════════════════════════════════
+       3. QUICK START
+       ════════════════════════════════════════════════════════════════════ -->
+  <div class="section"><h2>Quick Start (Step by Step)</h2>
+    <ol>
+      <li><strong>Launch the app.</strong> Start the backend server and open the desktop app. Verify the Dashboard loads without connection errors.</li>
+      <li><strong>Connect your broker.</strong> Go to Settings and save your Alpaca API credentials to Keychain. Start with paper trading keys.</li>
+      <li><strong>Load credentials.</strong> Click Load Keys from Keychain and confirm status badges show keys available.</li>
+      <li><strong>Set your budget.</strong> In Settings, configure your risk profile (Conservative for small accounts), weekly budget, and position size limits.</li>
+      <li><strong>Choose your universe.</strong> Open Screener, select Stocks or ETFs, pick a preset matching your budget, and confirm the symbol list loads.</li>
+      <li><strong>Inspect charts.</strong> Click any symbol to view its chart with SMA50/SMA250 overlays.</li>
+      <li><strong>Build a strategy.</strong> Pin symbols to a strategy from the chart, or create one directly on the Strategy page.</li>
+      <li><strong>Configure strategy parameters.</strong> Review the parameter sliders on the Strategy page. For small budgets, preset defaults are a good starting point.</li>
+      <li><strong>Backtest.</strong> Run a backtest to validate parameter choices. Look for positive total return and Sharpe ratio above 0.</li>
+      <li><strong>Activate and start.</strong> Activate at least one strategy, then click Start Runner.</li>
+      <li><strong>Monitor.</strong> Use Dashboard to track portfolio value and P&amp;L. Check Audit for trade history and events.</li>
+    </ol>
+  </div>
+
+  <!-- ════════════════════════════════════════════════════════════════════
+       4. STOCKS vs ETFs
+       ════════════════════════════════════════════════════════════════════ -->
+  <div class="section"><h2>Stocks vs ETFs</h2>
+    <h3>Individual Stocks</h3>
+    <ul>
+      <li><strong>More signals:</strong> Individual stocks dip more often, generating more trade opportunities.</li>
+      <li><strong>Higher potential:</strong> Single stocks can bounce 3-8% from a dip.</li>
+      <li><strong>More volatility:</strong> Larger drawdowns possible. Earnings can gap stocks down 10%+.</li>
+      <li><strong>Small Budget preset:</strong> Curated lower-priced stocks (INTC, PFE, CSCO) keep costs manageable.</li>
+      <li><strong>Best for:</strong> Active investors comfortable with daily monitoring.</li>
+    </ul>
+    <h3>ETFs (Exchange-Traded Funds)</h3>
+    <ul>
+      <li><strong>Built-in diversification:</strong> One ETF like SPY holds 500 stocks.</li>
+      <li><strong>Fewer signals:</strong> ETFs move less dramatically.</li>
+      <li><strong>Smoother equity curve:</strong> Less volatility, steadier growth.</li>
+      <li><strong>Simpler decisions:</strong> Fewer symbols, preset mode only.</li>
+      <li><strong>Best for:</strong> Beginners, hands-off investors, capital preservation.</li>
+    </ul>
+    <h3>Budget-Based Recommendation</h3>
+    <table>
+      <thead><tr><th>Budget Range</th><th>Recommended</th><th>Reasoning</th></tr></thead>
+      <tbody>
+        <tr><td>$100 - $200</td><td>Stocks (Small Budget Weekly)</td><td>Lower-priced stocks let you build multiple small positions.</td></tr>
+        <tr><td>$200 - $400</td><td>Either (depends on preference)</td><td>Stocks for activity; ETFs for simplicity.</td></tr>
+        <tr><td>$400 - $500+</td><td>Either or Both</td><td>Enough capital for meaningful positions in both.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- ════════════════════════════════════════════════════════════════════
+       5. PRESET GUIDE
+       ════════════════════════════════════════════════════════════════════ -->
+  <div class="section"><h2>Preset Guide</h2>
+    <h3>Stock Presets</h3>
+    <table>
+      <thead><tr><th>Preset</th><th>Goal</th><th>Best For</th><th>Seed Symbols</th></tr></thead>
+      <tbody>
+        <tr><td>Weekly Optimized</td><td>Higher activity and momentum-oriented stock basket.</td><td>$500+ accounts wanting active weekly trades.</td><td>NVDA, TSLA, AMD, META, AMZN, AAPL, MSFT, GOOGL, INTC, CRM</td></tr>
+        <tr><td>3-5 Trades/Week</td><td>Balanced activity with large-cap diversification.</td><td>$300-$500+ accounts seeking moderate activity.</td><td>AAPL, MSFT, AMZN, GOOGL, JPM, V, WMT, KO, PEP, DIS</td></tr>
+        <tr><td>Monthly Optimized</td><td>Lower-turnover large-cap basket for fewer entries.</td><td>Patient investors who check in weekly, not daily.</td><td>MSFT, AAPL, GOOGL, JPM, V, WMT, PEP, KO, CSCO, ORCL</td></tr>
+        <tr><td>Small Budget Weekly</td><td>Cost-aware weekly basket tuned for smaller accounts.</td><td>$100-$300 accounts. Lower-priced stocks keep position sizes affordable.</td><td>INTC, PFE, CSCO, PYPL, BABA, NKE, DIS, KO, XLF, IWM</td></tr>
+      </tbody>
+    </table>
+    <h3>ETF Presets</h3>
+    <table>
+      <thead><tr><th>Preset</th><th>Goal</th><th>Best For</th><th>Seed Symbols</th></tr></thead>
+      <tbody>
+        <tr><td>Conservative</td><td>Broad-market + defensive/fixed-income tilt.</td><td>Risk-averse investors or those building a base position.</td><td>SPY, VOO, IVV, AGG, TLT, XLP, XLV, VEA, VTI, DIA</td></tr>
+        <tr><td>Balanced</td><td>Mix of broad market, growth, and sector rotation.</td><td>General-purpose ETF portfolio with moderate risk.</td><td>SPY, QQQ, VTI, IWM, XLF, XLK, XLI, VEA, VWO, AGG</td></tr>
+        <tr><td>Aggressive</td><td>Higher-beta ETF mix with growth/cyclical exposure.</td><td>$500+ accounts comfortable with larger swings.</td><td>QQQ, IWM, XLE, XLK, XLY, EEM, VWO, XLF, SPY, DIA</td></tr>
+      </tbody>
+    </table>
+    <div class="callout"><strong>Note:</strong> If a preset's seed list has fewer symbols than your requested limit, the app backfills from currently active stocks/ETFs.</div>
+    <h3>Full Preset Settings Matrix</h3>
+    <p class="small">Default guardrails and strategy parameters for each preset. Auto-Optimize may adjust these based on your equity, buying power, and holdings.</p>
+    <table>
+      <thead><tr><th>Preset</th><th>Goal</th><th>Risk Profile</th><th>Screener Guardrails</th><th>Strategy Defaults</th></tr></thead>
+      <tbody>
+        <tr><td>1) Stocks &gt; Most Active</td><td>Highest-liquidity stock list with adaptive portfolio-aware filtering.</td><td>Uses current Settings risk profile.</td><td>Limit slider 10-200. Base: min_dollar_volume 10M, max_spread_bps 50, max_sector_weight_pct 45.</td><td>Inherits from current stock preset defaults.</td></tr>
+        <tr><td>2) Stocks &gt; Weekly Optimized</td><td>Higher activity, momentum-leaning weekly cadence.</td><td>Auto-Optimize target: aggressive.</td><td>min_dollar_volume 20M, max_spread_bps 35, max_sector_weight_pct 40.</td><td><span class="mono">position_size 1200; risk 1.5%; SL 2.0%; TP 5.0%; trail 2.5%; ATR 2.0; z-score -1.2; dip 1.5%; hold 10d.</span></td></tr>
+        <tr><td>3) Stocks &gt; 3-5 Trades/Week</td><td>Balanced weekly turnover and diversification.</td><td>Auto-Optimize target: balanced.</td><td>min_dollar_volume 12M, max_spread_bps 45, max_sector_weight_pct 45.</td><td><span class="mono">position_size 1000; risk 1.2%; SL 2.5%; TP 6.0%; trail 2.8%; ATR 1.9; z-score -1.3; dip 2.0%; hold 7d.</span></td></tr>
+        <tr><td>4) Stocks &gt; Monthly Optimized</td><td>Lower-turnover swing profile with longer hold window.</td><td>Auto-Optimize target: balanced.</td><td>min_dollar_volume 8M, max_spread_bps 60, max_sector_weight_pct 50.</td><td><span class="mono">position_size 900; risk 1.0%; SL 3.5%; TP 8.0%; trail 3.5%; ATR 2.2; z-score -1.5; dip 2.5%; hold 30d.</span></td></tr>
+        <tr><td>5) Stocks &gt; Small Budget Weekly</td><td>Budget-sensitive weekly execution with tighter sizing.</td><td>Auto-Optimize target: conservative.</td><td>min_dollar_volume 5M, max_spread_bps 80, max_sector_weight_pct 55.</td><td><span class="mono">position_size 500; risk 0.8%; SL 2.0%; TP 5.0%; trail 2.5%; ATR 1.8; z-score -1.2; dip 1.5%; hold 10d.</span></td></tr>
+        <tr><td>6) ETFs &gt; Conservative</td><td>Defensive ETF profile with stricter liquidity/sector limits.</td><td>Directly set to conservative.</td><td>min_dollar_volume 15M, max_spread_bps 30, max_sector_weight_pct 35.</td><td><span class="mono">position_size 1000; risk 0.8%; SL 2.0%; TP 5.0%; trail 2.5%; ATR 1.6; z-score -1.0; dip 1.2%; hold 12d.</span></td></tr>
+        <tr><td>7) ETFs &gt; Balanced</td><td>Moderate ETF mix balancing rotation and drawdown control.</td><td>Directly set to balanced.</td><td>min_dollar_volume 10M, max_spread_bps 40, max_sector_weight_pct 40.</td><td><span class="mono">position_size 1000; risk 1.0%; SL 2.5%; TP 6.0%; trail 2.8%; ATR 1.9; z-score -1.2; dip 1.5%; hold 10d.</span></td></tr>
+        <tr><td>8) ETFs &gt; Aggressive</td><td>Higher-beta ETF profile seeking larger moves.</td><td>Directly set to aggressive.</td><td>min_dollar_volume 7M, max_spread_bps 55, max_sector_weight_pct 45.</td><td><span class="mono">position_size 1300; risk 1.4%; SL 3.5%; TP 8.0%; trail 3.5%; ATR 2.0; z-score -1.5; dip 2.0%; hold 8d.</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- ════════════════════════════════════════════════════════════════════
+       6. DASHBOARD
+       ════════════════════════════════════════════════════════════════════ -->
+  <div class="section"><h2>Dashboard</h2>
+    <ul>
+      <li><strong>Top banner</strong> shows active asset mode, runner state, broker mode, and open holdings count.</li>
+      <li><strong>Summary cards</strong> display total value, unrealized P&amp;L, open positions, and current equity.</li>
+      <li><strong>Performance charts</strong> show equity curve and cumulative P&amp;L. Use 7D/30D/90D/180D/All range buttons.</li>
+      <li><strong>Strategy Runner card</strong> shows runner state, loaded strategies, poll interval, broker connectivity, and sleep/auto-resume status.</li>
+      <li><strong>Start/Stop controls</strong> manage the strategy execution engine.</li>
+      <li><strong>Panic Stop</strong> is available directly from Dashboard for emergency freeze and liquidation.</li>
+      <li><strong>Holdings table</strong> shows each position's symbol, type, market value, and portfolio weight %. Filter by Stocks or ETFs.</li>
+    </ul>
+  </div>
+
+  <!-- ════════════════════════════════════════════════════════════════════
+       7. SCREENER
+       ════════════════════════════════════════════════════════════════════ -->
+  <div class="section"><h2>Screener</h2>
+    <ul>
+      <li><strong>Asset Type</strong> selects Stocks or ETFs. ETF mode uses Preset only.</li>
+      <li><strong>Stocks</strong> support Most Active mode (dynamic, 10-200 symbols) or Strategy Preset mode (curated seed lists).</li>
+      <li><strong>Workspace Controls</strong> let you set budget, position limits, daily loss caps, and quality filters.</li>
+      <li><strong>Charts</strong> display price with SMA50 and SMA250 overlays. Use timeframe switches and pin-to-strategy action.</li>
+      <li><strong>Auto Regime Adjust</strong> adapts quality filters based on current market conditions.</li>
+    </ul>
+    <h3>Universe Wiring</h3>
+    <table>
+      <thead><tr><th>Mode</th><th>Source</th><th>Behavior</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td>Stocks + Most Active</td><td>Alpaca most-active stocks (strict mode blocks fallback)</td><td>Uses /screener/all with screener_mode=most_active; slider controls 10-200 symbols.</td><td>Portfolio-aware guardrails and overlap/concentration penalties are applied before final ranking.</td></tr>
+        <tr><td>Stocks + Strategy Preset</td><td>Curated stock preset seed symbols + active stock backfill</td><td>Uses /screener/preset; preset selection swaps seed universe and re-optimizes guardrails.</td><td>If preset seed has fewer symbols than requested limit, backfill comes from active stocks.</td></tr>
+        <tr><td>ETFs + Preset</td><td>Curated ETF preset seed symbols + active ETF backfill</td><td>Uses /screener/preset; ETF mode is preset-only.</td><td>Risk profile is aligned to ETF preset (Conservative/Balanced/Aggressive).</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- ════════════════════════════════════════════════════════════════════
+       8. STRATEGY
+       ════════════════════════════════════════════════════════════════════ -->
+  <div class="section"><h2>Strategy</h2>
+    <ul>
+      <li><strong>Create</strong> strategies with a symbol universe and optional description.</li>
+      <li><strong>Configure</strong> parameters using sliders. Each slider has a helper description.</li>
+      <li><strong>Activate/deactivate</strong> strategies individually. Only active strategies generate signals.</li>
+      <li><strong>Backtest panel</strong> shows total return, final capital, drawdown, win rate, Sharpe ratio, and trade sample.</li>
+      <li><strong>Start Runner</strong> from this page to begin automated trading.</li>
+      <li><strong>Runner sleep:</strong> Outside market hours, the runner enters sleeping state and auto-resumes.</li>
+      <li><strong>Sell Off All Holdings</strong> liquidates open positions only when explicitly clicked.</li>
+      <li><strong>Remove Defunct Strategies</strong> cleans empty/deprecated entries.</li>
+    </ul>
+    <div class="callout"><strong>Important:</strong> Changing a strategy does not auto-liquidate existing holdings. Use &quot;Sell Off All Holdings&quot; explicitly if needed.</div>
+  </div>
+
+  <!-- ════════════════════════════════════════════════════════════════════
+       9. BACKTEST & DIAGNOSTICS GUIDE
+       ════════════════════════════════════════════════════════════════════ -->
+  <div class="section"><h2>Backtest &amp; Diagnostics Guide</h2>
+    <p>Backtesting simulates your strategy against historical data to validate parameter choices before risking real money.</p>
+    <h3>Key Metrics to Watch</h3>
+    <table>
+      <thead><tr><th>Metric</th><th>Guidance</th></tr></thead>
+      <tbody>
+        <tr><td>Total Return</td><td>Percentage gain/loss over the period. Should be positive.</td></tr>
+        <tr><td>Sharpe Ratio</td><td>Risk-adjusted return. Above 0.5 is OK, above 1.0 is good. Negative = bad.</td></tr>
+        <tr><td>Win Rate</td><td>Percentage of profitable trades. 45-55% is normal for dip-buy.</td></tr>
+        <tr><td>Max Drawdown</td><td>Largest peak-to-trough drop. Keep under 10-15% for small accounts.</td></tr>
+      </tbody>
+    </table>
+    <h3>Diagnostic Messages</h3>
+    <table>
+      <thead><tr><th>Diagnostic</th><th>Meaning</th><th>How to Fix</th></tr></thead>
+      <tbody>
+        <tr><td>No dip-buy signal</td><td>Price was not far enough below SMA50 and/or Z-Score was not negative enough to trigger a buy.</td><td>Lower dip_buy_threshold_pct (e.g., 2.0 to 1.0) and/or raise zscore_entry_threshold closer to 0 (e.g., -1.5 to -0.8).</td></tr>
+        <tr><td>Insufficient indicator history</td><td>Not enough price bars to calculate SMA50, SMA250, or Z-Score for the first portion of the backtest.</td><td>Extend the backtest date range so there are at least 250+ trading days of data.</td></tr>
+        <tr><td>Already in open position</td><td>A signal was generated but the strategy was already holding that symbol.</td><td>Tighten exits: lower take_profit_pct, trailing_stop_pct, or reduce max_hold_days to free capital faster.</td></tr>
+      </tbody>
+    </table>
+    <h3>Tuning Workflow</h3>
+    <ol>
+      <li><strong>0 trades?</strong> Loosen entries: lower dip_buy_threshold_pct (try 1.0), raise zscore_entry_threshold (try -0.8).</li>
+      <li><strong>Low return / negative Sharpe?</strong> Tighten exits: lower take_profit_pct (try 2-3%), lower trailing_stop_pct (try 1.2-1.5%).</li>
+      <li><strong>&quot;Already in open position&quot; dominates?</strong> Reduce max_hold_days or tighten exits.</li>
+      <li><strong>High drawdown?</strong> Lower stop_loss_pct and reduce position_size relative to capital.</li>
+      <li><strong>Win rate under 40%?</strong> Tighten zscore_entry_threshold (more negative).</li>
+    </ol>
+    <div class="callout"><strong>Note:</strong> Use at least 1 year (250+ trading days) of history for reliable backtest results.</div>
+  </div>
+
+  <!-- ════════════════════════════════════════════════════════════════════
+       10. AUDIT
+       ════════════════════════════════════════════════════════════════════ -->
+  <div class="section"><h2>Audit</h2>
+    <ul>
+      <li><strong>Events tab</strong> shows system events with severity context.</li>
+      <li><strong>Trades tab</strong> shows complete trade history with symbol and date filtering.</li>
+      <li><strong>Exports tab</strong> supports CSV and PDF export.</li>
+      <li><strong>Quick chips</strong> (Today / 7D / 30D / Errors / Runner Events) accelerate filtering.</li>
+      <li><strong>Reset Audit Data</strong> performs a testing reset. Runner must be stopped first.</li>
+    </ul>
+  </div>
+
+  <!-- ════════════════════════════════════════════════════════════════════
+       11. SETTINGS
+       ════════════════════════════════════════════════════════════════════ -->
+  <div class="section"><h2>Settings</h2>
+    <ul>
+      <li><strong>Alpaca credentials</strong> for paper/live are stored in macOS Keychain and auto-loaded on startup.</li>
+      <li><strong>Strict Alpaca Data Mode</strong> (default on) makes screener/chart/backtest/runner fail fast when real data is unavailable.</li>
+      <li><strong>Backend API-key auth</strong> is optional. Local desktop usage keeps it disabled by default.</li>
+      <li><strong>Risk profile</strong> (Conservative/Balanced/Aggressive) defines sizing behavior and guardrail defaults.</li>
+      <li><strong>Weekly budget</strong> and screener preferences drive symbol selection and allocation.</li>
+      <li><strong>Safety Controls:</strong> Kill Switch (blocks new orders) and Panic Stop (emergency liquidation).</li>
+      <li><strong>Storage &amp; Retention</strong> includes cleanup actions and log/audit file visibility.</li>
+      <li><strong>Notifications:</strong> Desktop alerts, email/SMS summary delivery configuration.</li>
+    </ul>
+  </div>
+
+  <!-- ════════════════════════════════════════════════════════════════════
+       12. STRATEGY PARAMETER REFERENCE
+       ════════════════════════════════════════════════════════════════════ -->
+  <div class="section"><h2>Strategy Parameter Reference</h2>
+    <table>
+      <thead><tr><th>Parameter</th><th>Meaning</th><th>Example</th></tr></thead>
+      <tbody>
+        <tr><td>Position Size ($)</td><td>The dollar amount allocated per trade. For small accounts, keep this well below your total capital to allow multiple positions.</td><td>With $250 capital, a $80 position size lets you hold ~3 positions simultaneously.</td></tr>
+        <tr><td>Risk Per Trade (%)</td><td>Maximum percentage of your total capital you are willing to lose on a single trade. Lower values protect small accounts from outsized losses.</td><td>0.8% risk on a $300 account = $2.40 max loss per trade.</td></tr>
+        <tr><td>Stop Loss (%)</td><td>If a stock drops this percentage below your entry price, the position is automatically sold to limit losses.</td><td>2% stop loss on a $50 entry triggers a sell at $49.</td></tr>
+        <tr><td>Take Profit (%)</td><td>When a stock rises this percentage above entry, the position is sold to lock in gains.</td><td>5% take profit on a $50 entry triggers a sell at $52.50.</td></tr>
+        <tr><td>Trailing Stop (%)</td><td>A dynamic stop that follows the price upward. If the stock rises to $55 then drops 2.5%, it sells at ~$53.63 instead of waiting for the fixed stop.</td><td>Protects profits on stocks that run up before pulling back.</td></tr>
+        <tr><td>ATR Stop Multiplier</td><td>Uses the stock's own volatility (Average True Range) to set a smarter stop distance. Higher values give volatile stocks more room.</td><td>1.8x ATR on a stock with ATR of $1.50 sets the stop $2.70 below the high.</td></tr>
+        <tr><td>Z-Score Entry Threshold</td><td>Measures how far below its recent average a stock has fallen. More negative = deeper dip required. Values closer to 0 trigger on smaller pullbacks.</td><td>-1.0 triggers on moderate dips; -2.0 waits for significant selloffs.</td></tr>
+        <tr><td>Dip Buy Threshold (%)</td><td>How far below the 50-day moving average the price must drop to qualify as a dip-buy opportunity. Works together with Z-Score.</td><td>1.5% means the price must be at least 1.5% below SMA50.</td></tr>
+        <tr><td>Max Hold Days</td><td>Maximum number of trading days to hold a position. Forces exit if neither stop loss nor take profit has triggered.</td><td>10 days = roughly 2 calendar weeks of holding.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- ════════════════════════════════════════════════════════════════════
+       13. CONTROLS & LIMITS GLOSSARY
+       ════════════════════════════════════════════════════════════════════ -->
+  <div class="section"><h2>Controls &amp; Limits Glossary</h2>
+    <table>
+      <thead><tr><th>Control</th><th>Location</th><th>What It Does</th><th>Range</th></tr></thead>
+      <tbody>
+        <tr><td>Asset Type</td><td>Screener</td><td>Switches between Stocks and ETFs. ETFs use Preset mode only.</td><td>Stocks or ETFs</td></tr>
+        <tr><td>Universe Source</td><td>Screener (Stocks)</td><td>Choose Most Active (dynamic) or Strategy Preset (curated) stock universe.</td><td>Most Active or Preset</td></tr>
+        <tr><td>Most Active Count</td><td>Screener (Stocks + Most Active)</td><td>Number of ranked active stocks to fetch and screen.</td><td>10-200</td></tr>
+        <tr><td>Preset</td><td>Screener</td><td>Selects a curated seed universe and default risk/strategy profile.</td><td>Stock: 4, ETF: 3</td></tr>
+        <tr><td>Weekly Budget ($)</td><td>Screener</td><td>Maximum amount you plan to invest each week. Used for sizing and optimization.</td><td>$50-$1,000,000</td></tr>
+        <tr><td>Max Position Size ($)</td><td>Screener + Settings</td><td>Per-position dollar cap. Runner may size lower based on buying power.</td><td>$1-$5,000,000</td></tr>
+        <tr><td>Daily Loss Limit ($)</td><td>Screener + Settings</td><td>If daily losses reach this amount, new orders are blocked for the day.</td><td>$1-$1,000,000</td></tr>
+        <tr><td>Min Dollar Volume ($)</td><td>Screener</td><td>Liquidity floor. Stocks trading less than this daily volume are excluded.</td><td>$0-$1T</td></tr>
+        <tr><td>Max Spread (bps)</td><td>Screener</td><td>Trading cost filter. Stocks with wider bid-ask spreads are excluded.</td><td>1-2000</td></tr>
+        <tr><td>Max Sector Weight (%)</td><td>Screener</td><td>Caps how much of your screened universe comes from one sector.</td><td>5-100%</td></tr>
+        <tr><td>Auto Regime Adjust</td><td>Screener</td><td>Automatically adapts volume/spread filters based on current market conditions (trending, ranging, volatile).</td><td>On or Off</td></tr>
+        <tr><td>Paper Trading Mode</td><td>Settings</td><td>Toggle between paper (simulated) and live (real money) Alpaca account.</td><td>Paper or Live</td></tr>
+        <tr><td>Runner Poll Interval</td><td>Settings</td><td>How often (in seconds) the strategy engine checks for new signals.</td><td>Configurable</td></tr>
+        <tr><td>Realtime Stream Assist</td><td>Settings</td><td>Uses WebSocket for faster data updates alongside regular polling.</td><td>On or Off</td></tr>
+        <tr><td>Kill Switch</td><td>Settings</td><td>Blocks ALL new orders globally until disabled. Existing positions are kept open.</td><td>On or Off</td></tr>
+        <tr><td>Summary Notifications</td><td>Settings &gt; Notifications</td><td>Enables scheduled email or SMS transaction summary delivery.</td><td>On or Off</td></tr>
+        <tr><td>Summary Frequency</td><td>Settings &gt; Notifications</td><td>How often summaries are sent.</td><td>Daily or Weekly</td></tr>
+        <tr><td>Summary Channel</td><td>Settings &gt; Notifications</td><td>Delivery method for summaries.</td><td>Email or SMS</td></tr>
+        <tr><td>Summary Recipient</td><td>Settings &gt; Notifications</td><td>Email address or phone number for summary delivery.</td><td>Email or E.164 phone</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- ════════════════════════════════════════════════════════════════════
+       14. METRIC DEFINITIONS
+       ════════════════════════════════════════════════════════════════════ -->
+  <div class="section"><h2>Metric Definitions</h2>
+    <table>
+      <thead><tr><th>Metric</th><th>What It Tells You</th></tr></thead>
+      <tbody>
+        <tr><td>Total Value</td><td>Current market value of all your open positions combined.</td></tr>
+        <tr><td>Unrealized P&amp;L</td><td>How much your open positions are up or down right now (not yet sold).</td></tr>
+        <tr><td>Realized P&amp;L</td><td>Actual profit or loss from trades you have already closed.</td></tr>
+        <tr><td>Win Rate</td><td>Percentage of closed trades that made money. 50%+ is typical for dip-buy strategies.</td></tr>
+        <tr><td>Drawdown</td><td>The largest peak-to-trough drop in your account value. Smaller is better.</td></tr>
+        <tr><td>Volatility</td><td>How much your account value fluctuates. Lower volatility means smoother returns.</td></tr>
+        <tr><td>Sharpe Ratio</td><td>Risk-adjusted return score. Above 1.0 is good, above 2.0 is excellent. Negative means returns do not justify the risk.</td></tr>
+        <tr><td>Cost Basis</td><td>Total amount of capital currently tied up in open positions.</td></tr>
+        <tr><td>SMA50 / SMA250</td><td>50-day and 250-day moving averages. Price above both = uptrend. Price below SMA50 = potential dip-buy zone.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- ════════════════════════════════════════════════════════════════════
+       15. EMAIL & SMS NOTIFICATIONS
+       ════════════════════════════════════════════════════════════════════ -->
+  <div class="section"><h2>Email &amp; SMS Notifications</h2>
+    <ol>
+      <li>Open <strong>Settings &gt; Notifications</strong>.</li>
+      <li>Enable <strong>Transaction Summary via Email/SMS</strong>.</li>
+      <li>Select <strong>Frequency</strong> (Daily or Weekly).</li>
+      <li>Select <strong>Channel</strong> (Email or SMS), enter a valid recipient, and save.</li>
+      <li>Use <strong>Send Summary Now</strong> to validate delivery immediately.</li>
+    </ol>
+    <h3>Required Backend Environment Variables</h3>
+    <table>
+      <thead><tr><th>Channel</th><th>Variables</th></tr></thead>
+      <tbody>
+        <tr><td>Email (SMTP)</td><td>STOCKSBOT_SMTP_HOST, STOCKSBOT_SMTP_PORT, STOCKSBOT_SMTP_USERNAME, STOCKSBOT_SMTP_PASSWORD, STOCKSBOT_SMTP_FROM_EMAIL</td></tr>
+        <tr><td>SMS (Twilio)</td><td>STOCKSBOT_TWILIO_ACCOUNT_SID, STOCKSBOT_TWILIO_AUTH_TOKEN, STOCKSBOT_TWILIO_FROM_NUMBER</td></tr>
+      </tbody>
+    </table>
+    <div class="callout"><strong>Note:</strong> Email uses standard address format. SMS uses E.164 format (+15551234567).</div>
+  </div>
+
+  <!-- ════════════════════════════════════════════════════════════════════
+       16. SAFETY & RISK CONTROLS
+       ════════════════════════════════════════════════════════════════════ -->
+  <div class="section"><h2>Safety &amp; Risk Controls</h2>
+    <table>
+      <thead><tr><th>Control</th><th>Scope</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td>Stop Loss</td><td>Per trade</td><td>Automatically exits if price drops below set percentage from entry.</td></tr>
+        <tr><td>Trailing Stop</td><td>Per trade</td><td>Dynamic stop that follows price upward and locks in gains.</td></tr>
+        <tr><td>Daily Loss Limit</td><td>Account</td><td>Blocks new orders if daily losses reach configured limit.</td></tr>
+        <tr><td>Max Position Size</td><td>Per trade</td><td>Caps dollar amount per position to prevent overconcentration.</td></tr>
+        <tr><td>Kill Switch</td><td>Global</td><td>Blocks ALL new orders until disabled. Existing positions stay open.</td></tr>
+        <tr><td>Panic Stop</td><td>Emergency</td><td>Stops runner AND liquidates all positions.</td></tr>
+      </tbody>
+    </table>
+    <div class="callout"><strong>Important:</strong> For small accounts, use stop_loss 1.5-2%, risk_per_trade 0.5-0.8%, daily loss limit $5-$15.</div>
+  </div>
+
+  <!-- ════════════════════════════════════════════════════════════════════
+       17. TROUBLESHOOTING
+       ════════════════════════════════════════════════════════════════════ -->
+  <div class="section"><h2>Troubleshooting</h2>
+    <table>
+      <thead><tr><th>Issue</th><th>Solution</th></tr></thead>
+      <tbody>
+        <tr><td>Screener or charts show &quot;Load failed&quot;</td><td>Check that the backend is running. Verify broker connectivity in Settings or Dashboard, then refresh the Screener page.</td></tr>
+        <tr><td>Keychain prompt keeps reappearing</td><td>Clear stale StocksBot entries in macOS Keychain Access for service com.stocksbot.alpaca, then re-save keys from Settings.</td></tr>
+        <tr><td>Runner start fails with &quot;no active strategies&quot;</td><td>Create and activate at least one strategy with valid symbols before pressing Start Runner.</td></tr>
+        <tr><td>Auth errors (401) on API calls</td><td>If backend API-key auth is enabled, requests must include X-API-Key or Bearer token matching STOCKSBOT_API_KEY.</td></tr>
+        <tr><td>Reset Audit Data does nothing</td><td>The runner must be stopped first. Reset is intentionally blocked while the runner is running or sleeping.</td></tr>
+        <tr><td>Send Summary Now returns a delivery error</td><td>Summary delivery requires real SMTP or Twilio credentials. Configure the required env vars and enable summary preferences before retrying.</td></tr>
+        <tr><td>SMS recipient is rejected</td><td>Use E.164 format for phone numbers, for example: +15551234567. Save Settings again after correcting.</td></tr>
+        <tr><td>Backtest shows 0 trades</td><td>Entry thresholds are likely too strict. Lower dip_buy_threshold_pct and raise zscore_entry_threshold toward 0. See the Backtest Guide section.</td></tr>
+        <tr><td>Backtest has trades but negative Sharpe</td><td>Exit thresholds may be too wide. Reduce take_profit_pct and trailing_stop_pct so trades close faster. See the Backtest Guide section.</td></tr>
+        <tr><td>Positions never sell</td><td>Check that take_profit_pct, trailing_stop_pct, and stop_loss_pct are not set to very large values. Also check max_hold_days.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- ════════════════════════════════════════════════════════════════════
+       18. FAQ
+       ════════════════════════════════════════════════════════════════════ -->
+  <div class="section"><h2>Frequently Asked Questions</h2>
+    <div class="faq"><p class="faq-q">Can I really start trading with just $100?</p><p>Yes. Use the &quot;Small Budget Weekly&quot; stock preset and set position sizes to $50-$80. Alpaca supports fractional shares, so even high-priced stocks like AAPL can be purchased in small dollar amounts. Always start with paper trading to validate your setup before risking real money.</p></div>
+    <div class="faq"><p class="faq-q">Should I choose Stocks or ETFs?</p><p>ETFs are simpler and inherently diversified, making them ideal for beginners or hands-off investors. Individual stocks offer more signals and potentially higher returns, but with more volatility. With small budgets ($100-$300), stocks in the Small Budget preset are specifically chosen for affordability.</p></div>
+    <div class="faq"><p class="faq-q">What does &quot;paper trading&quot; mean?</p><p>Paper trading uses a simulated Alpaca account with fake money. It behaves identically to live trading, so you can test strategies without risking real capital. Always paper trade a strategy for at least 1-2 weeks before going live.</p></div>
+    <div class="faq"><p class="faq-q">How much should I set my weekly budget to?</p><p>Set it to the amount you can comfortably invest each week without affecting your living expenses. $30-$100/week is a solid starting range. The bot uses this to size positions and manage how many trades it takes per week.</p></div>
+    <div class="faq"><p class="faq-q">What is a &quot;dip buy&quot; strategy?</p><p>StocksBot uses a mean-reversion approach. It waits for a stock to dip below its recent average (measured by SMA50 and Z-Score), buys the dip, and sells when the price recovers. Think of it as &quot;buy low, sell when it bounces back.&quot;</p></div>
+    <div class="faq"><p class="faq-q">What if the market crashes?</p><p>Multiple safety layers protect you: stop-loss exits limit individual trade losses, daily loss limits pause trading after a bad day, the Kill Switch blocks all new orders instantly, and Panic Stop can liquidate all positions in an emergency.</p></div>
+    <div class="faq"><p class="faq-q">How do I know if my backtest settings are good?</p><p>A healthy backtest shows: positive total return, Sharpe ratio above 0.5, drawdown under 10-15%, and win rate near 50% or above. If you see 0 trades, loosen entries. If Sharpe is negative, tighten exits. See the Backtest Guide section for details.</p></div>
+    <div class="faq"><p class="faq-q">Can I run the bot and forget about it?</p><p>The bot is designed for semi-automated trading, but you should check in at least weekly. Review Dashboard for portfolio health, check Audit for any errors, and ensure the runner is still active. Enable email/SMS notifications to stay informed without opening the app.</p></div>
+    <div class="faq"><p class="faq-q">What happens outside market hours?</p><p>The runner enters a &quot;sleeping&quot; state outside market hours (weekends, holidays, after 4 PM ET). It automatically resumes when the next trading session opens. No action needed from you.</p></div>
+    <div class="faq"><p class="faq-q">How do I add or remove symbols from my strategy?</p><p>Use the Screener to browse available stocks/ETFs, click the chart button, then use the &quot;pin to strategy&quot; action. To remove symbols, go to the Strategy page and edit the symbol list directly.</p></div>
+  </div>
+
+  <!-- ════════════════════════════════════════════════════════════════════
+       19. AUDIT EVENT TYPES
+       ════════════════════════════════════════════════════════════════════ -->
+  <div class="section"><h2>Audit Event Types</h2>
+    <table>
+      <thead><tr><th>Event</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><span class="mono">order_created</span></td><td>A new buy or sell order was submitted to the broker.</td></tr>
+        <tr><td><span class="mono">order_filled</span></td><td>An order was fully executed at the broker.</td></tr>
+        <tr><td><span class="mono">order_cancelled</span></td><td>An order was cancelled before being filled.</td></tr>
+        <tr><td><span class="mono">strategy_started</span></td><td>A strategy was activated and is now eligible for signals.</td></tr>
+        <tr><td><span class="mono">strategy_stopped</span></td><td>A strategy was deactivated.</td></tr>
+        <tr><td><span class="mono">position_opened</span></td><td>A new position was established after an order filled.</td></tr>
+        <tr><td><span class="mono">position_closed</span></td><td>A position was fully exited (sold).</td></tr>
+        <tr><td><span class="mono">config_updated</span></td><td>A setting or strategy parameter was changed.</td></tr>
+        <tr><td><span class="mono">runner_started</span></td><td>The strategy runner engine was started.</td></tr>
+        <tr><td><span class="mono">runner_stopped</span></td><td>The strategy runner engine was stopped.</td></tr>
+        <tr><td><span class="mono">error</span></td><td>An error occurred (check details for specifics).</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="footer">StocksBot Help &amp; Guide &middot; February 14, 2026 &middot; All trading involves risk &middot; Past performance does not guarantee future results</div>
+</body>
+</html>

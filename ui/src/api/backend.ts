@@ -50,6 +50,7 @@ import {
   ParameterTuneResponse,
   TradingPreferences,
   TradingPreferencesUpdateRequest,
+  BudgetStatus,
   PreferenceRecommendationResponse,
   SymbolChartResponse,
   AssetTypePreference,
@@ -801,6 +802,17 @@ export async function updateTradingPreferences(
     asset_type: normalizedAssetType,
     screener_mode: normalizedAssetType === 'stock' ? raw.screener_mode : 'preset',
   };
+}
+
+/**
+ * Get weekly budget usage snapshot.
+ */
+export async function getBudgetStatus(): Promise<BudgetStatus> {
+  const response = await authFetch(`${BACKEND_URL}/budget/status`);
+  if (!response.ok) {
+    throw new Error(`Backend returned ${response.status}`);
+  }
+  return response.json();
 }
 
 /**

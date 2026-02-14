@@ -16,6 +16,9 @@ import {
   tuneParameter,
   getTradingPreferences,
   getScreenerAssets,
+  getPreferenceRecommendation,
+  getBudgetStatus,
+  getPortfolioSummary,
   getConfig,
   getBrokerAccount,
   getSafetyPreflight,
@@ -27,9 +30,12 @@ import {
   StrategyConfig,
   StrategyMetrics,
   BacktestResult,
+  BacktestDiagnostics,
   StrategyParameter,
   AssetTypePreference,
   TradingPreferences,
+  PreferenceRecommendationResponse,
+  BudgetStatus,
   ConfigResponse,
   BrokerAccountResponse,
 } from '../api/types';
@@ -54,12 +60,15 @@ interface RunnerInputSummary {
   preferences: TradingPreferences | null;
   config: ConfigResponse | null;
   brokerAccount: BrokerAccountResponse | null;
+  recommendation: PreferenceRecommendationResponse | null;
+  budgetStatus: BudgetStatus | null;
   activeStrategyCount: number;
   activeSymbolCount: number;
   activeSymbolsPreview: string[];
   inactiveStrategyCount: number;
   inactiveSymbolCount: number;
   inactiveSymbolsPreview: string[];
+  openPositionCount: number;
   generatedAt: string;
 }
 
@@ -96,6 +105,45 @@ function formatLocalDateTime(value: string | null | undefined): string {
   return parsed.toLocaleString();
 }
 
+function safeNumber(value: unknown, fallback = 0): number {
+  const parsed = typeof value === 'number' ? value : Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function computeEstimatedDynamicPositionSize(input: {
+  requestedPositionSize: number;
+  symbolCount: number;
+  existingPositionCount: number;
+  remainingWeeklyBudget: number;
+  buyingPower: number;
+  equity: number;
+  riskPerTradePct: number;
+  stopLossPct: number;
+}): number {
+  const requested = Math.max(25, safeNumber(input.requestedPositionSize, 1000));
+  const plannedSlots = Math.max(1, Math.round(Math.max(1, safeNumber(input.symbolCount, 1))));
+  const activeSlots = Math.max(0, Math.round(Math.max(0, safeNumber(input.existingPositionCount, 0))));
+  const slotsDenominator = Math.max(1, plannedSlots + Math.min(activeSlots, plannedSlots));
+  const caps: number[] = [requested];
+  const remaining = safeNumber(input.remainingWeeklyBudget, 0);
+  const buyingPower = safeNumber(input.buyingPower, 0);
+  const equity = safeNumber(input.equity, 0);
+  if (remaining > 0) caps.push(Math.max(50, remaining / slotsDenominator));
+  if (buyingPower > 0) caps.push(Math.max(75, buyingPower * 0.25));
+  if (equity > 0) {
+    caps.push(Math.max(75, equity * 0.1));
+    const riskPct = Math.max(0.1, Math.min(5, safeNumber(input.riskPerTradePct, 1)));
+    const stopLossPct = Math.max(0.5, Math.min(10, safeNumber(input.stopLossPct, 2)));
+    const riskDollars = equity * (riskPct / 100);
+    const positionFromRisk = riskDollars / (stopLossPct / 100);
+    caps.push(Math.max(50, positionFromRisk));
+  }
+  let sized = Math.min(...caps);
+  if (activeSlots >= 6) sized *= 0.85;
+  else if (activeSlots >= 3) sized *= 0.93;
+  return Math.max(50, Math.round(sized * 100) / 100);
+}
+
 function readWorkspaceSnapshot(): WorkspaceSnapshot | null {
   if (typeof window === 'undefined') return null;
   try {
@@ -126,6 +174,41 @@ function normalizeSymbols(raw: string): string[] {
 
 function isIsoDate(value: string): boolean {
   return /^\d{4}-\d{2}-\d{2}$/.test(value);
+}
+
+const BACKTEST_BLOCKER_LABELS: Record<string, string> = {
+  insufficient_history: 'Insufficient indicator history',
+  no_dip_signal: 'No dip-buy signal',
+  regime_filtered: 'Regime filter rejected',
+  already_in_position: 'Already in open position',
+  risk_cap_too_low: 'Risk cap too low',
+  invalid_position_size: 'Invalid position size',
+  cash_insufficient: 'Insufficient cash',
+};
+
+function getBacktestBlockerHint(reason: string): string {
+  switch (reason) {
+    case 'insufficient_history':
+      return 'Increase date range so more bars are available.';
+    case 'no_dip_signal':
+      return 'Loosen entries: lower dip_buy_threshold_pct and/or raise zscore_entry_threshold toward 0.';
+    case 'regime_filtered':
+      return 'Try different symbols or dates; current regime filter allows range-bound and trending-up only.';
+    case 'already_in_position':
+      return 'Entries are being held; tighten exits (smaller take-profit/stop windows) if you want faster turnover.';
+    case 'risk_cap_too_low':
+      return 'Increase risk_per_trade or initial capital, or reduce constraints causing tiny position sizing.';
+    case 'invalid_position_size':
+      return 'Check position_size and risk_per_trade values; computed position size must be positive.';
+    case 'cash_insufficient':
+      return 'Lower position_size or increase initial capital.';
+    default:
+      return 'Adjust symbols, date range, and entry/exit thresholds.';
+  }
+}
+
+function formatBlockerLabel(reason: string): string {
+  return BACKTEST_BLOCKER_LABELS[reason] || reason.replace(/_/g, ' ');
 }
 
 /**
@@ -167,17 +250,21 @@ function StrategyPage() {
   // Backtest state
   const [backtestLoading, setBacktestLoading] = useState(false);
   const [backtestResult, setBacktestResult] = useState<BacktestResult | null>(null);
+  const [backtestCompletedAt, setBacktestCompletedAt] = useState<string | null>(null);
   const [backtestStartDate, setBacktestStartDate] = useState('2024-01-01');
   const [backtestEndDate, setBacktestEndDate] = useState('2024-12-31');
   const [backtestCapital, setBacktestCapital] = useState('100000');
   const [detailTab, setDetailTab] = useState<'metrics' | 'config' | 'backtest'>('metrics');
   const activeStrategyCount = strategies.filter((s) => s.status === StrategyStatus.ACTIVE).length;
   const runnerIsActive = runnerStatus === 'running' || runnerStatus === 'sleeping';
+  const backtestDiagnostics: BacktestDiagnostics | null = backtestResult?.diagnostics || null;
+  const topBacktestBlockers = (backtestDiagnostics?.top_blockers || []).filter((item) => item.count > 0);
   const [settingsSummary, setSettingsSummary] = useState<string>('Loading trading preferences...');
   const [cleanupLoading, setCleanupLoading] = useState(false);
   const [runnerInputSummary, setRunnerInputSummary] = useState<RunnerInputSummary | null>(null);
   const [runnerInputSummaryLoading, setRunnerInputSummaryLoading] = useState(false);
   const [workspaceLastAppliedAt, setWorkspaceLastAppliedAt] = useState<string | null>(null);
+  const [workspaceSnapshot, setWorkspaceSnapshot] = useState<WorkspaceSnapshot | null>(null);
   const [prefillMessage, setPrefillMessage] = useState<string>('');
   const [prefillLoading, setPrefillLoading] = useState(false);
 
@@ -201,8 +288,10 @@ function StrategyPage() {
       if (typeof window === 'undefined') return;
       try {
         setWorkspaceLastAppliedAt(window.localStorage.getItem(WORKSPACE_LAST_APPLIED_AT_KEY));
+        setWorkspaceSnapshot(readWorkspaceSnapshot());
       } catch {
         setWorkspaceLastAppliedAt(null);
+        setWorkspaceSnapshot(null);
       }
     };
     const handleWorkspaceApplied = (event: Event) => {
@@ -280,22 +369,36 @@ function StrategyPage() {
         });
       });
 
-      const [prefs, config, brokerAccount] = await Promise.all([
+      const [prefs, config, brokerAccount, budgetStatus, portfolioSummary] = await Promise.all([
         getTradingPreferences().catch(() => null),
         getConfig().catch(() => null),
         getBrokerAccount().catch(() => null),
+        getBudgetStatus().catch(() => null),
+        getPortfolioSummary().catch(() => null),
       ]);
+      let recommendation: PreferenceRecommendationResponse | null = null;
+      if (prefs) {
+        const preset = prefs.asset_type === 'etf' ? prefs.etf_preset : prefs.stock_preset;
+        recommendation = await getPreferenceRecommendation({
+          asset_type: prefs.asset_type,
+          preset,
+          weekly_budget: prefs.weekly_budget,
+        }).catch(() => null);
+      }
 
       setRunnerInputSummary({
         preferences: prefs,
         config,
         brokerAccount,
+        recommendation,
+        budgetStatus,
         activeStrategyCount: activeStrategies.length,
         activeSymbolCount: symbolSet.size,
         activeSymbolsPreview: Array.from(symbolSet).slice(0, 12),
         inactiveStrategyCount: inactiveStrategies.length,
         inactiveSymbolCount: inactiveSymbolSet.size,
         inactiveSymbolsPreview: Array.from(inactiveSymbolSet).slice(0, 12),
+        openPositionCount: Math.max(0, Math.round(Number(portfolioSummary?.total_positions || 0))),
         generatedAt: new Date().toISOString(),
       });
     } finally {
@@ -320,6 +423,11 @@ function StrategyPage() {
       await showErrorNotification('Config Error', 'Failed to load strategy configuration');
     }
   }, []);
+
+  useEffect(() => {
+    if (!selectedStrategy || !workspaceLastAppliedAt) return;
+    void loadStrategyConfig(selectedStrategy.id);
+  }, [selectedStrategy, workspaceLastAppliedAt, loadStrategyConfig]);
 
   const loadStrategyMetrics = useCallback(async (strategyId: string) => {
     try {
@@ -552,7 +660,7 @@ function StrategyPage() {
   };
 
   const handleConfigUpdate = async () => {
-    if (!selectedStrategy) return;
+    if (!selectedStrategy || !strategyConfig) return;
 
     try {
       setConfigSaving(true);
@@ -570,9 +678,17 @@ function StrategyPage() {
         setConfigErrors(errors);
         return;
       }
+      const parameterUpdates = strategyConfig.parameters.reduce((acc, param) => {
+        const draft = parameterDrafts[param.name];
+        const parsed = Number.isFinite(draft) ? Number(draft) : param.value;
+        const bounded = Math.min(param.max_value, Math.max(param.min_value, parsed));
+        acc[param.name] = bounded;
+        return acc;
+      }, {} as Record<string, number>);
       await updateStrategyConfig(selectedStrategy.id, {
         symbols,
         enabled: configEnabled,
+        parameters: parameterUpdates,
       });
       await showSuccessNotification('Config Updated', 'Strategy configuration updated');
       await loadStrategyConfig(selectedStrategy.id);
@@ -611,11 +727,12 @@ function StrategyPage() {
   };
 
   const handleRunBacktest = async () => {
-    if (!selectedStrategy) return;
+    if (!selectedStrategy || !strategyConfig) return;
 
     try {
       setBacktestLoading(true);
       setBacktestError(null);
+      setBacktestCompletedAt(null);
       if (!isIsoDate(backtestStartDate) || !isIsoDate(backtestEndDate)) {
         setBacktestError('Start and end dates must be valid ISO dates');
         return;
@@ -629,12 +746,27 @@ function StrategyPage() {
         setBacktestError(`Initial capital must be between ${STRATEGY_LIMITS.backtestCapitalMin} and ${STRATEGY_LIMITS.backtestCapitalMax}`);
         return;
       }
+      const symbols = normalizeSymbols(configSymbols);
+      if (symbols.length === 0) {
+        setBacktestError('At least one valid symbol is required');
+        return;
+      }
+      const parameters = strategyConfig.parameters.reduce((acc, param) => {
+        const draft = parameterDrafts[param.name];
+        const parsed = Number.isFinite(draft) ? Number(draft) : param.value;
+        const bounded = Math.min(param.max_value, Math.max(param.min_value, parsed));
+        acc[param.name] = bounded;
+        return acc;
+      }, {} as Record<string, number>);
       const result = await runBacktest(selectedStrategy.id, {
         start_date: backtestStartDate,
         end_date: backtestEndDate,
         initial_capital: initialCapital,
+        symbols,
+        parameters,
       });
       setBacktestResult(result);
+      setBacktestCompletedAt(new Date().toISOString());
       await showSuccessNotification('Backtest Complete', `Completed ${result.total_trades} trades`);
     } catch (err) {
       await showErrorNotification('Backtest Error', 'Failed to run backtest');
@@ -692,6 +824,53 @@ function StrategyPage() {
       setPrefillLoading(false);
     }
   };
+
+  const selectedSymbolList = strategyConfig ? strategyConfig.symbols : normalizeSymbols(configSymbols);
+  const selectedSymbolSet = new Set(selectedSymbolList.map((symbol) => symbol.trim().toUpperCase()).filter(Boolean));
+  const savedParameterMap = strategyConfig
+    ? strategyConfig.parameters.reduce((acc, param) => {
+      acc[param.name] = param.value;
+      return acc;
+    }, {} as Record<string, number>)
+    : {};
+  const hasUnsavedParamChanges = strategyConfig
+    ? strategyConfig.parameters.some((param) => {
+      const draft = parameterDrafts[param.name];
+      return Number.isFinite(draft) && Number(draft) !== param.value;
+    })
+    : false;
+  const savedSymbols = strategyConfig?.symbols ?? [];
+  const draftSymbols = normalizeSymbols(configSymbols);
+  const hasUnsavedSymbolChanges = strategyConfig
+    ? draftSymbols.join(',') !== savedSymbols.join(',')
+    : false;
+  const currentPrefs = runnerInputSummary?.preferences ?? null;
+  const recommendation = runnerInputSummary?.recommendation ?? null;
+  const budgetStatus = runnerInputSummary?.budgetStatus ?? null;
+  const effectiveMinDollarVolume = typeof workspaceSnapshot?.min_dollar_volume === 'number'
+    ? workspaceSnapshot.min_dollar_volume
+    : recommendation?.guardrails?.min_dollar_volume;
+  const effectiveMaxSpreadBps = typeof workspaceSnapshot?.max_spread_bps === 'number'
+    ? workspaceSnapshot.max_spread_bps
+    : recommendation?.guardrails?.max_spread_bps;
+  const effectiveMaxSectorWeightPct = typeof workspaceSnapshot?.max_sector_weight_pct === 'number'
+    ? workspaceSnapshot.max_sector_weight_pct
+    : recommendation?.guardrails?.max_sector_weight_pct;
+  const effectiveAutoRegimeAdjust = typeof workspaceSnapshot?.auto_regime_adjust === 'boolean'
+    ? workspaceSnapshot.auto_regime_adjust
+    : true;
+  const estimatedPositionSize = strategyConfig
+    ? computeEstimatedDynamicPositionSize({
+      requestedPositionSize: savedParameterMap.position_size ?? 1000,
+      symbolCount: Math.max(1, selectedSymbolSet.size || 1),
+      existingPositionCount: runnerInputSummary?.openPositionCount ?? 0,
+      remainingWeeklyBudget: budgetStatus?.remaining_budget ?? currentPrefs?.weekly_budget ?? 0,
+      buyingPower: runnerInputSummary?.brokerAccount?.buying_power ?? 0,
+      equity: runnerInputSummary?.brokerAccount?.equity ?? 0,
+      riskPerTradePct: savedParameterMap.risk_per_trade ?? 1,
+      stopLossPct: savedParameterMap.stop_loss_pct ?? 2,
+    })
+    : null;
 
   return (
     <div className="p-8">
@@ -849,7 +1028,7 @@ function StrategyPage() {
               Poll interval: <span className="font-semibold">{runnerInputSummary?.config?.tick_interval_seconds ?? '-'}s</span>
             </div>
             <div className="rounded bg-blue-950/40 px-3 py-2">
-              Execution mode: <span className="font-semibold">{runnerInputSummary?.config?.paper_trading ? 'Paper' : 'Live'}</span>
+              Execution mode: <span className="font-semibold">{runnerInputSummary?.config ? (runnerInputSummary.config.paper_trading ? 'Paper' : 'Live') : '-'}</span>
             </div>
           </div>
           <p className="mt-2 text-xs text-blue-200">
@@ -970,6 +1149,131 @@ function StrategyPage() {
           <div className="col-span-8">
             {selectedStrategy ? (
               <div className="space-y-6">
+                <div className="rounded-lg border border-cyan-700 bg-cyan-900/20 p-5">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <h3 className="text-lg font-semibold text-cyan-100">Effective Runner Configuration</h3>
+                    <button
+                      onClick={() => loadRunnerInputSummary()}
+                      disabled={runnerInputSummaryLoading}
+                      className="rounded bg-cyan-700 px-3 py-1 text-xs font-medium text-white hover:bg-cyan-600 disabled:bg-gray-700"
+                    >
+                      {runnerInputSummaryLoading ? 'Refreshing...' : 'Refresh Inputs'}
+                    </button>
+                  </div>
+                  <p className="mt-1 text-xs text-cyan-200">
+                    Snapshot for <span className="font-semibold text-cyan-100">{selectedStrategy.name}</span>. This is the full config/guardrail/workspace set the runner evaluates.
+                  </p>
+                  {(hasUnsavedParamChanges || hasUnsavedSymbolChanges) && (
+                    <p className="mt-2 rounded bg-amber-900/60 px-3 py-2 text-xs text-amber-200">
+                      Unsaved edits detected in this tab. Runner uses saved values until you click Save Config/Apply.
+                    </p>
+                  )}
+
+                  <div className="mt-3 grid grid-cols-1 gap-2 text-xs text-cyan-100 md:grid-cols-3">
+                    <div className="rounded bg-cyan-950/40 px-3 py-2">
+                      Strategy status: <span className="font-semibold uppercase">{selectedStrategy.status}</span>
+                      <br />
+                      Enabled flag: <span className="font-semibold">{configEnabled ? 'Enabled' : 'Disabled'}</span>
+                    </div>
+                    <div className="rounded bg-cyan-950/40 px-3 py-2">
+                      Broker: <span className="font-semibold uppercase">{runnerInputSummary?.config?.broker || '-'}</span>
+                      <br />
+                      Mode: <span className="font-semibold">{runnerInputSummary?.config ? (runnerInputSummary.config.paper_trading ? 'Paper' : 'Live') : '-'}</span>
+                    </div>
+                    <div className="rounded bg-cyan-950/40 px-3 py-2">
+                      Poll interval: <span className="font-semibold">{runnerInputSummary?.config?.tick_interval_seconds ?? '-'}s</span>
+                      <br />
+                      Streaming: <span className="font-semibold">{runnerInputSummary?.config?.streaming_enabled ? 'On' : 'Off'}</span>
+                    </div>
+                    <div className="rounded bg-cyan-950/40 px-3 py-2">
+                      Strict Alpaca data: <span className="font-semibold">{runnerInputSummary?.config?.strict_alpaca_data ? 'On' : 'Off'}</span>
+                      <br />
+                      Trading enabled: <span className="font-semibold">{runnerInputSummary?.config?.trading_enabled ? 'On' : 'Off'}</span>
+                    </div>
+                    <div className="rounded bg-cyan-950/40 px-3 py-2">
+                      Workspace: <span className="font-semibold uppercase">{currentPrefs?.asset_type || '-'}</span> / {currentPrefs?.screener_mode || '-'}
+                      <br />
+                      Preset: <span className="font-semibold">{currentPrefs?.asset_type === 'etf' ? currentPrefs?.etf_preset : currentPrefs?.stock_preset}</span>
+                    </div>
+                    <div className="rounded bg-cyan-950/40 px-3 py-2">
+                      Screener limit: <span className="font-semibold">{currentPrefs?.screener_limit ?? '-'}</span>
+                      <br />
+                      Weekly budget: <span className="font-semibold">{formatCurrency(currentPrefs?.weekly_budget ?? 0)}</span>
+                    </div>
+                    <div className="rounded bg-cyan-950/40 px-3 py-2">
+                      Guardrail min $vol: <span className="font-semibold">{effectiveMinDollarVolume ? formatCurrency(effectiveMinDollarVolume) : 'N/A'}</span>
+                      <br />
+                      Guardrail spread: <span className="font-semibold">{typeof effectiveMaxSpreadBps === 'number' ? `${effectiveMaxSpreadBps} bps` : 'N/A'}</span>
+                    </div>
+                    <div className="rounded bg-cyan-950/40 px-3 py-2">
+                      Guardrail sector cap: <span className="font-semibold">{typeof effectiveMaxSectorWeightPct === 'number' ? `${effectiveMaxSectorWeightPct}%` : 'N/A'}</span>
+                      <br />
+                      Auto regime adjust: <span className="font-semibold">{effectiveAutoRegimeAdjust ? 'On' : 'Off'}</span>
+                    </div>
+                    <div className="rounded bg-cyan-950/40 px-3 py-2">
+                      Open positions: <span className="font-semibold">{runnerInputSummary?.openPositionCount ?? 0}</span>
+                      <br />
+                      Remaining weekly budget: <span className="font-semibold">{formatCurrency(budgetStatus?.remaining_budget ?? currentPrefs?.weekly_budget ?? 0)}</span>
+                    </div>
+                    <div className="rounded bg-cyan-950/40 px-3 py-2">
+                      Equity: <span className="font-semibold">{formatCurrency(runnerInputSummary?.brokerAccount?.equity ?? 0)}</span>
+                      <br />
+                      Buying power: <span className="font-semibold">{formatCurrency(runnerInputSummary?.brokerAccount?.buying_power ?? 0)}</span>
+                    </div>
+                    <div className="rounded bg-cyan-950/40 px-3 py-2">
+                      Max position cap: <span className="font-semibold">{formatCurrency(runnerInputSummary?.config?.max_position_size ?? 0)}</span>
+                      <br />
+                      Daily loss cap: <span className="font-semibold">{formatCurrency(runnerInputSummary?.config?.risk_limit_daily ?? 0)}</span>
+                    </div>
+                    <div className="rounded bg-cyan-950/40 px-3 py-2">
+                      Estimated dynamic position size: <span className="font-semibold">{estimatedPositionSize !== null ? formatCurrency(estimatedPositionSize) : 'N/A'}</span>
+                      <br />
+                      Workspace applied: <span className="font-semibold">{formatLocalDateTime(workspaceLastAppliedAt)}</span>
+                    </div>
+                  </div>
+
+                  <div className="mt-3 rounded bg-cyan-950/40 px-3 py-2 text-xs text-cyan-100">
+                    Symbols ({selectedSymbolSet.size}):{' '}
+                    <span className="font-mono">{Array.from(selectedSymbolSet).join(', ') || 'None'}</span>
+                  </div>
+
+                  {strategyConfig?.parameters && strategyConfig.parameters.length > 0 && (
+                    <div className="mt-3 overflow-x-auto">
+                      <table className="w-full text-xs text-cyan-100">
+                        <thead className="text-cyan-300">
+                          <tr>
+                            <th className="text-left py-1 pr-2">Parameter</th>
+                            <th className="text-right py-1 pr-2">Saved</th>
+                            <th className="text-right py-1">Current Draft</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {strategyConfig.parameters.map((param) => {
+                            const draftValue = Number.isFinite(parameterDrafts[param.name])
+                              ? Number(parameterDrafts[param.name])
+                              : param.value;
+                            return (
+                              <tr key={`runner-summary-${param.name}`} className="border-t border-cyan-900/70">
+                                <td className="py-1 pr-2 text-cyan-200">{param.name}</td>
+                                <td className="py-1 pr-2 text-right text-cyan-100">{param.value.toFixed(4)}</td>
+                                <td className={`py-1 text-right ${draftValue !== param.value ? 'text-amber-300 font-semibold' : 'text-cyan-100'}`}>
+                                  {draftValue.toFixed(4)}
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+
+                  {recommendation && (
+                    <p className="mt-2 text-[11px] text-cyan-200">
+                      Recommendation baseline: {recommendation.preset} / {recommendation.risk_profile}, guardrails from live portfolio context.
+                    </p>
+                  )}
+                </div>
+
                 <div className="inline-flex rounded-lg border border-gray-700 bg-gray-800 p-1">
                   {(['metrics', 'config', 'backtest'] as const).map((tab) => (
                     <button
@@ -1076,7 +1380,20 @@ function StrategyPage() {
                       </div>
 
                       <div>
-                        <label className="text-white font-medium block mb-2">Parameters</label>
+                        <div className="flex items-center justify-between mb-2">
+                          <label className="text-white font-medium">Parameters</label>
+                          {runnerInputSummary?.preferences && (
+                            <span className="text-xs text-gray-500">
+                              Defaults from{' '}
+                              <span className="text-gray-400 font-medium uppercase">
+                                {runnerInputSummary.preferences.asset_type === 'etf'
+                                  ? runnerInputSummary.preferences.etf_preset
+                                  : runnerInputSummary.preferences.stock_preset}
+                              </span>
+                              {' '}({runnerInputSummary.preferences.asset_type.toUpperCase()}) preset
+                            </span>
+                          )}
+                        </div>
                         <div className="space-y-3">
                           {strategyConfig.parameters.map((param) => {
                             const value = parameterDrafts[param.name] ?? param.value;
@@ -1095,6 +1412,7 @@ function StrategyPage() {
                                   {param.name === 'atr_stop_mult' && 'Volatility-adjusted stop distance using ATR.'}
                                   {param.name === 'zscore_entry_threshold' && 'Mean-reversion entry trigger based on z-score.'}
                                   {param.name === 'dip_buy_threshold_pct' && 'Minimum dip below SMA for dip-buy setup.'}
+                                  {param.name === 'max_hold_days' && 'Max days to hold a position before forced exit.'}
                                 </p>
                                 <input
                                   type="range"
@@ -1127,6 +1445,9 @@ function StrategyPage() {
                       </div>
 
                       <div className="flex gap-2">
+                        <p className="text-xs text-gray-400 self-center">
+                          Save Config persists symbols, enabled state, and all parameter drafts.
+                        </p>
                         <button
                           onClick={handleConfigUpdate}
                           disabled={configSaving}
@@ -1205,12 +1526,15 @@ function StrategyPage() {
                         />
                       </div>
                       {backtestError && <p className="text-red-400 text-sm">{backtestError}</p>}
+                      {!backtestError && backtestLoading && (
+                        <p className="text-blue-300 text-xs">Backtest running. Results will appear automatically when complete.</p>
+                      )}
 
                       <button
                         onClick={handleRunBacktest}
-                        disabled={backtestLoading}
+                        disabled={backtestLoading || !strategyConfig}
                         className={`px-4 py-2 rounded font-medium w-full ${
-                          backtestLoading
+                          backtestLoading || !strategyConfig
                             ? 'bg-gray-600 text-gray-400 cursor-not-allowed'
                             : 'bg-purple-600 hover:bg-purple-700 text-white'
                         }`}
@@ -1249,6 +1573,98 @@ function StrategyPage() {
                         </div>
                       </div>
 
+                      {backtestDiagnostics && (
+                        <div className="bg-gray-900 rounded p-4">
+                          <div className="text-white font-medium mb-2">Backtest Diagnostics</div>
+                          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs mb-3">
+                            <div className="rounded bg-gray-800 px-3 py-2">
+                              <div className="text-gray-400">Symbols With Data</div>
+                              <div className="text-white font-semibold">
+                                {backtestDiagnostics.symbols_with_data}/{backtestDiagnostics.symbols_requested}
+                              </div>
+                            </div>
+                            <div className="rounded bg-gray-800 px-3 py-2">
+                              <div className="text-gray-400">Trading Days</div>
+                              <div className="text-white font-semibold">{backtestDiagnostics.trading_days_evaluated}</div>
+                            </div>
+                            <div className="rounded bg-gray-800 px-3 py-2">
+                              <div className="text-gray-400">Entry Checks</div>
+                              <div className="text-white font-semibold">{backtestDiagnostics.entry_checks}</div>
+                            </div>
+                            <div className="rounded bg-gray-800 px-3 py-2">
+                              <div className="text-gray-400">Signals / Entries</div>
+                              <div className="text-white font-semibold">{backtestDiagnostics.entry_signals} / {backtestDiagnostics.entries_opened}</div>
+                            </div>
+                          </div>
+
+                          {backtestDiagnostics.symbols_without_data.length > 0 && (
+                            <p className="text-amber-300 text-xs mb-2">
+                              No chart data for: {backtestDiagnostics.symbols_without_data.join(', ')}.
+                              Check symbols and Alpaca/data connectivity.
+                            </p>
+                          )}
+
+                          {topBacktestBlockers.length > 0 ? (
+                            <div className="space-y-2">
+                              {topBacktestBlockers.slice(0, 4).map((blocker) => (
+                                <div key={blocker.reason} className="rounded bg-gray-800 px-3 py-2">
+                                  <p className="text-gray-200 text-sm">
+                                    {formatBlockerLabel(blocker.reason)}: <span className="font-semibold">{blocker.count}</span>
+                                  </p>
+                                  <p className="text-gray-400 text-xs">{getBacktestBlockerHint(blocker.reason)}</p>
+                                </div>
+                              ))}
+                            </div>
+                          ) : (
+                            <p className="text-gray-400 text-xs">No blocker counters were recorded for this run.</p>
+                          )}
+                        </div>
+                      )}
+
+                      {backtestDiagnostics?.advanced_metrics && (
+                        <div className="bg-gray-900 rounded p-4">
+                          <div className="text-white font-medium mb-2">Advanced Metrics</div>
+                          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
+                            <div className="rounded bg-gray-800 px-3 py-2">
+                              <div className="text-gray-400">Profit Factor</div>
+                              <div className={`font-semibold ${backtestDiagnostics.advanced_metrics.profit_factor >= 1.5 ? 'text-green-400' : backtestDiagnostics.advanced_metrics.profit_factor >= 1.0 ? 'text-yellow-400' : 'text-red-400'}`}>
+                                {backtestDiagnostics.advanced_metrics.profit_factor.toFixed(2)}
+                              </div>
+                            </div>
+                            <div className="rounded bg-gray-800 px-3 py-2">
+                              <div className="text-gray-400">Sortino Ratio</div>
+                              <div className="text-white font-semibold">{backtestDiagnostics.advanced_metrics.sortino_ratio.toFixed(2)}</div>
+                            </div>
+                            <div className="rounded bg-gray-800 px-3 py-2">
+                              <div className="text-gray-400">Expectancy/Trade</div>
+                              <div className={`font-semibold ${backtestDiagnostics.advanced_metrics.expectancy_per_trade >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                                ${backtestDiagnostics.advanced_metrics.expectancy_per_trade.toFixed(2)}
+                              </div>
+                            </div>
+                            <div className="rounded bg-gray-800 px-3 py-2">
+                              <div className="text-gray-400">Avg Win/Loss Ratio</div>
+                              <div className="text-white font-semibold">{backtestDiagnostics.advanced_metrics.avg_win_loss_ratio.toFixed(2)}</div>
+                            </div>
+                            <div className="rounded bg-gray-800 px-3 py-2">
+                              <div className="text-gray-400">Max Consec. Losses</div>
+                              <div className="text-white font-semibold">{backtestDiagnostics.advanced_metrics.max_consecutive_losses}</div>
+                            </div>
+                            <div className="rounded bg-gray-800 px-3 py-2">
+                              <div className="text-gray-400">Recovery Factor</div>
+                              <div className="text-white font-semibold">{backtestDiagnostics.advanced_metrics.recovery_factor.toFixed(2)}</div>
+                            </div>
+                            <div className="rounded bg-gray-800 px-3 py-2">
+                              <div className="text-gray-400">Calmar Ratio</div>
+                              <div className="text-white font-semibold">{backtestDiagnostics.advanced_metrics.calmar_ratio.toFixed(2)}</div>
+                            </div>
+                            <div className="rounded bg-gray-800 px-3 py-2">
+                              <div className="text-gray-400">Avg Hold Days</div>
+                              <div className="text-white font-semibold">{backtestDiagnostics.advanced_metrics.avg_hold_days.toFixed(1)}</div>
+                            </div>
+                          </div>
+                        </div>
+                      )}
+
                       {backtestResult.trades.length > 0 && (
                         <div className="bg-gray-900 rounded p-4">
                           <div className="text-white font-medium mb-2">Recent Trades</div>
@@ -1260,6 +1676,8 @@ function StrategyPage() {
                                   <th className="text-left py-1">Entry</th>
                                   <th className="text-left py-1">Exit</th>
                                   <th className="text-right py-1">P&L</th>
+                                  <th className="text-right py-1">Days</th>
+                                  <th className="text-left py-1">Reason</th>
                                 </tr>
                               </thead>
                               <tbody>
@@ -1269,6 +1687,8 @@ function StrategyPage() {
                                     <td className="py-1">{trade.entry_price.toFixed(2)}</td>
                                     <td className="py-1">{trade.exit_price.toFixed(2)}</td>
                                     <td className={`py-1 text-right ${trade.pnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>{trade.pnl.toFixed(2)}</td>
+                                    <td className="py-1 text-right text-gray-400">{trade.days_held ?? '-'}</td>
+                                    <td className="py-1 text-gray-400 text-xs">{trade.reason ?? ''}</td>
                                   </tr>
                                 ))}
                               </tbody>
@@ -1278,11 +1698,19 @@ function StrategyPage() {
                       )}
 
                       <button
-                        onClick={() => setBacktestResult(null)}
+                        onClick={() => {
+                          setBacktestResult(null);
+                          setBacktestCompletedAt(null);
+                        }}
                         className="px-4 py-2 rounded font-medium bg-gray-600 hover:bg-gray-700 text-white w-full"
                       >
                         Run New Backtest
                       </button>
+                      {backtestCompletedAt && (
+                        <p className="text-xs text-gray-400 text-center">
+                          Completed at {new Date(backtestCompletedAt).toLocaleString()}
+                        </p>
+                      )}
                     </div>
                   )}
                 </div>

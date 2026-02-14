@@ -235,7 +235,12 @@ class StrategyRepository:
     
     def get_active(self) -> List[Strategy]:
         """Get all active strategies."""
-        return self.db.query(Strategy).filter(Strategy.is_active == True).all()
+        return (
+            self.db.query(Strategy)
+            .filter(Strategy.is_active == True)
+            .filter(or_(Strategy.is_enabled == True, Strategy.is_enabled.is_(None)))
+            .all()
+        )
     
     def get_all(self) -> List[Strategy]:
         """Get all strategies."""

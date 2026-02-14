@@ -25,6 +25,7 @@ import {
   EtfPresetPreference,
   SummaryNotificationFrequency,
   SummaryNotificationChannel,
+  BrokerCredentialsStatusResponse,
   MaintenanceStorageResponse,
 } from '../api/types';
 import HelpTooltip from '../components/HelpTooltip';
@@ -74,6 +75,7 @@ function SettingsPage() {
   const [riskLimitDaily, setRiskLimitDaily] = useState(500);
   const [tickIntervalSeconds, setTickIntervalSeconds] = useState(60);
   const [streamingEnabled, setStreamingEnabled] = useState(false);
+  const [strictAlpacaData, setStrictAlpacaData] = useState(true);
   const [broker, setBroker] = useState("paper");
   const [logDirectory, setLogDirectory] = useState('./logs');
   const [auditExportDirectory, setAuditExportDirectory] = useState('./audit_exports');
@@ -89,6 +91,9 @@ function SettingsPage() {
     paper_available: false,
     live_available: false,
   });
+  const [keychainStatusCheckedAt, setKeychainStatusCheckedAt] = useState<string | null>(null);
+  const [keychainStatusError, setKeychainStatusError] = useState<string | null>(null);
+  const [runtimeCredentialStatus, setRuntimeCredentialStatus] = useState<BrokerCredentialsStatusResponse | null>(null);
   const [assetType, setAssetType] = useState<AssetTypePreference>('stock');
   const [riskProfile, setRiskProfile] = useState<RiskProfilePreference>('balanced');
   const [weeklyBudget, setWeeklyBudget] = useState(200);
@@ -139,7 +144,7 @@ function SettingsPage() {
 
   useEffect(() => {
     loadSettings();
-    // Avoid automatic keychain access on mount to prevent repeated OS prompts.
+    void loadKeychainStatus();
   }, []);
 
   const loadSettings = async () => {
@@ -156,6 +161,7 @@ function SettingsPage() {
       setRiskLimitDaily(config.risk_limit_daily);
       setTickIntervalSeconds(config.tick_interval_seconds || 60);
       setStreamingEnabled(Boolean(config.streaming_enabled));
+      setStrictAlpacaData(config.strict_alpaca_data !== false);
       setBroker(config.broker);
       setLogDirectory(config.log_directory || './logs');
       setAuditExportDirectory(config.audit_export_directory || './audit_exports');
@@ -179,6 +185,11 @@ function SettingsPage() {
       setSummaryRecipient(summaryPrefs.recipient || '');
       const safety = await getSafetyStatus().catch(() => ({ kill_switch_active: false, last_broker_sync_at: null }));
       setKillSwitchActive(Boolean(safety.kill_switch_active));
+      try {
+        setRuntimeCredentialStatus(await getBrokerCredentialsStatus());
+      } catch {
+        setRuntimeCredentialStatus(null);
+      }
       try {
         const storage = await getMaintenanceStorage();
         setStorageInfo(storage);
@@ -215,6 +226,7 @@ function SettingsPage() {
         paper_trading: paperTrading,
         tick_interval_seconds: tickIntervalSeconds,
         streaming_enabled: streamingEnabled,
+        strict_alpaca_data: strictAlpacaData,
         log_directory: logDirectory.trim(),
         audit_export_directory: auditExportDirectory.trim(),
         log_retention_days: logRetentionDays,
@@ -236,6 +248,7 @@ function SettingsPage() {
         verifiedConfig.paper_trading === paperTrading &&
         verifiedConfig.tick_interval_seconds === tickIntervalSeconds &&
         Boolean(verifiedConfig.streaming_enabled) === streamingEnabled &&
+        Boolean(verifiedConfig.strict_alpaca_data) === strictAlpacaData &&
         (verifiedConfig.log_directory || '').trim() === logDirectory.trim() &&
         (verifiedConfig.audit_export_directory || '').trim() === auditExportDirectory.trim() &&
         verifiedConfig.log_retention_days === logRetentionDays &&
@@ -267,11 +280,15 @@ function SettingsPage() {
 
   const loadKeychainStatus = async () => {
     try {
+      setKeychainStatusError(null);
       const status = await invoke<KeychainCredentialStatus>('get_alpaca_credentials_status');
       setKeychainStatus(status);
+      setKeychainStatusCheckedAt(new Date().toISOString());
     } catch {
       // Running in browser/dev mode without Tauri commands.
       setKeychainStatus({ paper_available: false, live_available: false });
+      setKeychainStatusError('Keychain status unavailable in browser/dev mode.');
+      setKeychainStatusCheckedAt(new Date().toISOString());
     }
   };
 
@@ -310,11 +327,12 @@ function SettingsPage() {
         secretKey,
       });
 
-      await setBrokerCredentials({
+      const runtimeStatus = await setBrokerCredentials({
         mode: credentialMode,
         api_key: apiKey,
         secret_key: secretKey,
       });
+      setRuntimeCredentialStatus(runtimeStatus);
 
       const nextPaperTrading = credentialMode === 'paper';
       setPaperTrading(nextPaperTrading);
@@ -323,7 +341,7 @@ function SettingsPage() {
         paper_trading: nextPaperTrading,
         broker: 'alpaca',
       });
-      await getBrokerCredentialsStatus();
+      setRuntimeCredentialStatus(await getBrokerCredentialsStatus());
       await loadKeychainStatus();
 
       await showSuccessNotification(
@@ -577,11 +595,71 @@ function SettingsPage() {
             <p className="text-gray-400 text-xs mt-2">Current broker mode: {broker}</p>
           </div>
 
+          <div className="flex items-center justify-between rounded border border-gray-700 bg-gray-900/40 p-3">
+            <div className="pr-4">
+              <label className="text-white font-medium flex items-center gap-1">
+                Strict Alpaca Data Mode
+                <HelpTooltip text="When enabled with Alpaca broker, screener/chart/backtest/runner fail if real Alpaca data is unavailable. No synthetic fallback." />
+              </label>
+              <p className="text-gray-400 text-sm">Recommended to keep ON for production-like testing and live operation.</p>
+            </div>
+            <button
+              onClick={() => setStrictAlpacaData(!strictAlpacaData)}
+              className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                strictAlpacaData ? 'bg-emerald-600' : 'bg-gray-600'
+              }`}
+            >
+              <span
+                className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                  strictAlpacaData ? 'translate-x-6' : 'translate-x-1'
+                }`}
+              />
+            </button>
+          </div>
+
           <div className="border-t border-gray-700 pt-4">
             <label className="text-white font-medium block mb-2">Alpaca Credentials Source <HelpTooltip text="Credentials are read from Keychain first and loaded into backend runtime." /></label>
             <p className="text-gray-400 text-xs mb-3">
               Keys are stored in OS Keychain and loaded from Keychain first.
             </p>
+            <div className="rounded border border-gray-700 bg-gray-900/50 p-3 mb-3 text-xs">
+              <p className="text-gray-300 font-medium">
+                Keychain Storage Status:
+                {' '}
+                <span className="text-gray-400">
+                  {keychainStatusCheckedAt
+                    ? `Checked ${new Date(keychainStatusCheckedAt).toLocaleString()}`
+                    : 'Not checked yet'}
+                </span>
+              </p>
+              <div className="mt-2 flex flex-wrap gap-2">
+                <span className={`rounded px-2 py-1 ${keychainStatus.paper_available ? 'bg-emerald-900/60 text-emerald-200' : 'bg-amber-900/60 text-amber-200'}`}>
+                  Paper: {keychainStatusCheckedAt ? (keychainStatus.paper_available ? 'Stored' : 'Not Stored') : 'Not Checked'}
+                </span>
+                <span className={`rounded px-2 py-1 ${keychainStatus.live_available ? 'bg-emerald-900/60 text-emerald-200' : 'bg-amber-900/60 text-amber-200'}`}>
+                  Live: {keychainStatusCheckedAt ? (keychainStatus.live_available ? 'Stored' : 'Not Stored') : 'Not Checked'}
+                </span>
+              </div>
+              {keychainStatusError && <p className="mt-2 text-amber-300">{keychainStatusError}</p>}
+            </div>
+            <div className="rounded border border-gray-700 bg-gray-900/50 p-3 mb-3 text-xs">
+              <p className="text-gray-300 font-medium">Backend Runtime Credential Status</p>
+              {runtimeCredentialStatus ? (
+                <div className="mt-2 flex flex-wrap gap-2">
+                  <span className={`rounded px-2 py-1 ${runtimeCredentialStatus.paper_available ? 'bg-emerald-900/60 text-emerald-200' : 'bg-amber-900/60 text-amber-200'}`}>
+                    Runtime Paper: {runtimeCredentialStatus.paper_available ? 'Loaded' : 'Missing'}
+                  </span>
+                  <span className={`rounded px-2 py-1 ${runtimeCredentialStatus.live_available ? 'bg-emerald-900/60 text-emerald-200' : 'bg-amber-900/60 text-amber-200'}`}>
+                    Runtime Live: {runtimeCredentialStatus.live_available ? 'Loaded' : 'Missing'}
+                  </span>
+                  <span className={`rounded px-2 py-1 ${runtimeCredentialStatus.using_runtime_credentials ? 'bg-blue-900/60 text-blue-200' : 'bg-gray-700 text-gray-300'}`}>
+                    Active Mode ({runtimeCredentialStatus.active_mode.toUpperCase()}): {runtimeCredentialStatus.using_runtime_credentials ? 'Using Runtime Keys' : 'Not Using Runtime Keys'}
+                  </span>
+                </div>
+              ) : (
+                <p className="mt-2 text-gray-400">Backend status unavailable right now.</p>
+              )}
+            </div>
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mb-3">
               <button
@@ -841,6 +919,39 @@ function SettingsPage() {
               <p className="text-white font-medium">${riskLimitDaily.toLocaleString()}</p>
             </div>
           </div>
+
+          {/* Active Preset Trading Parameters */}
+          {(() => {
+            const stockPresets: Record<string, Record<string, number>> = {
+              weekly_optimized: { position_size: 1200, stop_loss_pct: 2.0, take_profit_pct: 5.0, trailing_stop_pct: 2.5, max_hold_days: 10, risk_per_trade: 1.5 },
+              three_to_five_weekly: { position_size: 1000, stop_loss_pct: 2.5, take_profit_pct: 6.0, trailing_stop_pct: 2.8, max_hold_days: 7, risk_per_trade: 1.2 },
+              monthly_optimized: { position_size: 900, stop_loss_pct: 3.5, take_profit_pct: 8.0, trailing_stop_pct: 3.5, max_hold_days: 30, risk_per_trade: 1.0 },
+              small_budget_weekly: { position_size: 500, stop_loss_pct: 2.0, take_profit_pct: 5.0, trailing_stop_pct: 2.5, max_hold_days: 10, risk_per_trade: 0.8 },
+            };
+            const etfPresets: Record<string, Record<string, number>> = {
+              conservative: { position_size: 1000, stop_loss_pct: 2.0, take_profit_pct: 5.0, trailing_stop_pct: 2.5, max_hold_days: 12, risk_per_trade: 0.8 },
+              balanced: { position_size: 1000, stop_loss_pct: 2.5, take_profit_pct: 6.0, trailing_stop_pct: 2.8, max_hold_days: 10, risk_per_trade: 1.0 },
+              aggressive: { position_size: 1300, stop_loss_pct: 3.5, take_profit_pct: 8.0, trailing_stop_pct: 3.5, max_hold_days: 8, risk_per_trade: 1.4 },
+            };
+            const activePreset = assetType === 'etf'
+              ? etfPresets[etfPreset] || etfPresets.balanced
+              : stockPresets[stockPreset] || stockPresets.weekly_optimized;
+            const tpSlRatio = (activePreset.take_profit_pct / activePreset.stop_loss_pct).toFixed(1);
+            return (
+              <div className="mt-1 rounded-lg border border-gray-700 bg-gray-800/30 p-3">
+                <p className="text-xs text-gray-400 mb-2">Active Preset Defaults (applied to new strategies)</p>
+                <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2 text-sm">
+                  <div><span className="text-gray-500">Position:</span> <span className="text-white">${activePreset.position_size}</span></div>
+                  <div><span className="text-gray-500">SL:</span> <span className="text-white">{activePreset.stop_loss_pct}%</span></div>
+                  <div><span className="text-gray-500">TP:</span> <span className="text-white">{activePreset.take_profit_pct}%</span></div>
+                  <div><span className="text-gray-500">Trail:</span> <span className="text-white">{activePreset.trailing_stop_pct}%</span></div>
+                  <div><span className="text-gray-500">Hold:</span> <span className="text-white">{activePreset.max_hold_days}d</span></div>
+                  <div><span className="text-gray-500">TP:SL:</span> <span className={parseFloat(tpSlRatio) >= 2.0 ? 'text-green-400' : 'text-yellow-400'}>{tpSlRatio}:1</span></div>
+                </div>
+              </div>
+            );
+          })()}
+
           <button
             onClick={() => navigate('/screener')}
             className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded font-medium"

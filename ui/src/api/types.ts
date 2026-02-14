@@ -66,6 +66,7 @@ export interface ConfigResponse {
   risk_limit_daily: number;
   tick_interval_seconds: number;
   streaming_enabled: boolean;
+  strict_alpaca_data: boolean;
   log_directory: string;
   audit_export_directory: string;
   log_retention_days: number;
@@ -130,6 +131,7 @@ export interface ConfigUpdateRequest {
   risk_limit_daily?: number;
   tick_interval_seconds?: number;
   streaming_enabled?: boolean;
+  strict_alpaca_data?: boolean;
   log_directory?: string;
   audit_export_directory?: string;
   log_retention_days?: number;
@@ -502,11 +504,48 @@ export interface BacktestTrade {
   quantity: number;
   pnl: number;
   return_pct: number;
+  reason?: string;
+  days_held?: number;
 }
 
 export interface BacktestEquityPoint {
   timestamp: string;
   equity: number;
+}
+
+export interface BacktestBlockerCount {
+  reason: string;
+  count: number;
+}
+
+export interface BacktestAdvancedMetrics {
+  profit_factor: number;
+  sortino_ratio: number;
+  expectancy_per_trade: number;
+  avg_win: number;
+  avg_loss: number;
+  avg_win_loss_ratio: number;
+  max_consecutive_losses: number;
+  recovery_factor: number;
+  calmar_ratio: number;
+  avg_hold_days: number;
+  slippage_bps_applied: number;
+}
+
+export interface BacktestDiagnostics {
+  symbols_requested: number;
+  symbols_with_data: number;
+  symbols_without_data: string[];
+  trading_days_evaluated: number;
+  bars_evaluated: number;
+  entry_checks: number;
+  entry_signals: number;
+  entries_opened: number;
+  blocked_reasons: Record<string, number>;
+  exit_reasons: Record<string, number>;
+  top_blockers: BacktestBlockerCount[];
+  parameters_used: Record<string, number>;
+  advanced_metrics?: BacktestAdvancedMetrics;
 }
 
 export interface BacktestResult {
@@ -525,6 +564,7 @@ export interface BacktestResult {
   volatility: number;
   trades: BacktestTrade[];
   equity_curve: BacktestEquityPoint[];
+  diagnostics?: BacktestDiagnostics;
 }
 
 export interface ParameterTuneRequest {
@@ -569,6 +609,17 @@ export interface TradingPreferencesUpdateRequest {
   screener_mode?: ScreenerModePreference;
   stock_preset?: StockPresetPreference;
   etf_preset?: EtfPresetPreference;
+}
+
+export interface BudgetStatus {
+  weekly_budget: number;
+  used_budget: number;
+  remaining_budget: number;
+  used_percent: number;
+  trades_this_week: number;
+  weekly_pnl: number;
+  week_start: string;
+  days_remaining: number;
 }
 
 export interface PreferenceRecommendationGuardrails {

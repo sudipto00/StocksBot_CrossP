@@ -17,9 +17,9 @@ def test_get_risk_profile_conservative():
     profile = get_risk_profile(RiskProfile.CONSERVATIVE)
     
     assert profile["name"] == "Conservative"
-    assert profile["max_position_size"] == 50.0
+    assert profile["max_position_size"] == 100.0
     assert profile["max_positions"] == 3
-    assert profile["stop_loss_percent"] == 0.03
+    assert profile["stop_loss_percent"] == 0.02
     assert profile["max_weekly_loss"] == 0.15
 
 
@@ -28,9 +28,9 @@ def test_get_risk_profile_balanced():
     profile = get_risk_profile(RiskProfile.BALANCED)
     
     assert profile["name"] == "Balanced"
-    assert profile["max_position_size"] == 80.0
+    assert profile["max_position_size"] == 150.0
     assert profile["max_positions"] == 4
-    assert profile["stop_loss_percent"] == 0.05
+    assert profile["stop_loss_percent"] == 0.025
 
 
 def test_get_risk_profile_aggressive():
@@ -38,9 +38,9 @@ def test_get_risk_profile_aggressive():
     profile = get_risk_profile(RiskProfile.AGGRESSIVE)
     
     assert profile["name"] == "Aggressive"
-    assert profile["max_position_size"] == 120.0
+    assert profile["max_position_size"] == 200.0
     assert profile["max_positions"] == 5
-    assert profile["stop_loss_percent"] == 0.08
+    assert profile["stop_loss_percent"] == 0.035
 
 
 def test_get_risk_profile_invalid():
@@ -67,8 +67,8 @@ def test_get_position_size_conservative():
         current_positions=0
     )
     
-    # Should be 20% of 200 = 40, but capped at max of 50
-    assert size == 40.0
+    # Should be 25% of 200 = 50, capped at max of 100
+    assert size == 50.0
 
 
 def test_get_position_size_balanced():
@@ -103,8 +103,8 @@ def test_get_position_size_with_cap():
         current_positions=0
     )
     
-    # Should be capped at max position size of 50
-    assert size == 50.0
+    # Should be capped at max position size of 100
+    assert size == 100.0
 
 
 def test_get_position_size_with_diversification():
@@ -115,8 +115,8 @@ def test_get_position_size_with_diversification():
         current_positions=1
     )
     
-    # Base size would be 40, reduced by 10% for diversification
-    assert size == pytest.approx(36.0, rel=0.01)
+    # Base size would be 50, reduced by 10% for diversification = 45
+    assert size == pytest.approx(45.0, rel=0.01)
 
 
 def test_get_position_size_minimum():
@@ -149,12 +149,12 @@ def test_validate_trade_exceeds_position_size():
     """Test validation fails when position size exceeded."""
     is_valid, reason = validate_trade(
         RiskProfile.CONSERVATIVE,
-        position_size=100.0,  # Max is 50
+        position_size=150.0,  # Max is 100
         weekly_budget=200.0,
         current_positions=0,
         weekly_loss=0.0
     )
-    
+
     assert is_valid is False
     assert "exceeds max" in reason.lower()
 

@@ -215,35 +215,51 @@ class BuyAndHoldStrategy(StrategyInterface):
 
 class MetricsDrivenStrategy(StrategyInterface):
     """
-    Metrics-driven strategy using dip-buy + z-score entries and TP/SL/trailing/ATR exits.
+    Metrics-driven strategy using dip-buy + z-score entries and
+    TP/SL/trailing/ATR/time-based exits.
+
+    Key improvements over baseline:
+    - Composite entry: fires on EITHER dip OR z-score condition (relaxed).
+    - Only enters in range_bound regime (pure mean-reversion).
+    - Dynamic ATR stop ratchets upward each tick.
+    - Time-based exit forces close after max_hold_days.
+    - trailing_stop_pct >= stop_loss_pct to avoid redundancy.
     """
 
     def __init__(self, config: Dict[str, Any]):
         super().__init__(config)
-        self.position_size = float(config.get("position_size", 1000.0))  # dollars
+        self.position_size = float(config.get("position_size", 1000.0))
         self.stop_loss_pct = float(config.get("stop_loss_pct", 2.0))
         self.take_profit_pct = float(config.get("take_profit_pct", 5.0))
         self.trailing_stop_pct = float(config.get("trailing_stop_pct", 2.5))
-        self.atr_stop_mult = float(config.get("atr_stop_mult", 1.8))
-        self.zscore_entry_threshold = float(config.get("zscore_entry_threshold", -1.5))
-        self.dip_buy_threshold_pct = float(config.get("dip_buy_threshold_pct", 2.0))
-        self.allowed_regimes = set(config.get("allowed_regimes", ["range_bound", "trending_up"]))
+        self.atr_stop_mult = float(config.get("atr_stop_mult", 2.0))
+        self.zscore_entry_threshold = float(config.get("zscore_entry_threshold", -1.2))
+        self.dip_buy_threshold_pct = float(config.get("dip_buy_threshold_pct", 1.5))
+        self.max_hold_days = int(config.get("max_hold_days", 10))
+        # Only range_bound for dip-buy mean-reversion strategies.
+        self.allowed_regimes = set(config.get("allowed_regimes", ["range_bound"]))
 
-        self.screener = MarketScreener(config.get("alpaca_client"))
-        self.state = {
-            "positions": {},  # symbol -> {entry_price, qty, peak_price, atr_stop_price, take_profit_price}
+        self.screener = MarketScreener(
+            config.get("alpaca_client"),
+            require_real_data=bool(config.get("require_real_data", False)),
+        )
+        self.state: Dict[str, Any] = {
+            "positions": {},
             "last_regime": "unknown",
         }
+        self._tick_count = 0
 
     def on_start(self) -> None:
         for symbol in self.symbols:
             self.state["positions"][symbol] = None
+        self._tick_count = 0
         self.is_running = True
 
     def on_tick(self, market_data: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
         signals: List[Dict[str, Any]] = []
         regime = self.screener.detect_market_regime()
         self.state["last_regime"] = regime
+        self._tick_count += 1
 
         for symbol in self.symbols:
             data = market_data.get(symbol)
@@ -265,9 +281,13 @@ class MetricsDrivenStrategy(StrategyInterface):
             position = self.state["positions"].get(symbol)
 
             if position is None:
+                # Composite entry: either dip OR z-score condition triggers.
                 dip_buy_signal = bool(indicators.get("dip_buy_signal", False))
-                if dip_buy_signal and regime in self.allowed_regimes:
-                    qty = max(1.0, self.position_size / price)
+                zscore_val = indicators.get("zscore20", indicators.get("zscore", 0.0))
+                zscore_signal = (zscore_val is not None and float(zscore_val) <= self.zscore_entry_threshold)
+                entry_signal = dip_buy_signal or zscore_signal
+                if entry_signal and regime in self.allowed_regimes:
+                    qty = self.position_size / price  # fractional shares OK
                     atr_pct = float(indicators.get("atr14_pct", 0.0))
                     atr_stop_price = price * (1.0 - (self.atr_stop_mult * atr_pct / 100.0))
                     stop_loss_price = price * (1.0 - self.stop_loss_pct / 100.0)
@@ -277,38 +297,55 @@ class MetricsDrivenStrategy(StrategyInterface):
                         "peak_price": price,
                         "atr_stop_price": min(atr_stop_price, stop_loss_price),
                         "take_profit_price": price * (1.0 + self.take_profit_pct / 100.0),
+                        "entry_tick": self._tick_count,
                     }
                     signals.append({
                         "symbol": symbol,
                         "signal": Signal.BUY,
                         "quantity": qty,
                         "order_type": "market",
-                        "reason": f"Dip+zscore entry (regime={regime}, z={indicators.get('zscore20')})",
+                        "reason": f"Dip+zscore entry (regime={regime}, z={zscore_val})",
                     })
                 continue
 
-            # Exit logic for open position
+            # --- Dynamic ATR stop: recalculate and ratchet upward ---
+            current_atr_pct = float(indicators.get("atr14_pct", 0.0))
+            if current_atr_pct > 0:
+                new_atr_stop = price * (1.0 - (self.atr_stop_mult * current_atr_pct / 100.0))
+                if new_atr_stop > float(position["atr_stop_price"]):
+                    position["atr_stop_price"] = new_atr_stop
+
+            # --- Exit logic ---
             position["peak_price"] = max(float(position["peak_price"]), price)
             trailing_stop = float(position["peak_price"]) * (1.0 - self.trailing_stop_pct / 100.0)
             take_profit_price = float(position["take_profit_price"])
             atr_stop_price = float(position["atr_stop_price"])
+
+            # Time-based exit: approximate days from tick count (1 tick ~ 1 min during market hours).
+            # 390 ticks per trading day (6.5 hours * 60 min).
+            ticks_held = self._tick_count - int(position.get("entry_tick", self._tick_count))
+            approx_days_held = ticks_held / 390.0
+            time_exit = approx_days_held >= self.max_hold_days
+
             should_exit = (
-                price <= atr_stop_price
+                time_exit
+                or price <= atr_stop_price
                 or price <= trailing_stop
                 or price >= take_profit_price
             )
             if should_exit:
                 qty = float(position["qty"])
+                exit_reason = "time_exit" if time_exit else (
+                    f"Exit trigger tp={take_profit_price:.2f}, "
+                    f"trail={trailing_stop:.2f}, atr_stop={atr_stop_price:.2f}, price={price:.2f}"
+                )
                 self.state["positions"][symbol] = None
                 signals.append({
                     "symbol": symbol,
                     "signal": Signal.SELL,
                     "quantity": qty,
                     "order_type": "market",
-                    "reason": (
-                        f"Exit trigger tp={take_profit_price:.2f}, "
-                        f"trail={trailing_stop:.2f}, atr_stop={atr_stop_price:.2f}, price={price:.2f}"
-                    ),
+                    "reason": exit_reason,
                 })
 
         return signals

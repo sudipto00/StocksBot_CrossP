@@ -4,7 +4,17 @@ import Sidebar from './components/Sidebar';
 import AppTopBar from './components/AppTopBar';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { getApiAuthKey, getAuditLogs, getPositions, getStrategies, getSystemHealthSnapshot, getTradingPreferences, startRunner, stopRunner } from './api/backend';
+import {
+  getApiAuthKey,
+  getAuditLogs,
+  getPositions,
+  getStrategies,
+  getSystemHealthSnapshot,
+  getTradingPreferences,
+  setBrokerCredentials,
+  startRunner,
+  stopRunner,
+} from './api/backend';
 import { AuditEventType, StrategyStatus } from './api/types';
 import { showSuccessNotification } from './utils/notifications';
 
@@ -16,10 +26,52 @@ const ScreenerPage = lazy(() => import('./pages/ScreenerPage'));
 const HelpPage = lazy(() => import('./pages/HelpPage'));
 const BACKEND_URL = (import.meta as { env?: { VITE_BACKEND_URL?: string } }).env?.VITE_BACKEND_URL || 'http://127.0.0.1:8000';
 
+interface KeychainCredentialStatus {
+  paper_available: boolean;
+  live_available: boolean;
+}
+
+interface StoredCredentials {
+  api_key: string;
+  secret_key: string;
+}
+
 function App() {
   const seenFilledEventIdsRef = useRef<Set<string>>(new Set());
   const trayFailureCountRef = useRef(0);
   const trayLastSuccessMsRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    const isTauriRuntime = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in (window as unknown as Record<string, unknown>);
+    if (!isTauriRuntime) {
+      return;
+    }
+    const hydrateRuntimeCredentials = async () => {
+      try {
+        const keychainStatus = await invoke<KeychainCredentialStatus>('get_alpaca_credentials_status').catch(() => null);
+        if (!keychainStatus) {
+          return;
+        }
+        const modes: Array<'paper' | 'live'> = [];
+        if (keychainStatus.paper_available) modes.push('paper');
+        if (keychainStatus.live_available) modes.push('live');
+        await Promise.all(modes.map(async (mode) => {
+          const creds = await invoke<StoredCredentials | null>('get_alpaca_credentials', { mode });
+          if (!creds?.api_key || !creds?.secret_key) {
+            return;
+          }
+          await setBrokerCredentials({
+            mode,
+            api_key: creds.api_key,
+            secret_key: creds.secret_key,
+          });
+        }));
+      } catch {
+        // Startup hydration is best-effort.
+      }
+    };
+    void hydrateRuntimeCredentials();
+  }, []);
 
   useEffect(() => {
     const pollFilledEvents = async () => {

@@ -245,9 +245,13 @@ class AlpacaBroker(BrokerInterface):
         
         # Submit order based on type
         if order_type == OrderType.MARKET:
+            # Alpaca supports fractional shares for market orders on
+            # eligible symbols.  Pass qty with up to 9 decimal places
+            # so small-budget positions (e.g. 0.25 shares of a $400
+            # stock) are filled correctly.
             order_data = MarketOrderRequest(
                 symbol=symbol,
-                qty=quantity,
+                qty=round(quantity, 9),
                 side=alpaca_side,
                 time_in_force=TimeInForce.DAY
             )
