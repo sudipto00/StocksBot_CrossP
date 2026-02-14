@@ -11,8 +11,9 @@ const sections = [
       'Summary cards show total value, unrealized P&L, open positions, and current equity.',
       'Performance section contains the equity curve and cumulative P&L charts in one place.',
       'Use 7D/30D/90D/180D/All to change chart range for both curves together.',
-      'Strategy Runner card shows runner state, loaded strategy count, interval, and broker connectivity.',
+      'Strategy Runner card shows runner state, loaded strategy count, interval, broker connectivity, and off-hours sleep/auto-resume context.',
       'Use Start/Stop controls to manage strategy execution engine status.',
+      'Panic Stop is available directly from Dashboard for emergency freeze + liquidation workflow.',
       'Current Portfolio Holdings includes symbol type, market value, weight %, and Stock/ETF filtering.',
     ],
   },
@@ -26,6 +27,7 @@ const sections = [
       'Activate/deactivate strategies and tune parameters with sliders.',
       'Config section includes one-line helper descriptions for each key parameter.',
       'Backtest panel provides total return, final capital, drawdown, win rate, and trade sample.',
+      'Runner can enter sleeping state outside market hours and automatically resume at next session.',
       'Sell Off All Holdings liquidates open positions only when explicitly clicked.',
       'Remove Defunct Strategies cleans inactive/empty/deprecated strategy entries; Cleanup + Selloff performs liquidation first.',
     ],
@@ -64,6 +66,9 @@ const sections = [
       'Backend API-key auth is optional and intended for secured API access; local desktop usage keeps it disabled by default.',
       'Risk profile defines sizing and controls (Conservative/Balanced/Aggressive).',
       'Weekly budget and screener preferences drive symbol selection and allocation behavior.',
+      'Safety Controls provide Kill Switch and Panic Stop to block new orders and run emergency stop workflow.',
+      'Storage & Retention includes cleanup actions plus log/audit file inventory visibility.',
+      'Notifications section includes desktop test notifications and summary delivery preferences (daily/weekly, email/SMS recipient).',
       'Changing strategy does not auto-liquidate existing holdings unless selloff is explicitly chosen.',
     ],
   },
@@ -218,6 +223,30 @@ const controlDefinitions = [
     range: 'Configured in Settings',
   },
   {
+    name: 'Summary Notifications',
+    location: 'Settings > Notifications',
+    meaning: 'Enables/disables scheduled transaction summary delivery.',
+    range: 'Enabled or Disabled',
+  },
+  {
+    name: 'Summary Frequency',
+    location: 'Settings > Notifications',
+    meaning: 'Selects summary delivery cadence.',
+    range: 'Daily or Weekly',
+  },
+  {
+    name: 'Summary Channel',
+    location: 'Settings > Notifications',
+    meaning: 'Selects delivery transport for summary messages.',
+    range: 'Email or SMS',
+  },
+  {
+    name: 'Summary Recipient',
+    location: 'Settings > Notifications',
+    meaning: 'Destination address/number used by summary delivery transport.',
+    range: 'Valid email or E.164-like phone (+15551234567)',
+  },
+  {
     name: 'Realtime Stream Assist',
     location: 'Settings',
     meaning: 'Uses websocket updates for faster sync while keeping polling fallback.',
@@ -288,6 +317,14 @@ const troubleshootingTips = [
     title: 'Reset Audit Data does nothing',
     detail: 'Stop the runner first; reset is intentionally blocked while runner status is running/sleeping.',
   },
+  {
+    title: 'Send Summary Now returns delivery/config error',
+    detail: 'Summary delivery is real (SMTP/Twilio). Configure required transport env vars and keep summary preferences enabled before retrying.',
+  },
+  {
+    title: 'SMS recipient is rejected',
+    detail: 'Use an E.164-like number format, for example +15551234567, then save Settings again.',
+  },
 ];
 
 function HelpPage() {
@@ -312,6 +349,7 @@ function HelpPage() {
         <div className="mt-3 flex flex-wrap gap-2 text-xs">
           <a href="#getting-started" className="rounded bg-blue-800 px-2 py-1 text-blue-100 hover:text-white">Get Started</a>
           <a href="#troubleshooting" className="rounded bg-gray-800 px-2 py-1 text-gray-300 hover:text-white">Troubleshooting</a>
+          <a href="#notifications" className="rounded bg-gray-800 px-2 py-1 text-gray-300 hover:text-white">Email/SMS Setup</a>
           <a href="#wiring" className="rounded bg-gray-800 px-2 py-1 text-gray-300 hover:text-white">Universe Wiring</a>
           <a href="#preset-universes" className="rounded bg-gray-800 px-2 py-1 text-gray-300 hover:text-white">Preset Universes</a>
           <a href="#controls" className="rounded bg-gray-800 px-2 py-1 text-gray-300 hover:text-white">Controls</a>
@@ -368,6 +406,35 @@ function HelpPage() {
               <p className="text-gray-300 mt-1">{tip.detail}</p>
             </div>
           ))}
+        </div>
+      </div>
+
+      <div id="notifications" className="bg-emerald-900/20 border border-emerald-700 rounded-lg p-5 mb-8 scroll-mt-24">
+        <h3 className="text-lg font-semibold text-emerald-300 mb-3">Enable Email/SMS Summary Notifications</h3>
+        <ol className="space-y-2 text-sm text-emerald-100 list-decimal pl-5">
+          <li>Open <span className="font-semibold">Settings {'>'} Notifications</span>.</li>
+          <li>Enable <span className="font-semibold">Transaction Summary via Email/SMS</span>.</li>
+          <li>Select delivery <span className="font-semibold">Frequency</span> (Daily or Weekly).</li>
+          <li>Select <span className="font-semibold">Channel</span> (Email or SMS), then enter a valid recipient and save settings.</li>
+          <li>Use <span className="font-semibold">Send Summary Now</span> to validate delivery immediately.</li>
+        </ol>
+        <div className="mt-4 rounded bg-emerald-950/40 p-3 text-xs text-emerald-100">
+          Recipient format:
+          {' '}Email uses standard address format (for example, name@example.com).
+          {' '}SMS uses E.164-like format (for example, +15551234567).
+        </div>
+        <div className="mt-4 rounded bg-emerald-950/40 p-3 text-xs text-emerald-100">
+          Required backend env vars:
+          {' '}Email (SMTP): STOCKSBOT_SMTP_HOST, STOCKSBOT_SMTP_PORT, STOCKSBOT_SMTP_USERNAME, STOCKSBOT_SMTP_PASSWORD, STOCKSBOT_SMTP_FROM_EMAIL.
+          {' '}SMS (Twilio): STOCKSBOT_TWILIO_ACCOUNT_SID, STOCKSBOT_TWILIO_AUTH_TOKEN, STOCKSBOT_TWILIO_FROM_NUMBER.
+        </div>
+        <div className="mt-4 rounded bg-emerald-950/40 p-3 text-xs text-emerald-100">
+          Scheduler controls:
+          {' '}STOCKSBOT_SUMMARY_NOTIFICATIONS_ENABLED=true,
+          {' '}STOCKSBOT_SUMMARY_SCHEDULER_ENABLED=true,
+          {' '}STOCKSBOT_SUMMARY_SCHEDULER_POLL_SECONDS (default 60),
+          {' '}STOCKSBOT_SUMMARY_SCHEDULER_RETRY_SECONDS (default 1800).
+          {' '}Daily/weekly summaries are sent for completed UTC periods and deduplicated across restarts.
         </div>
       </div>
 
