@@ -1,5 +1,9 @@
 #!/bin/bash
+# Run from App root path
+
 set -e
+source ~/.bash_profile
+source .venv/bin/activate
 
 echo "🚀 Building StocksBot Standalone Application"
 echo "=============================================="
