@@ -16,6 +16,8 @@ import {
   tuneParameter,
   getTradingPreferences,
   getScreenerAssets,
+  getConfig,
+  getBrokerAccount,
   getSafetyPreflight,
   getSafetyStatus,
 } from '../api/backend';
@@ -27,6 +29,9 @@ import {
   BacktestResult,
   StrategyParameter,
   AssetTypePreference,
+  TradingPreferences,
+  ConfigResponse,
+  BrokerAccountResponse,
 } from '../api/types';
 import HelpTooltip from '../components/HelpTooltip';
 import PageHeader from '../components/PageHeader';
@@ -38,6 +43,70 @@ const STRATEGY_LIMITS = {
   backtestCapitalMin: 100,
   backtestCapitalMax: 100_000_000,
 };
+const WORKSPACE_LAST_APPLIED_AT_KEY = 'stocksbot.workspace.lastAppliedAt';
+const WORKSPACE_SNAPSHOT_KEY = 'stocksbot.workspace.snapshot';
+const USD_FORMATTER = new Intl.NumberFormat('en-US', {
+  style: 'currency',
+  currency: 'USD',
+});
+
+interface RunnerInputSummary {
+  preferences: TradingPreferences | null;
+  config: ConfigResponse | null;
+  brokerAccount: BrokerAccountResponse | null;
+  activeStrategyCount: number;
+  activeSymbolCount: number;
+  activeSymbolsPreview: string[];
+  inactiveStrategyCount: number;
+  inactiveSymbolCount: number;
+  inactiveSymbolsPreview: string[];
+  generatedAt: string;
+}
+
+interface WorkspaceSnapshot {
+  asset_type?: AssetTypePreference;
+  screener_mode?: 'most_active' | 'preset';
+  stock_preset?: 'weekly_optimized' | 'three_to_five_weekly' | 'monthly_optimized' | 'small_budget_weekly';
+  etf_preset?: 'conservative' | 'balanced' | 'aggressive';
+  screener_limit?: number;
+  min_dollar_volume?: number;
+  max_spread_bps?: number;
+  max_sector_weight_pct?: number;
+  auto_regime_adjust?: boolean;
+}
+
+function formatCurrency(value: number): string {
+  return USD_FORMATTER.format(value);
+}
+
+function formatUniverseLabel(prefs: TradingPreferences | null): string {
+  if (!prefs) return 'Unavailable';
+  if (prefs.asset_type === 'stock') {
+    return prefs.screener_mode === 'most_active'
+      ? `Most Active (${prefs.screener_limit})`
+      : `Stock Preset (${prefs.stock_preset})`;
+  }
+  return `ETF Preset (${prefs.etf_preset})`;
+}
+
+function formatLocalDateTime(value: string | null | undefined): string {
+  if (!value) return 'Not recorded yet';
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return value;
+  return parsed.toLocaleString();
+}
+
+function readWorkspaceSnapshot(): WorkspaceSnapshot | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw = window.localStorage.getItem(WORKSPACE_SNAPSHOT_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as WorkspaceSnapshot;
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
+}
 
 function normalizeSymbols(raw: string): string[] {
   const result: string[] = [];
@@ -106,18 +175,49 @@ function StrategyPage() {
   const runnerIsActive = runnerStatus === 'running' || runnerStatus === 'sleeping';
   const [settingsSummary, setSettingsSummary] = useState<string>('Loading trading preferences...');
   const [cleanupLoading, setCleanupLoading] = useState(false);
+  const [runnerInputSummary, setRunnerInputSummary] = useState<RunnerInputSummary | null>(null);
+  const [runnerInputSummaryLoading, setRunnerInputSummaryLoading] = useState(false);
+  const [workspaceLastAppliedAt, setWorkspaceLastAppliedAt] = useState<string | null>(null);
+  const [prefillMessage, setPrefillMessage] = useState<string>('');
+  const [prefillLoading, setPrefillLoading] = useState(false);
 
+  /* eslint-disable react-hooks/exhaustive-deps */
   useEffect(() => {
     loadStrategies();
     loadRunnerStatus();
     loadSettingsSummary();
   }, []);
+  /* eslint-enable react-hooks/exhaustive-deps */
 
   useEffect(() => {
     const interval = setInterval(() => {
       loadRunnerStatus();
     }, 5000);
     return () => clearInterval(interval);
+  }, []);
+
+  useEffect(() => {
+    const readLastApplied = () => {
+      if (typeof window === 'undefined') return;
+      try {
+        setWorkspaceLastAppliedAt(window.localStorage.getItem(WORKSPACE_LAST_APPLIED_AT_KEY));
+      } catch {
+        setWorkspaceLastAppliedAt(null);
+      }
+    };
+    const handleWorkspaceApplied = (event: Event) => {
+      const custom = event as CustomEvent<{ appliedAt?: string }>;
+      if (custom.detail?.appliedAt) {
+        setWorkspaceLastAppliedAt(custom.detail.appliedAt);
+        return;
+      }
+      readLastApplied();
+    };
+    readLastApplied();
+    window.addEventListener('workspace-settings-applied', handleWorkspaceApplied as EventListener);
+    return () => {
+      window.removeEventListener('workspace-settings-applied', handleWorkspaceApplied as EventListener);
+    };
   }, []);
 
   const loadStrategies = async () => {
@@ -127,6 +227,7 @@ function StrategyPage() {
 
       const response = await getStrategies();
       setStrategies(response.strategies);
+      void loadRunnerInputSummary(response.strategies);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load strategies');
     } finally {
@@ -157,6 +258,50 @@ function StrategyPage() {
       setSettingsSummary('Settings not available');
     }
   };
+
+  const loadRunnerInputSummary = useCallback(async (strategySnapshot?: Strategy[]) => {
+    try {
+      setRunnerInputSummaryLoading(true);
+      const sourceStrategies = strategySnapshot ?? strategies;
+      const activeStrategies = sourceStrategies.filter((strategy) => strategy.status === StrategyStatus.ACTIVE);
+      const inactiveStrategies = sourceStrategies.filter((strategy) => strategy.status !== StrategyStatus.ACTIVE);
+      const symbolSet = new Set<string>();
+      activeStrategies.forEach((strategy) => {
+        (strategy.symbols || []).forEach((symbol) => {
+          const normalized = symbol.trim().toUpperCase();
+          if (normalized) symbolSet.add(normalized);
+        });
+      });
+      const inactiveSymbolSet = new Set<string>();
+      inactiveStrategies.forEach((strategy) => {
+        (strategy.symbols || []).forEach((symbol) => {
+          const normalized = symbol.trim().toUpperCase();
+          if (normalized) inactiveSymbolSet.add(normalized);
+        });
+      });
+
+      const [prefs, config, brokerAccount] = await Promise.all([
+        getTradingPreferences().catch(() => null),
+        getConfig().catch(() => null),
+        getBrokerAccount().catch(() => null),
+      ]);
+
+      setRunnerInputSummary({
+        preferences: prefs,
+        config,
+        brokerAccount,
+        activeStrategyCount: activeStrategies.length,
+        activeSymbolCount: symbolSet.size,
+        activeSymbolsPreview: Array.from(symbolSet).slice(0, 12),
+        inactiveStrategyCount: inactiveStrategies.length,
+        inactiveSymbolCount: inactiveSymbolSet.size,
+        inactiveSymbolsPreview: Array.from(inactiveSymbolSet).slice(0, 12),
+        generatedAt: new Date().toISOString(),
+      });
+    } finally {
+      setRunnerInputSummaryLoading(false);
+    }
+  }, [strategies]);
 
   const loadStrategyConfig = useCallback(async (strategyId: string) => {
     try {
@@ -213,11 +358,14 @@ function StrategyPage() {
   const handleStartRunner = async () => {
     try {
       setRunnerLoading(true);
+      await loadRunnerInputSummary();
       const result = await startRunner();
 
       if (result.success) {
         await showSuccessNotification('Runner Started', result.message);
         setRunnerStatus(result.status);
+        await loadRunnerStatus();
+        await loadRunnerInputSummary();
       } else {
         await showErrorNotification('Start Failed', result.message);
       }
@@ -236,6 +384,8 @@ function StrategyPage() {
       if (result.success) {
         await showSuccessNotification('Runner Stopped', result.message);
         setRunnerStatus(result.status);
+        await loadRunnerStatus();
+        await loadRunnerInputSummary();
       } else {
         await showErrorNotification('Stop Failed', result.message);
       }
@@ -295,6 +445,7 @@ function StrategyPage() {
       }
       await loadStrategies();
       await loadRunnerStatus();
+      await loadRunnerInputSummary();
     } catch {
       await showErrorNotification('Cleanup Error', 'Failed to remove defunct strategies');
     } finally {
@@ -349,6 +500,7 @@ function StrategyPage() {
       setFormSymbols('');
       setShowCreateModal(false);
       await loadStrategies();
+      await loadRunnerInputSummary();
     } catch (err) {
       await showErrorNotification('Create Error', 'Failed to create strategy');
     }
@@ -369,6 +521,7 @@ function StrategyPage() {
 
       await loadStrategies();
       await loadRunnerStatus();
+      await loadRunnerInputSummary();
     } catch (err) {
       await showErrorNotification('Update Error', 'Failed to update strategy');
     }
@@ -390,6 +543,7 @@ function StrategyPage() {
       }
       await loadStrategies();
       await loadRunnerStatus();
+      await loadRunnerInputSummary();
     } catch (err) {
       await showErrorNotification('Delete Error', err instanceof Error ? err.message : 'Failed to delete strategy');
     } finally {
@@ -494,20 +648,48 @@ function StrategyPage() {
     setFormDescription('');
     setFormSymbols('');
     setFormErrors({});
+    setPrefillMessage('');
     setShowCreateModal(true);
-    prefillSymbolsFromSettings();
+    void prefillSymbolsFromSettings();
   };
 
   const prefillSymbolsFromSettings = async () => {
     try {
+      setPrefillLoading(true);
+      setPrefillMessage('Loading symbols from Screener workspace...');
       const prefs = await getTradingPreferences();
-      const response = await getScreenerAssets(prefs.asset_type as AssetTypePreference, prefs.screener_limit);
-      const symbols = (response.assets || []).slice(0, Math.min(20, prefs.screener_limit)).map((a) => a.symbol);
+      const snapshot = readWorkspaceSnapshot();
+      const useSnapshot = snapshot && snapshot.asset_type === prefs.asset_type ? snapshot : null;
+      const screenerMode =
+        prefs.asset_type === 'stock'
+          ? (useSnapshot?.screener_mode || prefs.screener_mode)
+          : 'preset';
+      const response = await getScreenerAssets(prefs.asset_type as AssetTypePreference, prefs.screener_limit, {
+        screenerMode,
+        stockPreset: prefs.stock_preset,
+        etfPreset: prefs.etf_preset,
+        minDollarVolume: useSnapshot?.min_dollar_volume,
+        maxSpreadBps: useSnapshot?.max_spread_bps,
+        maxSectorWeightPct: useSnapshot?.max_sector_weight_pct,
+        autoRegimeAdjust: useSnapshot?.auto_regime_adjust,
+      });
+      const symbols = normalizeSymbols((response.assets || []).map((asset) => asset.symbol).join(', '))
+        .slice(0, STRATEGY_LIMITS.maxSymbols);
       if (symbols.length > 0) {
         setFormSymbols(symbols.join(', '));
+        const sourceLabel = prefs.asset_type === 'stock'
+          ? screenerMode === 'most_active'
+            ? `Stocks Most Active (${prefs.screener_limit})`
+            : `Stock Preset (${prefs.stock_preset})`
+          : `ETF Preset (${prefs.etf_preset})`;
+        setPrefillMessage(`Prefilled ${symbols.length} symbols from ${sourceLabel}.`);
+      } else {
+        setPrefillMessage('No symbols were returned from the current Screener selection.');
       }
     } catch {
-      // Keep form empty on errors.
+      setPrefillMessage('Failed to load symbols from Screener. You can still enter symbols manually.');
+    } finally {
+      setPrefillLoading(false);
     }
   };
 
@@ -623,6 +805,79 @@ function StrategyPage() {
               Cleanup + Selloff
             </button>
           </div>
+        </div>
+        <div className="mt-4 rounded-lg border border-blue-800 bg-blue-900/20 p-4">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <p className="text-sm font-semibold text-blue-100">Runner Input Summary (current snapshot)</p>
+            <button
+              onClick={() => loadRunnerInputSummary()}
+              disabled={runnerInputSummaryLoading}
+              className="rounded bg-blue-700 px-3 py-1 text-xs font-medium text-white hover:bg-blue-600 disabled:bg-gray-700"
+            >
+              {runnerInputSummaryLoading ? 'Refreshing...' : 'Refresh Snapshot'}
+            </button>
+          </div>
+          <p className="mt-1 text-xs text-blue-200">
+            Start Runner executes active strategy symbols and applies the controls shown here.
+          </p>
+          <div className="mt-3 grid grid-cols-1 gap-2 text-xs text-blue-100 md:grid-cols-3">
+            <div className="rounded bg-blue-950/40 px-3 py-2">
+              Active strategies used: <span className="font-semibold">{runnerInputSummary?.activeStrategyCount ?? activeStrategyCount}</span>
+            </div>
+            <div className="rounded bg-blue-950/40 px-3 py-2">
+              Inactive strategies: <span className="font-semibold">{runnerInputSummary?.inactiveStrategyCount ?? 0}</span>
+            </div>
+            <div className="rounded bg-blue-950/40 px-3 py-2">
+              Unique symbols in scope: <span className="font-semibold">{runnerInputSummary?.activeSymbolCount ?? 0}</span>
+            </div>
+            <div className="rounded bg-blue-950/40 px-3 py-2">
+              Workspace universe: <span className="font-semibold">{formatUniverseLabel(runnerInputSummary?.preferences ?? null)}</span>
+            </div>
+            <div className="rounded bg-blue-950/40 px-3 py-2">
+              Asset type: <span className="font-semibold uppercase">{runnerInputSummary?.preferences?.asset_type ?? '-'}</span>
+            </div>
+            <div className="rounded bg-blue-950/40 px-3 py-2">
+              Weekly budget: <span className="font-semibold">{formatCurrency(runnerInputSummary?.preferences?.weekly_budget ?? 0)}</span>
+            </div>
+            <div className="rounded bg-blue-950/40 px-3 py-2">
+              Max position: <span className="font-semibold">{formatCurrency(runnerInputSummary?.config?.max_position_size ?? 0)}</span>
+            </div>
+            <div className="rounded bg-blue-950/40 px-3 py-2">
+              Daily loss cap: <span className="font-semibold">{formatCurrency(runnerInputSummary?.config?.risk_limit_daily ?? 0)}</span>
+            </div>
+            <div className="rounded bg-blue-950/40 px-3 py-2">
+              Poll interval: <span className="font-semibold">{runnerInputSummary?.config?.tick_interval_seconds ?? '-'}s</span>
+            </div>
+            <div className="rounded bg-blue-950/40 px-3 py-2">
+              Execution mode: <span className="font-semibold">{runnerInputSummary?.config?.paper_trading ? 'Paper' : 'Live'}</span>
+            </div>
+          </div>
+          <p className="mt-2 text-xs text-blue-200">
+            Symbol sample:{' '}
+            <span className="font-mono text-blue-100">
+              {(runnerInputSummary?.activeSymbolsPreview || []).length > 0
+                ? (runnerInputSummary?.activeSymbolsPreview || []).join(', ')
+                : (runnerInputSummary?.inactiveSymbolsPreview || []).length > 0
+                  ? `No active strategy symbols. Stopped-strategy sample: ${(runnerInputSummary?.inactiveSymbolsPreview || []).join(', ')}`
+                  : 'No strategy symbols found'}
+            </span>
+          </p>
+          <p className="mt-1 text-xs text-blue-200">
+            Buying power snapshot:{' '}
+            <span className="font-semibold">
+              {runnerInputSummary?.brokerAccount
+                ? `${formatCurrency(runnerInputSummary.brokerAccount.buying_power)} (${runnerInputSummary.brokerAccount.mode.toUpperCase()})`
+                : 'Unavailable'}
+            </span>
+            {' | '}
+            Workspace last applied:{' '}
+            <span className="font-semibold">{formatLocalDateTime(workspaceLastAppliedAt)}</span>
+            {' | '}
+            Generated:{' '}
+            <span className="font-semibold">
+              {runnerInputSummary?.generatedAt ? new Date(runnerInputSummary.generatedAt).toLocaleString() : 'N/A'}
+            </span>
+          </p>
         </div>
         {activeStrategyCount === 0 && (
           <p className="text-yellow-400 text-xs mt-3">
@@ -1048,6 +1303,17 @@ function StrategyPage() {
         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
           <div className="bg-gray-800 rounded-lg p-6 border border-gray-700 w-full max-w-md">
             <h3 className="text-xl font-bold text-white mb-4">Create New Strategy</h3>
+            <div className="mb-4 rounded border border-blue-800 bg-blue-900/20 p-3 text-xs text-blue-100">
+              Runner uses active strategy symbols plus workspace controls.
+              {' '}
+              Current workspace: <span className="font-semibold">{formatUniverseLabel(runnerInputSummary?.preferences ?? null)}</span>
+              {' | '}
+              Max position: <span className="font-semibold">{formatCurrency(runnerInputSummary?.config?.max_position_size ?? 0)}</span>
+              {' | '}
+              Daily loss: <span className="font-semibold">{formatCurrency(runnerInputSummary?.config?.risk_limit_daily ?? 0)}</span>
+              {' | '}
+              Screener applied: <span className="font-semibold">{formatLocalDateTime(workspaceLastAppliedAt)}</span>
+            </div>
 
             <div className="space-y-4">
               <div>
@@ -1082,16 +1348,22 @@ function StrategyPage() {
 
               <div>
                 <label className="text-white font-medium block mb-2">Symbols *</label>
-                <input
-                  type="text"
+                <textarea
                   value={formSymbols}
                   onChange={(e) => setFormSymbols(e.target.value)}
                   className={`bg-gray-700 text-white px-4 py-2 rounded border ${
                     formErrors.symbols ? 'border-red-500' : 'border-gray-600'
                   } w-full`}
                   placeholder="AAPL, MSFT, GOOGL"
+                  rows={4}
                 />
                 <p className="text-gray-400 text-xs mt-1">Comma-separated list of symbols</p>
+                {prefillLoading && (
+                  <p className="text-blue-300 text-xs mt-1">Loading Screener symbols...</p>
+                )}
+                {!prefillLoading && prefillMessage && (
+                  <p className="text-blue-300 text-xs mt-1">{prefillMessage}</p>
+                )}
                 {formErrors.symbols && (
                   <p className="text-red-400 text-sm mt-1">{formErrors.symbols}</p>
                 )}

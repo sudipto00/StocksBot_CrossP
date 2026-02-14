@@ -3,15 +3,15 @@ Storage service - High-level interface for storage operations.
 Provides business logic on top of repositories.
 """
 from typing import List, Optional, Dict, Any
-from datetime import datetime
+from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 
 from storage.repositories import (
     PositionRepository, OrderRepository, TradeRepository,
-    StrategyRepository, ConfigRepository, AuditLogRepository
+    StrategyRepository, ConfigRepository, AuditLogRepository, PortfolioSnapshotRepository
 )
 from storage.models import (
-    Position, Order, Trade, Strategy, Config, AuditLog,
+    Position, Order, Trade, Strategy, Config, AuditLog, PortfolioSnapshot,
     PositionSideEnum, OrderSideEnum, OrderTypeEnum, OrderStatusEnum, TradeTypeEnum,
     AuditEventTypeEnum
 )
@@ -36,6 +36,7 @@ class StorageService:
         self.strategies = StrategyRepository(db)
         self.config = ConfigRepository(db)
         self.audit_logs = AuditLogRepository(db)
+        self.portfolio_snapshots = PortfolioSnapshotRepository(db)
     
     # Position operations
     
@@ -241,3 +242,56 @@ class StorageService:
         # For now, return recent trades since we don't have strategy_id on trades
         # In a full implementation, Trade model would have a strategy_id field
         return self.trades.get_recent(limit=1000)
+
+    # Portfolio snapshot operations
+
+    def record_portfolio_snapshot(
+        self,
+        equity: float,
+        cash: float,
+        buying_power: float,
+        market_value: float,
+        unrealized_pnl: float,
+        realized_pnl_total: float,
+        open_positions: int,
+        timestamp: Optional[datetime] = None,
+    ) -> PortfolioSnapshot:
+        """Persist an account/portfolio snapshot row."""
+        return self.portfolio_snapshots.create(
+            equity=float(equity),
+            cash=float(cash),
+            buying_power=float(buying_power),
+            market_value=float(market_value),
+            unrealized_pnl=float(unrealized_pnl),
+            realized_pnl_total=float(realized_pnl_total),
+            open_positions=int(open_positions),
+            timestamp=timestamp,
+        )
+
+    def get_recent_portfolio_snapshots(self, limit: int = 5000) -> List[PortfolioSnapshot]:
+        """Return most recent snapshots in ascending order."""
+        return self.portfolio_snapshots.get_recent(limit=limit)
+
+    def get_latest_portfolio_snapshot(self) -> Optional[PortfolioSnapshot]:
+        """Return latest snapshot row, if present."""
+        return self.portfolio_snapshots.get_latest()
+
+    def get_portfolio_snapshots_since(
+        self,
+        cutoff: Optional[datetime] = None,
+        limit: int = 5000,
+    ) -> List[PortfolioSnapshot]:
+        """Get snapshots with optional UTC cutoff."""
+        snapshots = self.get_recent_portfolio_snapshots(limit=limit)
+        if cutoff is None:
+            return snapshots
+        cutoff_utc = cutoff if cutoff.tzinfo else cutoff.replace(tzinfo=timezone.utc)
+        filtered: List[PortfolioSnapshot] = []
+        for snapshot in snapshots:
+            ts = snapshot.timestamp
+            if ts is None:
+                continue
+            ts_utc = ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+            if ts_utc >= cutoff_utc:
+                filtered.append(snapshot)
+        return filtered

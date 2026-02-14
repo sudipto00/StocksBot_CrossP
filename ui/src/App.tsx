@@ -4,7 +4,7 @@ import Sidebar from './components/Sidebar';
 import AppTopBar from './components/AppTopBar';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { getAuditLogs, getPositions, getStrategies, getSystemHealthSnapshot, getTradingPreferences, startRunner, stopRunner } from './api/backend';
+import { getApiAuthKey, getAuditLogs, getPositions, getStrategies, getSystemHealthSnapshot, getTradingPreferences, startRunner, stopRunner } from './api/backend';
 import { AuditEventType, StrategyStatus } from './api/types';
 import { showSuccessNotification } from './utils/notifications';
 
@@ -158,7 +158,11 @@ function App() {
     const connect = () => {
       try {
         const wsUrl = BACKEND_URL.replace('http://', 'ws://').replace('https://', 'wss://');
-        ws = new WebSocket(`${wsUrl}/ws/system-health`);
+        const apiKey = getApiAuthKey();
+        const wsPath = apiKey
+          ? `${wsUrl}/ws/system-health?api_key=${encodeURIComponent(apiKey)}`
+          : `${wsUrl}/ws/system-health`;
+        ws = new WebSocket(wsPath);
         ws.onmessage = (event) => {
           try {
             const payload = JSON.parse(event.data);
@@ -194,6 +198,7 @@ function App() {
           <Suspense fallback={<div className="p-6 text-gray-400">Loading page...</div>}>
             <Routes>
               <Route path="/" element={<DashboardPage />} />
+              <Route path="/dashboard" element={<DashboardPage />} />
               <Route path="/strategy" element={<StrategyPage />} />
               <Route path="/analytics" element={<Navigate to="/" replace />} />
               <Route path="/screener" element={<ScreenerPage />} />

@@ -20,6 +20,7 @@
       "icons/icon.ico"
     ],
     "resources": [],
+    "externalBin": [],
     "copyright": "",
     "category": "Finance",
     "shortDescription": "Cross-platform trading bot",

@@ -50,6 +50,28 @@ class Settings(BaseSettings):
     # API authentication (optional for local desktop dev/test)
     api_auth_enabled: bool = Field(default=False, alias="STOCKSBOT_API_KEY_AUTH_ENABLED")
     api_auth_key: Optional[str] = Field(default=None, alias="STOCKSBOT_API_KEY")
+
+    # Notification delivery (email + sms)
+    summary_notifications_enabled: bool = Field(default=True, alias="STOCKSBOT_SUMMARY_NOTIFICATIONS_ENABLED")
+    summary_scheduler_enabled: bool = Field(default=True, alias="STOCKSBOT_SUMMARY_SCHEDULER_ENABLED")
+    summary_scheduler_poll_seconds: int = Field(default=60, alias="STOCKSBOT_SUMMARY_SCHEDULER_POLL_SECONDS")
+    summary_scheduler_retry_seconds: int = Field(default=1800, alias="STOCKSBOT_SUMMARY_SCHEDULER_RETRY_SECONDS")
+
+    # SMTP email delivery configuration
+    smtp_host: Optional[str] = Field(default=None, alias="STOCKSBOT_SMTP_HOST")
+    smtp_port: int = Field(default=587, alias="STOCKSBOT_SMTP_PORT")
+    smtp_username: Optional[str] = Field(default=None, alias="STOCKSBOT_SMTP_USERNAME")
+    smtp_password: Optional[str] = Field(default=None, alias="STOCKSBOT_SMTP_PASSWORD")
+    smtp_from_email: Optional[str] = Field(default=None, alias="STOCKSBOT_SMTP_FROM_EMAIL")
+    smtp_use_tls: bool = Field(default=True, alias="STOCKSBOT_SMTP_USE_TLS")
+    smtp_use_ssl: bool = Field(default=False, alias="STOCKSBOT_SMTP_USE_SSL")
+    smtp_timeout_seconds: int = Field(default=15, alias="STOCKSBOT_SMTP_TIMEOUT_SECONDS")
+
+    # Twilio SMS delivery configuration
+    twilio_account_sid: Optional[str] = Field(default=None, alias="STOCKSBOT_TWILIO_ACCOUNT_SID")
+    twilio_auth_token: Optional[str] = Field(default=None, alias="STOCKSBOT_TWILIO_AUTH_TOKEN")
+    twilio_from_number: Optional[str] = Field(default=None, alias="STOCKSBOT_TWILIO_FROM_NUMBER")
+    twilio_timeout_seconds: int = Field(default=15, alias="STOCKSBOT_TWILIO_TIMEOUT_SECONDS")
     
     model_config = SettingsConfigDict(
         env_file=".env",

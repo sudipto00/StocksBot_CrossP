@@ -3,6 +3,7 @@ import { getAuditLogs, getAuditTrades, resetAuditData } from '../api/backend';
 import { AuditLog, AuditEventType, TradeHistoryItem } from '../api/types';
 import HelpTooltip from '../components/HelpTooltip';
 import PageHeader from '../components/PageHeader';
+import { formatDateTime, parseTimestamp } from '../utils/datetime';
 
 type AuditView = 'events' | 'trades' | 'exports';
 type QuickScope = 'all' | 'errors' | 'runner';
@@ -86,7 +87,8 @@ function AuditPage() {
     const toDate = dateTo ? new Date(`${dateTo}T23:59:59`) : null;
 
     return trades.filter((trade) => {
-      const tradeTs = new Date(trade.executed_at);
+      const tradeTs = parseTimestamp(trade.executed_at);
+      if (!tradeTs) return false;
       const symbolOk = !normalizedSymbol || trade.symbol.toUpperCase().includes(normalizedSymbol);
       const fromOk = !fromDate || tradeTs >= fromDate;
       const toOk = !toDate || tradeTs <= toDate;
@@ -208,7 +210,7 @@ function AuditPage() {
             <td>${trade.quantity}</td>
             <td>${trade.price.toFixed(2)}</td>
             <td>${(trade.realized_pnl ?? 0).toFixed(2)}</td>
-            <td>${new Date(trade.executed_at).toLocaleString()}</td>
+            <td>${formatDateTime(trade.executed_at)}</td>
           </tr>`
       )
       .join('');
@@ -516,7 +518,7 @@ function AuditPage() {
                           <div className={`text-sm font-medium ${getEventTypeColor(log.event_type)}`}>
                             {log.event_type.replace(/_/g, ' ').toUpperCase()}
                           </div>
-                          <div className="text-xs text-gray-500">{new Date(log.timestamp).toLocaleString()}</div>
+                          <div className="text-xs text-gray-500">{formatDateTime(log.timestamp)}</div>
                         </div>
                         <div className="text-sm text-gray-200 mt-1">{log.description}</div>
                       </div>
@@ -533,7 +535,7 @@ function AuditPage() {
                   </div>
                   <div className="mt-2 text-sm text-gray-300 space-y-1">
                     <p><span className="text-gray-400">Type:</span> {selectedLog.event_type}</p>
-                    <p><span className="text-gray-400">Timestamp:</span> {new Date(selectedLog.timestamp).toLocaleString()}</p>
+                    <p><span className="text-gray-400">Timestamp:</span> {formatDateTime(selectedLog.timestamp)}</p>
                     <p><span className="text-gray-400">Description:</span> {selectedLog.description}</p>
                     <pre className="mt-2 max-h-48 overflow-auto rounded bg-gray-900 p-2 text-xs text-gray-300">{JSON.stringify(selectedLog.details || {}, null, 2)}</pre>
                   </div>
@@ -612,7 +614,7 @@ function AuditPage() {
                       <tbody>
                         {filteredTrades.map((trade) => (
                           <tr key={trade.id} className="border-b border-gray-700 hover:bg-gray-750">
-                            <td className="px-4 py-3">{new Date(trade.executed_at).toLocaleString()}</td>
+                            <td className="px-4 py-3">{formatDateTime(trade.executed_at)}</td>
                             <td className="px-4 py-3 font-semibold text-white">{trade.symbol}</td>
                             <td className={`px-4 py-3 ${trade.side === 'buy' ? 'text-green-400' : 'text-yellow-400'}`}>{trade.side.toUpperCase()}</td>
                             <td className="px-4 py-3">{trade.quantity}</td>

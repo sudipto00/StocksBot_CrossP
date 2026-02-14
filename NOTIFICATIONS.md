@@ -1,276 +1,147 @@
 # Notifications Guide
 
-This guide explains how to use the notification system in StocksBot.
+This guide describes the current notification flow in StocksBot.
 
-## Overview
+## Current Notification Channels
 
-StocksBot provides a cross-platform notification system that works on Windows, macOS, and Linux. Notifications can be triggered from:
-- The frontend (UI events, user actions)
-- The backend (trade executions, alerts, system events)
-- The Tauri layer (system tray events)
+1. Desktop system notifications (implemented via Tauri plugin)
+2. Summary notifications:
+   - manual `send-now` delivery
+   - automatic scheduler delivery for completed daily/weekly windows
 
-## Architecture
+## Desktop Notification Flow
 
-```
-┌─────────────────────────────────────────┐
-│         Frontend (React)                │
-│  utils/notifications.ts                 │
-│  ├─ showNotification()                  │
-│  └─ getNotificationPermission()         │
-└───────────────┬─────────────────────────┘
-                │ invoke()
-                ▼
-┌─────────────────────────────────────────┐
-│         Tauri (Rust)                    │
-│  src/main.rs                            │
-│  ├─ show_notification command           │
-│  └─ System notification API             │
-└───────────────┬─────────────────────────┘
-                │ OS API
-                ▼
-        ┌───────────────┐
-        │  OS Notification │
-        │  System          │
-        └───────────────┘
-```
+`ui/src/utils/notifications.ts` invokes Tauri commands in `src-tauri/src/main.rs`:
 
-## Frontend Usage
+- `show_notification`
+- `get_notification_permission`
+- `request_notification_permission`
 
-### Basic Notification
+Severity values:
 
-```typescript
-import { showNotification, NotificationSeverity } from '../utils/notifications';
+- `info`
+- `warning`
+- `error`
+- `success`
 
-// Show a notification
-await showNotification(
-  'Trade Executed',
-  'Bought 100 shares of AAPL at $150.00',
-  NotificationSeverity.SUCCESS
-);
-```
+Behavior:
 
-### Convenience Functions
+- UI checks permission first
+- If not granted, UI requests permission
+- On grant, OS notification is shown
 
-```typescript
-import {
-  showSuccessNotification,
-  showErrorNotification,
-  showWarningNotification,
-  showInfoNotification
-} from '../utils/notifications';
+## Summary Notification Preferences (Backend)
 
-// Success notification
-await showSuccessNotification('Order Filled', 'Your buy order has been filled');
+Endpoints:
 
-// Error notification
-await showErrorNotification('Connection Lost', 'Lost connection to backend');
+- `GET /notifications/summary/preferences`
+- `POST /notifications/summary/preferences`
+- `POST /notifications/summary/send-now`
 
-// Warning notification
-await showWarningNotification('Risk Limit', 'Approaching daily loss limit');
+Supported config:
 
-// Info notification
-await showInfoNotification('Market Open', 'The market is now open');
-```
+- `enabled` (`true|false`)
+- `frequency` (`daily|weekly`)
+- `channel` (`email|sms`)
+- `recipient` (email address or E.164-like phone)
 
-### Check Permission
+Validation:
 
-```typescript
-import { getNotificationPermission } from '../utils/notifications';
+- Recipient required when enabled
+- Email channel validates email format
+- SMS channel validates phone-like format
 
-const permission = await getNotificationPermission();
-if (permission === 'granted') {
-  // Show notifications
-} else {
-  // Request permission or show in-app notifications
-}
-```
+### Important
 
-## Backend Integration
+`POST /notifications/summary/send-now` performs real delivery:
 
-The backend can request notifications via the `/notifications` endpoint:
+- `channel=email` uses SMTP (`smtplib`)
+- `channel=sms` uses Twilio REST API
 
-```python
-# Example: Notify user of trade execution
-from api.models import NotificationRequest, NotificationSeverity
+If transport credentials are missing/invalid, the endpoint returns `success=false` with an actionable message and writes an audit error entry.
 
-notification = NotificationRequest(
-    title="Trade Executed",
-    message="Bought 100 shares of AAPL at $150.00",
-    severity=NotificationSeverity.SUCCESS
-)
+Automatic scheduler behavior:
 
-# POST to /notifications endpoint
-# Frontend will receive and display via websocket (TODO)
-```
+- Runs in backend background thread (startup/shutdown managed by FastAPI lifecycle)
+- Sends once per completed period and persists checkpoint state to avoid duplicates after restarts
+- Daily: sends previous UTC day summary
+- Weekly: sends previous UTC week summary
+- Failed sends use retry backoff before retrying the same period again
 
-## OS-Specific Setup
+### Required Backend Environment Variables
 
-### Windows
+Enable transport toggle:
 
-Windows 10+ supports notifications natively via the Action Center.
+- `STOCKSBOT_SUMMARY_NOTIFICATIONS_ENABLED=true` (default `true`)
+- `STOCKSBOT_SUMMARY_SCHEDULER_ENABLED=true` (default `true`)
+- `STOCKSBOT_SUMMARY_SCHEDULER_POLL_SECONDS=60` (default `60`, minimum effectively `15`)
+- `STOCKSBOT_SUMMARY_SCHEDULER_RETRY_SECONDS=1800` (default `1800`)
 
-**No additional setup required** - notifications work out of the box.
+For email (SMTP):
 
-**Troubleshooting:**
-- If notifications don't appear, check Windows Settings → System → Notifications & actions
-- Ensure "Get notifications from apps and other senders" is enabled
-- Add StocksBot to allowed apps if needed
+- `STOCKSBOT_SMTP_HOST`
+- `STOCKSBOT_SMTP_PORT` (default `587`)
+- `STOCKSBOT_SMTP_USERNAME`
+- `STOCKSBOT_SMTP_PASSWORD`
+- `STOCKSBOT_SMTP_FROM_EMAIL`
+- Optional: `STOCKSBOT_SMTP_USE_TLS` (default `true`), `STOCKSBOT_SMTP_USE_SSL` (default `false`), `STOCKSBOT_SMTP_TIMEOUT_SECONDS`
 
-### macOS
+For SMS (Twilio):
 
-macOS notifications require proper app signing and entitlements.
+- `STOCKSBOT_TWILIO_ACCOUNT_SID`
+- `STOCKSBOT_TWILIO_AUTH_TOKEN`
+- `STOCKSBOT_TWILIO_FROM_NUMBER`
+- Optional: `STOCKSBOT_TWILIO_TIMEOUT_SECONDS`
 
-**Setup:**
-1. Notifications work in development mode
-2. For production, ensure proper code signing
-3. Users may need to grant permission on first launch
+## Backend `/notifications` Endpoint
 
-**Troubleshooting:**
-- Check System Preferences → Notifications → StocksBot
-- Ensure "Allow Notifications" is enabled
-- Set "StocksBot alert style" to "Banners" or "Alerts"
+`POST /notifications` exists for request/queue semantics and returns success response, but does not currently push real-time events to UI over websocket.
 
-**Permission Request:**
-```rust
-// TODO: Implement macOS-specific permission request
-// Will be triggered on first notification attempt
-```
+## Example (Frontend)
 
-### Linux
-
-Linux notification support varies by desktop environment.
-
-**Supported:**
-- GNOME (via libnotify)
-- KDE Plasma
-- XFCE
-- Most modern desktop environments
-
-**Setup:**
-1. Ensure `libnotify` is installed:
-   ```bash
-   # Ubuntu/Debian
-   sudo apt-get install libnotify-bin
-   
-   # Fedora
-   sudo dnf install libnotify
-   
-   # Arch
-   sudo pacman -S libnotify
-   ```
-
-2. For development, you may need `libayatana-appindicator3-dev`:
-   ```bash
-   sudo apt-get install libayatana-appindicator3-dev
-   ```
-
-**Troubleshooting:**
-- If notifications don't appear, check your desktop environment's notification settings
-- Test with: `notify-send "Test" "This is a test notification"`
-- Some minimal window managers may not support notifications
-
-## Notification Levels
-
-The system supports four severity levels:
-
-| Severity | Use Case | Example |
-|----------|----------|---------|
-| `INFO` | General information | Market opened, Strategy started |
-| `SUCCESS` | Positive events | Order filled, Profit target hit |
-| `WARNING` | Warnings that need attention | Risk limit approaching, Connection issue |
-| `ERROR` | Errors and failures | Order rejected, Backend crash |
-
-## Current Limitations
-
-⚠️ **TODO Items:**
-
-1. **Persistence**: Notifications are not persisted - they disappear after being shown
-2. **WebSocket**: Backend → Frontend notification push not implemented (polling needed)
-3. **Rich Content**: Only text notifications supported (no images, actions)
-4. **History**: No notification history/log
-5. **Preferences**: No per-notification-type preferences
-6. **Sound**: No sound support yet
-7. **Badge**: App icon badge count not implemented
-
-## Future Enhancements
-
-Planned features for the notification system:
-
-- [ ] Notification history/log in UI
-- [ ] Per-severity notification preferences
-- [ ] Custom sound selection
-- [ ] Rich notifications (images, action buttons)
-- [ ] Notification grouping
-- [ ] Do Not Disturb mode
-- [ ] Desktop/mobile notification sync
-- [ ] WebSocket for real-time backend notifications
-- [ ] Email/SMS notification fallback
-
-## Example: Complete Integration
-
-Here's a complete example showing frontend + backend integration:
-
-**Frontend (React component):**
 ```typescript
 import { showSuccessNotification } from '../utils/notifications';
-import { createOrder } from '../api/backend';
 
-async function handleBuyOrder() {
-  try {
-    const order = await createOrder({
-      symbol: 'AAPL',
-      side: OrderSide.BUY,
-      type: OrderType.MARKET,
-      quantity: 100
-    });
-    
-    // Show success notification
-    await showSuccessNotification(
-      'Order Submitted',
-      `Buy order for 100 shares of AAPL submitted`
-    );
-  } catch (error) {
-    await showErrorNotification(
-      'Order Failed',
-      error.message
-    );
-  }
+await showSuccessNotification(
+  'Order Filled',
+  'Buy order for AAPL filled successfully'
+);
+```
+
+## Example (Summary Preferences API)
+
+```json
+{
+  "enabled": true,
+  "frequency": "weekly",
+  "channel": "email",
+  "recipient": "trading-alerts@example.com"
 }
 ```
 
-**Backend (FastAPI):**
-```python
-@router.post("/orders")
-async def create_order(request: OrderRequest):
-    # ... process order ...
-    
-    # Queue notification (TODO: Implement push via WebSocket)
-    notification = NotificationRequest(
-        title="Order Filled",
-        message=f"Buy order for {request.quantity} shares of {request.symbol} filled at ${fill_price}",
-        severity=NotificationSeverity.SUCCESS
-    )
-    
-    # For now, notifications are pull-based via polling
-    # Future: Push via WebSocket
-```
+## Troubleshooting
 
-## Testing Notifications
+### Notifications not appearing
 
-To test notifications in development:
+- Confirm OS notification permission for StocksBot
+- Verify `get_notification_permission` returns `granted`
+- On macOS, check System Settings > Notifications > StocksBot
 
-```typescript
-import { showNotification, NotificationSeverity } from '../utils/notifications';
+### Summary send-now says disabled
 
-// In your component or dev console
-showNotification(
-  'Test Notification',
-  'This is a test notification',
-  NotificationSeverity.INFO
-);
-```
+- Enable summary preferences first via `POST /notifications/summary/preferences`
+
+### Summary recipient validation errors
+
+- Use a valid email for `channel=email`
+- Use E.164-like number for `channel=sms` (e.g. `+14155550123`)
+
+## Known Gaps
+
+- `POST /notifications` is still a local placeholder endpoint (not an external push channel)
+- No persistent in-app notification center/history UI yet
 
 ---
 
-**Last Updated:** 2024  
-**Version:** 0.1.0
+Last Updated: `2026-02-13`
+Version: `0.1.0`

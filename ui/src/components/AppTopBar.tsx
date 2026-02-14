@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { getSystemHealthSnapshot, getStrategies, getTradingPreferences } from '../api/backend';
 import { RunnerStatus, StrategyStatus } from '../api/types';
+import { formatDateTime, formatTime, getLocalTimeZoneLabel } from '../utils/datetime';
 
 function AppTopBar() {
   const location = useLocation();
@@ -16,12 +17,12 @@ function AppTopBar() {
   const [sleeping, setSleeping] = useState(false);
   const [nextMarketOpenAt, setNextMarketOpenAt] = useState<string | null>(null);
   const [query, setQuery] = useState('');
+  const [timezoneLabel] = useState(getLocalTimeZoneLabel());
 
   const formatNextOpen = (value: string | null): string => {
     if (!value) return '';
-    const dt = new Date(value);
-    if (Number.isNaN(dt.getTime())) return '';
-    return dt.toLocaleString();
+    const formatted = formatDateTime(value);
+    return formatted === '-' ? '' : formatted;
   };
 
   const sync = async () => {
@@ -50,15 +51,15 @@ function AppTopBar() {
       setNextMarketOpenAt(runnerRes.next_market_open_at || null);
       setLastBrokerSync(
         runnerRes.last_broker_sync_at
-          ? new Date(runnerRes.last_broker_sync_at).toLocaleTimeString()
+          ? formatTime(runnerRes.last_broker_sync_at)
           : runnerRes.last_successful_poll_at
-          ? new Date(runnerRes.last_successful_poll_at).toLocaleTimeString()
+          ? formatTime(runnerRes.last_successful_poll_at)
           : ''
       );
-      setLastSync(new Date().toLocaleTimeString());
+      setLastSync(formatTime(new Date()));
     } catch {
       setRunnerLabel('error');
-      setLastSync(new Date().toLocaleTimeString());
+      setLastSync(formatTime(new Date()));
     }
   };
 
@@ -89,7 +90,7 @@ function AppTopBar() {
         ? detail.last_successful_poll_at
         : '';
       if (syncAt) {
-        setLastBrokerSync(new Date(syncAt).toLocaleTimeString());
+        setLastBrokerSync(formatTime(syncAt));
       }
     };
     window.addEventListener('system-health', onHealth as EventListener);
@@ -121,6 +122,7 @@ function AppTopBar() {
         <div className="text-xs text-gray-200 bg-gray-800 rounded px-2 py-1">Universe: <span className="font-semibold">{universeLabel}</span></div>
         <div className="text-xs bg-gray-800 rounded px-2 py-1">Runner: <span className={`font-semibold ${runnerColor}`}>{runnerLabel.toUpperCase()}</span></div>
         <div className="text-xs bg-gray-800 rounded px-2 py-1">Broker Sync: <span className="font-semibold">{lastBrokerSync || '-'}</span></div>
+        <div className="text-xs bg-gray-800 rounded px-2 py-1">TZ: <span className="font-semibold">{timezoneLabel}</span></div>
         {killSwitchActive && <div className="text-xs bg-red-900/70 text-red-200 rounded px-2 py-1 font-semibold">KILL SWITCH ACTIVE</div>}
 
         <div className="ml-auto flex items-center gap-2">

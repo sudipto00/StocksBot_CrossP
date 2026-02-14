@@ -61,6 +61,7 @@ const sections = [
     description: 'Broker credentials, risk profile, and trading preferences.',
     points: [
       'Alpaca keys are requested for paper/live and stored in Keychain; app checks Keychain first.',
+      'Backend API-key auth is optional and intended for secured API access; local desktop usage keeps it disabled by default.',
       'Risk profile defines sizing and controls (Conservative/Balanced/Aggressive).',
       'Weekly budget and screener preferences drive symbol selection and allocation behavior.',
       'Changing strategy does not auto-liquidate existing holdings unless selloff is explicitly chosen.',
@@ -266,6 +267,29 @@ const eventTypes = [
   'error',
 ];
 
+const troubleshootingTips = [
+  {
+    title: 'Screener or charts show "Load failed"',
+    detail: 'Check backend is running, then verify broker/account connectivity in Settings or Dashboard and refresh Screener.',
+  },
+  {
+    title: 'Keychain prompt keeps reappearing',
+    detail: 'Clear stale StocksBot entries in macOS Keychain Access for service com.stocksbot.alpaca, then re-save keys from Settings.',
+  },
+  {
+    title: 'Runner start fails with no active strategies',
+    detail: 'At least one strategy must be active and contain valid symbols before pressing Start Runner.',
+  },
+  {
+    title: 'Auth errors (401) on API calls',
+    detail: 'If backend API auth is enabled, clients must send X-API-Key or Bearer token matching STOCKSBOT_API_KEY.',
+  },
+  {
+    title: 'Reset Audit Data does nothing',
+    detail: 'Stop the runner first; reset is intentionally blocked while runner status is running/sleeping.',
+  },
+];
+
 function HelpPage() {
   const location = useLocation();
 
@@ -287,6 +311,7 @@ function HelpPage() {
         </p>
         <div className="mt-3 flex flex-wrap gap-2 text-xs">
           <a href="#getting-started" className="rounded bg-blue-800 px-2 py-1 text-blue-100 hover:text-white">Get Started</a>
+          <a href="#troubleshooting" className="rounded bg-gray-800 px-2 py-1 text-gray-300 hover:text-white">Troubleshooting</a>
           <a href="#wiring" className="rounded bg-gray-800 px-2 py-1 text-gray-300 hover:text-white">Universe Wiring</a>
           <a href="#preset-universes" className="rounded bg-gray-800 px-2 py-1 text-gray-300 hover:text-white">Preset Universes</a>
           <a href="#controls" className="rounded bg-gray-800 px-2 py-1 text-gray-300 hover:text-white">Controls</a>
@@ -311,7 +336,7 @@ function HelpPage() {
           <li>Start backend and desktop app, then verify Dashboard loads without connection errors.</li>
           <li>Open Settings and save Alpaca credentials to Keychain (begin with paper keys).</li>
           <li>Use Load Keys from Keychain and confirm status badges show the selected mode keys available.</li>
-          <li>Set paper/live mode, risk limits, and notification recipient (if summary notifications are enabled), then Save Settings.</li>
+          <li>Set paper/live mode and runner/notification options in Settings, then configure risk limits and guardrails in Screener Workspace.</li>
           <li>Open Screener, choose Stock/ETF universe mode, confirm symbol list loads, and inspect chart with SMA50/SMA250.</li>
           <li>Pin selected symbols to an existing strategy or create a new strategy directly from Screener.</li>
           <li>Open Strategy, review parameter helper text, validate symbols/config, and activate at least one strategy.</li>
@@ -328,6 +353,21 @@ function HelpPage() {
         </div>
         <div className="mt-4 rounded bg-blue-950/50 p-3 text-xs text-blue-100">
           Alpaca funds mode: Paper by default. The app uses the current Paper/Live setting from Settings and loads matching credentials from Keychain first.
+        </div>
+        <div className="mt-4 rounded bg-blue-950/50 p-3 text-xs text-blue-100">
+          API auth note: If backend API-key auth is enabled (`STOCKSBOT_API_KEY_AUTH_ENABLED=true`), requests must include `X-API-Key` or `Authorization: Bearer` with the configured key.
+        </div>
+      </div>
+
+      <div id="troubleshooting" className="bg-gray-800 border border-gray-700 rounded-lg p-5 mb-8 scroll-mt-24">
+        <h3 className="text-lg font-semibold text-white mb-3">Troubleshooting</h3>
+        <div className="space-y-3 text-sm">
+          {troubleshootingTips.map((tip) => (
+            <div key={tip.title} className="rounded border border-gray-700 bg-gray-900/50 p-3">
+              <p className="text-white font-medium">{tip.title}</p>
+              <p className="text-gray-300 mt-1">{tip.detail}</p>
+            </div>
+          ))}
         </div>
       </div>
 

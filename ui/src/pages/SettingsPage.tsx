@@ -10,7 +10,6 @@ import {
   getMaintenanceStorage,
   runMaintenanceCleanup,
   getTradingPreferences,
-  updateTradingPreferences,
   getSummaryNotificationPreferences,
   updateSummaryNotificationPreferences,
   sendSummaryNotificationNow,
@@ -45,14 +44,6 @@ interface StoredCredentials {
 }
 
 const SETTINGS_LIMITS = {
-  maxPositionMin: 1,
-  maxPositionMax: 10_000_000,
-  riskDailyMin: 1,
-  riskDailyMax: 1_000_000,
-  weeklyBudgetMin: 50,
-  weeklyBudgetMax: 1_000_000,
-  screenerLimitMin: 10,
-  screenerLimitMax: 200,
   tickIntervalMin: 5,
   tickIntervalMax: 3600,
   retentionDaysMin: 1,
@@ -111,25 +102,13 @@ function SettingsPage() {
   const [summaryRecipient, setSummaryRecipient] = useState('');
   const [killSwitchActive, setKillSwitchActive] = useState(false);
   const [panicLoading, setPanicLoading] = useState(false);
+  const [saveVerificationMessage, setSaveVerificationMessage] = useState<string | null>(null);
   
   // Validation errors
   const [validationErrors, setValidationErrors] = useState<Record<string, string>>({});
 
   const collectValidationErrors = (): Record<string, string> => {
     const errors: Record<string, string> = {};
-    
-    if (maxPositionSize < SETTINGS_LIMITS.maxPositionMin || maxPositionSize > SETTINGS_LIMITS.maxPositionMax) {
-      errors.maxPositionSize = `Max position size must be between ${SETTINGS_LIMITS.maxPositionMin} and ${SETTINGS_LIMITS.maxPositionMax}`;
-    }
-    if (riskLimitDaily < SETTINGS_LIMITS.riskDailyMin || riskLimitDaily > SETTINGS_LIMITS.riskDailyMax) {
-      errors.riskLimitDaily = `Daily risk limit must be between ${SETTINGS_LIMITS.riskDailyMin} and ${SETTINGS_LIMITS.riskDailyMax}`;
-    }
-    if (weeklyBudget < SETTINGS_LIMITS.weeklyBudgetMin || weeklyBudget > SETTINGS_LIMITS.weeklyBudgetMax) {
-      errors.weeklyBudget = `Weekly budget must be between ${SETTINGS_LIMITS.weeklyBudgetMin} and ${SETTINGS_LIMITS.weeklyBudgetMax}`;
-    }
-    if (screenerLimit < SETTINGS_LIMITS.screenerLimitMin || screenerLimit > SETTINGS_LIMITS.screenerLimitMax) {
-      errors.screenerLimit = `Most active count must be between ${SETTINGS_LIMITS.screenerLimitMin} and ${SETTINGS_LIMITS.screenerLimitMax}`;
-    }
     if (tickIntervalSeconds < SETTINGS_LIMITS.tickIntervalMin || tickIntervalSeconds > SETTINGS_LIMITS.tickIntervalMax) {
       errors.tickIntervalSeconds = `Runner interval must be between ${SETTINGS_LIMITS.tickIntervalMin} and ${SETTINGS_LIMITS.tickIntervalMax} seconds`;
     }
@@ -144,9 +123,6 @@ function SettingsPage() {
     }
     if (auditRetentionDays < SETTINGS_LIMITS.retentionDaysMin || auditRetentionDays > SETTINGS_LIMITS.retentionDaysMax) {
       errors.auditRetentionDays = `Audit retention must be between ${SETTINGS_LIMITS.retentionDaysMin} and ${SETTINGS_LIMITS.retentionDaysMax} days`;
-    }
-    if (assetType !== 'stock' && universeMode === 'most_active') {
-      errors.universeMode = 'Most Active universe is available only for Stocks';
     }
     if (summaryEnabled) {
       const recipient = summaryRecipient.trim();
@@ -170,6 +146,7 @@ function SettingsPage() {
     try {
       setLoading(true);
       setError(null);
+      setSaveVerificationMessage(null);
       
       const config = await getConfig();
       
@@ -232,17 +209,10 @@ function SettingsPage() {
     try {
       setSaving(true);
       setError(null);
-
-      const effectiveRiskProfile: RiskProfilePreference =
-        assetType === 'etf' ? (etfPreset as RiskProfilePreference) : riskProfile;
-      const effectiveUniverseMode: ScreenerModePreference =
-        assetType === 'stock' ? universeMode : 'preset';
       
       await updateConfig({
         trading_enabled: tradingEnabled,
         paper_trading: paperTrading,
-        max_position_size: maxPositionSize,
-        risk_limit_daily: riskLimitDaily,
         tick_interval_seconds: tickIntervalSeconds,
         streaming_enabled: streamingEnabled,
         log_directory: logDirectory.trim(),
@@ -251,21 +221,35 @@ function SettingsPage() {
         audit_retention_days: auditRetentionDays,
         broker,
       });
-      await updateTradingPreferences({
-        asset_type: assetType,
-        risk_profile: effectiveRiskProfile,
-        weekly_budget: weeklyBudget,
-        screener_limit: screenerLimit,
-        screener_mode: effectiveUniverseMode,
-        stock_preset: stockPreset,
-        etf_preset: etfPreset,
-      });
       await updateSummaryNotificationPreferences({
         enabled: summaryEnabled,
         frequency: summaryFrequency,
         channel: summaryChannel,
         recipient: summaryRecipient.trim(),
       });
+      const [verifiedConfig, verifiedSummary] = await Promise.all([
+        getConfig(),
+        getSummaryNotificationPreferences(),
+      ]);
+      const configVerified =
+        verifiedConfig.trading_enabled === tradingEnabled &&
+        verifiedConfig.paper_trading === paperTrading &&
+        verifiedConfig.tick_interval_seconds === tickIntervalSeconds &&
+        Boolean(verifiedConfig.streaming_enabled) === streamingEnabled &&
+        (verifiedConfig.log_directory || '').trim() === logDirectory.trim() &&
+        (verifiedConfig.audit_export_directory || '').trim() === auditExportDirectory.trim() &&
+        verifiedConfig.log_retention_days === logRetentionDays &&
+        verifiedConfig.audit_retention_days === auditRetentionDays &&
+        verifiedConfig.broker === broker;
+      const summaryVerified =
+        verifiedSummary.enabled === summaryEnabled &&
+        verifiedSummary.frequency === summaryFrequency &&
+        verifiedSummary.channel === summaryChannel &&
+        (verifiedSummary.recipient || '').trim() === summaryRecipient.trim();
+      if (!configVerified || !summaryVerified) {
+        throw new Error('Save verification failed. Reload settings and retry.');
+      }
+      setSaveVerificationMessage(`Settings saved and verified at ${new Date().toLocaleString()}`);
       try {
         setStorageInfo(await getMaintenanceStorage());
       } catch {
@@ -468,6 +452,11 @@ function SettingsPage() {
           <p className="text-amber-300 text-sm">{Object.values(collectValidationErrors())[0]}</p>
         </div>
       )}
+      {saveVerificationMessage && (
+        <div className="bg-emerald-900/20 border border-emerald-700 rounded-lg p-3 mb-6">
+          <p className="text-emerald-300 text-sm">{saveVerificationMessage}</p>
+        </div>
+      )}
 
       <CollapsibleSection title="General Trading" summary="Global execution mode and paper/live selection">
         <div className="space-y-4">
@@ -532,58 +521,8 @@ function SettingsPage() {
         </div>
       </CollapsibleSection>
 
-      <CollapsibleSection title="Risk Management" summary="Position and daily risk thresholds">
+      <CollapsibleSection title="Runner & Sync" summary="Execution polling interval and update cadence">
         <div className="space-y-4">
-          <div>
-            <label className="text-white font-medium block mb-2">Max Position Size ($) <HelpTooltip text="Maximum capital allowed in a single position." /></label>
-            <input
-              type="number"
-              value={maxPositionSize}
-            onChange={(e) => setMaxPositionSize(parseFloat(e.target.value) || 0)}
-            onBlur={(e) => {
-              const parsed = Number.parseFloat(e.target.value);
-              setMaxPositionSize(
-                Number.isFinite(parsed)
-                  ? clamp(parsed, SETTINGS_LIMITS.maxPositionMin, SETTINGS_LIMITS.maxPositionMax)
-                  : SETTINGS_LIMITS.maxPositionMin
-              );
-            }}
-              className={`bg-gray-700 text-white px-4 py-2 rounded border ${
-                validationErrors.maxPositionSize ? 'border-red-500' : 'border-gray-600'
-              } w-full`}
-              min="0"
-              step="100"
-            />
-            {validationErrors.maxPositionSize && (
-              <p className="text-red-400 text-sm mt-1">{validationErrors.maxPositionSize}</p>
-            )}
-          </div>
-          
-          <div>
-            <label className="text-white font-medium block mb-2">Daily Loss Limit ($) <HelpTooltip text="Stops further risk once this loss threshold is reached." /></label>
-            <input
-              type="number"
-              value={riskLimitDaily}
-            onChange={(e) => setRiskLimitDaily(parseFloat(e.target.value) || 0)}
-            onBlur={(e) => {
-              const parsed = Number.parseFloat(e.target.value);
-              setRiskLimitDaily(
-                Number.isFinite(parsed)
-                  ? clamp(parsed, SETTINGS_LIMITS.riskDailyMin, SETTINGS_LIMITS.riskDailyMax)
-                  : SETTINGS_LIMITS.riskDailyMin
-              );
-            }}
-              className={`bg-gray-700 text-white px-4 py-2 rounded border ${
-                validationErrors.riskLimitDaily ? 'border-red-500' : 'border-gray-600'
-              } w-full`}
-              min="0"
-              step="10"
-            />
-            {validationErrors.riskLimitDaily && (
-              <p className="text-red-400 text-sm mt-1">{validationErrors.riskLimitDaily}</p>
-            )}
-          </div>
-
           <div>
             <label className="text-white font-medium block mb-2">Runner Poll Interval (seconds) <HelpTooltip text="How often strategies poll market data and evaluate signals." /></label>
             <input
@@ -610,6 +549,16 @@ function SettingsPage() {
               <p className="text-red-400 text-sm mt-1">{validationErrors.tickIntervalSeconds}</p>
             )}
           </div>
+          <div className="rounded-lg border border-blue-800 bg-blue-900/20 p-3 text-sm text-blue-100">
+            Position sizing, daily loss caps, universe filters, and budget guardrails are managed in
+            <span className="font-semibold"> Screener Workspace Controls</span> to avoid duplicate risk inputs.
+          </div>
+          <button
+            onClick={() => navigate('/screener')}
+            className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded font-medium"
+          >
+            Open Screener Workspace
+          </button>
         </div>
       </CollapsibleSection>
 
@@ -858,7 +807,7 @@ function SettingsPage() {
             Universe selection, symbol list, charts, metrics, and guardrails are all managed in
             <span className="font-semibold"> Screener</span> now.
           </div>
-          <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
+          <div className="grid grid-cols-1 md:grid-cols-3 xl:grid-cols-4 gap-3">
             <div className="rounded border border-gray-700 bg-gray-800/40 p-3">
               <p className="text-xs text-gray-400">Asset Type</p>
               <p className="text-white font-medium uppercase">{assetType}</p>
@@ -874,6 +823,22 @@ function SettingsPage() {
             <div className="rounded border border-gray-700 bg-gray-800/40 p-3">
               <p className="text-xs text-gray-400">Most Active Count</p>
               <p className="text-white font-medium">{screenerLimit}</p>
+            </div>
+            <div className="rounded border border-gray-700 bg-gray-800/40 p-3">
+              <p className="text-xs text-gray-400">Risk Profile</p>
+              <p className="text-white font-medium uppercase">{riskProfile}</p>
+            </div>
+            <div className="rounded border border-gray-700 bg-gray-800/40 p-3">
+              <p className="text-xs text-gray-400">Weekly Budget</p>
+              <p className="text-white font-medium">${weeklyBudget.toLocaleString()}</p>
+            </div>
+            <div className="rounded border border-gray-700 bg-gray-800/40 p-3">
+              <p className="text-xs text-gray-400">Max Position Size</p>
+              <p className="text-white font-medium">${maxPositionSize.toLocaleString()}</p>
+            </div>
+            <div className="rounded border border-gray-700 bg-gray-800/40 p-3">
+              <p className="text-xs text-gray-400">Daily Loss Limit</p>
+              <p className="text-white font-medium">${riskLimitDaily.toLocaleString()}</p>
             </div>
           </div>
           <button

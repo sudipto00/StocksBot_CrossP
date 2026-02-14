@@ -4,7 +4,7 @@ const steps = [
   { label: '1. Configure', to: '/settings' },
   { label: '2. Select Universe', to: '/screener' },
   { label: '3. Activate Strategy', to: '/strategy' },
-  { label: '4. Monitor', to: '/dashboard' },
+  { label: '4. Monitor', to: '/' },
 ];
 
 function GuidedFlowStrip() {

@@ -216,3 +216,20 @@ class AuditLog(Base):
     # Timestamps
     timestamp = Column(DateTime, default=func.now(), nullable=False, index=True)
     created_at = Column(DateTime, default=func.now(), nullable=False)
+
+
+class PortfolioSnapshot(Base):
+    """
+    Persisted portfolio/account snapshot for chart continuity and analytics.
+    """
+    __tablename__ = "portfolio_snapshots"
+
+    id = Column(Integer, primary_key=True, index=True)
+    timestamp = Column(DateTime, default=func.now(), nullable=False, index=True)
+    equity = Column(Float, nullable=False, default=0.0)
+    cash = Column(Float, nullable=False, default=0.0)
+    buying_power = Column(Float, nullable=False, default=0.0)
+    market_value = Column(Float, nullable=False, default=0.0)
+    unrealized_pnl = Column(Float, nullable=False, default=0.0)
+    realized_pnl_total = Column(Float, nullable=False, default=0.0)
+    open_positions = Column(Integer, nullable=False, default=0)

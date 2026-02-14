@@ -53,17 +53,57 @@ import {
   PreferenceRecommendationResponse,
   SymbolChartResponse,
   AssetTypePreference,
+  ScreenerModePreference,
+  StockPresetPreference,
+  EtfPresetPreference,
 } from './types';
 
 // Access environment variables via import.meta.env in Vite
-const BACKEND_URL = (import.meta as { env?: { VITE_BACKEND_URL?: string } }).env?.VITE_BACKEND_URL || "http://127.0.0.1:8000";
-const DEFAULT_INITIAL_CAPITAL = 100000;
+const ENV = (import.meta as { env?: { VITE_BACKEND_URL?: string; VITE_STOCKSBOT_API_KEY?: string } }).env;
+const BACKEND_URL = ENV?.VITE_BACKEND_URL || "http://127.0.0.1:8000";
+const API_KEY_STORAGE_KEY = 'stocksbot_api_key';
+
+function resolveApiAuthKey(): string {
+  if (typeof window !== 'undefined') {
+    const fromStorage = (window.localStorage.getItem(API_KEY_STORAGE_KEY) || '').trim();
+    if (fromStorage) return fromStorage;
+  }
+  return (ENV?.VITE_STOCKSBOT_API_KEY || '').trim();
+}
+
+function buildAuthHeaders(existing?: HeadersInit): Headers {
+  const headers = new Headers(existing || {});
+  const apiKey = resolveApiAuthKey();
+  if (apiKey) {
+    headers.set('X-API-Key', apiKey);
+  }
+  return headers;
+}
+
+async function authFetch(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
+  const headers = buildAuthHeaders(init.headers);
+  return window.fetch(input, { ...init, headers });
+}
+
+export function getApiAuthKey(): string {
+  return resolveApiAuthKey();
+}
+
+export function setApiAuthKey(apiKey: string): void {
+  if (typeof window === 'undefined') return;
+  const trimmed = apiKey.trim();
+  if (trimmed) {
+    window.localStorage.setItem(API_KEY_STORAGE_KEY, trimmed);
+  } else {
+    window.localStorage.removeItem(API_KEY_STORAGE_KEY);
+  }
+}
 
 /**
  * Get backend status.
  */
 export async function getBackendStatus(): Promise<StatusResponse> {
-  const response = await fetch(`${BACKEND_URL}/status`);
+  const response = await authFetch(`${BACKEND_URL}/status`);
   
   if (!response.ok) {
     throw new Error(`Backend returned ${response.status}`);
@@ -76,7 +116,7 @@ export async function getBackendStatus(): Promise<StatusResponse> {
  * Get configuration.
  */
 export async function getConfig(): Promise<ConfigResponse> {
-  const response = await fetch(`${BACKEND_URL}/config`);
+  const response = await authFetch(`${BACKEND_URL}/config`);
   
   if (!response.ok) {
     throw new Error(`Backend returned ${response.status}`);
@@ -89,7 +129,7 @@ export async function getConfig(): Promise<ConfigResponse> {
  * Update configuration.
  */
 export async function updateConfig(config: ConfigUpdateRequest): Promise<ConfigResponse> {
-  const response = await fetch(`${BACKEND_URL}/config`, {
+  const response = await authFetch(`${BACKEND_URL}/config`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -110,7 +150,7 @@ export async function updateConfig(config: ConfigUpdateRequest): Promise<ConfigR
 export async function setBrokerCredentials(
   request: BrokerCredentialsRequest
 ): Promise<BrokerCredentialsStatusResponse> {
-  const response = await fetch(`${BACKEND_URL}/broker/credentials`, {
+  const response = await authFetch(`${BACKEND_URL}/broker/credentials`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -129,7 +169,7 @@ export async function setBrokerCredentials(
  * Get runtime broker credentials status.
  */
 export async function getBrokerCredentialsStatus(): Promise<BrokerCredentialsStatusResponse> {
-  const response = await fetch(`${BACKEND_URL}/broker/credentials/status`);
+  const response = await authFetch(`${BACKEND_URL}/broker/credentials/status`);
 
   if (!response.ok) {
     throw new Error(`Backend returned ${response.status}`);
@@ -142,7 +182,7 @@ export async function getBrokerCredentialsStatus(): Promise<BrokerCredentialsSta
  * Get active broker account snapshot (cash/equity/buying power).
  */
 export async function getBrokerAccount(): Promise<BrokerAccountResponse> {
-  const response = await fetch(`${BACKEND_URL}/broker/account`);
+  const response = await authFetch(`${BACKEND_URL}/broker/account`);
 
   if (!response.ok) {
     throw new Error(`Backend returned ${response.status}`);
@@ -155,7 +195,7 @@ export async function getBrokerAccount(): Promise<BrokerAccountResponse> {
  * Get current positions.
  */
 export async function getPositions(): Promise<PositionsResponse> {
-  const response = await fetch(`${BACKEND_URL}/positions`);
+  const response = await authFetch(`${BACKEND_URL}/positions`);
   
   if (!response.ok) {
     throw new Error(`Backend returned ${response.status}`);
@@ -168,7 +208,7 @@ export async function getPositions(): Promise<PositionsResponse> {
  * Get orders.
  */
 export async function getOrders(): Promise<OrdersResponse> {
-  const response = await fetch(`${BACKEND_URL}/orders`);
+  const response = await authFetch(`${BACKEND_URL}/orders`);
   
   if (!response.ok) {
     throw new Error(`Backend returned ${response.status}`);
@@ -181,7 +221,7 @@ export async function getOrders(): Promise<OrdersResponse> {
  * Create a new order (placeholder).
  */
 export async function createOrder(order: OrderRequest): Promise<{ message: string }> {
-  const response = await fetch(`${BACKEND_URL}/orders`, {
+  const response = await authFetch(`${BACKEND_URL}/orders`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -200,7 +240,7 @@ export async function createOrder(order: OrderRequest): Promise<{ message: strin
  * Request a notification from backend.
  */
 export async function requestNotification(notification: NotificationRequest): Promise<NotificationResponse> {
-  const response = await fetch(`${BACKEND_URL}/notifications`, {
+  const response = await authFetch(`${BACKEND_URL}/notifications`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -219,7 +259,7 @@ export async function requestNotification(notification: NotificationRequest): Pr
  * Get daily/weekly transaction summary notification preferences.
  */
 export async function getSummaryNotificationPreferences(): Promise<SummaryNotificationPreferences> {
-  const response = await fetch(`${BACKEND_URL}/notifications/summary/preferences`);
+  const response = await authFetch(`${BACKEND_URL}/notifications/summary/preferences`);
 
   if (!response.ok) {
     throw new Error(`Backend returned ${response.status}`);
@@ -234,7 +274,7 @@ export async function getSummaryNotificationPreferences(): Promise<SummaryNotifi
 export async function updateSummaryNotificationPreferences(
   request: SummaryNotificationPreferencesUpdateRequest
 ): Promise<SummaryNotificationPreferences> {
-  const response = await fetch(`${BACKEND_URL}/notifications/summary/preferences`, {
+  const response = await authFetch(`${BACKEND_URL}/notifications/summary/preferences`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -253,7 +293,7 @@ export async function updateSummaryNotificationPreferences(
  * Send summary notification immediately using configured preferences.
  */
 export async function sendSummaryNotificationNow(): Promise<NotificationResponse> {
-  const response = await fetch(`${BACKEND_URL}/notifications/summary/send-now`, {
+  const response = await authFetch(`${BACKEND_URL}/notifications/summary/send-now`, {
     method: 'POST',
   });
 
@@ -268,7 +308,7 @@ export async function sendSummaryNotificationNow(): Promise<NotificationResponse
  * Get all strategies.
  */
 export async function getStrategies(): Promise<StrategiesResponse> {
-  const response = await fetch(`${BACKEND_URL}/strategies`);
+  const response = await authFetch(`${BACKEND_URL}/strategies`);
   
   if (!response.ok) {
     throw new Error(`Backend returned ${response.status}`);
@@ -281,7 +321,7 @@ export async function getStrategies(): Promise<StrategiesResponse> {
  * Create a new strategy.
  */
 export async function createStrategy(strategy: StrategyCreateRequest): Promise<Strategy> {
-  const response = await fetch(`${BACKEND_URL}/strategies`, {
+  const response = await authFetch(`${BACKEND_URL}/strategies`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -300,7 +340,7 @@ export async function createStrategy(strategy: StrategyCreateRequest): Promise<S
  * Get a specific strategy by ID.
  */
 export async function getStrategy(id: string): Promise<Strategy> {
-  const response = await fetch(`${BACKEND_URL}/strategies/${id}`);
+  const response = await authFetch(`${BACKEND_URL}/strategies/${id}`);
   
   if (!response.ok) {
     throw new Error(`Backend returned ${response.status}`);
@@ -313,7 +353,7 @@ export async function getStrategy(id: string): Promise<Strategy> {
  * Update a strategy.
  */
 export async function updateStrategy(id: string, updates: StrategyUpdateRequest): Promise<Strategy> {
-  const response = await fetch(`${BACKEND_URL}/strategies/${id}`, {
+  const response = await authFetch(`${BACKEND_URL}/strategies/${id}`, {
     method: 'PUT',
     headers: {
       'Content-Type': 'application/json',
@@ -332,7 +372,7 @@ export async function updateStrategy(id: string, updates: StrategyUpdateRequest)
  * Delete a strategy.
  */
 export async function deleteStrategy(id: string): Promise<void> {
-  const response = await fetch(`${BACKEND_URL}/strategies/${id}`, {
+  const response = await authFetch(`${BACKEND_URL}/strategies/${id}`, {
     method: 'DELETE',
   });
   
@@ -351,7 +391,7 @@ export async function getAuditLogs(limit?: number, eventType?: AuditEventType): 
   if (eventType) params.append('event_type', eventType);
   
   const url = `${BACKEND_URL}/audit/logs${params.toString() ? '?' + params.toString() : ''}`;
-  const response = await fetch(url);
+  const response = await authFetch(url);
   
   if (!response.ok) {
     throw new Error(`Backend returned ${response.status}`);
@@ -368,7 +408,7 @@ export async function getAuditTrades(limit?: number): Promise<TradeHistoryRespon
   if (limit) params.append('limit', limit.toString());
 
   const url = `${BACKEND_URL}/audit/trades${params.toString() ? '?' + params.toString() : ''}`;
-  const response = await fetch(url);
+  const response = await authFetch(url);
 
   if (!response.ok) {
     throw new Error(`Backend returned ${response.status}`);
@@ -381,7 +421,7 @@ export async function getAuditTrades(limit?: number): Promise<TradeHistoryRespon
  * Get strategy runner status.
  */
 export async function getRunnerStatus(): Promise<RunnerStatusResponse> {
-  const response = await fetch(`${BACKEND_URL}/runner/status`);
+  const response = await authFetch(`${BACKEND_URL}/runner/status`);
   
   if (!response.ok) {
     throw new Error(`Backend returned ${response.status}`);
@@ -394,7 +434,7 @@ export async function getRunnerStatus(): Promise<RunnerStatusResponse> {
  * Start the strategy runner.
  */
 export async function startRunner(): Promise<RunnerActionResponse> {
-  const response = await fetch(`${BACKEND_URL}/runner/start`, {
+  const response = await authFetch(`${BACKEND_URL}/runner/start`, {
     method: 'POST',
   });
   
@@ -409,7 +449,7 @@ export async function startRunner(): Promise<RunnerActionResponse> {
  * Stop the strategy runner.
  */
 export async function stopRunner(): Promise<RunnerActionResponse> {
-  const response = await fetch(`${BACKEND_URL}/runner/stop`, {
+  const response = await authFetch(`${BACKEND_URL}/runner/stop`, {
     method: 'POST',
   });
   
@@ -449,7 +489,7 @@ export async function getSystemHealthSnapshot(): Promise<SystemHealthSnapshot> {
 }
 
 export async function getSafetyStatus(): Promise<SafetyStatusResponse> {
-  const response = await fetch(`${BACKEND_URL}/safety/status`);
+  const response = await authFetch(`${BACKEND_URL}/safety/status`);
   if (!response.ok) {
     throw new Error(`Backend returned ${response.status}`);
   }
@@ -457,7 +497,7 @@ export async function getSafetyStatus(): Promise<SafetyStatusResponse> {
 }
 
 export async function setKillSwitch(active: boolean): Promise<{ success: boolean; kill_switch_active: boolean }> {
-  const response = await fetch(`${BACKEND_URL}/safety/kill-switch?active=${encodeURIComponent(String(active))}`, {
+  const response = await authFetch(`${BACKEND_URL}/safety/kill-switch?active=${encodeURIComponent(String(active))}`, {
     method: 'POST',
   });
   if (!response.ok) {
@@ -467,7 +507,7 @@ export async function setKillSwitch(active: boolean): Promise<{ success: boolean
 }
 
 export async function runPanicStop(): Promise<RunnerActionResponse> {
-  const response = await fetch(`${BACKEND_URL}/safety/panic-stop`, { method: 'POST' });
+  const response = await authFetch(`${BACKEND_URL}/safety/panic-stop`, { method: 'POST' });
   if (!response.ok) {
     throw new Error(`Backend returned ${response.status}`);
   }
@@ -475,7 +515,7 @@ export async function runPanicStop(): Promise<RunnerActionResponse> {
 }
 
 export async function getSafetyPreflight(symbol: string): Promise<SafetyPreflightResponse> {
-  const response = await fetch(`${BACKEND_URL}/safety/preflight?symbol=${encodeURIComponent(symbol)}`);
+  const response = await authFetch(`${BACKEND_URL}/safety/preflight?symbol=${encodeURIComponent(symbol)}`);
   if (!response.ok) {
     throw new Error(`Backend returned ${response.status}`);
   }
@@ -486,7 +526,7 @@ export async function getSafetyPreflight(symbol: string): Promise<SafetyPrefligh
  * Get current storage paths, retention values, and recent files.
  */
 export async function getMaintenanceStorage(): Promise<MaintenanceStorageResponse> {
-  const response = await fetch(`${BACKEND_URL}/maintenance/storage`);
+  const response = await authFetch(`${BACKEND_URL}/maintenance/storage`);
 
   if (!response.ok) {
     throw new Error(`Backend returned ${response.status}`);
@@ -499,7 +539,7 @@ export async function getMaintenanceStorage(): Promise<MaintenanceStorageRespons
  * Run retention cleanup immediately.
  */
 export async function runMaintenanceCleanup(): Promise<MaintenanceCleanupResponse> {
-  const response = await fetch(`${BACKEND_URL}/maintenance/cleanup`, {
+  const response = await authFetch(`${BACKEND_URL}/maintenance/cleanup`, {
     method: 'POST',
   });
 
@@ -526,7 +566,7 @@ export async function resetAuditData(
   if (typeof request.clear_trade_history === 'boolean') params.append('clear_trade_history', String(request.clear_trade_history));
   if (typeof request.clear_log_files === 'boolean') params.append('clear_log_files', String(request.clear_log_files));
   if (typeof request.clear_audit_export_files === 'boolean') params.append('clear_audit_export_files', String(request.clear_audit_export_files));
-  const response = await fetch(`${BACKEND_URL}/maintenance/reset-audit-data${params.toString() ? `?${params.toString()}` : ''}`, {
+  const response = await authFetch(`${BACKEND_URL}/maintenance/reset-audit-data${params.toString() ? `?${params.toString()}` : ''}`, {
     method: 'POST',
   });
   if (!response.ok) {
@@ -543,7 +583,7 @@ export async function resetAuditData(
  * Explicitly liquidate all open positions.
  */
 export async function selloffPortfolio(): Promise<RunnerActionResponse> {
-  const response = await fetch(`${BACKEND_URL}/portfolio/selloff`, {
+  const response = await authFetch(`${BACKEND_URL}/portfolio/selloff`, {
     method: 'POST',
   });
 
@@ -563,7 +603,7 @@ export async function getPortfolioAnalytics(days?: number): Promise<PortfolioAna
   if (days) params.append('days', days.toString());
   
   const url = `${BACKEND_URL}/analytics/portfolio${params.toString() ? '?' + params.toString() : ''}`;
-  const response = await fetch(url);
+  const response = await authFetch(url);
   
   if (!response.ok) {
     throw new Error(`Backend returned ${response.status}`);
@@ -589,7 +629,7 @@ export async function getPortfolioAnalytics(days?: number): Promise<PortfolioAna
  * Get portfolio summary statistics.
  */
 export async function getPortfolioSummary(): Promise<PortfolioSummaryResponse> {
-  const response = await fetch(`${BACKEND_URL}/analytics/summary`);
+  const response = await authFetch(`${BACKEND_URL}/analytics/summary`);
   
   if (!response.ok) {
     throw new Error(`Backend returned ${response.status}`);
@@ -611,8 +651,13 @@ export async function getEquityCurve(limit?: number): Promise<{ data: EquityPoin
     value: point.equity,
   }));
   
-  // Calculate initial capital from first equity point or use default
-  const initial_capital = equityData.length > 0 ? equityData[0].value : DEFAULT_INITIAL_CAPITAL;
+  // Calculate initial capital from first point; fall back to current equity when available.
+  const initial_capital =
+    equityData.length > 0
+      ? equityData[0].value
+      : Number.isFinite(analytics.current_equity)
+      ? analytics.current_equity
+      : 0;
   
   return {
     data: equityData,
@@ -624,7 +669,7 @@ export async function getEquityCurve(limit?: number): Promise<{ data: EquityPoin
  * Get strategy configuration.
  */
 export async function getStrategyConfig(strategyId: string): Promise<StrategyConfig> {
-  const response = await fetch(`${BACKEND_URL}/strategies/${strategyId}/config`);
+  const response = await authFetch(`${BACKEND_URL}/strategies/${strategyId}/config`);
   
   if (!response.ok) {
     throw new Error(`Backend returned ${response.status}`);
@@ -640,7 +685,7 @@ export async function updateStrategyConfig(
   strategyId: string,
   updates: StrategyConfigUpdateRequest
 ): Promise<StrategyConfig> {
-  const response = await fetch(`${BACKEND_URL}/strategies/${strategyId}/config`, {
+  const response = await authFetch(`${BACKEND_URL}/strategies/${strategyId}/config`, {
     method: 'PUT',
     headers: {
       'Content-Type': 'application/json',
@@ -659,7 +704,7 @@ export async function updateStrategyConfig(
  * Get strategy performance metrics.
  */
 export async function getStrategyMetrics(strategyId: string): Promise<StrategyMetrics> {
-  const response = await fetch(`${BACKEND_URL}/strategies/${strategyId}/metrics`);
+  const response = await authFetch(`${BACKEND_URL}/strategies/${strategyId}/metrics`);
   
   if (!response.ok) {
     throw new Error(`Backend returned ${response.status}`);
@@ -675,7 +720,7 @@ export async function runBacktest(
   strategyId: string,
   request: BacktestRequest
 ): Promise<BacktestResult> {
-  const response = await fetch(`${BACKEND_URL}/strategies/${strategyId}/backtest`, {
+  const response = await authFetch(`${BACKEND_URL}/strategies/${strategyId}/backtest`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -697,7 +742,7 @@ export async function tuneParameter(
   strategyId: string,
   request: ParameterTuneRequest
 ): Promise<ParameterTuneResponse> {
-  const response = await fetch(`${BACKEND_URL}/strategies/${strategyId}/tune`, {
+  const response = await authFetch(`${BACKEND_URL}/strategies/${strategyId}/tune`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -716,7 +761,7 @@ export async function tuneParameter(
  * Get trading preferences used by screener and risk controls.
  */
 export async function getTradingPreferences(): Promise<TradingPreferences> {
-  const response = await fetch(`${BACKEND_URL}/preferences`);
+  const response = await authFetch(`${BACKEND_URL}/preferences`);
 
   if (!response.ok) {
     throw new Error(`Backend returned ${response.status}`);
@@ -737,7 +782,7 @@ export async function getTradingPreferences(): Promise<TradingPreferences> {
 export async function updateTradingPreferences(
   request: TradingPreferencesUpdateRequest
 ): Promise<TradingPreferences> {
-  const response = await fetch(`${BACKEND_URL}/preferences`, {
+  const response = await authFetch(`${BACKEND_URL}/preferences`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -778,7 +823,7 @@ export async function getPreferenceRecommendation(
   if (typeof request.target_trades_per_week === 'number' && Number.isFinite(request.target_trades_per_week)) {
     params.append('target_trades_per_week', String(Math.max(1, Math.round(request.target_trades_per_week))));
   }
-  const response = await fetch(`${BACKEND_URL}/preferences/recommendation${params.toString() ? `?${params.toString()}` : ''}`);
+  const response = await authFetch(`${BACKEND_URL}/preferences/recommendation${params.toString() ? `?${params.toString()}` : ''}`);
   if (!response.ok) {
     const body = await response.json().catch(() => null);
     throw new Error(body?.detail || `Backend returned ${response.status}`);
@@ -790,7 +835,7 @@ export async function getPreferenceRecommendation(
  * Get symbol chart data with SMA overlays.
  */
 export async function getSymbolChart(symbol: string, days = 320): Promise<SymbolChartResponse> {
-  const response = await fetch(`${BACKEND_URL}/screener/chart/${symbol}?days=${days}`);
+  const response = await authFetch(`${BACKEND_URL}/screener/chart/${symbol}?days=${days}`);
 
   if (!response.ok) {
     throw new Error(`Backend returned ${response.status}`);
@@ -804,15 +849,72 @@ export async function getSymbolChart(symbol: string, days = 320): Promise<Symbol
  */
 export async function getScreenerAssets(
   assetType?: AssetTypePreference,
-  limit?: number
-): Promise<{ assets: Array<{ symbol: string }> }> {
-  const params = new URLSearchParams();
-  if (assetType) params.append('asset_type', assetType);
-  if (limit) params.append('limit', String(limit));
-  const url = `${BACKEND_URL}/screener/all${params.toString() ? `?${params.toString()}` : ''}`;
-  const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error(`Backend returned ${response.status}`);
+  limit?: number,
+  options: {
+    screenerMode?: ScreenerModePreference;
+    stockPreset?: StockPresetPreference;
+    etfPreset?: EtfPresetPreference;
+    minDollarVolume?: number;
+    maxSpreadBps?: number;
+    maxSectorWeightPct?: number;
+    autoRegimeAdjust?: boolean;
+  } = {}
+): Promise<{ assets: Array<{ symbol: string }>; total_count?: number; total_pages?: number }> {
+  const normalizedAssetType: AssetTypePreference = assetType === 'etf' ? 'etf' : 'stock';
+  const normalizedLimit = Math.max(10, Math.min(200, Math.round(limit || 50)));
+  const mode = options.screenerMode;
+  const pageSize = Math.max(10, Math.min(100, normalizedLimit));
+
+  const baseParams = new URLSearchParams();
+  baseParams.append('asset_type', normalizedAssetType);
+  baseParams.append('limit', String(normalizedLimit));
+  baseParams.append('page_size', String(pageSize));
+  if (typeof options.minDollarVolume === 'number' && Number.isFinite(options.minDollarVolume)) {
+    baseParams.append('min_dollar_volume', String(options.minDollarVolume));
   }
-  return response.json();
+  if (typeof options.maxSpreadBps === 'number' && Number.isFinite(options.maxSpreadBps)) {
+    baseParams.append('max_spread_bps', String(options.maxSpreadBps));
+  }
+  if (typeof options.maxSectorWeightPct === 'number' && Number.isFinite(options.maxSectorWeightPct)) {
+    baseParams.append('max_sector_weight_pct', String(options.maxSectorWeightPct));
+  }
+  if (typeof options.autoRegimeAdjust === 'boolean') {
+    baseParams.append('auto_regime_adjust', String(options.autoRegimeAdjust));
+  }
+
+  let endpoint = `${BACKEND_URL}/screener/all`;
+  if (mode === 'preset') {
+    endpoint = `${BACKEND_URL}/screener/preset`;
+    const preset = normalizedAssetType === 'etf'
+      ? (options.etfPreset || 'balanced')
+      : (options.stockPreset || 'weekly_optimized');
+    baseParams.append('preset', preset);
+  } else if (mode === 'most_active') {
+    baseParams.append('screener_mode', mode);
+  }
+
+  const fetchPage = async (page: number): Promise<{ assets: Array<{ symbol: string }>; total_count: number; total_pages: number }> => {
+    const params = new URLSearchParams(baseParams);
+    params.append('page', String(page));
+    const response = await authFetch(`${endpoint}?${params.toString()}`);
+    if (!response.ok) {
+      const body = await response.json().catch(() => null);
+      throw new Error(body?.detail || `Backend returned ${response.status}`);
+    }
+    return response.json();
+  };
+
+  const firstPage = await fetchPage(1);
+  const allAssets = [...(firstPage.assets || [])];
+  const totalPages = Math.max(1, firstPage.total_pages || 1);
+  for (let page = 2; page <= totalPages; page += 1) {
+    const next = await fetchPage(page);
+    allAssets.push(...(next.assets || []));
+  }
+
+  return {
+    assets: allAssets.slice(0, normalizedLimit),
+    total_count: firstPage.total_count ?? allAssets.length,
+    total_pages: totalPages,
+  };
 }

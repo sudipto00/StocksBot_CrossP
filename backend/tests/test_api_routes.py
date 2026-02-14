@@ -11,6 +11,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app import app
+from api import routes as api_routes
 from storage.database import Base, get_db
 from storage.service import StorageService
 from storage.models import OrderSideEnum, TradeTypeEnum
@@ -279,6 +280,235 @@ def test_get_audit_trades():
 
 
 # ============================================================================
+# Summary Notification Tests
+# ============================================================================
+
+def test_send_summary_notification_now_timezone_safe(monkeypatch):
+    """send-now should handle naive/aware datetimes without crashing."""
+    prefs_response = client.post(
+        "/notifications/summary/preferences",
+        json={
+            "enabled": True,
+            "frequency": "daily",
+            "channel": "email",
+            "recipient": "test@example.com",
+        },
+    )
+    assert prefs_response.status_code == 200
+
+    db = TestingSessionLocal()
+    try:
+        storage = StorageService(db)
+        order = storage.create_order(
+            symbol="AAPL",
+            side="buy",
+            order_type="market",
+            quantity=1.0,
+        )
+        # Intentionally store naive datetime to cover sqlite/runtime behavior.
+        trade = storage.trades.create(
+            order_id=order.id,
+            symbol="AAPL",
+            side=OrderSideEnum.BUY,
+            type=TradeTypeEnum.OPEN,
+            quantity=1.0,
+            price=100.0,
+            executed_at=datetime.now(),
+        )
+        trade.realized_pnl = 5.0
+        db.commit()
+    finally:
+        db.close()
+
+    monkeypatch.setattr(
+        "services.notification_delivery.NotificationDeliveryService.send_summary",
+        lambda self, channel, recipient, subject, body: f"Email sent to {recipient}",
+    )
+
+    response = client.post("/notifications/summary/send-now")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["success"] is True
+    assert "Email sent to test@example.com" in data["message"]
+
+
+def test_send_summary_notification_now_delivery_failure(monkeypatch):
+    """Transport failures should return success=false with actionable message."""
+    prefs_response = client.post(
+        "/notifications/summary/preferences",
+        json={
+            "enabled": True,
+            "frequency": "daily",
+            "channel": "sms",
+            "recipient": "+15551234567",
+        },
+    )
+    assert prefs_response.status_code == 200
+
+    db = TestingSessionLocal()
+    try:
+        storage = StorageService(db)
+        order = storage.create_order(
+            symbol="MSFT",
+            side="buy",
+            order_type="market",
+            quantity=1.0,
+        )
+        storage.trades.create(
+            order_id=order.id,
+            symbol="MSFT",
+            side=OrderSideEnum.BUY,
+            type=TradeTypeEnum.OPEN,
+            quantity=1.0,
+            price=200.0,
+            executed_at=datetime.now(timezone.utc),
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    def _raise_delivery_error(*_args, **_kwargs):
+        raise RuntimeError("Twilio delivery failed: missing credentials")
+
+    monkeypatch.setattr(
+        "services.notification_delivery.NotificationDeliveryService.send_summary",
+        _raise_delivery_error,
+    )
+
+    response = client.post("/notifications/summary/send-now")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["success"] is False
+    assert "Summary delivery failed" in data["message"]
+
+
+def test_scheduled_summary_dispatch_daily_once(monkeypatch):
+    """Scheduled daily summary should send once per completed day window."""
+    prefs_response = client.post(
+        "/notifications/summary/preferences",
+        json={
+            "enabled": True,
+            "frequency": "daily",
+            "channel": "email",
+            "recipient": "daily@example.com",
+        },
+    )
+    assert prefs_response.status_code == 200
+
+    db = TestingSessionLocal()
+    try:
+        storage = StorageService(db)
+        order = storage.create_order(
+            symbol="AAPL",
+            side="buy",
+            order_type="market",
+            quantity=1.0,
+        )
+        # Falls into previous-day completed window for now=2026-02-14.
+        trade = storage.trades.create(
+            order_id=order.id,
+            symbol="AAPL",
+            side=OrderSideEnum.BUY,
+            type=TradeTypeEnum.OPEN,
+            quantity=1.0,
+            price=180.0,
+            executed_at=datetime(2026, 2, 13, 14, 0, 0, tzinfo=timezone.utc),
+        )
+        trade.realized_pnl = 3.5
+        db.commit()
+
+        sent_calls = {"count": 0}
+
+        def _send(*_args, **_kwargs):
+            sent_calls["count"] += 1
+            return "Email sent to daily@example.com"
+
+        monkeypatch.setattr(
+            "services.notification_delivery.NotificationDeliveryService.send_summary",
+            _send,
+        )
+
+        now = datetime(2026, 2, 14, 12, 0, 0, tzinfo=timezone.utc)
+        first = api_routes._dispatch_scheduled_summary(storage=storage, now_utc=now)
+        assert first["status"] == "sent"
+        assert first["period_id"] == "2026-02-13"
+        assert sent_calls["count"] == 1
+
+        second = api_routes._dispatch_scheduled_summary(storage=storage, now_utc=now)
+        assert second["status"] == "skipped"
+        assert second["reason"] == "already_sent"
+        assert sent_calls["count"] == 1
+    finally:
+        db.close()
+
+
+def test_scheduled_summary_dispatch_retry_backoff(monkeypatch):
+    """Scheduled summary should back off after failure and retry later."""
+    prefs_response = client.post(
+        "/notifications/summary/preferences",
+        json={
+            "enabled": True,
+            "frequency": "weekly",
+            "channel": "sms",
+            "recipient": "+15551230000",
+        },
+    )
+    assert prefs_response.status_code == 200
+
+    db = TestingSessionLocal()
+    try:
+        storage = StorageService(db)
+        order = storage.create_order(
+            symbol="MSFT",
+            side="buy",
+            order_type="market",
+            quantity=2.0,
+        )
+        # In completed week 2026-02-09 .. 2026-02-15 for now=2026-02-18.
+        trade = storage.trades.create(
+            order_id=order.id,
+            symbol="MSFT",
+            side=OrderSideEnum.BUY,
+            type=TradeTypeEnum.OPEN,
+            quantity=2.0,
+            price=300.0,
+            executed_at=datetime(2026, 2, 10, 10, 0, 0, tzinfo=timezone.utc),
+        )
+        trade.realized_pnl = -4.0
+        db.commit()
+
+        attempts = {"count": 0}
+
+        def _flaky_send(*_args, **_kwargs):
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                raise RuntimeError("Twilio outage")
+            return "SMS sent to +15551230000"
+
+        monkeypatch.setattr(
+            "services.notification_delivery.NotificationDeliveryService.send_summary",
+            _flaky_send,
+        )
+
+        now = datetime(2026, 2, 18, 12, 0, 0, tzinfo=timezone.utc)
+        first = api_routes._dispatch_scheduled_summary(storage=storage, now_utc=now)
+        assert first["status"] == "failed"
+        assert attempts["count"] == 1
+
+        second = api_routes._dispatch_scheduled_summary(storage=storage, now_utc=now)
+        assert second["status"] == "skipped"
+        assert second["reason"] == "retry_backoff"
+        assert attempts["count"] == 1
+
+        later = now + timedelta(seconds=1900)
+        third = api_routes._dispatch_scheduled_summary(storage=storage, now_utc=later)
+        assert third["status"] == "sent"
+        assert attempts["count"] == 2
+    finally:
+        db.close()
+
+
+# ============================================================================
 # Runner Endpoint Tests
 # ============================================================================
 
@@ -422,6 +652,7 @@ def test_analytics_with_days_param():
     assert response.status_code == 200
     data = response.json()
     assert "time_series" in data
+    assert len(data["time_series"]) >= 1
 
 
 def test_analytics_days_filters_old_trades():
@@ -460,4 +691,48 @@ def test_analytics_days_filters_old_trades():
 
     assert data["total_trades"] == 1
     assert abs(data["total_pnl"] - 25.0) < 1e-6
+    assert len(data["time_series"]) >= 1
+    assert all("equity" in point for point in data["time_series"])
+
+
+def test_analytics_returns_baseline_when_no_scoped_trades():
+    """Analytics should still return one baseline point when scoped trade set is empty."""
+    db = TestingSessionLocal()
+    try:
+        storage = StorageService(db)
+        old_trade = storage.trades.create(
+            order_id=1,
+            symbol="AAPL",
+            side=OrderSideEnum.BUY,
+            type=TradeTypeEnum.OPEN,
+            quantity=1,
+            price=100.0,
+            executed_at=datetime.now(timezone.utc) - timedelta(days=120),
+        )
+        old_trade.realized_pnl = 10.0
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.get("/analytics/portfolio?days=7")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total_trades"] == 0
     assert len(data["time_series"]) == 1
+    assert data["time_series"][0]["symbol"] == "PORTFOLIO"
+    assert abs(float(data["time_series"][0]["pnl"])) < 1e-6
+
+
+def test_analytics_persists_snapshot_points():
+    """Analytics should persist snapshot history and expose growing series."""
+    first = client.get("/analytics/portfolio?days=7")
+    assert first.status_code == 200
+    first_data = first.json()
+    first_len = len(first_data["time_series"])
+    assert first_len >= 1
+
+    second = client.get("/analytics/portfolio?days=7")
+    assert second.status_code == 200
+    second_data = second.json()
+    second_len = len(second_data["time_series"])
+    assert second_len >= first_len

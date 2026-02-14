@@ -10,6 +10,7 @@ import threading
 import time
 import logging
 import json
+import math
 
 from engine.strategy_interface import StrategyInterface
 from services.broker import BrokerInterface, OrderSide, OrderType
@@ -272,6 +273,12 @@ class StrategyRunner:
                 self._maybe_reconcile_positions_with_broker()
             except Exception as e:
                 print(f"[StrategyRunner] Error during position reconciliation: {e}")
+
+            # Persist account/portfolio snapshot for dashboard/analytics continuity.
+            try:
+                self._record_portfolio_snapshot()
+            except Exception as e:
+                print(f"[StrategyRunner] Error recording portfolio snapshot: {e}")
             
             # Wait for next tick, but wake early on broker trade updates.
             self._sleep_wait(self.tick_interval)
@@ -507,6 +514,55 @@ class StrategyRunner:
                 print(f"[StrategyRunner] Error fetching data for {symbol}: {e}")
         
         return market_data
+
+    def _record_portfolio_snapshot(self) -> None:
+        """Persist a point-in-time portfolio snapshot."""
+        if not self.storage:
+            return
+
+        account = self.broker.get_account_info()
+        equity = self._safe_float(account.get("equity", account.get("portfolio_value", 0.0)))
+        cash = self._safe_float(account.get("cash", 0.0))
+        buying_power = self._safe_float(account.get("buying_power", 0.0))
+
+        positions = self.broker.get_positions()
+        market_value = 0.0
+        unrealized_pnl = 0.0
+        for row in positions:
+            qty = abs(self._safe_float(row.get("quantity", 0.0)))
+            current_price = self._safe_float(row.get("current_price", row.get("price", 0.0)))
+            avg_entry_price = self._safe_float(row.get("avg_entry_price", 0.0))
+            row_market_value = self._safe_float(row.get("market_value", 0.0))
+            if row_market_value <= 0 and qty > 0:
+                row_market_value = qty * (current_price if current_price > 0 else avg_entry_price)
+            market_value += max(0.0, row_market_value)
+            row_cost = qty * avg_entry_price
+            unrealized_pnl += row_market_value - row_cost
+
+        trades = self.storage.get_all_trades(limit=5000)
+        realized_pnl_total = sum(self._safe_float(getattr(t, "realized_pnl", 0.0), 0.0) for t in trades)
+
+        self.storage.record_portfolio_snapshot(
+            equity=max(0.0, equity),
+            cash=max(0.0, cash),
+            buying_power=max(0.0, buying_power),
+            market_value=max(0.0, market_value),
+            unrealized_pnl=unrealized_pnl,
+            realized_pnl_total=realized_pnl_total,
+            open_positions=len(positions),
+            timestamp=datetime.now(timezone.utc),
+        )
+
+    @staticmethod
+    def _safe_float(value: Any, default: float = 0.0) -> float:
+        """Best-effort finite float conversion."""
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return default
+        if not math.isfinite(parsed):
+            return default
+        return parsed
     
     def _execute_signals(self, strategy: StrategyInterface, signals: List[Dict[str, Any]]) -> None:
         """

@@ -33,7 +33,7 @@ function EquityCurveChart({ data, initialCapital }: EquityCurveChartProps) {
   const values = chartData.map(d => d.value);
   const minValue = Math.min(...values, initialCapital);
   const maxValue = Math.max(...values, initialCapital);
-  const padding = (maxValue - minValue) * 0.1 || 1000; // 10% padding or $1000 default
+  const padding = (maxValue - minValue) * 0.1 || Math.max(1, maxValue * 0.02);
 
   return (
     <div className="bg-gray-800 rounded-lg p-6 border border-gray-700">

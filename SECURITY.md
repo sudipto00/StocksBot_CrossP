@@ -1,132 +1,84 @@
-# Security Summary
+# Security Guide
 
-## Vulnerability Assessment - RESOLVED ✅
+This document summarizes the current security posture of StocksBot and recommended hardening steps for production-like use.
 
-### Fixed Vulnerabilities
+## Current Security Controls
 
-#### 1. FastAPI ReDoS Vulnerability
-- **Severity**: Medium
-- **Package**: fastapi
-- **Vulnerable Version**: 0.104.1 (≤ 0.109.0)
-- **Patched Version**: 0.109.1
-- **CVE**: Content-Type Header ReDoS (Regular Expression Denial of Service)
-- **Status**: ✅ **FIXED**
-- **Action Taken**: Updated `backend/requirements.txt` from 0.104.1 to 0.109.1
-- **Verification**: All tests pass with updated version
+### 1) Optional API-Key Authentication (Implemented)
 
-### Current Security Status
+Backend supports API-key auth middleware for HTTP + WebSocket:
 
-✅ **No Known Vulnerabilities**
+- Env flags:
+  - `STOCKSBOT_API_KEY_AUTH_ENABLED=true`
+  - `STOCKSBOT_API_KEY=<strong-key>`
+- Accepted headers:
+  - `X-API-Key: <key>`
+  - `Authorization: Bearer <key>`
+- Applies to all non-public routes and `WS /ws/system-health`
+- Public routes kept open: `/`, `/status`, docs/openapi endpoints
 
-All dependencies have been checked and updated to secure versions:
-- `fastapi==0.109.1` - Patched ReDoS vulnerability
-- `uvicorn[standard]==0.24.0` - No known vulnerabilities
-- `pydantic==2.5.0` - No known vulnerabilities
-- `pydantic-settings==2.1.0` - No known vulnerabilities
-- `python-dotenv==1.0.0` - No known vulnerabilities
-- `httpx==0.25.1` - No known vulnerabilities
-- `pytest==7.4.3` - Dev dependency, no known vulnerabilities
+### 2) Credential Handling (Implemented)
 
-### Security Best Practices Implemented
+- Desktop stores Alpaca credentials in OS Keychain (`com.stocksbot.alpaca`).
+- Backend runtime credential endpoint keeps key material in memory and does not persist API secrets to DB.
+- Environment variable fallback exists for headless/local backend operation.
 
-1. **CORS Configuration**: Properly configured CORS middleware in backend/app.py
-   - Limited origins to localhost and Tauri URLs
-   - Appropriate for development and desktop app deployment
+### 3) Input Validation and Guardrails (Implemented)
 
-2. **No Hardcoded Secrets**: No credentials or API keys in source code
-   - Environment variables ready via python-dotenv
-   - Configuration module placeholder for secure settings management
+- Pydantic request validation across API surface.
+- Symbol/order parameter validation.
+- Finite-number/range checks for risk/guardrail fields.
+- Runtime execution checks (market open, tradable symbol, buying power, kill switch, etc.).
 
-3. **Type Safety**: 
-   - TypeScript in frontend for type safety
-   - Pydantic models in backend for data validation
+### 4) Safety Controls (Implemented)
 
-4. **Dependency Management**:
-   - All dependencies pinned to specific versions
-   - Regular updates recommended
+- Global kill switch endpoints.
+- Panic-stop endpoint that enables kill switch, stops runner, and liquidates positions.
+- Reconciliation endpoint to compare local/broker position state.
 
-### Security Recommendations for Future Development
+### 5) Security-Conscious Logging (Implemented)
 
-1. **Authentication & Authorization**
-   - Implement user authentication before production
-   - Consider OAuth2 with JWT tokens
-   - Add API key management for external integrations
+- Write-request middleware logs request metadata with sensitive fields redacted.
+- Credentials/tokens are masked in structured log payload handling.
 
-2. **Data Protection**
-   - Encrypt sensitive data at rest (API keys, credentials)
-   - Use HTTPS/TLS for production deployments
-   - Implement secure session management
+### 6) CORS and Desktop Scope (Implemented)
 
-3. **Input Validation**
-   - Validate all user inputs (already using Pydantic)
-   - Sanitize data before database operations
-   - Implement rate limiting for API endpoints
+- CORS scoped to desktop development origins (`http://localhost:1420`, `tauri://localhost`).
 
-4. **Audit & Logging**
-   - Implement comprehensive audit logging (placeholder exists in backend/audit/)
-   - Log security-relevant events
-   - Monitor for suspicious activities
+## Recommended Hardening
 
-5. **Dependency Updates**
-   - Regularly check for dependency updates
-   - Monitor security advisories
-   - Use tools like `pip-audit` or `safety`
+1. Enable API-key auth outside local-only testing.
+2. Use a long random API key and rotate it periodically.
+3. Keep live trading keys separate from paper keys.
+4. Restrict local machine access (desktop session + Keychain access).
+5. Use least-privilege network exposure (avoid broad LAN/public exposure).
+6. Keep dependencies up to date and run routine vulnerability scans.
 
-6. **Code Security**
-   - Regular security audits
-   - Follow OWASP guidelines
-   - Implement proper error handling (don't expose stack traces in production)
+## Known Limitations / Residual Risk
 
-7. **Broker API Security**
-   - Store broker credentials securely
-   - Use environment variables or secure vaults
-   - Implement credential rotation
-   - Use read-only API keys where possible
+1. No multi-user identity model (desktop app is effectively single-user local trust model).
+2. No built-in rate limiting/throttling at HTTP ingress layer.
+3. Notification summary email/SMS transport is currently a queue/placeholder hook, not guaranteed external delivery.
+4. `GET /orders` currently serves stub data (execution path itself is validated and persisted via `POST /orders`).
 
-8. **Desktop App Security**
-   - Sign the Tauri application for distribution
-   - Implement auto-update with signature verification
-   - Protect against code injection in IPC
+## Operational Security Checklist
 
-### Compliance Considerations
+- [ ] Set `STOCKSBOT_API_KEY_AUTH_ENABLED=true` in non-dev environments
+- [ ] Set `STOCKSBOT_API_KEY` and verify unauthorized requests are rejected
+- [ ] Store only active Alpaca keys in Keychain; remove old/unused keys
+- [ ] Run in paper mode for validation before any live mode session
+- [ ] Verify kill switch and panic-stop behavior regularly
+- [ ] Configure log/audit retention settings and cleanup cadence
+- [ ] Periodically run dependency audits (`pip-audit`, npm audit where appropriate)
 
-For production deployment of a trading application:
+## Reporting Security Issues
 
-1. **Data Privacy**: Ensure compliance with GDPR, CCPA, etc.
-2. **Financial Regulations**: Follow SEC, FINRA guidelines
-3. **Audit Trail**: Maintain immutable audit logs
-4. **Data Retention**: Implement proper data retention policies
-5. **Disaster Recovery**: Implement backup and recovery procedures
+If you discover a vulnerability:
 
-### Security Testing Checklist (TODO)
-
-- [ ] Implement automated dependency vulnerability scanning
-- [ ] Add security-focused unit tests
-- [ ] Perform penetration testing before production
-- [ ] Set up security monitoring and alerting
-- [ ] Implement secure secrets management
-- [ ] Add rate limiting and DDoS protection
-- [ ] Conduct security code review
-- [ ] Test authentication and authorization flows
-- [ ] Validate all input sanitization
-- [ ] Test for SQL injection (when database is added)
-- [ ] Test for XSS vulnerabilities
-- [ ] Verify HTTPS/TLS configuration
-- [ ] Test session management security
-- [ ] Verify proper error handling
-- [ ] Check for information disclosure
-
-### Reporting Security Issues
-
-If you discover a security vulnerability:
-
-1. **Do not** open a public GitHub issue
-2. Email security concerns to: [SECURITY_EMAIL_TO_BE_CONFIGURED]
-3. Include detailed description and reproduction steps
-4. Allow reasonable time for patching before disclosure
+1. Do not disclose publicly first.
+2. Provide impact, reproduction steps, and affected versions.
+3. Coordinate a fix before public disclosure.
 
 ---
 
-**Last Updated**: 2024-02-09  
-**Status**: ✅ All known vulnerabilities resolved  
-**Next Review**: Recommended before production deployment
+Last Updated: `2026-02-13`

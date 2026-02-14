@@ -142,3 +142,46 @@ def test_screener_data_format():
         assert len(stock["symbol"]) > 0
         assert stock["volume"] >= 0
         assert stock["price"] > 0
+
+
+def test_optimize_assets_accepts_portfolio_context_kwargs():
+    """Regression: optimize_assets should accept portfolio context kwargs from API routes."""
+    screener = MarketScreener()
+    assets = screener.get_active_stocks(limit=30)
+
+    optimized = screener.optimize_assets(
+        assets=assets,
+        limit=12,
+        min_dollar_volume=1_000_000,
+        max_spread_bps=200,
+        max_sector_weight_pct=60,
+        regime="range_bound",
+        auto_regime_adjust=True,
+        current_holdings=[{"symbol": "AAPL", "asset_type": "stock", "market_value": 1000}],
+        buying_power=5_000,
+        equity=25_000,
+        weekly_budget=800,
+    )
+
+    assert isinstance(optimized, list)
+    assert len(optimized) <= 12
+    assert all("symbol" in item for item in optimized)
+
+
+def test_chart_indicators_use_true_atr_from_ohlc():
+    """ATR should use true range from high/low/previous-close, not close-to-close proxy only."""
+    screener = MarketScreener()
+    points = [
+        {"timestamp": "2026-01-01T00:00:00", "close": 100.0, "high": 102.0, "low": 98.0},
+        {"timestamp": "2026-01-02T00:00:00", "close": 105.0, "high": 107.0, "low": 104.0},
+        {"timestamp": "2026-01-03T00:00:00", "close": 103.0, "high": 106.0, "low": 101.0},
+        {"timestamp": "2026-01-04T00:00:00", "close": 108.0, "high": 110.0, "low": 107.0},
+        {"timestamp": "2026-01-05T00:00:00", "close": 107.0, "high": 109.0, "low": 106.0},
+    ]
+
+    indicators = screener.get_chart_indicators(points)
+
+    # TR series uses gaps against previous close:
+    # [7, 5, 7, 3] => ATR abs = 5.5; ATR% = 5.5 / 107 * 100 = 5.1402
+    assert indicators["atr14"] == pytest.approx(5.5, rel=1e-6)
+    assert indicators["atr14_pct"] == pytest.approx(5.1402, rel=1e-6)

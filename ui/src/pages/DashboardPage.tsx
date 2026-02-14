@@ -8,6 +8,7 @@ import HelpTooltip from '../components/HelpTooltip';
 import PageHeader from '../components/PageHeader';
 import GuidedFlowStrip from '../components/GuidedFlowStrip';
 import { showErrorNotification, showSuccessNotification } from '../utils/notifications';
+import { formatDateTime } from '../utils/datetime';
 
 /**
  * Dashboard page component.
@@ -56,6 +57,23 @@ function DashboardPage() {
       console.error('Failed to load runner status:', err);
     }
   }, []);
+
+  const refreshPortfolioData = useCallback(async () => {
+    try {
+      const [positionsData, analyticsData, summaryData, brokerAccountData] = await Promise.all([
+        getPositions(),
+        getPortfolioAnalytics(analyticsDays === 'all' ? undefined : analyticsDays),
+        getPortfolioSummary(),
+        getBrokerAccount(),
+      ]);
+      setPositions(positionsData.positions);
+      setAnalytics(analyticsData);
+      setSummary(summaryData);
+      setBrokerAccount(brokerAccountData);
+    } catch (err) {
+      console.error('Failed to refresh dashboard portfolio data:', err);
+    }
+  }, [analyticsDays]);
 
   const loadData = useCallback(async () => {
     try {
@@ -121,6 +139,13 @@ function DashboardPage() {
     return () => clearInterval(interval);
   }, [loadRunnerStatus]);
 
+  useEffect(() => {
+    const interval = setInterval(() => {
+      void refreshPortfolioData();
+    }, 10000);
+    return () => clearInterval(interval);
+  }, [refreshPortfolioData]);
+
   const handleStartRunner = async () => {
     try {
       setRunnerLoading(true);
@@ -183,7 +208,10 @@ function DashboardPage() {
         value: point.equity,
       }))
     : [];
-  const initialCapital = equityCurve.length > 0 ? equityCurve[0].value : 100000;
+  const initialCapital =
+    equityCurve.length > 0
+      ? equityCurve[0].value
+      : (summary?.equity ?? analytics?.current_equity ?? brokerAccount?.equity ?? totalValue ?? 0);
   const performancePnl = summary?.total_pnl ?? analytics?.total_pnl ?? 0;
   const performancePnlClass = performancePnl >= 0 ? 'text-green-400' : 'text-red-400';
   const runnerStatusLabel = (runnerState?.status || 'unknown').toUpperCase();
@@ -205,7 +233,7 @@ function DashboardPage() {
     ? `${tradingPrefs.asset_type.toUpperCase()} | ${tradingPrefs.screener_mode === 'most_active' ? `Most Active (${tradingPrefs.screener_limit})` : `Preset ${tradingPrefs.asset_type === 'etf' ? tradingPrefs.etf_preset : tradingPrefs.stock_preset}`}`
     : 'Settings unavailable';
   const nextMarketOpenLabel = runnerState?.next_market_open_at
-    ? new Date(runnerState.next_market_open_at).toLocaleString()
+    ? formatDateTime(runnerState.next_market_open_at)
     : '';
 
   return (
@@ -459,7 +487,7 @@ function DashboardPage() {
                 <p>
                   Last Success:{' '}
                   <span className="text-gray-200">
-                    {runnerState?.last_successful_poll_at ? new Date(runnerState.last_successful_poll_at).toLocaleString() : '-'}
+                    {runnerState?.last_successful_poll_at ? formatDateTime(runnerState.last_successful_poll_at) : '-'}
                   </span>
                 </p>
                 <p className="text-red-300 truncate" title={runnerState?.last_poll_error || 'None'}>

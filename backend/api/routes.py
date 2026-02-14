@@ -5,6 +5,8 @@ Defines all REST API endpoints for StocksBot.
 from datetime import datetime, timedelta, timezone
 import json
 import math
+import logging
+import os
 import re
 import secrets
 import threading
@@ -16,7 +18,7 @@ from typing import List, Optional, Dict, Any
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
 
-from storage.database import get_db
+from storage.database import SessionLocal, get_db
 from storage.service import StorageService
 from storage.models import AuditLog as DBAuditLog, Trade as DBTrade
 from services.broker import BrokerInterface, PaperBroker
@@ -29,6 +31,7 @@ from services.order_execution import (
 )
 from config.settings import get_settings, has_alpaca_credentials
 from services.logging_service import configure_file_logging, cleanup_old_files
+from services.notification_delivery import NotificationDeliveryService
 
 from .models import (
     StatusResponse,
@@ -84,6 +87,7 @@ from services.strategy_analytics import StrategyAnalyticsService
 from config.strategy_config import get_default_parameters
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 # ============================================================================
 # Broker Initialization
@@ -258,12 +262,16 @@ _idempotency_lock = threading.Lock()
 _last_broker_sync_at: Optional[str] = None
 
 _SUMMARY_NOTIFICATION_PREFERENCES_KEY = "summary_notification_preferences"
+_SUMMARY_NOTIFICATION_SCHEDULE_STATE_KEY = "summary_notification_schedule_state"
 _summary_notification_preferences = SummaryNotificationPreferencesResponse(
     enabled=False,
     frequency=SummaryNotificationFrequency.DAILY,
     channel=SummaryNotificationChannel.EMAIL,
     recipient="",
 )
+_summary_scheduler_thread: Optional[threading.Thread] = None
+_summary_scheduler_stop_event = threading.Event()
+_summary_scheduler_lock = threading.Lock()
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _PHONE_RE = re.compile(r"^\+?[1-9]\d{7,14}$")
@@ -284,6 +292,14 @@ def _extract_api_key_from_headers(headers: Any) -> str:
     if auth_header.lower().startswith("bearer "):
         return auth_header[7:].strip()
     return ""
+
+
+def _extract_api_key_from_websocket(websocket: WebSocket) -> str:
+    """Extract API key for websocket auth from query first, then headers."""
+    query_key = (websocket.query_params.get("api_key") or "").strip()
+    if query_key:
+        return query_key
+    return _extract_api_key_from_headers(websocket.headers)
 
 
 def _is_api_key_valid(provided_key: str) -> bool:
@@ -367,6 +383,15 @@ def _set_last_broker_sync(ts_iso: Optional[str]) -> None:
 def _get_last_broker_sync() -> Optional[str]:
     with _state_lock:
         return _last_broker_sync_at
+
+
+def _ensure_utc_datetime(value: Optional[datetime]) -> Optional[datetime]:
+    """Normalize datetimes to UTC for stable API serialization."""
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 def _balance_adjusted_limits(
@@ -466,6 +491,67 @@ def _load_holdings_snapshot(storage: StorageService, broker: Optional[BrokerInte
             "asset_type": "",
         })
     return holdings
+
+
+def _capture_portfolio_snapshot(storage: StorageService, broker: Optional[BrokerInterface]) -> Optional[Dict[str, float]]:
+    """Persist one portfolio snapshot row and return normalized snapshot values."""
+    if broker is None:
+        return None
+
+    now_utc = datetime.now(timezone.utc)
+    account_snapshot = _load_account_snapshot(broker)
+    holdings_snapshot = _load_holdings_snapshot(storage, broker)
+    market_value = sum(_safe_float(h.get("market_value", 0.0), 0.0) for h in holdings_snapshot)
+    unrealized_pnl = 0.0
+    for h in holdings_snapshot:
+        qty = abs(_safe_float(h.get("quantity", 0.0), 0.0))
+        current_price = _safe_float(h.get("current_price", 0.0), 0.0)
+        avg_entry_price = _safe_float(h.get("avg_entry_price", 0.0), 0.0)
+        row_market_value = _safe_float(h.get("market_value", qty * current_price), 0.0)
+        unrealized_pnl += row_market_value - (qty * avg_entry_price)
+
+    trades = storage.get_all_trades(limit=5000)
+    realized_pnl_total = sum(_safe_float(trade.realized_pnl, 0.0) for trade in trades)
+
+    # Avoid duplicate writes when repeated UI polling samples within a few seconds.
+    latest = storage.get_latest_portfolio_snapshot()
+    if latest is not None and latest.timestamp is not None:
+        latest_ts = _ensure_utc_datetime(latest.timestamp)
+        if latest_ts is not None and (now_utc - latest_ts).total_seconds() < 5:
+            if (
+                abs(_safe_float(latest.equity, 0.0) - _safe_float(account_snapshot.get("equity", 0.0), 0.0)) < 1e-9
+                and abs(_safe_float(latest.market_value, 0.0) - market_value) < 1e-9
+                and abs(_safe_float(latest.realized_pnl_total, 0.0) - realized_pnl_total) < 1e-9
+            ):
+                return {
+                    "equity": _safe_float(latest.equity, 0.0),
+                    "cash": _safe_float(latest.cash, 0.0),
+                    "buying_power": _safe_float(latest.buying_power, 0.0),
+                    "market_value": _safe_float(latest.market_value, 0.0),
+                    "unrealized_pnl": _safe_float(latest.unrealized_pnl, 0.0),
+                    "realized_pnl_total": _safe_float(latest.realized_pnl_total, 0.0),
+                    "open_positions": float(_safe_float(latest.open_positions, 0.0)),
+                }
+
+    snapshot = storage.record_portfolio_snapshot(
+        equity=_safe_float(account_snapshot.get("equity", 0.0), 0.0),
+        cash=_safe_float(account_snapshot.get("cash", 0.0), 0.0),
+        buying_power=_safe_float(account_snapshot.get("buying_power", 0.0), 0.0),
+        market_value=market_value,
+        unrealized_pnl=unrealized_pnl,
+        realized_pnl_total=realized_pnl_total,
+        open_positions=len(holdings_snapshot),
+        timestamp=now_utc,
+    )
+    return {
+        "equity": _safe_float(snapshot.equity, 0.0),
+        "cash": _safe_float(snapshot.cash, 0.0),
+        "buying_power": _safe_float(snapshot.buying_power, 0.0),
+        "market_value": _safe_float(snapshot.market_value, 0.0),
+        "unrealized_pnl": _safe_float(snapshot.unrealized_pnl, 0.0),
+        "realized_pnl_total": _safe_float(snapshot.realized_pnl_total, 0.0),
+        "open_positions": float(_safe_float(snapshot.open_positions, 0.0)),
+    }
 
 
 def _normalize_symbols(raw_symbols: List[str], max_symbols: int = 200) -> List[str]:
@@ -592,6 +678,288 @@ def _save_summary_notification_preferences(
         value_type="json",
         description="Daily/weekly transaction summary notification preferences",
     )
+
+
+def _load_summary_notification_schedule_state(storage: StorageService) -> Dict[str, Any]:
+    """Load summary scheduler state from DB config."""
+    entry = storage.config.get_by_key(_SUMMARY_NOTIFICATION_SCHEDULE_STATE_KEY)
+    if not entry or not entry.value:
+        return {}
+    try:
+        raw = json.loads(entry.value)
+        return raw if isinstance(raw, dict) else {}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+
+
+def _save_summary_notification_schedule_state(storage: StorageService, state: Dict[str, Any]) -> None:
+    """Persist summary scheduler state into DB config."""
+    storage.config.upsert(
+        key=_SUMMARY_NOTIFICATION_SCHEDULE_STATE_KEY,
+        value=json.dumps(state),
+        value_type="json",
+        description="Summary notification scheduler checkpoint state",
+    )
+
+
+def _collect_summary_trade_stats(
+    storage: StorageService,
+    start: datetime,
+    end: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Collect summary trade stats within [start, end) in UTC."""
+    trades = storage.get_all_trades(limit=5000)
+    scoped: List[DBTrade] = []
+    for trade in trades:
+        executed_at = _ensure_utc_datetime(trade.executed_at)
+        if executed_at is None:
+            continue
+        if executed_at < start:
+            continue
+        if end is not None and executed_at >= end:
+            continue
+        scoped.append(trade)
+
+    trade_count = len(scoped)
+    gross_notional = sum(float(t.quantity or 0.0) * float(t.price or 0.0) for t in scoped)
+    realized_pnl = sum(float(t.realized_pnl or 0.0) for t in scoped if t.realized_pnl is not None)
+    return {
+        "trade_count": trade_count,
+        "gross_notional": gross_notional,
+        "realized_pnl": realized_pnl,
+    }
+
+
+def _completed_summary_period_window(
+    frequency: SummaryNotificationFrequency,
+    now_utc: datetime,
+) -> tuple[datetime, datetime, str]:
+    """Get completed UTC summary window [start, end) and stable period identifier."""
+    if frequency == SummaryNotificationFrequency.DAILY:
+        end = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+        start = end - timedelta(days=1)
+        period_id = start.date().isoformat()
+        return start, end, period_id
+
+    current_week_start = now_utc.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=now_utc.weekday())
+    end = current_week_start
+    start = end - timedelta(days=7)
+    iso_week = start.isocalendar()
+    period_id = f"{iso_week.year}-W{iso_week.week:02d}"
+    return start, end, period_id
+
+
+def _parse_utc_iso_timestamp(raw: Any) -> Optional[datetime]:
+    """Parse an ISO timestamp string as UTC datetime when possible."""
+    if not raw or not isinstance(raw, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return _ensure_utc_datetime(parsed)
+
+
+def _send_summary_with_stats(
+    storage: StorageService,
+    prefs: SummaryNotificationPreferencesResponse,
+    stats: Dict[str, Any],
+    subject: str,
+    summary_body: str,
+    source: str,
+) -> NotificationResponse:
+    """Deliver summary through configured channel and write audit logs."""
+    trade_count = int(stats.get("trade_count", 0))
+    gross_notional = float(stats.get("gross_notional", 0.0))
+    realized_pnl = float(stats.get("realized_pnl", 0.0))
+    try:
+        delivery = NotificationDeliveryService()
+        delivery_result = delivery.send_summary(
+            channel=prefs.channel,
+            recipient=prefs.recipient,
+            subject=subject,
+            body=summary_body,
+        )
+    except RuntimeError as exc:
+        storage.create_audit_log(
+            event_type="error",
+            description=f"Summary notification failed ({prefs.channel.value})",
+            details={
+                "source": source,
+                "recipient": prefs.recipient,
+                "trade_count": trade_count,
+                "gross_notional": gross_notional,
+                "realized_pnl": realized_pnl,
+                "error": str(exc),
+            },
+        )
+        return NotificationResponse(
+            success=False,
+            message=f"Summary delivery failed: {exc}",
+        )
+
+    storage.create_audit_log(
+        event_type="config_updated",
+        description=f"Sent {prefs.frequency.value} {prefs.channel.value} summary notification",
+        details={
+            "source": source,
+            "recipient": prefs.recipient,
+            "trade_count": trade_count,
+            "gross_notional": gross_notional,
+            "realized_pnl": realized_pnl,
+            "delivery": delivery_result,
+        },
+    )
+    return NotificationResponse(
+        success=True,
+        message=f"{delivery_result}: {summary_body}",
+    )
+
+
+def _dispatch_scheduled_summary(
+    storage: StorageService,
+    now_utc: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Best-effort scheduler cycle for automatic daily/weekly summary delivery."""
+    prefs = _load_summary_notification_preferences(storage)
+    if not prefs.enabled:
+        return {"status": "skipped", "reason": "disabled"}
+    if not prefs.recipient:
+        return {"status": "skipped", "reason": "missing_recipient"}
+
+    now = _ensure_utc_datetime(now_utc) or datetime.now(timezone.utc)
+    start, end, period_id = _completed_summary_period_window(prefs.frequency, now)
+    if end <= start or now < end:
+        return {"status": "skipped", "reason": "window_not_closed"}
+
+    frequency_key = prefs.frequency.value
+    sent_period_key = f"{frequency_key}_last_sent_period"
+    sent_at_key = f"{frequency_key}_last_sent_at"
+    failed_period_key = f"{frequency_key}_last_failed_period"
+    failed_at_key = f"{frequency_key}_last_failed_at"
+
+    state = _load_summary_notification_schedule_state(storage)
+    if str(state.get(sent_period_key) or "") == period_id:
+        return {"status": "skipped", "reason": "already_sent", "period_id": period_id}
+
+    retry_seconds = max(60, int(get_settings().summary_scheduler_retry_seconds))
+    last_failed_period = str(state.get(failed_period_key) or "")
+    last_failed_at = _parse_utc_iso_timestamp(state.get(failed_at_key))
+    if (
+        last_failed_period == period_id
+        and last_failed_at is not None
+        and (now - last_failed_at).total_seconds() < retry_seconds
+    ):
+        return {"status": "skipped", "reason": "retry_backoff", "period_id": period_id}
+
+    stats = _collect_summary_trade_stats(storage, start=start, end=end)
+    if prefs.frequency == SummaryNotificationFrequency.DAILY:
+        period_label = f"{start.date().isoformat()} UTC"
+    else:
+        period_label = f"{start.date().isoformat()} to {(end - timedelta(days=1)).date().isoformat()} UTC"
+    summary = (
+        f"{prefs.frequency.value.title()} summary ({period_label}): {stats['trade_count']} trade(s), "
+        f"gross ${stats['gross_notional']:.2f}, realized P&L ${stats['realized_pnl']:.2f}"
+    )
+    subject = f"StocksBot {prefs.frequency.value.title()} Trade Summary ({period_label})"
+    result = _send_summary_with_stats(
+        storage=storage,
+        prefs=prefs,
+        stats=stats,
+        subject=subject,
+        summary_body=summary,
+        source="scheduler",
+    )
+    if result.success:
+        state[sent_period_key] = period_id
+        state[sent_at_key] = now.isoformat()
+        state.pop(failed_period_key, None)
+        state.pop(failed_at_key, None)
+        _save_summary_notification_schedule_state(storage, state)
+        return {
+            "status": "sent",
+            "period_id": period_id,
+            "frequency": frequency_key,
+            "trade_count": int(stats["trade_count"]),
+            "message": result.message,
+        }
+
+    state[failed_period_key] = period_id
+    state[failed_at_key] = now.isoformat()
+    _save_summary_notification_schedule_state(storage, state)
+    return {
+        "status": "failed",
+        "period_id": period_id,
+        "frequency": frequency_key,
+        "message": result.message,
+    }
+
+
+def run_scheduled_summary_dispatch_cycle() -> Dict[str, Any]:
+    """
+    Execute one scheduler cycle using an internal DB session.
+    Safe to call from background threads.
+    """
+    db = SessionLocal()
+    try:
+        storage = StorageService(db)
+        return _dispatch_scheduled_summary(storage=storage)
+    except (RuntimeError, ValueError, TypeError, SQLAlchemyError) as exc:
+        logger.exception("Scheduled summary dispatch cycle failed")
+        return {"status": "error", "message": str(exc)}
+    finally:
+        db.close()
+
+
+def _summary_scheduler_loop() -> None:
+    """Background loop for automatic daily/weekly summary notification dispatch."""
+    settings = get_settings()
+    poll_seconds = max(15, int(settings.summary_scheduler_poll_seconds))
+    logger.info("Summary scheduler started (poll=%ss)", poll_seconds)
+    while not _summary_scheduler_stop_event.is_set():
+        cycle_result = run_scheduled_summary_dispatch_cycle()
+        status = cycle_result.get("status")
+        if status == "failed":
+            logger.warning("Summary scheduler delivery failed: %s", cycle_result.get("message", "unknown"))
+        elif status == "error":
+            logger.error("Summary scheduler cycle error: %s", cycle_result.get("message", "unknown"))
+        _summary_scheduler_stop_event.wait(timeout=poll_seconds)
+    logger.info("Summary scheduler stopped")
+
+
+def start_summary_scheduler() -> bool:
+    """Start automatic summary scheduler thread (idempotent)."""
+    global _summary_scheduler_thread
+    settings = get_settings()
+    if not settings.summary_scheduler_enabled:
+        return False
+    # Keep test runs deterministic and avoid side-thread churn in pytest.
+    if "PYTEST_CURRENT_TEST" in os.environ:
+        return False
+    with _summary_scheduler_lock:
+        if _summary_scheduler_thread and _summary_scheduler_thread.is_alive():
+            return False
+        _summary_scheduler_stop_event.clear()
+        _summary_scheduler_thread = threading.Thread(
+            target=_summary_scheduler_loop,
+            daemon=True,
+            name="stocksbot-summary-scheduler",
+        )
+        _summary_scheduler_thread.start()
+        return True
+
+
+def stop_summary_scheduler() -> bool:
+    """Stop automatic summary scheduler thread (idempotent)."""
+    global _summary_scheduler_thread
+    with _summary_scheduler_lock:
+        thread = _summary_scheduler_thread
+        if thread is None or not thread.is_alive():
+            return False
+        _summary_scheduler_stop_event.set()
+        thread.join(timeout=5.0)
+        _summary_scheduler_thread = None
+        return True
 
 
 @router.get("/config", response_model=ConfigResponse)
@@ -866,8 +1234,8 @@ async def get_orders():
             status=OrderStatus.FILLED,
             filled_quantity=100,
             avg_fill_price=150.00,
-            created_at=datetime.now(),
-            updated_at=datetime.now(),
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
         ),
         Order(
             id="order-002",
@@ -878,8 +1246,8 @@ async def get_orders():
             status=OrderStatus.FILLED,
             filled_quantity=50,
             avg_fill_price=300.00,
-            created_at=datetime.now(),
-            updated_at=datetime.now(),
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
         ),
     ]
 
@@ -938,8 +1306,8 @@ async def create_order(
             status=OrderStatus(order.status.value),
             filled_quantity=order.filled_quantity or 0.0,
             avg_fill_price=order.avg_fill_price,
-            created_at=order.created_at,
-            updated_at=order.updated_at
+            created_at=_ensure_utc_datetime(order.created_at),
+            updated_at=_ensure_utc_datetime(order.updated_at),
         )
         
     except OrderValidationError as e:
@@ -1024,8 +1392,8 @@ async def update_summary_notification_preferences(
 @router.post("/notifications/summary/send-now", response_model=NotificationResponse)
 async def send_summary_notification_now(db: Session = Depends(get_db)):
     """
-    Generate and queue a summary notification immediately.
-    This prepares the payload for email/SMS delivery.
+    Generate and deliver a summary notification immediately.
+    Uses current in-progress daily/weekly window.
     """
     storage = StorageService(db)
     prefs = _load_summary_notification_preferences(storage)
@@ -1035,39 +1403,25 @@ async def send_summary_notification_now(db: Session = Depends(get_db)):
     if not prefs.recipient:
         return NotificationResponse(success=False, message="Recipient is required")
 
-    trades = storage.get_all_trades(limit=5000)
     now = datetime.now(timezone.utc)
     if prefs.frequency == SummaryNotificationFrequency.DAILY:
         start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     else:
         start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         start = start - timedelta(days=start.weekday())
-
-    scoped = [t for t in trades if t.executed_at and t.executed_at >= start]
-    trade_count = len(scoped)
-    gross_notional = sum(float(t.quantity or 0) * float(t.price or 0) for t in scoped)
-    realized_pnl = sum(float(t.realized_pnl or 0) for t in scoped if t.realized_pnl is not None)
+    stats = _collect_summary_trade_stats(storage=storage, start=start, end=None)
     summary = (
-        f"{prefs.frequency.value.title()} summary: {trade_count} trade(s), "
-        f"gross ${gross_notional:.2f}, realized P&L ${realized_pnl:.2f}"
+        f"{prefs.frequency.value.title()} summary: {stats['trade_count']} trade(s), "
+        f"gross ${stats['gross_notional']:.2f}, realized P&L ${stats['realized_pnl']:.2f}"
     )
-
-    # Placeholder transport hook for email/SMS integration.
-    print(f"[SUMMARY:{prefs.channel.value}] to {prefs.recipient} -> {summary}")
-    storage.create_audit_log(
-        event_type="config_updated",
-        description=f"Queued {prefs.frequency.value} {prefs.channel.value} summary notification",
-        details={
-            "recipient": prefs.recipient,
-            "trade_count": trade_count,
-            "gross_notional": gross_notional,
-            "realized_pnl": realized_pnl,
-        },
-    )
-
-    return NotificationResponse(
-        success=True,
-        message=f"Queued {prefs.channel.value} summary to {prefs.recipient}: {summary}",
+    subject = f"StocksBot {prefs.frequency.value.title()} Trade Summary"
+    return _send_summary_with_stats(
+        storage=storage,
+        prefs=prefs,
+        stats=stats,
+        subject=subject,
+        summary_body=summary,
+        source="manual_send_now",
     )
 
 
@@ -1091,8 +1445,8 @@ async def get_strategies(db: Session = Depends(get_db)):
             description=db_strat.description or "",
             status=StrategyStatus.ACTIVE if db_strat.is_active else StrategyStatus.STOPPED,
             symbols=db_strat.config.get('symbols', []) if db_strat.config else [],
-            created_at=db_strat.created_at,
-            updated_at=db_strat.updated_at,
+            created_at=_ensure_utc_datetime(db_strat.created_at),
+            updated_at=_ensure_utc_datetime(db_strat.updated_at),
         ))
 
     return StrategiesResponse(
@@ -1132,8 +1486,8 @@ async def create_strategy(request: StrategyCreateRequest, db: Session = Depends(
         description=db_strategy.description or "",
         status=StrategyStatus.STOPPED,
         symbols=symbols,
-        created_at=db_strategy.created_at,
-        updated_at=db_strategy.updated_at,
+        created_at=_ensure_utc_datetime(db_strategy.created_at),
+        updated_at=_ensure_utc_datetime(db_strategy.updated_at),
     )
 
 
@@ -1159,8 +1513,8 @@ async def get_strategy(strategy_id: str, db: Session = Depends(get_db)):
         description=db_strategy.description or "",
         status=StrategyStatus.ACTIVE if db_strategy.is_active else StrategyStatus.STOPPED,
         symbols=db_strategy.config.get('symbols', []) if db_strategy.config else [],
-        created_at=db_strategy.created_at,
-        updated_at=db_strategy.updated_at,
+        created_at=_ensure_utc_datetime(db_strategy.created_at),
+        updated_at=_ensure_utc_datetime(db_strategy.updated_at),
     )
 
 
@@ -1206,8 +1560,8 @@ async def update_strategy(strategy_id: str, request: StrategyUpdateRequest, db: 
         description=db_strategy.description or "",
         status=StrategyStatus.ACTIVE if db_strategy.is_active else StrategyStatus.STOPPED,
         symbols=db_strategy.config.get('symbols', []) if db_strategy.config else [],
-        created_at=db_strategy.created_at,
-        updated_at=db_strategy.updated_at,
+        created_at=_ensure_utc_datetime(db_strategy.created_at),
+        updated_at=_ensure_utc_datetime(db_strategy.updated_at),
     )
 
 
@@ -1273,7 +1627,7 @@ async def get_audit_logs(
     for db_log in db_logs:
         logs.append(AuditLog(
             id=str(db_log.id),
-            timestamp=db_log.timestamp,
+            timestamp=_ensure_utc_datetime(db_log.timestamp),
             event_type=AuditEventType(
                 db_log.event_type.value if hasattr(db_log.event_type, "value") else str(db_log.event_type)
             ),
@@ -1310,7 +1664,7 @@ async def get_audit_trades(
                 price=trade.price,
                 commission=trade.commission or 0.0,
                 fees=trade.fees or 0.0,
-                executed_at=trade.executed_at,
+                executed_at=_ensure_utc_datetime(trade.executed_at),
                 realized_pnl=trade.realized_pnl,
             )
         )
@@ -1345,13 +1699,13 @@ async def get_storage_settings():
     audit_files = []
     if log_dir.exists():
         log_files = sorted(
-            [{"name": p.name, "size_bytes": p.stat().st_size, "modified_at": datetime.fromtimestamp(p.stat().st_mtime).isoformat()} for p in log_dir.iterdir() if p.is_file()],
+            [{"name": p.name, "size_bytes": p.stat().st_size, "modified_at": datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc).isoformat()} for p in log_dir.iterdir() if p.is_file()],
             key=lambda row: row["modified_at"],
             reverse=True,
         )[:50]
     if audit_dir.exists():
         audit_files = sorted(
-            [{"name": p.name, "size_bytes": p.stat().st_size, "modified_at": datetime.fromtimestamp(p.stat().st_mtime).isoformat()} for p in audit_dir.iterdir() if p.is_file()],
+            [{"name": p.name, "size_bytes": p.stat().st_size, "modified_at": datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc).isoformat()} for p in audit_dir.iterdir() if p.is_file()],
             key=lambda row: row["modified_at"],
             reverse=True,
         )[:50]
@@ -1519,7 +1873,7 @@ async def run_reconciliation(db: Session = Depends(get_db)):
 async def ws_system_health(websocket: WebSocket):
     """Realtime health snapshot stream for UI surfaces."""
     if _is_api_auth_required():
-        provided_key = _extract_api_key_from_headers(websocket.headers)
+        provided_key = _extract_api_key_from_websocket(websocket)
         if not _is_api_key_valid(provided_key):
             await websocket.close(code=4401)
             return
@@ -1650,7 +2004,7 @@ async def selloff_all_positions(x_idempotency_key: Optional[str] = Header(defaul
 
 @router.get("/analytics/portfolio")
 async def get_portfolio_analytics(
-    days: int = Query(default=30, ge=1, le=3650),
+    days: Optional[int] = Query(default=None, ge=1, le=3650),
     db: Session = Depends(get_db)
 ):
     """
@@ -1660,7 +2014,7 @@ async def get_portfolio_analytics(
     storage = StorageService(db)
 
     trades = storage.get_recent_trades(limit=5000)
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days) if days is not None else None
     scoped_trades = []
     for trade in trades:
         if not trade.executed_at:
@@ -1670,30 +2024,116 @@ async def get_portfolio_analytics(
             if trade.executed_at.tzinfo is None
             else trade.executed_at.astimezone(timezone.utc)
         )
-        if executed_at >= cutoff:
-            scoped_trades.append(trade)
+        if cutoff is not None and executed_at < cutoff:
+            continue
+        scoped_trades.append(trade)
+
+    scoped_trades.sort(
+        key=lambda trade: _ensure_utc_datetime(trade.executed_at) or datetime.min.replace(tzinfo=timezone.utc)
+    )
+
+    total_realized_pnl = sum(_safe_float(trade.realized_pnl, 0.0) for trade in scoped_trades)
+    total_realized_all = sum(_safe_float(trade.realized_pnl, 0.0) for trade in trades)
+    broker: Optional[BrokerInterface]
+    try:
+        broker = get_broker()
+    except (RuntimeError, ValueError, TypeError, KeyError):
+        broker = None
+
+    # Persist live account snapshot first, then build chart from persisted snapshots.
+    try:
+        _capture_portfolio_snapshot(storage, broker)
+    except (RuntimeError, ValueError, TypeError, KeyError):
+        pass
+
+    snapshot_rows = storage.get_portfolio_snapshots_since(cutoff=cutoff, limit=5000)
+    if not snapshot_rows:
+        latest_snapshot = storage.get_latest_portfolio_snapshot()
+        if latest_snapshot is not None:
+            snapshot_rows = [latest_snapshot]
+
+    if snapshot_rows:
+        time_series: List[Dict[str, Any]] = []
+        first_equity = _safe_float(snapshot_rows[0].equity, 0.0)
+        first_realized_total = _safe_float(snapshot_rows[0].realized_pnl_total, 0.0)
+        previous_realized_total = first_realized_total
+
+        for index, snapshot in enumerate(snapshot_rows):
+            ts = _ensure_utc_datetime(snapshot.timestamp) or datetime.now(timezone.utc)
+            equity = _safe_float(snapshot.equity, first_equity)
+            realized_total = _safe_float(snapshot.realized_pnl_total, previous_realized_total)
+            realized_pnl_delta = 0.0 if index == 0 else (realized_total - previous_realized_total)
+            cumulative_pnl = realized_total - first_realized_total
+            time_series.append({
+                "timestamp": ts.isoformat(),
+                "equity": equity,
+                "pnl": realized_pnl_delta,
+                "cumulative_pnl": cumulative_pnl,
+                "symbol": "PORTFOLIO",
+            })
+            previous_realized_total = realized_total
+
+        current_equity = _safe_float(snapshot_rows[-1].equity, 0.0)
+        if current_equity <= 0.0:
+            account_snapshot = _load_account_snapshot(broker)
+            current_equity = _safe_float(account_snapshot.get("equity", 0.0), 0.0)
+
+        return {
+            "time_series": time_series,
+            "total_trades": len(scoped_trades),
+            "current_equity": current_equity,
+            "total_pnl": total_realized_pnl,
+        }
+
+    holdings_snapshot = _load_holdings_snapshot(storage, broker)
+    holdings_value = sum(_safe_float(h.get("market_value", 0.0), 0.0) for h in holdings_snapshot)
+    account_snapshot = _load_account_snapshot(broker)
+    current_equity = _safe_float(account_snapshot.get("equity", 0.0), 0.0)
+    if current_equity <= 0.0:
+        current_equity = max(0.0, holdings_value + total_realized_all)
 
     time_series = []
     cumulative_pnl = 0.0
-    equity = 100000.0
+    opening_equity = max(0.0, current_equity - total_realized_pnl)
+    if not scoped_trades and current_equity > 0.0:
+        opening_equity = current_equity
+    equity = opening_equity
 
-    for trade in reversed(scoped_trades):
-        cumulative_pnl += trade.realized_pnl or 0.0
-        equity += trade.realized_pnl or 0.0
+    if scoped_trades:
+        baseline_ts = (
+            cutoff
+            if cutoff is not None
+            else (_ensure_utc_datetime(scoped_trades[0].executed_at) or datetime.now(timezone.utc))
+        )
+    else:
+        baseline_ts = cutoff or datetime.now(timezone.utc)
+    time_series.append({
+        "timestamp": baseline_ts.isoformat(),
+        "equity": opening_equity,
+        "pnl": 0.0,
+        "cumulative_pnl": 0.0,
+        "symbol": "PORTFOLIO",
+    })
+
+    for trade in scoped_trades:
+        realized_pnl = _safe_float(trade.realized_pnl, 0.0)
+        cumulative_pnl += realized_pnl
+        equity += realized_pnl
+        executed_at = _ensure_utc_datetime(trade.executed_at) or datetime.now(timezone.utc)
 
         time_series.append({
-            'timestamp': trade.executed_at.isoformat(),
-            'equity': equity,
-            'pnl': trade.realized_pnl or 0.0,
-            'cumulative_pnl': cumulative_pnl,
-            'symbol': trade.symbol,
+            "timestamp": executed_at.isoformat(),
+            "equity": equity,
+            "pnl": realized_pnl,
+            "cumulative_pnl": cumulative_pnl,
+            "symbol": trade.symbol,
         })
 
     return {
-        'time_series': time_series,
-        'total_trades': len(scoped_trades),
-        'current_equity': equity,
-        'total_pnl': cumulative_pnl,
+        "time_series": time_series,
+        "total_trades": len(scoped_trades),
+        "current_equity": current_equity,
+        "total_pnl": cumulative_pnl,
     }
 
 
@@ -1705,6 +2145,19 @@ async def get_portfolio_summary(db: Session = Depends(get_db)):
     """
     storage = StorageService(db)
 
+    broker: Optional[BrokerInterface]
+    try:
+        broker = get_broker()
+    except (RuntimeError, ValueError, TypeError, KeyError):
+        broker = None
+
+    try:
+        _capture_portfolio_snapshot(storage, broker)
+    except (RuntimeError, ValueError, TypeError, KeyError):
+        pass
+
+    holdings_snapshot = _load_holdings_snapshot(storage, broker)
+    account_snapshot = _load_account_snapshot(broker)
     positions = storage.get_open_positions()
     trades = storage.get_recent_trades(limit=1000)
 
@@ -1714,8 +2167,15 @@ async def get_portfolio_summary(db: Session = Depends(get_db)):
     losing_trades = len([t for t in trades if (t.realized_pnl or 0.0) < 0])
     win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0.0
 
-    total_position_value = sum(p.cost_basis for p in positions)
-    total_positions = len(positions)
+    total_position_value = sum(_safe_float(h.get("market_value", 0.0), 0.0) for h in holdings_snapshot)
+    total_positions = len(holdings_snapshot) if holdings_snapshot else len(positions)
+    equity = _safe_float(account_snapshot.get("equity", 0.0), 0.0)
+    if equity <= 0.0:
+        latest_snapshot = storage.get_latest_portfolio_snapshot()
+        if latest_snapshot is not None:
+            equity = _safe_float(latest_snapshot.equity, 0.0)
+        if equity <= 0.0:
+            equity = max(0.0, total_position_value + total_pnl)
 
     return {
         'total_trades': total_trades,
@@ -1725,7 +2185,7 @@ async def get_portfolio_summary(db: Session = Depends(get_db)):
         'win_rate': win_rate,
         'total_positions': total_positions,
         'total_position_value': total_position_value,
-        'equity': 100000.0 + total_pnl,
+        'equity': equity,
     }
 
 
@@ -1884,7 +2344,7 @@ async def get_strategy_metrics(strategy_id: str, db: Session = Depends(get_db)):
         losing_trades=metrics.losing_trades,
         total_pnl=metrics.total_pnl,
         sharpe_ratio=metrics.sharpe_ratio,
-        updated_at=metrics.updated_at,
+        updated_at=_ensure_utc_datetime(metrics.updated_at),
     )
 
 
@@ -2530,7 +2990,10 @@ async def get_preference_recommendation(
         else _safe_float(account_snapshot.get("equity", 0.0), 0.0)
     )
     if effective_equity <= 0:
-        effective_equity = 10_000.0
+        effective_equity = max(
+            0.0,
+            sum(_safe_float(row.get("market_value", 0.0), 0.0) for row in holdings_snapshot),
+        )
     effective_buying_power = _safe_float(account_snapshot.get("buying_power", 0.0), 0.0)
     effective_weekly_budget = (
         _safe_float(weekly_budget, 0.0)

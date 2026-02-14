@@ -3,12 +3,12 @@ Repository classes for database CRUD operations.
 Provides abstraction layer between services and database models.
 """
 from typing import List, Optional, Dict, Any
-from datetime import datetime
+from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, or_
 
 from storage.models import (
-    Position, Order, Trade, Strategy, Config, AuditLog,
+    Position, Order, Trade, Strategy, Config, AuditLog, PortfolioSnapshot,
     PositionSideEnum, OrderSideEnum, OrderTypeEnum, OrderStatusEnum, TradeTypeEnum,
     AuditEventTypeEnum
 )
@@ -395,3 +395,62 @@ class AuditLogRepository:
         ).delete()
         self.db.commit()
         return deleted
+
+
+def _to_db_datetime(value: datetime) -> datetime:
+    """Normalize datetime for DB comparisons/storage."""
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+class PortfolioSnapshotRepository:
+    """Repository for portfolio snapshot persistence."""
+
+    def __init__(self, db: Session):
+        self.db = db
+
+    def create(
+        self,
+        equity: float,
+        cash: float,
+        buying_power: float,
+        market_value: float,
+        unrealized_pnl: float,
+        realized_pnl_total: float,
+        open_positions: int,
+        timestamp: Optional[datetime] = None,
+    ) -> PortfolioSnapshot:
+        snapshot = PortfolioSnapshot(
+            timestamp=_to_db_datetime(timestamp) if timestamp is not None else datetime.now(timezone.utc).replace(tzinfo=None),
+            equity=equity,
+            cash=cash,
+            buying_power=buying_power,
+            market_value=market_value,
+            unrealized_pnl=unrealized_pnl,
+            realized_pnl_total=realized_pnl_total,
+            open_positions=open_positions,
+        )
+        self.db.add(snapshot)
+        self.db.commit()
+        self.db.refresh(snapshot)
+        return snapshot
+
+    def get_recent(self, limit: int = 5000) -> List[PortfolioSnapshot]:
+        """Get most recent snapshots in ascending time order."""
+        rows = (
+            self.db.query(PortfolioSnapshot)
+            .order_by(PortfolioSnapshot.timestamp.desc())
+            .limit(limit)
+            .all()
+        )
+        rows.reverse()
+        return rows
+
+    def get_latest(self) -> Optional[PortfolioSnapshot]:
+        """Get latest snapshot row."""
+        return (
+            self.db.query(PortfolioSnapshot)
+            .order_by(PortfolioSnapshot.timestamp.desc())
+            .first()
+        )

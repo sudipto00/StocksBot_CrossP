@@ -1,10 +1,11 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from 'recharts';
-import { createStrategy, getBrokerAccount, getConfig, getPortfolioSummary, getPreferenceRecommendation, getStrategies, getStrategyConfig, getSafetyPreflight, getSafetyStatus, updateConfig, updateStrategy } from '../api/backend';
+import { createStrategy, getApiAuthKey, getBrokerAccount, getConfig, getPortfolioSummary, getPreferenceRecommendation, getStrategies, getStrategyConfig, getSafetyPreflight, getSafetyStatus, updateConfig, updateStrategy } from '../api/backend';
 import { BrokerAccountResponse, PortfolioSummaryResponse, Strategy, StrategyStatus } from '../api/types';
 import HelpTooltip from '../components/HelpTooltip';
 import PageHeader from '../components/PageHeader';
 import GuidedFlowStrip from '../components/GuidedFlowStrip';
+import { formatDateTime as formatTimestamp } from '../utils/datetime';
 
 interface Asset {
   symbol: string;
@@ -66,10 +67,6 @@ function daysForRange(range: ChartRange): number {
   return 320;
 }
 
-function formatDateTime(value: string): string {
-  return new Date(value).toLocaleString();
-}
-
 const USD_FORMATTER = new Intl.NumberFormat('en-US', {
   style: 'currency',
   currency: 'USD',
@@ -77,6 +74,15 @@ const USD_FORMATTER = new Intl.NumberFormat('en-US', {
 
 function formatCurrency(value: number): string {
   return USD_FORMATTER.format(value);
+}
+
+function authFetch(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
+  const headers = new Headers(init.headers || {});
+  const apiKey = getApiAuthKey();
+  if (apiKey) {
+    headers.set('X-API-Key', apiKey);
+  }
+  return window.fetch(input, { ...init, headers });
 }
 
 const WORKSPACE_LIMITS = {
@@ -93,9 +99,45 @@ const WORKSPACE_LIMITS = {
   maxSectorWeightMin: 5,
   maxSectorWeightMax: 100,
 };
+const WORKSPACE_LAST_APPLIED_AT_KEY = 'stocksbot.workspace.lastAppliedAt';
+const WORKSPACE_SNAPSHOT_KEY = 'stocksbot.workspace.snapshot';
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
+}
+
+function markWorkspaceApplied(source: 'manual' | 'auto_optimize' = 'manual'): void {
+  if (typeof window === 'undefined') return;
+  const appliedAt = new Date().toISOString();
+  try {
+    window.localStorage.setItem(WORKSPACE_LAST_APPLIED_AT_KEY, appliedAt);
+    window.dispatchEvent(
+      new CustomEvent('workspace-settings-applied', {
+        detail: { appliedAt, source },
+      })
+    );
+  } catch {
+    // Best effort only.
+  }
+}
+
+function persistWorkspaceSnapshot(snapshot: {
+  asset_type: Preferences['asset_type'];
+  screener_mode: ScreenerMode;
+  stock_preset: StockPreset;
+  etf_preset: EtfPreset;
+  screener_limit: number;
+  min_dollar_volume: number;
+  max_spread_bps: number;
+  max_sector_weight_pct: number;
+  auto_regime_adjust: boolean;
+}): void {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.setItem(WORKSPACE_SNAPSHOT_KEY, JSON.stringify(snapshot));
+  } catch {
+    // Best effort only.
+  }
 }
 
 const ScreenerPage: React.FC = () => {
@@ -160,7 +202,7 @@ const ScreenerPage: React.FC = () => {
 
   const fetchPreferences = useCallback(async () => {
     try {
-      const response = await fetch(`${BACKEND_URL}/preferences`);
+      const response = await authFetch(`${BACKEND_URL}/preferences`);
       if (!response.ok) throw new Error('Failed to fetch preferences');
       const data = await response.json();
       const normalizedAssetType: Preferences['asset_type'] = data.asset_type === 'etf' ? 'etf' : 'stock';
@@ -184,7 +226,7 @@ const ScreenerPage: React.FC = () => {
 
   const fetchBudgetStatus = useCallback(async () => {
     try {
-      const response = await fetch(`${BACKEND_URL}/budget/status`);
+      const response = await authFetch(`${BACKEND_URL}/budget/status`);
       if (!response.ok) throw new Error('Failed to fetch budget status');
       const data = await response.json();
       setBudgetStatus(data);
@@ -206,8 +248,11 @@ const ScreenerPage: React.FC = () => {
         zscore_entry_threshold: String(strategySignalParams.zscore_entry_threshold),
         dip_buy_threshold_pct: String(strategySignalParams.dip_buy_threshold_pct),
       });
-      const response = await fetch(`${BACKEND_URL}/screener/chart/${symbol}?${params.toString()}`);
-      if (!response.ok) throw new Error('Failed to fetch chart');
+      const response = await authFetch(`${BACKEND_URL}/screener/chart/${symbol}?${params.toString()}`);
+      if (!response.ok) {
+        const body = await response.json().catch(() => null);
+        throw new Error(body?.detail || body?.message || `Failed to fetch chart (${response.status})`);
+      }
       const data = await response.json();
       setChartData(data.points || []);
       setChartIndicators(data.indicators || {});
@@ -237,8 +282,11 @@ const ScreenerPage: React.FC = () => {
         dataSource = `${preferences.asset_type}_preset:${preset}`;
       }
       url = `${url}&page=${currentPage}&page_size=${pageSize}&min_dollar_volume=${minDollarVolume}&max_spread_bps=${maxSpreadBps}&max_sector_weight_pct=${maxSectorWeightPct}&auto_regime_adjust=${autoRegimeAdjust}`;
-      const response = await fetch(url);
-      if (!response.ok) throw new Error('Failed to fetch assets');
+      const response = await authFetch(url);
+      if (!response.ok) {
+        const body = await response.json().catch(() => null);
+        throw new Error(body?.detail || body?.message || `Failed to fetch assets (${response.status})`);
+      }
       const data = await response.json();
       setAssets(data.assets);
       setTotalAssetCount(data.total_count ?? data.assets?.length ?? 0);
@@ -271,7 +319,7 @@ const ScreenerPage: React.FC = () => {
 
   const updatePreferences = async (updates: Partial<Preferences>): Promise<Preferences | null> => {
     try {
-      const response = await fetch(`${BACKEND_URL}/preferences`, {
+      const response = await authFetch(`${BACKEND_URL}/preferences`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(updates),
@@ -344,7 +392,7 @@ const ScreenerPage: React.FC = () => {
         max_position_size: nextMaxPosition,
         risk_limit_daily: nextRiskDaily,
       });
-      await updatePreferences({
+      const updatedPrefs = await updatePreferences({
         asset_type: assetType,
         risk_profile: recommendation.risk_profile,
         screener_mode: assetType === 'stock' ? mode : 'preset',
@@ -354,9 +402,27 @@ const ScreenerPage: React.FC = () => {
           ? Math.max(10, Math.min(200, Math.round((preferences.screener_limit + nextScreenerLimit) / 2)))
           : preferences.screener_limit,
       });
+      const snapshotPrefs = updatedPrefs || {
+        stock_preset: preferences.stock_preset,
+        etf_preset: preferences.etf_preset,
+        screener_limit: preferences.screener_limit,
+      };
+      persistWorkspaceSnapshot({
+        asset_type: assetType,
+        screener_mode: assetType === 'stock' ? mode : 'preset',
+        stock_preset: snapshotPrefs.stock_preset,
+        etf_preset: snapshotPrefs.etf_preset,
+        screener_limit: snapshotPrefs.screener_limit,
+        min_dollar_volume: nextMinDollar,
+        max_spread_bps: nextSpread,
+        max_sector_weight_pct: nextSector,
+        auto_regime_adjust: autoRegimeAdjust,
+      });
+      markWorkspaceApplied('auto_optimize');
       setPortfolioOptimizationSummary(
         `Auto-optimized for ${recommendation.asset_type.toUpperCase()} ${recommendation.preset}: Equity ${formatCurrency(recommendation.portfolio_context.equity)}, Buying Power ${formatCurrency(recommendation.portfolio_context.buying_power)}, Holdings ${recommendation.portfolio_context.holdings_count}.`
       );
+      setWorkspaceMessage('Auto-optimization applied from current portfolio context.');
     } catch (err) {
       if (requestId !== optimizeRequestIdRef.current) return;
       setWorkspaceMessage(err instanceof Error ? err.message : 'Failed to auto-optimize from portfolio context.');
@@ -365,7 +431,7 @@ const ScreenerPage: React.FC = () => {
         setOptimizingWorkspace(false);
       }
     }
-  }, [preferences.asset_type, preferences.etf_preset, preferences.screener_limit, preferences.stock_preset, preferences.weekly_budget, screenerMode]);
+  }, [autoRegimeAdjust, preferences.asset_type, preferences.etf_preset, preferences.screener_limit, preferences.stock_preset, preferences.weekly_budget, screenerMode]);
 
   const fetchConfig = useCallback(async () => {
     try {
@@ -462,6 +528,18 @@ const ScreenerPage: React.FC = () => {
       await fetchBudgetStatus();
       await fetchPortfolioSummary();
       await fetchBrokerAccount();
+      persistWorkspaceSnapshot({
+        asset_type: preferences.asset_type,
+        screener_mode: effectiveScreenerMode,
+        stock_preset: preferences.stock_preset,
+        etf_preset: preferences.etf_preset,
+        screener_limit: preferences.screener_limit,
+        min_dollar_volume: minDollarVolume,
+        max_spread_bps: maxSpreadBps,
+        max_sector_weight_pct: maxSectorWeightPct,
+        auto_regime_adjust: autoRegimeAdjust,
+      });
+      markWorkspaceApplied('manual');
       setWorkspaceMessage('Workspace settings applied successfully.');
     } catch (err) {
       setWorkspaceMessage(err instanceof Error ? err.message : 'Failed to apply workspace settings.');
@@ -588,7 +666,7 @@ const ScreenerPage: React.FC = () => {
     { value: 'aggressive', label: 'Aggressive' },
   ];
   const presetOptions = preferences.asset_type === 'etf' ? etfPresets : stockPresets;
-  const prettyLastRefresh = lastRefreshAt ? new Date(lastRefreshAt).toLocaleString() : 'Not refreshed yet';
+  const prettyLastRefresh = lastRefreshAt ? formatTimestamp(lastRefreshAt) : 'Not refreshed yet';
   const prettyDataSource =
     lastDataSource === 'alpaca'
       ? 'Alpaca'
@@ -1231,7 +1309,7 @@ const ScreenerPage: React.FC = () => {
                   <YAxis domain={['auto', 'auto']} />
                   <Tooltip
                     cursor={{ stroke: '#64748b', strokeDasharray: '4 4' }}
-                    labelFormatter={(value) => formatDateTime(String(value))}
+                    labelFormatter={(value) => formatTimestamp(String(value))}
                     formatter={(value: number | string | undefined, name?: string) => {
                       const numeric = typeof value === 'number' ? value : Number(value ?? 0);
                       return [`$${numeric.toFixed(2)}`, name ?? ''];

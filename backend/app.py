@@ -3,6 +3,7 @@ StocksBot FastAPI Backend
 Main application entry point for the sidecar backend.
 """
 import secrets
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.requests import Request
@@ -10,7 +11,11 @@ from starlette.responses import Response, JSONResponse
 import logging
 import uvicorn
 
-from api.routes import router as api_router
+from api.routes import (
+    router as api_router,
+    start_summary_scheduler,
+    stop_summary_scheduler,
+)
 from config.settings import get_settings
 
 logger = logging.getLogger(__name__)
@@ -24,10 +29,31 @@ AUTH_SKIP_PATHS = {
     "/redoc",
 }
 
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    """Manage background service lifecycle."""
+    try:
+        started = start_summary_scheduler()
+        if started:
+            logger.info("Summary notification scheduler started")
+    except (RuntimeError, ValueError, TypeError):
+        logger.exception("Failed to start summary notification scheduler")
+    try:
+        yield
+    finally:
+        try:
+            stopped = stop_summary_scheduler()
+            if stopped:
+                logger.info("Summary notification scheduler stopped")
+        except (RuntimeError, ValueError, TypeError):
+            logger.exception("Failed to stop summary notification scheduler")
+
+
 app = FastAPI(
     title="StocksBot API",
     description="Cross-platform StocksBot backend service",
-    version="0.1.0"
+    version="0.1.0",
+    lifespan=_lifespan,
 )
 
 # Configure CORS for Tauri frontend

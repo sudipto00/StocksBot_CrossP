@@ -345,8 +345,22 @@ class MarketScreener:
         max_sector_weight_pct: float,
         regime: str,
         auto_regime_adjust: bool = True,
+        current_holdings: Optional[List[Dict[str, Any]]] = None,
+        buying_power: float = 0.0,
+        equity: float = 0.0,
+        weekly_budget: float = 0.0,
     ) -> List[Dict[str, Any]]:
         """Apply scoring and guardrails (liquidity/spread/sector concentration)."""
+
+        def _safe_non_negative(value: Any) -> float:
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError):
+                return 0.0
+            if not math.isfinite(parsed):
+                return 0.0
+            return max(0.0, parsed)
+
         if auto_regime_adjust:
             if regime == "high_volatility_range":
                 max_spread_bps = min(max_spread_bps, 35)
@@ -356,28 +370,58 @@ class MarketScreener:
             elif regime == "trending_down":
                 min_dollar_volume = max(min_dollar_volume, 18_000_000)
 
+        holdings = current_holdings or []
+        held_symbols = {
+            str(row.get("symbol", "")).strip().upper()
+            for row in holdings
+            if str(row.get("symbol", "")).strip()
+        }
+        safe_buying_power = _safe_non_negative(buying_power)
+        safe_equity = _safe_non_negative(equity)
+        safe_weekly_budget = _safe_non_negative(weekly_budget)
+        budget_candidates = [value for value in (safe_buying_power, safe_weekly_budget, safe_equity * 0.20) if value > 0]
+        portfolio_budget_cap = min(budget_candidates) if budget_candidates else 0.0
+
         candidates = self._enrich_assets(assets)
         for asset in candidates:
             dollar_volume = float(asset.get("dollar_volume", 0.0))
             spread = float(asset.get("spread_bps", 999.0))
-            tradable = dollar_volume >= min_dollar_volume and spread <= max_spread_bps
+            symbol = str(asset.get("symbol", "")).upper()
+            estimated_ticket = max(1.0, float(asset.get("price", 0.0))) * 3.0
+            affordable = (
+                portfolio_budget_cap <= 0
+                or estimated_ticket <= portfolio_budget_cap * 1.5
+                or symbol in held_symbols
+            )
+            tradable = dollar_volume >= min_dollar_volume and spread <= max_spread_bps and affordable
             asset["tradable"] = tradable
+            base_score = float(asset.get("score", 0.0))
+            adjusted_score = base_score
+            if symbol in held_symbols:
+                adjusted_score += 3.0
+            if portfolio_budget_cap > 0 and estimated_ticket > portfolio_budget_cap:
+                adjusted_score -= min(20.0, ((estimated_ticket / portfolio_budget_cap) - 1.0) * 10.0)
+            asset["_score_adjusted"] = round(adjusted_score, 2)
             if tradable:
                 asset["selection_reason"] = (
-                    f"Score {asset.get('score', 0):.1f}; "
+                    f"Score {asset.get('_score_adjusted', asset.get('score', 0)):.1f}; "
                     f"${dollar_volume/1_000_000:.1f}M dollar vol; "
                     f"{spread:.1f} bps spread"
                 )
+                if symbol in held_symbols:
+                    asset["selection_reason"] += "; continuity boost"
             else:
                 reasons = []
                 if dollar_volume < min_dollar_volume:
                     reasons.append("low dollar volume")
                 if spread > max_spread_bps:
                     reasons.append("wide spread")
+                if not affordable:
+                    reasons.append("budget constrained")
                 asset["selection_reason"] = "Filtered: " + ", ".join(reasons)
 
         tradable_assets = [a for a in candidates if a.get("tradable")]
-        tradable_assets.sort(key=lambda a: float(a.get("score", 0.0)), reverse=True)
+        tradable_assets.sort(key=lambda a: float(a.get("_score_adjusted", a.get("score", 0.0))), reverse=True)
         max_sector_fraction = max(0.1, min(1.0, max_sector_weight_pct / 100.0))
         per_sector_cap = max(1, int(limit * max_sector_fraction))
         selected: List[Dict[str, Any]] = []
@@ -398,7 +442,10 @@ class MarketScreener:
                 selected.append(asset)
                 if len(selected) >= limit:
                     break
-        return selected[:limit]
+        final = selected[:limit]
+        for asset in final:
+            asset.pop("_score_adjusted", None)
+        return final
 
     def _enrich_assets(self, assets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Attach sector/spread/dollar-volume/score fields for explainability."""
@@ -479,10 +526,16 @@ class MarketScreener:
                 prices = []
                 for bar in bars:
                     close = float(getattr(bar, "close", getattr(bar, "c", 0.0)))
+                    high = float(getattr(bar, "high", getattr(bar, "h", close)))
+                    low = float(getattr(bar, "low", getattr(bar, "l", close)))
+                    if high < low:
+                        high, low = low, high
                     ts = getattr(bar, "timestamp", getattr(bar, "t", datetime.now()))
                     prices.append({
                         "timestamp": ts.isoformat() if hasattr(ts, "isoformat") else str(ts),
                         "close": close,
+                        "high": high,
+                        "low": low,
                     })
                 if prices:
                     return self._with_sma(prices)
@@ -502,7 +555,15 @@ class MarketScreener:
             noise = math.sin(i / 7.0) * 0.8 + math.cos(i / 17.0) * 0.4
             trend = (i / max(days, 1)) * 0.05
             close = max(1.0, base_price * (1 + trend + noise / 100.0))
-            points.append({"timestamp": dt.isoformat(), "close": close})
+            intraday_range_pct = 0.004 + abs(noise) / 300.0
+            high = close * (1.0 + intraday_range_pct)
+            low = max(0.01, close * (1.0 - intraday_range_pct))
+            points.append({
+                "timestamp": dt.isoformat(),
+                "close": close,
+                "high": high,
+                "low": low,
+            })
         return self._with_sma(points)
 
     def get_chart_indicators(
@@ -517,19 +578,70 @@ class MarketScreener:
         """Compute minimal high-value chart indicators/monitors."""
         if not points:
             return {}
-        closes = [float(p.get("close", 0.0)) for p in points if p.get("close") is not None]
+        normalized_points = []
+        for point in points:
+            raw_close = point.get("close")
+            if raw_close is None:
+                continue
+            try:
+                close = float(raw_close)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(close) or close <= 0:
+                continue
+            raw_high = point.get("high")
+            raw_low = point.get("low")
+            high = None
+            low = None
+            if raw_high is not None:
+                try:
+                    parsed_high = float(raw_high)
+                    if math.isfinite(parsed_high) and parsed_high > 0:
+                        high = parsed_high
+                except (TypeError, ValueError):
+                    high = None
+            if raw_low is not None:
+                try:
+                    parsed_low = float(raw_low)
+                    if math.isfinite(parsed_low) and parsed_low > 0:
+                        low = parsed_low
+                except (TypeError, ValueError):
+                    low = None
+            normalized_points.append({
+                "close": close,
+                "high": high,
+                "low": low,
+                "sma50": point.get("sma50"),
+            })
+
+        closes = [point["close"] for point in normalized_points]
         if len(closes) < 2:
             return {}
         latest_close = closes[-1]
-        # ATR proxy from close-to-close move for lightweight calculation.
+        # True ATR(14): TR = max(high-low, |high-prev_close|, |low-prev_close|).
         atr_window = min(14, len(closes) - 1)
-        diffs = []
-        for i in range(len(closes) - atr_window, len(closes)):
-            prev = closes[i - 1]
-            curr = closes[i]
-            if prev > 0:
-                diffs.append(abs(curr - prev) / prev)
-        atr_pct = (sum(diffs) / len(diffs) * 100.0) if diffs else 0.0
+        true_ranges = []
+        start_idx = len(closes) - atr_window
+        for idx in range(start_idx, len(closes)):
+            prev_close = closes[idx - 1]
+            close = closes[idx]
+            high = normalized_points[idx].get("high")
+            low = normalized_points[idx].get("low")
+            if high is None:
+                high = max(close, prev_close)
+            if low is None:
+                low = min(close, prev_close)
+            if high < low:
+                high, low = low, high
+            tr = max(
+                high - low,
+                abs(high - prev_close),
+                abs(low - prev_close),
+            )
+            if math.isfinite(tr) and tr >= 0:
+                true_ranges.append(tr)
+        atr_abs = (sum(true_ranges) / len(true_ranges)) if true_ranges else 0.0
+        atr_pct = (atr_abs / latest_close * 100.0) if latest_close > 0 else 0.0
 
         z_window = min(20, len(closes))
         z_slice = closes[-z_window:]
@@ -538,7 +650,7 @@ class MarketScreener:
         z_std = variance ** 0.5
         zscore20 = (latest_close - z_mean) / z_std if z_std > 0 else 0.0
 
-        latest_sma50 = points[-1].get("sma50")
+        latest_sma50 = normalized_points[-1].get("sma50")
         dip_trigger_price = None
         dip_buy_signal = False
         if latest_sma50:
@@ -552,6 +664,7 @@ class MarketScreener:
 
         return {
             "latest_close": round(latest_close, 4),
+            "atr14": round(atr_abs, 4),
             "atr14_pct": round(atr_pct, 4),
             "zscore20": round(zscore20, 4),
             "take_profit_price": round(take_profit_price, 4),
@@ -577,12 +690,17 @@ class MarketScreener:
                 sma50 = sum(closes[idx - 49:idx + 1]) / 50.0
             if idx >= 249:
                 sma250 = sum(closes[idx - 249:idx + 1]) / 250.0
-            result.append({
+            point = {
                 "timestamp": p["timestamp"],
                 "close": p["close"],
                 "sma50": sma50,
                 "sma250": sma250,
-            })
+            }
+            if p.get("high") is not None:
+                point["high"] = p["high"]
+            if p.get("low") is not None:
+                point["low"] = p["low"]
+            result.append(point)
         return result
     
     def _get_fallback_stocks(self, limit: int) -> List[Dict[str, Any]]:
