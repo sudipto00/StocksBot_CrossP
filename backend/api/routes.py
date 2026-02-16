@@ -28,6 +28,7 @@ from services.order_execution import (
     BrokerError,
     set_global_kill_switch,
     get_global_kill_switch,
+    set_global_trading_enabled,
 )
 from config.settings import get_settings, has_alpaca_credentials
 from services.logging_service import configure_file_logging, cleanup_old_files
@@ -225,13 +226,19 @@ def get_order_execution_service(
     Returns:
         OrderExecutionService instance
     """
-    broker = get_broker()
     storage = StorageService(db)
     set_global_kill_switch(_load_kill_switch(storage))
     
     # Get config for risk limits
     config = _load_runtime_config(storage)
     _set_config_snapshot(config)
+    set_global_trading_enabled(bool(config.trading_enabled))
+    if config.trading_enabled:
+        broker = get_broker()
+    else:
+        # Use local paper broker while trading is disabled to avoid credential-gated failures.
+        broker = PaperBroker()
+        broker.connect()
     
     # Keep budget checks opt-in at endpoint level to avoid global-state bleed
     # across tests and long-running UI sessions.
@@ -272,6 +279,7 @@ _config = ConfigResponse(
     audit_retention_days=90,
     broker="paper",
 )
+set_global_trading_enabled(bool(_config.trading_enabled))
 configure_file_logging(_config.log_directory)
 _last_housekeeping_run: Optional[datetime] = None
 _CONFIG_KEY = "runtime_config"
@@ -656,6 +664,9 @@ def _normalize_symbols(raw_symbols: List[str], max_symbols: int = 200) -> List[s
 
 def _execution_block_reason(symbol: str, broker: BrokerInterface) -> Optional[str]:
     """Return first blocking safety reason for execution, if any."""
+    config = _get_config_snapshot()
+    if not bool(config.trading_enabled):
+        return "Trading is disabled in Settings"
     if get_global_kill_switch():
         return "Trading is blocked: kill switch is active"
     if not broker.is_connected():
@@ -665,6 +676,105 @@ def _execution_block_reason(symbol: str, broker: BrokerInterface) -> Optional[st
     if not broker.is_market_open():
         return "Market is closed"
     return None
+
+
+def _to_order_status(raw_status: Any) -> OrderStatus:
+    """Normalize broker/storage order status to API status enum."""
+    normalized = str(raw_status or "pending").strip().lower()
+    mapping = {
+        "pending": OrderStatus.PENDING,
+        "open": OrderStatus.SUBMITTED,
+        "submitted": OrderStatus.SUBMITTED,
+        "accepted": OrderStatus.SUBMITTED,
+        "new": OrderStatus.SUBMITTED,
+        "filled": OrderStatus.FILLED,
+        "partially_filled": OrderStatus.PARTIALLY_FILLED,
+        "partial_fill": OrderStatus.PARTIALLY_FILLED,
+        "canceled": OrderStatus.CANCELLED,
+        "cancelled": OrderStatus.CANCELLED,
+        "expired": OrderStatus.CANCELLED,
+        "rejected": OrderStatus.REJECTED,
+    }
+    return mapping.get(normalized, OrderStatus.PENDING)
+
+
+def _to_utc_datetime(value: Any) -> datetime:
+    """Best-effort datetime parser for mixed DB/broker payloads."""
+    if isinstance(value, datetime):
+        return _ensure_utc_datetime(value) or datetime.now(timezone.utc)
+    if isinstance(value, str):
+        candidate = value.strip()
+        if candidate:
+            if candidate.endswith("Z"):
+                candidate = f"{candidate[:-1]}+00:00"
+            try:
+                parsed = datetime.fromisoformat(candidate)
+                return _ensure_utc_datetime(parsed) or datetime.now(timezone.utc)
+            except ValueError:
+                pass
+    return datetime.now(timezone.utc)
+
+
+def _to_order_side(raw_side: Any) -> OrderSide:
+    normalized = str(raw_side or "").strip().lower()
+    return OrderSide.SELL if normalized == "sell" else OrderSide.BUY
+
+
+def _to_order_type(raw_type: Any) -> OrderType:
+    normalized = str(raw_type or "").strip().lower()
+    mapping = {
+        "market": OrderType.MARKET,
+        "limit": OrderType.LIMIT,
+        "stop": OrderType.STOP,
+        "stop_limit": OrderType.STOP_LIMIT,
+        "stop-limit": OrderType.STOP_LIMIT,
+    }
+    return mapping.get(normalized, OrderType.MARKET)
+
+
+def _api_order_from_storage_row(row: Any) -> Order:
+    """Map DB order row to API model."""
+    return Order(
+        id=str(row.id),
+        symbol=str(row.symbol).upper(),
+        side=OrderSide(str(row.side.value).lower()),
+        type=OrderType(str(row.type.value).lower()),
+        quantity=float(row.quantity),
+        price=float(row.price) if row.price is not None else None,
+        status=_to_order_status(getattr(row.status, "value", row.status)),
+        filled_quantity=float(row.filled_quantity or 0.0),
+        avg_fill_price=float(row.avg_fill_price) if row.avg_fill_price is not None else None,
+        created_at=_ensure_utc_datetime(row.created_at) or datetime.now(timezone.utc),
+        updated_at=_ensure_utc_datetime(row.updated_at) or datetime.now(timezone.utc),
+    )
+
+
+def _api_order_from_broker_row(raw: Dict[str, Any]) -> Optional[Order]:
+    """Map broker order payload to API model."""
+    if not isinstance(raw, dict):
+        return None
+    order_id = str(raw.get("id", "")).strip()
+    symbol = str(raw.get("symbol", "")).strip().upper()
+    if not order_id or not symbol:
+        return None
+    created_at = _to_utc_datetime(raw.get("created_at"))
+    updated_at = _to_utc_datetime(raw.get("updated_at") or raw.get("filled_at") or created_at)
+    quantity = _safe_float(raw.get("quantity", 0.0), 0.0)
+    if quantity <= 0:
+        return None
+    return Order(
+        id=order_id,
+        symbol=symbol,
+        side=_to_order_side(raw.get("side")),
+        type=_to_order_type(raw.get("type")),
+        quantity=quantity,
+        price=_safe_float(raw.get("price"), 0.0) if raw.get("price") is not None else None,
+        status=_to_order_status(raw.get("status")),
+        filled_quantity=max(0.0, _safe_float(raw.get("filled_quantity", 0.0), 0.0)),
+        avg_fill_price=_safe_float(raw.get("avg_fill_price"), 0.0) if raw.get("avg_fill_price") is not None else None,
+        created_at=created_at,
+        updated_at=updated_at,
+    )
 
 
 def _load_summary_notification_preferences(storage: StorageService) -> SummaryNotificationPreferencesResponse:
@@ -1125,6 +1235,7 @@ async def update_config(
 
     # Recreate broker on next use when mode changes.
     _set_config_snapshot(config)
+    set_global_trading_enabled(bool(config.trading_enabled))
     _invalidate_broker_instance()
     _run_housekeeping(storage, force=True)
     _save_runtime_config(storage, config)
@@ -1232,15 +1343,19 @@ async def get_broker_account():
 @router.get("/positions", response_model=PositionsResponse)
 async def get_positions(db: Session = Depends(get_db)):
     """
-    Get current positions.
-    TODO: Integrate with portfolio service and broker API.
-    Returns stub data for now.
+    Get current positions from broker, with local fallback if broker is unavailable.
     """
     broker_positions: List[Dict[str, Any]] = []
+    data_source = "broker"
+    degraded = False
+    degraded_reason: Optional[str] = None
     try:
         broker = get_broker()
         broker_positions = broker.get_positions()
-    except RuntimeError:
+    except RuntimeError as exc:
+        data_source = "local_fallback"
+        degraded = True
+        degraded_reason = f"Broker positions unavailable: {exc}"
         storage = StorageService(db)
         local_positions = storage.get_open_positions()
         for position in local_positions:
@@ -1249,28 +1364,49 @@ async def get_positions(db: Session = Depends(get_db)):
                 "quantity": float(position.quantity),
                 "side": position.side.value if hasattr(position.side, "value") else str(position.side),
                 "avg_entry_price": float(position.avg_entry_price),
-                "current_price": float(position.avg_entry_price),
+                "current_price": None,
                 "market_value": float(position.cost_basis),
                 "cost_basis": float(position.cost_basis),
                 "unrealized_pnl": 0.0,
                 "unrealized_pnl_percent": 0.0,
+                "current_price_available": False,
+                "valuation_source": "cost_basis_fallback",
             })
     positions: List[Position] = []
     for raw in broker_positions:
         qty = float(raw.get("quantity", 0.0))
-        current_price = float(raw.get("current_price", raw.get("price", 0.0)))
+        current_price_raw = raw.get("current_price", raw.get("price", None))
+        current_price_available = current_price_raw is not None
+        if current_price_available:
+            current_price = float(current_price_raw)
+            if not math.isfinite(current_price) or current_price <= 0:
+                current_price = 0.0
+                current_price_available = False
+        else:
+            current_price = 0.0
         avg_entry_price = float(raw.get("avg_entry_price", 0.0))
         cost_basis = float(raw.get("cost_basis", abs(qty) * avg_entry_price))
-        market_value = float(raw.get("market_value", abs(qty) * current_price))
-        unrealized_pnl = float(raw.get("unrealized_pnl", market_value - cost_basis))
+        if "market_value" in raw:
+            market_value = float(raw.get("market_value", 0.0))
+        elif current_price_available:
+            market_value = abs(qty) * current_price
+        else:
+            market_value = cost_basis
+        if "unrealized_pnl" in raw:
+            unrealized_pnl = float(raw.get("unrealized_pnl", 0.0))
+        elif current_price_available:
+            unrealized_pnl = market_value - cost_basis
+        else:
+            unrealized_pnl = 0.0
         unrealized_pnl_percent = float(
             raw.get(
                 "unrealized_pnl_percent",
-                ((unrealized_pnl / cost_basis) * 100.0) if cost_basis > 0 else 0.0,
+                ((unrealized_pnl / cost_basis) * 100.0) if current_price_available and cost_basis > 0 else 0.0,
             )
         )
         side_raw = str(raw.get("side", "long")).lower()
         side = PositionSide.SHORT if side_raw == "short" else PositionSide.LONG
+        valuation_source = str(raw.get("valuation_source", "broker_mark" if current_price_available else "cost_basis_fallback"))
         positions.append(
             Position(
                 symbol=str(raw.get("symbol", "")).upper(),
@@ -1282,6 +1418,8 @@ async def get_positions(db: Session = Depends(get_db)):
                 unrealized_pnl_percent=unrealized_pnl_percent,
                 cost_basis=cost_basis,
                 market_value=market_value,
+                current_price_available=current_price_available,
+                valuation_source=valuation_source,
             )
         )
 
@@ -1295,6 +1433,9 @@ async def get_positions(db: Session = Depends(get_db)):
         total_value=total_value,
         total_pnl=total_pnl,
         total_pnl_percent=total_pnl_percent,
+        data_source=data_source,
+        degraded=degraded,
+        degraded_reason=degraded_reason,
     )
 
 
@@ -1303,45 +1444,43 @@ async def get_positions(db: Session = Depends(get_db)):
 # ============================================================================
 
 @router.get("/orders", response_model=OrdersResponse)
-async def get_orders():
+async def get_orders(db: Session = Depends(get_db)):
     """
-    Get orders.
-    TODO: Integrate with order service and broker API.
-    Returns stub data for now.
+    Get recent orders from local storage and enrich with broker state when available.
     """
-    # Stub data for development
-    stub_orders = [
-        Order(
-            id="order-001",
-            symbol="AAPL",
-            side=OrderSide.BUY,
-            type=OrderType.LIMIT,
-            quantity=100,
-            price=150.00,
-            status=OrderStatus.FILLED,
-            filled_quantity=100,
-            avg_fill_price=150.00,
-            created_at=datetime.now(timezone.utc),
-            updated_at=datetime.now(timezone.utc),
-        ),
-        Order(
-            id="order-002",
-            symbol="MSFT",
-            side=OrderSide.BUY,
-            type=OrderType.MARKET,
-            quantity=50,
-            status=OrderStatus.FILLED,
-            filled_quantity=50,
-            avg_fill_price=300.00,
-            created_at=datetime.now(timezone.utc),
-            updated_at=datetime.now(timezone.utc),
-        ),
-    ]
+    storage = StorageService(db)
+    local_rows = storage.get_recent_orders(limit=500)
+    orders = [_api_order_from_storage_row(row) for row in local_rows]
 
-    return OrdersResponse(
-        orders=stub_orders,
-        total_count=len(stub_orders),
-    )
+    by_external_id: Dict[str, int] = {}
+    for idx, row in enumerate(local_rows):
+        external_id = str(getattr(row, "external_id", "") or "").strip()
+        if external_id:
+            by_external_id[external_id] = idx
+
+    try:
+        broker = get_broker()
+        broker_rows = broker.get_orders()
+    except (RuntimeError, ValueError, TypeError):
+        broker_rows = []
+
+    for raw in broker_rows:
+        broker_order = _api_order_from_broker_row(raw)
+        if broker_order is None:
+            continue
+        external_id = str(raw.get("id", "")).strip()
+        local_index = by_external_id.get(external_id)
+        if local_index is not None and 0 <= local_index < len(orders):
+            local_order = orders[local_index]
+            local_order.status = broker_order.status
+            local_order.filled_quantity = broker_order.filled_quantity
+            local_order.avg_fill_price = broker_order.avg_fill_price
+            local_order.updated_at = broker_order.updated_at
+            continue
+        orders.append(broker_order)
+
+    orders.sort(key=lambda row: row.updated_at, reverse=True)
+    return OrdersResponse(orders=orders, total_count=len(orders))
 
 
 @router.post("/orders", response_model=Order)
@@ -1390,7 +1529,7 @@ async def create_order(
             type=OrderType(order.type.value),
             quantity=order.quantity,
             price=order.price,
-            status=OrderStatus(order.status.value),
+            status=_to_order_status(order.status.value),
             filled_quantity=order.filled_quantity or 0.0,
             avg_fill_price=order.avg_fill_price,
             created_at=_ensure_utc_datetime(order.created_at),
@@ -2077,6 +2216,11 @@ async def safety_preflight(symbol: str, db: Session = Depends(get_db)):
     """Return execution block reason for a candidate symbol."""
     storage = StorageService(db)
     set_global_kill_switch(_load_kill_switch(storage))
+    config = _load_runtime_config(storage)
+    _set_config_snapshot(config)
+    set_global_trading_enabled(bool(config.trading_enabled))
+    if not config.trading_enabled:
+        return {"allowed": False, "reason": "Trading is disabled in Settings"}
     broker = get_broker()
     reason = _execution_block_reason(symbol.strip().upper(), broker)
     return {"allowed": reason is None, "reason": reason or ""}
@@ -2196,6 +2340,17 @@ async def start_runner(
     storage = StorageService(db)
     config = _load_runtime_config(storage)
     _set_config_snapshot(config)
+    set_global_trading_enabled(bool(config.trading_enabled))
+    if not config.trading_enabled:
+        active_strategy_count = len(storage.get_active_strategies())
+        if active_strategy_count > 0:
+            payload = {
+                "success": False,
+                "message": "Trading is disabled in Settings. Enable Trading Enabled before starting runner.",
+                "status": "stopped",
+            }
+            _idempotency_cache_set("/runner/start", x_idempotency_key, payload)
+            return RunnerActionResponse(**payload)
     try:
         broker = get_broker()
     except RuntimeError as exc:
@@ -2983,6 +3138,13 @@ async def run_strategy_backtest(
         "symbols_source": "strategy_symbols",
         "symbols_requested": len(selected_symbols),
     }
+    live_parity_context: Dict[str, Any] = {
+        "broker": broker_name or "unknown",
+        "broker_mode": _bt_mode,
+        "strict_real_data_required": _bt_require_real_data,
+        "credentials_available": bool(_bt_creds),
+        "workspace_universe_requested": bool(request.use_workspace_universe),
+    }
     if request.use_workspace_universe:
         try:
             screener = MarketScreener(
@@ -3054,6 +3216,13 @@ async def run_strategy_backtest(
             requested_max_position_size=max_position_size,
             requested_risk_limit_daily=risk_limit_daily,
         )
+    live_parity_context["require_fractionable"] = require_fractionable
+    live_parity_context["symbol_capabilities_checked"] = bool(symbol_capabilities)
+    live_parity_context["symbols_selected"] = len(selected_symbols)
+    live_parity_context["symbols_filtered_out_count"] = len(filtered_out)
+    live_parity_context["max_position_size"] = max_position_size
+    live_parity_context["risk_limit_daily"] = risk_limit_daily
+    universe_context["live_parity_context"] = live_parity_context
 
     analytics = StrategyAnalyticsService(
         db,

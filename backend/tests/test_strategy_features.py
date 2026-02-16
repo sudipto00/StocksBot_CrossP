@@ -353,6 +353,11 @@ class TestStrategyBacktesting:
         assert "calmar_ratio" in advanced
         assert "avg_hold_days" in advanced
         assert "slippage_bps_applied" in advanced
+        parity = payload["diagnostics"].get("live_parity")
+        assert parity is not None
+        assert "universe_source" in parity
+        assert "max_position_size_applied" in parity
+        assert "risk_limit_daily_applied" in parity
         # Verify time_exit is tracked in exit_reasons.
         assert "time_exit" in payload["diagnostics"]["exit_reasons"]
 
@@ -417,6 +422,8 @@ class TestStrategyBacktesting:
         universe = diagnostics.get("universe_context", {})
         assert universe.get("symbols_source") == "workspace_universe"
         assert universe.get("preset_universe_mode") == "seed_only"
+        parity = diagnostics.get("live_parity", {})
+        assert parity.get("universe_source") == "workspace_universe"
 
 
 class TestParameterTuning:

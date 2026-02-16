@@ -590,6 +590,23 @@ def test_start_stop_runner():
     assert stop_response.status_code == 200
 
 
+def test_start_runner_blocked_when_trading_disabled_with_active_strategy():
+    """Runner start should be blocked when trading is disabled and active strategies exist."""
+    create_response = client.post("/strategies", json={
+        "name": "Disabled Runner Test",
+        "symbols": ["AAPL"],
+    })
+    strategy_id = create_response.json()["id"]
+    client.put(f"/strategies/{strategy_id}", json={"status": "active"})
+    client.post("/config", json={"trading_enabled": False})
+
+    response = client.post("/runner/start")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["success"] is False
+    assert "trading is disabled" in payload["message"].lower()
+
+
 def test_runner_idempotent_start():
     """Test that starting runner multiple times is idempotent."""
     # Start twice

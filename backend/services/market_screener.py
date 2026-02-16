@@ -72,27 +72,45 @@ class MarketScreener:
                     api_key=runtime_api_key,
                     secret_key=runtime_secret_key
                 )
-                if TradingClient:
-                    self._trading_client = TradingClient(
-                        api_key=runtime_api_key,
-                        secret_key=runtime_secret_key,
-                        paper=True,
-                    )
+                self._trading_client = self._create_trading_client(
+                    api_key=runtime_api_key,
+                    secret_key=runtime_secret_key,
+                    paper=True,
+                )
             elif has_alpaca_credentials():
                 settings = get_settings()
                 self._data_client = StockHistoricalDataClient(
                     api_key=settings.alpaca_api_key,
                     secret_key=settings.alpaca_secret_key
                 )
-                if TradingClient:
-                    self._trading_client = TradingClient(
-                        api_key=settings.alpaca_api_key,
-                        secret_key=settings.alpaca_secret_key,
-                        paper=True,
-                    )
+                self._trading_client = self._create_trading_client(
+                    api_key=settings.alpaca_api_key,
+                    secret_key=settings.alpaca_secret_key,
+                    paper=True,
+                )
         if self.require_real_data and self._data_client is None:
             raise RuntimeError(
                 "Strict Alpaca data mode is enabled but Alpaca data client could not be initialized"
+            )
+
+    def _create_trading_client(self, api_key: str, secret_key: str, paper: bool) -> Any:
+        """Create TradingClient with raw payloads when supported by installed SDK."""
+        if not TradingClient:
+            return None
+        try:
+            # raw_data avoids strict enum parsing failures when Alpaca introduces new values.
+            return TradingClient(
+                api_key=api_key,
+                secret_key=secret_key,
+                paper=paper,
+                raw_data=True,
+            )
+        except TypeError:
+            # Older SDK builds may not accept raw_data; fall back to model mode.
+            return TradingClient(
+                api_key=api_key,
+                secret_key=secret_key,
+                paper=paper,
             )
     
     def get_active_stocks(self, limit: int = 100) -> List[Dict[str, Any]]:
@@ -360,6 +378,32 @@ class MarketScreener:
         ranked_assets.sort(key=lambda x: x.get("volume", 0), reverse=True)
         return ranked_assets[:limit]
 
+    def _asset_field(self, asset: Any, key: str, default: Any = None) -> Any:
+        """Read asset fields from either SDK model objects or raw dict payloads."""
+        if isinstance(asset, dict):
+            value = asset.get(key, default)
+        else:
+            value = getattr(asset, key, default)
+        if key == "asset_class" and (value is None or str(value).strip() == ""):
+            if isinstance(asset, dict):
+                value = asset.get("class")
+            else:
+                value = getattr(asset, "class", default)
+        if hasattr(value, "value"):
+            return value.value
+        return value if value is not None else default
+
+    def _asset_bool(self, asset: Any, key: str, default: bool = False) -> bool:
+        """Coerce mixed payload fields to bool (supports string/integer payloads)."""
+        value = self._asset_field(asset, key, default)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+        if isinstance(value, (int, float)):
+            return bool(value)
+        return bool(default)
+
     def _get_candidate_symbols_for_asset_class(self, asset_class: str) -> Tuple[List[str], List[Dict[str, Any]]]:
         """Resolve candidate symbols using Alpaca tradable universe with fallback safety."""
         fallback_assets = (
@@ -384,18 +428,20 @@ class MarketScreener:
         candidate_rows: List[Dict[str, Any]] = []
         seen: set[str] = set()
         for asset in all_assets:
-            symbol = str(getattr(asset, "symbol", "") or "").strip().upper()
+            symbol = str(self._asset_field(asset, "symbol", "") or "").strip().upper()
             if not symbol or symbol in seen:
                 continue
             # Keep only active, US-equity style tradable rows.
-            if not bool(getattr(asset, "tradable", False)):
+            if not self._asset_bool(asset, "tradable", False):
                 continue
-            if str(getattr(asset, "status", "")).lower() not in {"active", "assetstatus.active"}:
+            status = str(self._asset_field(asset, "status", "")).lower()
+            if status not in {"active", "assetstatus.active"}:
                 continue
-            asset_class_name = str(getattr(asset, "asset_class", "")).lower()
+            asset_class_name = str(self._asset_field(asset, "asset_class", "")).lower()
             if asset_class_name and "us_equity" not in asset_class_name and "us-equity" not in asset_class_name:
                 continue
-            is_probable_etf = self._is_probable_etf_asset(symbol, str(getattr(asset, "name", "") or ""))
+            asset_name = str(self._asset_field(asset, "name", "") or "")
+            is_probable_etf = self._is_probable_etf_asset(symbol, asset_name)
             if asset_class == "etf" and not is_probable_etf:
                 continue
             if asset_class == "stock" and is_probable_etf:
@@ -404,7 +450,7 @@ class MarketScreener:
             fallback_row = fallback_by_symbol.get(symbol)
             candidate_rows.append({
                 "symbol": symbol,
-                "name": str(getattr(asset, "name", "") or (fallback_row or {}).get("name", symbol)),
+                "name": str(asset_name or (fallback_row or {}).get("name", symbol)),
                 "asset_type": asset_class,
                 "volume": int((fallback_row or {}).get("volume", 0)),
                 "price": float((fallback_row or {}).get("price", 0.0)),

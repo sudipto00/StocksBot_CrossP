@@ -278,3 +278,28 @@ def test_get_preset_assets_rejects_unknown_universe_mode():
             limit=20,
             preset_universe_mode="invalid_mode",
         )
+
+
+def test_candidate_universe_tolerates_raw_alpaca_assets_with_new_enum_values():
+    """Raw Alpaca rows with unknown enum values should be filtered, not crash screening."""
+    screener = MarketScreener()
+
+    class DummyTradingClient:
+        def get_all_assets(self):
+            return [
+                {"symbol": "BTCUSD", "tradable": True, "status": "active", "class": "crypto_perp", "exchange": "CRYPTO", "name": "Bitcoin Perp"},
+                {"symbol": "ABC", "tradable": True, "status": "active", "class": "us_equity", "exchange": "ASCX", "name": "ABC Corp"},
+                {"symbol": "SPY", "tradable": True, "status": "active", "class": "us_equity", "exchange": "ARCA", "name": "SPDR S&P 500 ETF Trust"},
+                {"symbol": "AAPL", "tradable": True, "status": "active", "class": "us_equity", "exchange": "NASDAQ", "name": "Apple Inc"},
+                {"symbol": "ZZZZ", "tradable": False, "status": "active", "class": "us_equity", "exchange": "NYSE", "name": "Inactive"},
+            ]
+
+    screener._trading_client = DummyTradingClient()
+    symbols, rows = screener._get_candidate_symbols_for_asset_class("stock")
+    symbol_set = set(symbols)
+
+    assert "AAPL" in symbol_set
+    assert "ABC" in symbol_set
+    assert "SPY" not in symbol_set  # ETF filtered in stock mode
+    assert "BTCUSD" not in symbol_set  # Non us_equity class ignored
+    assert all(row["asset_type"] == "stock" for row in rows)

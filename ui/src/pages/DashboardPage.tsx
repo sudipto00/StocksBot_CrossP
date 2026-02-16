@@ -18,6 +18,9 @@ function DashboardPage() {
   const navigate = useNavigate();
   const [status, setStatus] = useState<StatusResponse | null>(null);
   const [positions, setPositions] = useState<Position[]>([]);
+  const [positionsDataSource, setPositionsDataSource] = useState<string>('broker');
+  const [positionsDegraded, setPositionsDegraded] = useState(false);
+  const [positionsDegradedReason, setPositionsDegradedReason] = useState<string>('');
   const [runnerState, setRunnerState] = useState<RunnerState | null>(null);
   const [analytics, setAnalytics] = useState<PortfolioAnalytics | null>(null);
   const [summary, setSummary] = useState<PortfolioSummaryResponse | null>(null);
@@ -78,6 +81,9 @@ function DashboardPage() {
         getBrokerAccount(),
       ]);
       setPositions(positionsData.positions);
+      setPositionsDataSource(positionsData.data_source || 'broker');
+      setPositionsDegraded(Boolean(positionsData.degraded));
+      setPositionsDegradedReason(positionsData.degraded_reason || '');
       setAnalytics(analyticsData);
       setSummary(summaryData);
       setBrokerAccount(brokerAccountData);
@@ -120,6 +126,9 @@ function DashboardPage() {
       
       setStatus(statusData);
       setPositions(positionsData.positions);
+      setPositionsDataSource(positionsData.data_source || 'broker');
+      setPositionsDegraded(Boolean(positionsData.degraded));
+      setPositionsDegradedReason(positionsData.degraded_reason || '');
       setRunnerState({
         status: runnerData.status as RunnerStatus,
         strategies: runnerData.strategies,
@@ -538,6 +547,12 @@ function DashboardPage() {
               </div>
             </div>
             <p className="mb-3 text-xs text-gray-400">Shows current holdings with market value and portfolio weight. ETF filtering is based on current ETF universe classification.</p>
+            {positionsDegraded && (
+              <div className="mb-3 rounded border border-amber-700 bg-amber-900/30 px-3 py-2 text-xs text-amber-100">
+                Position marks are degraded ({positionsDataSource}). Live broker prices were unavailable.
+                {positionsDegradedReason ? ` ${positionsDegradedReason}` : ''}
+              </div>
+            )}
 
             {filteredPositions.length === 0 ? (
               <p className="text-gray-400 text-sm">No positions</p>
@@ -567,7 +582,13 @@ function DashboardPage() {
                         <td className="py-3 uppercase text-xs text-gray-300">{type}</td>
                         <td className="py-3">{pos.quantity}</td>
                         <td className="py-3">${pos.avg_entry_price.toFixed(2)}</td>
-                        <td className="py-3">${pos.current_price.toFixed(2)}</td>
+                        <td className="py-3">
+                          {pos.current_price_available === false ? (
+                            <span className="text-amber-300">N/A</span>
+                          ) : (
+                            `$${pos.current_price.toFixed(2)}`
+                          )}
+                        </td>
                         <td className="py-3">${pos.market_value.toLocaleString(undefined, { maximumFractionDigits: 2 })}</td>
                         <td className="py-3">{weightPct.toFixed(2)}%</td>
                         <td className={`py-3 ${pos.unrealized_pnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>

@@ -23,6 +23,8 @@ from config.risk_profiles import RiskProfile, validate_trade, get_position_size
 logger = logging.getLogger(__name__)
 _GLOBAL_KILL_SWITCH = False
 _GLOBAL_KILL_SWITCH_LOCK = threading.Lock()
+_GLOBAL_TRADING_ENABLED = True
+_GLOBAL_TRADING_ENABLED_LOCK = threading.Lock()
 
 
 def set_global_kill_switch(active: bool) -> None:
@@ -36,6 +38,19 @@ def get_global_kill_switch() -> bool:
     """Read global kill switch state."""
     with _GLOBAL_KILL_SWITCH_LOCK:
         return _GLOBAL_KILL_SWITCH
+
+
+def set_global_trading_enabled(active: bool) -> None:
+    """Enable/disable global trading execution gate."""
+    global _GLOBAL_TRADING_ENABLED
+    with _GLOBAL_TRADING_ENABLED_LOCK:
+        _GLOBAL_TRADING_ENABLED = bool(active)
+
+
+def get_global_trading_enabled() -> bool:
+    """Read global trading execution gate."""
+    with _GLOBAL_TRADING_ENABLED_LOCK:
+        return _GLOBAL_TRADING_ENABLED
 
 
 class OrderExecutionError(Exception):
@@ -134,12 +149,14 @@ class OrderExecutionService:
         if price is not None and price <= 0:
             raise OrderValidationError("Price must be positive")
         
+        if get_global_kill_switch():
+            raise OrderValidationError("Trading is blocked: kill switch is active")
+        if not get_global_trading_enabled():
+            raise OrderValidationError("Trading is disabled in Settings")
+
         # Check broker connection
         if not self.broker.is_connected():
             raise BrokerError("Broker is not connected")
-
-        if get_global_kill_switch():
-            raise OrderValidationError("Trading is blocked: kill switch is active")
 
         if not self.broker.is_symbol_tradable(symbol):
             raise OrderValidationError(f"Symbol {symbol} is not tradable")

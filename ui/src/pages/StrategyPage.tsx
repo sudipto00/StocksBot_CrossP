@@ -31,6 +31,7 @@ import {
   StrategyMetrics,
   BacktestResult,
   BacktestDiagnostics,
+  BacktestLiveParityReport,
   StrategyParameter,
   AssetTypePreference,
   TradingPreferences,
@@ -230,6 +231,44 @@ function formatBlockerLabel(reason: string): string {
   return BACKTEST_BLOCKER_LABELS[reason] || reason.replace(/_/g, ' ');
 }
 
+function formatYesNo(flag: boolean | null | undefined): string {
+  return flag ? 'Yes' : 'No';
+}
+
+function formatTitle(value: string | null | undefined): string {
+  if (!value) return 'n/a';
+  return value
+    .replace(/_/g, ' ')
+    .split(' ')
+    .filter(Boolean)
+    .map((part) => `${part[0].toUpperCase()}${part.slice(1)}`)
+    .join(' ');
+}
+
+function formatUniverseSourceLabel(value: string | null | undefined): string {
+  if (value === 'workspace_universe') return 'Workspace Universe';
+  if (value === 'strategy_symbols') return 'Strategy Symbols';
+  return formatTitle(value);
+}
+
+function summarizeGuardrails(liveParity: BacktestLiveParityReport): string {
+  const guardrails = liveParity.guardrails;
+  if (!guardrails) return 'n/a';
+  const minDollarVolume = typeof guardrails.min_dollar_volume === 'number'
+    ? `$${guardrails.min_dollar_volume.toLocaleString()}`
+    : 'n/a';
+  const maxSpreadBps = typeof guardrails.max_spread_bps === 'number'
+    ? `${guardrails.max_spread_bps} bps`
+    : 'n/a';
+  const maxSectorWeightPct = typeof guardrails.max_sector_weight_pct === 'number'
+    ? `${guardrails.max_sector_weight_pct}%`
+    : 'n/a';
+  const regimeAdjust = typeof guardrails.auto_regime_adjust === 'boolean'
+    ? (guardrails.auto_regime_adjust ? 'on' : 'off')
+    : 'n/a';
+  return `Min $Vol ${minDollarVolume}, Max Spread ${maxSpreadBps}, Max Sector ${maxSectorWeightPct}, Regime Auto ${regimeAdjust}`;
+}
+
 /**
  * Strategy page component.
  * Manage trading strategies - start, stop, configure, backtest, and tune.
@@ -277,6 +316,7 @@ function StrategyPage() {
   const activeStrategyCount = strategies.filter((s) => s.status === StrategyStatus.ACTIVE).length;
   const runnerIsActive = runnerStatus === 'running' || runnerStatus === 'sleeping';
   const backtestDiagnostics: BacktestDiagnostics | null = backtestResult?.diagnostics || null;
+  const backtestLiveParity: BacktestLiveParityReport | null = backtestDiagnostics?.live_parity || null;
   const topBacktestBlockers = (backtestDiagnostics?.top_blockers || []).filter((item) => item.count > 0);
   const [settingsSummary, setSettingsSummary] = useState<string>('Loading trading preferences...');
   const [cleanupLoading, setCleanupLoading] = useState(false);
@@ -1671,6 +1711,103 @@ function StrategyPage() {
                           ) : (
                             <p className="text-gray-400 text-xs">No blocker counters were recorded for this run.</p>
                           )}
+                        </div>
+                      )}
+
+                      {backtestLiveParity && (
+                        <div className="bg-gray-900 rounded p-4">
+                          <div className="text-white font-medium mb-2">Live-Parity Report</div>
+                          <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
+                            <div className="rounded bg-gray-800 px-3 py-2">
+                              <div className="text-gray-400">Emulation Enabled</div>
+                              <div className="text-white font-semibold">{formatYesNo(backtestLiveParity.emulate_live_trading)}</div>
+                            </div>
+                            <div className="rounded bg-gray-800 px-3 py-2">
+                              <div className="text-gray-400">Strict Real Data</div>
+                              <div className="text-white font-semibold">{formatYesNo(backtestLiveParity.strict_real_data_required)}</div>
+                            </div>
+                            <div className="rounded bg-gray-800 px-3 py-2">
+                              <div className="text-gray-400">Data Provider</div>
+                              <div className="text-white font-semibold">{formatTitle(backtestLiveParity.data_provider)}</div>
+                            </div>
+                            <div className="rounded bg-gray-800 px-3 py-2">
+                              <div className="text-gray-400">Broker / Mode</div>
+                              <div className="text-white font-semibold">
+                                {formatTitle(backtestLiveParity.broker)} / {formatTitle(backtestLiveParity.broker_mode)}
+                              </div>
+                            </div>
+                            <div className="rounded bg-gray-800 px-3 py-2">
+                              <div className="text-gray-400">Workspace Universe Mode</div>
+                              <div className="text-white font-semibold">{formatYesNo(backtestLiveParity.workspace_universe_enabled)}</div>
+                            </div>
+                            <div className="rounded bg-gray-800 px-3 py-2">
+                              <div className="text-gray-400">Universe Source</div>
+                              <div className="text-white font-semibold">{formatUniverseSourceLabel(backtestLiveParity.universe_source)}</div>
+                            </div>
+                            <div className="rounded bg-gray-800 px-3 py-2">
+                              <div className="text-gray-400">Universe Profile</div>
+                              <div className="text-white font-semibold">
+                                {formatTitle(backtestLiveParity.asset_type || 'n/a')}
+                                {' / '}
+                                {formatTitle(backtestLiveParity.screener_mode || 'n/a')}
+                                {' / '}
+                                {formatTitle(backtestLiveParity.preset || 'n/a')}
+                              </div>
+                              <div className="text-gray-500 mt-1">
+                                Preset Universe: {formatTitle(backtestLiveParity.preset_universe_mode || 'n/a')}
+                              </div>
+                            </div>
+                            <div className="rounded bg-gray-800 px-3 py-2">
+                              <div className="text-gray-400">Guardrails</div>
+                              <div className="text-white font-semibold">{summarizeGuardrails(backtestLiveParity)}</div>
+                            </div>
+                            <div className="rounded bg-gray-800 px-3 py-2">
+                              <div className="text-gray-400">Execution Rules</div>
+                              <div className="text-white font-semibold">
+                                Tradable Required: {formatYesNo(backtestLiveParity.require_broker_tradable)}
+                              </div>
+                              <div className="text-white font-semibold">
+                                Fractionable Required: {formatYesNo(backtestLiveParity.require_fractionable)}
+                              </div>
+                              <div className="text-gray-500 mt-1">
+                                Capability Checks: {formatYesNo(backtestLiveParity.symbol_capabilities_enforced)}
+                              </div>
+                            </div>
+                            <div className="rounded bg-gray-800 px-3 py-2">
+                              <div className="text-gray-400">Universe Counts</div>
+                              <div className="text-white font-semibold">
+                                Requested {backtestLiveParity.symbols_requested}
+                                {' | '}
+                                Selected {backtestLiveParity.symbols_selected_for_entries}
+                                {' | '}
+                                With Data {backtestLiveParity.symbols_with_data}
+                              </div>
+                              <div className="text-gray-500 mt-1">
+                                Filtered Out by Live Rules: {backtestLiveParity.symbols_filtered_out_count}
+                              </div>
+                            </div>
+                            <div className="rounded bg-gray-800 px-3 py-2">
+                              <div className="text-gray-400">Risk Limits Applied</div>
+                              <div className="text-white font-semibold">
+                                Max Position {formatCurrency(backtestLiveParity.max_position_size_applied)}
+                              </div>
+                              <div className="text-white font-semibold">
+                                Daily Risk {formatCurrency(backtestLiveParity.risk_limit_daily_applied)}
+                              </div>
+                            </div>
+                            <div className="rounded bg-gray-800 px-3 py-2">
+                              <div className="text-gray-400">Execution Frictions</div>
+                              <div className="text-white font-semibold">
+                                Slippage: {formatTitle(backtestLiveParity.slippage_model)} ({backtestLiveParity.slippage_bps_base.toFixed(2)} bps)
+                              </div>
+                              <div className="text-white font-semibold">
+                                Fees: {formatTitle(backtestLiveParity.fee_model)} ({backtestLiveParity.fee_bps_applied.toFixed(2)} bps)
+                              </div>
+                              <div className="text-gray-500 mt-1">
+                                Estimated Fees Paid: {formatCurrency(backtestLiveParity.fees_paid_total)}
+                              </div>
+                            </div>
+                          </div>
                         </div>
                       )}
 

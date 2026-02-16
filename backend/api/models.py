@@ -85,6 +85,8 @@ class Position(BaseModel):
     unrealized_pnl_percent: float = Field(..., description="Unrealized P&L percentage")
     cost_basis: float = Field(..., description="Total cost basis")
     market_value: float = Field(..., description="Current market value")
+    current_price_available: bool = Field(default=True, description="Whether current_price is sourced from live market data")
+    valuation_source: str = Field(default="broker_mark", description="Valuation source: broker_mark or cost_basis_fallback")
 
 
 class PositionsResponse(BaseModel):
@@ -93,6 +95,9 @@ class PositionsResponse(BaseModel):
     total_value: float = Field(default=0.0, description="Total portfolio value")
     total_pnl: float = Field(default=0.0, description="Total unrealized P&L")
     total_pnl_percent: float = Field(default=0.0, description="Total P&L percentage")
+    data_source: str = Field(default="broker", description="Primary source for position payload")
+    degraded: bool = Field(default=False, description="True when broker market marks were unavailable")
+    degraded_reason: Optional[str] = Field(default=None, description="Reason for degraded fallback mode")
 
 
 class Order(BaseModel):

@@ -67,6 +67,8 @@ def setup_database():
     """Create and drop test database for each test."""
     app.dependency_overrides[get_db] = override_get_db
     Base.metadata.create_all(bind=engine)
+    # Trading gate must be enabled for order endpoint tests unless explicitly overridden.
+    client.post("/config", json={"trading_enabled": True})
     yield
     Base.metadata.drop_all(bind=engine)
     app.dependency_overrides.pop(get_db, None)
@@ -511,3 +513,35 @@ def test_api_multiple_orders_create_correct_positions():
         assert position.is_open is True
     finally:
         db.close()
+
+
+def test_api_create_order_blocked_when_trading_disabled():
+    """POST /orders should be blocked when global trading is disabled."""
+    client.post("/config", json={"trading_enabled": False})
+    response = client.post("/orders", json={
+        "symbol": "AAPL",
+        "side": "buy",
+        "type": "market",
+        "quantity": 1,
+    })
+    assert response.status_code == 409
+    assert "trading is disabled" in response.json()["detail"].lower()
+
+
+def test_api_get_orders_returns_persisted_rows_not_stub_payload():
+    """GET /orders should return persisted order rows rather than hardcoded stubs."""
+    create = client.post("/orders", json={
+        "symbol": "AAPL",
+        "side": "buy",
+        "type": "market",
+        "quantity": 2,
+    })
+    assert create.status_code == 200
+    created_id = str(create.json()["id"])
+
+    response = client.get("/orders")
+    assert response.status_code == 200
+    payload = response.json()
+    ids = {str(item["id"]) for item in payload.get("orders", [])}
+    assert created_id in ids
+    assert "order-001" not in ids

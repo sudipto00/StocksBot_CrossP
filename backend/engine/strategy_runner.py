@@ -320,7 +320,7 @@ class StrategyRunner:
                     },
                 )
             except Exception:
-                pass
+                logger.exception("Failed to audit runner sleep-mode transition")
 
     def _resume_from_sleep(self) -> None:
         """Resume active processing after off-hours sleep."""
@@ -335,7 +335,7 @@ class StrategyRunner:
         try:
             _ = self._fetch_market_data()
         except Exception:
-            pass
+            logger.debug("Failed to warm market-data cache during resume", exc_info=True)
         self._persist_sleep_state()
         if self.storage:
             try:
@@ -348,7 +348,7 @@ class StrategyRunner:
                     },
                 )
             except Exception:
-                pass
+                logger.exception("Failed to audit runner resume transition")
 
     def _safe_next_market_open(self) -> Optional[datetime]:
         """Best-effort next market-open timestamp from broker."""
@@ -360,6 +360,7 @@ class StrategyRunner:
                 return next_open.replace(tzinfo=timezone.utc)
             return next_open.astimezone(timezone.utc)
         except Exception:
+            logger.debug("Failed to fetch next market open from broker", exc_info=True)
             return None
 
     def _persist_sleep_state(self) -> None:
@@ -382,7 +383,7 @@ class StrategyRunner:
                 description="Runner sleep/resume continuity checkpoint",
             )
         except Exception:
-            pass
+            logger.exception("Failed to persist runner sleep-state checkpoint")
 
     def _restore_sleep_state(self) -> None:
         """Load prior sleep/resume checkpoint from DB config, if present."""
@@ -402,7 +403,7 @@ class StrategyRunner:
             if self.sleeping:
                 self.status = StrategyStatus.SLEEPING
         except Exception:
-            pass
+            logger.exception("Failed to restore runner sleep-state checkpoint")
 
     def _parse_iso(self, value: Any) -> Optional[datetime]:
         """Parse optional ISO datetime safely."""
@@ -414,6 +415,7 @@ class StrategyRunner:
                 return parsed.replace(tzinfo=timezone.utc)
             return parsed.astimezone(timezone.utc)
         except Exception:
+            logger.debug("Failed to parse ISO datetime value: %s", value, exc_info=True)
             return None
 
     def _reconcile_open_orders(self) -> None:
@@ -445,7 +447,7 @@ class StrategyRunner:
             if bind_url.startswith("sqlite:///:memory:"):
                 return
         except Exception:
-            pass
+            logger.debug("Failed to inspect storage bind URL for reconciliation guard", exc_info=True)
         now = time.time()
         if now - self._last_reconciliation_ts < 300:
             return
@@ -490,7 +492,7 @@ class StrategyRunner:
                 details={"source": "strategy_runner_poll"},
             )
         except Exception:
-            pass
+            logger.exception("Failed to persist runner poll error audit log")
     
     def _fetch_market_data(self) -> Dict[str, Dict[str, Any]]:
         """

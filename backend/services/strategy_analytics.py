@@ -247,6 +247,17 @@ class StrategyAnalyticsService:
                 "avg_hold_days": 0.0,
                 "slippage_bps_applied": _DEFAULT_SLIPPAGE_BPS,
             }
+            diagnostics["live_parity"] = self._build_live_parity_report(
+                diagnostics=diagnostics,
+                emulate_live_trading=emulate_live_trading,
+                require_fractionable=require_fractionable,
+                symbol_capabilities=symbol_capabilities,
+                max_position_size=max_position_size,
+                daily_risk_limit=daily_risk_limit,
+                fee_bps=fee_bps,
+                base_slippage_bps=_DEFAULT_SLIPPAGE_BPS,
+                total_fees_paid=0.0,
+            )
             return BacktestResult(
                 strategy_id=request.strategy_id,
                 start_date=request.start_date,
@@ -652,6 +663,17 @@ class StrategyAnalyticsService:
             "slippage_bps_applied": slippage_bps,
             "fees_paid": round(total_fees_paid, 4),
         }
+        diagnostics["live_parity"] = self._build_live_parity_report(
+            diagnostics=diagnostics,
+            emulate_live_trading=emulate_live_trading,
+            require_fractionable=require_fractionable,
+            symbol_capabilities=symbol_capabilities,
+            max_position_size=max_position_size,
+            daily_risk_limit=daily_risk_limit,
+            fee_bps=fee_bps,
+            base_slippage_bps=slippage_bps,
+            total_fees_paid=total_fees_paid,
+        )
 
         return BacktestResult(
             strategy_id=request.strategy_id,
@@ -671,6 +693,82 @@ class StrategyAnalyticsService:
             equity_curve=equity_curve,
             diagnostics=diagnostics,
         )
+
+    def _build_live_parity_report(
+        self,
+        diagnostics: Dict[str, Any],
+        emulate_live_trading: bool,
+        require_fractionable: bool,
+        symbol_capabilities: Dict[str, Dict[str, bool]],
+        max_position_size: float,
+        daily_risk_limit: float,
+        fee_bps: float,
+        base_slippage_bps: float,
+        total_fees_paid: float,
+    ) -> Dict[str, Any]:
+        """Build a compact diagnostics summary of live-equivalent constraints."""
+        universe_context = diagnostics.get("universe_context")
+        if not isinstance(universe_context, dict):
+            universe_context = {}
+        live_ctx = universe_context.get("live_parity_context")
+        if not isinstance(live_ctx, dict):
+            live_ctx = {}
+        guardrails = universe_context.get("guardrails")
+        if not isinstance(guardrails, dict):
+            guardrails = {}
+        filtered_out = universe_context.get("symbols_filtered_out")
+        filtered_count = len(filtered_out) if isinstance(filtered_out, list) else 0
+
+        symbols_selected_for_entries = live_ctx.get("symbols_selected")
+        if not isinstance(symbols_selected_for_entries, int):
+            symbols_selected_for_entries = universe_context.get("symbols_selected")
+        if not isinstance(symbols_selected_for_entries, int):
+            symbols_selected_for_entries = int(diagnostics.get("symbols_requested", 0))
+
+        return {
+            "emulate_live_trading": bool(emulate_live_trading),
+            "strict_real_data_required": bool(
+                live_ctx.get("strict_real_data_required", self._require_real_data)
+            ),
+            "data_provider": "alpaca" if self._alpaca_creds else "fallback",
+            "broker": str(live_ctx.get("broker", "unknown")),
+            "broker_mode": str(live_ctx.get("broker_mode", "paper")),
+            "credentials_available": bool(
+                live_ctx.get("credentials_available", bool(self._alpaca_creds))
+            ),
+            "workspace_universe_enabled": bool(
+                live_ctx.get(
+                    "workspace_universe_requested",
+                    universe_context.get("symbols_source") == "workspace_universe",
+                )
+            ),
+            "universe_source": str(universe_context.get("symbols_source", "strategy_symbols")),
+            "asset_type": universe_context.get("asset_type"),
+            "screener_mode": universe_context.get("screener_mode"),
+            "preset": universe_context.get("preset"),
+            "preset_universe_mode": universe_context.get("preset_universe_mode"),
+            "guardrails": guardrails,
+            "require_broker_tradable": bool(
+                universe_context.get("require_broker_tradable", emulate_live_trading)
+            ),
+            "require_fractionable": bool(require_fractionable),
+            "symbol_capabilities_enforced": bool(symbol_capabilities),
+            "symbols_requested": int(diagnostics.get("symbols_requested", 0)),
+            "symbols_selected_for_entries": int(symbols_selected_for_entries),
+            "symbols_with_data": int(diagnostics.get("symbols_with_data", 0)),
+            "symbols_filtered_out_count": int(
+                live_ctx.get("symbols_filtered_out_count", filtered_count)
+            ),
+            "max_position_size_applied": round(float(max_position_size), 4),
+            "risk_limit_daily_applied": round(float(daily_risk_limit), 4),
+            "slippage_model": "dynamic_bar_range" if emulate_live_trading else "fixed_bps",
+            "slippage_bps_base": round(float(base_slippage_bps), 4),
+            "fee_model": (
+                "fee_bps_plus_sec_taf_on_sells" if emulate_live_trading else "fee_bps_only"
+            ),
+            "fee_bps_applied": round(float(fee_bps), 4),
+            "fees_paid_total": round(float(total_fees_paid), 4),
+        }
 
     # ------------------------------------------------------------------
     # Parameter resolution

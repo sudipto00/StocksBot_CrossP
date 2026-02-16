@@ -84,6 +84,8 @@ export interface Position {
   unrealized_pnl_percent: number;
   cost_basis: number;
   market_value: number;
+  current_price_available?: boolean;
+  valuation_source?: string;
 }
 
 export interface PositionsResponse {
@@ -91,6 +93,9 @@ export interface PositionsResponse {
   total_value: number;
   total_pnl: number;
   total_pnl_percent: number;
+  data_source?: string;
+  degraded?: boolean;
+  degraded_reason?: string | null;
 }
 
 export interface Order {
@@ -546,6 +551,36 @@ export interface BacktestAdvancedMetrics {
   fees_paid?: number;
 }
 
+export interface BacktestLiveParityReport {
+  emulate_live_trading: boolean;
+  strict_real_data_required: boolean;
+  data_provider: string;
+  broker: string;
+  broker_mode: string;
+  credentials_available: boolean;
+  workspace_universe_enabled: boolean;
+  universe_source: string;
+  asset_type?: 'stock' | 'etf' | null;
+  screener_mode?: 'most_active' | 'preset' | null;
+  preset?: string | null;
+  preset_universe_mode?: 'seed_only' | 'seed_guardrail_blend' | 'guardrail_only' | null;
+  guardrails?: Record<string, number | boolean>;
+  require_broker_tradable: boolean;
+  require_fractionable: boolean;
+  symbol_capabilities_enforced: boolean;
+  symbols_requested: number;
+  symbols_selected_for_entries: number;
+  symbols_with_data: number;
+  symbols_filtered_out_count: number;
+  max_position_size_applied: number;
+  risk_limit_daily_applied: number;
+  slippage_model: string;
+  slippage_bps_base: number;
+  fee_model: string;
+  fee_bps_applied: number;
+  fees_paid_total: number;
+}
+
 export interface BacktestDiagnostics {
   symbols_requested: number;
   symbols_with_data: number;
@@ -560,6 +595,7 @@ export interface BacktestDiagnostics {
   top_blockers: BacktestBlockerCount[];
   parameters_used: Record<string, number>;
   advanced_metrics?: BacktestAdvancedMetrics;
+  live_parity?: BacktestLiveParityReport;
 }
 
 export interface BacktestResult {

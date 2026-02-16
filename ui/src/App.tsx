@@ -46,15 +46,20 @@ function App() {
     if (!isTauriRuntime) {
       return;
     }
-    const hydrateRuntimeCredentials = async () => {
+    let cancelled = false;
+    let retryTimer: number | null = null;
+    const hydrateRuntimeCredentials = async (): Promise<boolean> => {
       try {
         const keychainStatus = await invoke<KeychainCredentialStatus>('get_alpaca_credentials_status').catch(() => null);
         if (!keychainStatus) {
-          return;
+          return false;
         }
         const modes: Array<'paper' | 'live'> = [];
         if (keychainStatus.paper_available) modes.push('paper');
         if (keychainStatus.live_available) modes.push('live');
+        if (modes.length === 0) {
+          return true;
+        }
         await Promise.all(modes.map(async (mode) => {
           const creds = await invoke<StoredCredentials | null>('get_alpaca_credentials', { mode });
           if (!creds?.api_key || !creds?.secret_key) {
@@ -66,11 +71,29 @@ function App() {
             secret_key: creds.secret_key,
           });
         }));
+        return true;
       } catch {
-        // Startup hydration is best-effort.
+        return false;
       }
     };
-    void hydrateRuntimeCredentials();
+    const runHydrationWithRetry = async (attempt = 0) => {
+      if (cancelled) return;
+      const ok = await hydrateRuntimeCredentials();
+      if (ok || cancelled) return;
+      const delayMs = Math.min(30_000, 1_000 * (attempt + 1));
+      retryTimer = window.setTimeout(() => {
+        void runHydrationWithRetry(attempt + 1);
+      }, delayMs);
+    };
+    void runHydrationWithRetry(0);
+    const interval = window.setInterval(() => {
+      void hydrateRuntimeCredentials();
+    }, 120_000);
+    return () => {
+      cancelled = true;
+      if (retryTimer) window.clearTimeout(retryTimer);
+      window.clearInterval(interval);
+    };
   }, []);
 
   useEffect(() => {

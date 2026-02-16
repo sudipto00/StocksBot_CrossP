@@ -63,11 +63,13 @@ import {
 // Access environment variables via import.meta.env in Vite
 const ENV = (import.meta as { env?: { VITE_BACKEND_URL?: string; VITE_STOCKSBOT_API_KEY?: string } }).env;
 const BACKEND_URL = ENV?.VITE_BACKEND_URL || "http://127.0.0.1:8000";
-const API_KEY_STORAGE_KEY = 'stocksbot_api_key';
+const API_KEY_STORAGE_KEY = 'stocksbot_api_key_session';
+let inMemoryApiAuthKey = '';
 
 function resolveApiAuthKey(): string {
+  if (inMemoryApiAuthKey) return inMemoryApiAuthKey;
   if (typeof window !== 'undefined') {
-    const fromStorage = (window.localStorage.getItem(API_KEY_STORAGE_KEY) || '').trim();
+    const fromStorage = (window.sessionStorage.getItem(API_KEY_STORAGE_KEY) || '').trim();
     if (fromStorage) return fromStorage;
   }
   return (ENV?.VITE_STOCKSBOT_API_KEY || '').trim();
@@ -92,12 +94,14 @@ export function getApiAuthKey(): string {
 }
 
 export function setApiAuthKey(apiKey: string): void {
-  if (typeof window === 'undefined') return;
   const trimmed = apiKey.trim();
-  if (trimmed) {
-    window.localStorage.setItem(API_KEY_STORAGE_KEY, trimmed);
-  } else {
-    window.localStorage.removeItem(API_KEY_STORAGE_KEY);
+  inMemoryApiAuthKey = trimmed;
+  if (typeof window !== 'undefined') {
+    if (trimmed) {
+      window.sessionStorage.setItem(API_KEY_STORAGE_KEY, trimmed);
+    } else {
+      window.sessionStorage.removeItem(API_KEY_STORAGE_KEY);
+    }
   }
 }
 
