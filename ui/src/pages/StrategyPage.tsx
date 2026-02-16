@@ -204,6 +204,11 @@ const BACKTEST_BLOCKER_LABELS: Record<string, string> = {
   risk_cap_too_low: 'Risk cap too low',
   invalid_position_size: 'Invalid position size',
   cash_insufficient: 'Insufficient cash',
+  not_tradable: 'Symbol not tradable',
+  not_fractionable: 'Symbol not fractionable',
+  daily_risk_limit: 'Daily risk limit reached',
+  risk_circuit_breaker: 'Risk circuit breaker active',
+  risk_validation_failed: 'Risk validation failed',
 };
 
 function getBacktestBlockerHint(reason: string): string {
@@ -222,6 +227,16 @@ function getBacktestBlockerHint(reason: string): string {
       return 'Check position_size and risk_per_trade values; computed position size must be positive.';
     case 'cash_insufficient':
       return 'Lower position_size or increase initial capital.';
+    case 'not_tradable':
+      return 'Use symbols tradable by the configured broker/account mode (paper/live).';
+    case 'not_fractionable':
+      return 'Enable/choose fractionable symbols or increase capital/position size for whole-share execution.';
+    case 'daily_risk_limit':
+      return 'Raise risk_limit_daily, shorten test window, or reduce loss frequency with stricter entries/exits.';
+    case 'risk_circuit_breaker':
+      return 'Circuit breaker tripped after repeated losses/drawdown. Raise max_consecutive_losses/max_drawdown_pct or tighten entry quality.';
+    case 'risk_validation_failed':
+      return 'Order-level risk checks failed. Reduce position_size/risk_per_trade, or increase max_position_size and available capital.';
     default:
       return 'Adjust symbols, date range, and entry/exit thresholds.';
   }
@@ -327,20 +342,38 @@ function StrategyPage() {
   const [prefillMessage, setPrefillMessage] = useState<string>('');
   const [prefillLoading, setPrefillLoading] = useState(false);
 
+  const refreshRunnerPreflight = useCallback(async () => {
+    try {
+      const preflight = await getSafetyPreflight('AAPL').catch(() => ({ allowed: true, reason: '' }));
+      setRunnerBlockedReason(preflight.allowed ? '' : preflight.reason);
+    } catch {
+      setRunnerBlockedReason('');
+    }
+  }, []);
+
   /* eslint-disable react-hooks/exhaustive-deps */
   useEffect(() => {
     loadStrategies();
-    loadRunnerStatus();
+    loadRunnerStatus(true);
     loadSettingsSummary();
+  }, []);
+  /* eslint-enable react-hooks/exhaustive-deps */
+
+  /* eslint-disable react-hooks/exhaustive-deps */
+  useEffect(() => {
+    const interval = setInterval(() => {
+      void loadRunnerStatus(false);
+    }, 5000);
+    return () => clearInterval(interval);
   }, []);
   /* eslint-enable react-hooks/exhaustive-deps */
 
   useEffect(() => {
     const interval = setInterval(() => {
-      loadRunnerStatus();
-    }, 5000);
+      void refreshRunnerPreflight();
+    }, 30000);
     return () => clearInterval(interval);
-  }, []);
+  }, [refreshRunnerPreflight]);
 
   useEffect(() => {
     const readLastApplied = () => {
@@ -383,18 +416,21 @@ function StrategyPage() {
     }
   };
 
-  const loadRunnerStatus = async () => {
+  const loadRunnerStatus = useCallback(async (includePreflight = false) => {
     try {
-      const status = await getRunnerStatus();
+      const [status, safety] = await Promise.all([
+        getRunnerStatus(),
+        getSafetyStatus().catch(() => ({ kill_switch_active: false, last_broker_sync_at: null })),
+      ]);
       setRunnerStatus(status.status);
-      const safety = await getSafetyStatus().catch(() => ({ kill_switch_active: false, last_broker_sync_at: null }));
       setKillSwitchActive(Boolean(safety.kill_switch_active));
-      const preflight = await getSafetyPreflight('AAPL').catch(() => ({ allowed: true, reason: '' }));
-      setRunnerBlockedReason(preflight.allowed ? '' : preflight.reason);
+      if (includePreflight) {
+        void refreshRunnerPreflight();
+      }
     } catch (err) {
       console.error('Failed to load runner status:', err);
     }
-  };
+  }, [refreshRunnerPreflight]);
 
   const loadSettingsSummary = async () => {
     try {
@@ -531,7 +567,7 @@ function StrategyPage() {
       if (result.success) {
         await showSuccessNotification('Runner Started', result.message);
         setRunnerStatus(result.status);
-        await loadRunnerStatus();
+        await loadRunnerStatus(true);
         await loadRunnerInputSummary();
       } else {
         await showErrorNotification('Start Failed', result.message);
@@ -551,7 +587,7 @@ function StrategyPage() {
       if (result.success) {
         await showSuccessNotification('Runner Stopped', result.message);
         setRunnerStatus(result.status);
-        await loadRunnerStatus();
+        await loadRunnerStatus(true);
         await loadRunnerInputSummary();
       } else {
         await showErrorNotification('Stop Failed', result.message);
@@ -611,7 +647,7 @@ function StrategyPage() {
         setStrategyMetrics(null);
       }
       await loadStrategies();
-      await loadRunnerStatus();
+      await loadRunnerStatus(false);
       await loadRunnerInputSummary();
     } catch {
       await showErrorNotification('Cleanup Error', 'Failed to remove defunct strategies');
@@ -687,7 +723,7 @@ function StrategyPage() {
       );
 
       await loadStrategies();
-      await loadRunnerStatus();
+      await loadRunnerStatus(false);
       await loadRunnerInputSummary();
     } catch (err) {
       await showErrorNotification('Update Error', 'Failed to update strategy');
@@ -709,7 +745,7 @@ function StrategyPage() {
         setStrategyMetrics(null);
       }
       await loadStrategies();
-      await loadRunnerStatus();
+      await loadRunnerStatus(false);
       await loadRunnerInputSummary();
     } catch (err) {
       await showErrorNotification('Delete Error', err instanceof Error ? err.message : 'Failed to delete strategy');

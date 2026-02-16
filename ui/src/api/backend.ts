@@ -29,6 +29,7 @@ import {
   // Runner types
   RunnerStatusResponse,
   RunnerActionResponse,
+  WebSocketAuthTicketResponse,
   SystemHealthSnapshot,
   SafetyStatusResponse,
   SafetyPreflightResponse,
@@ -463,6 +464,21 @@ export async function stopRunner(): Promise<RunnerActionResponse> {
     throw new Error(`Backend returned ${response.status}`);
   }
   
+  return response.json();
+}
+
+/**
+ * Create a short-lived websocket auth ticket.
+ */
+export async function createWebSocketAuthTicket(): Promise<WebSocketAuthTicketResponse> {
+  const response = await authFetch(`${BACKEND_URL}/auth/ws-ticket`, {
+    method: 'POST',
+  });
+
+  if (!response.ok) {
+    throw new Error(`Backend returned ${response.status}`);
+  }
+
   return response.json();
 }
 

@@ -18,6 +18,7 @@ function DashboardPage() {
   const navigate = useNavigate();
   const [status, setStatus] = useState<StatusResponse | null>(null);
   const [positions, setPositions] = useState<Position[]>([]);
+  const [positionsAsOf, setPositionsAsOf] = useState<string | null>(null);
   const [positionsDataSource, setPositionsDataSource] = useState<string>('broker');
   const [positionsDegraded, setPositionsDegraded] = useState(false);
   const [positionsDegradedReason, setPositionsDegradedReason] = useState<string>('');
@@ -45,6 +46,15 @@ function DashboardPage() {
   });
   const [killSwitchActive, setKillSwitchActive] = useState(false);
   const [blockedReason, setBlockedReason] = useState<string>('');
+
+  const refreshSafetyPreflight = useCallback(async () => {
+    try {
+      const preflight = await getSafetyPreflight('AAPL').catch(() => ({ allowed: true, reason: '' }));
+      setBlockedReason(preflight.allowed ? '' : preflight.reason);
+    } catch {
+      setBlockedReason('');
+    }
+  }, []);
 
   const loadRunnerStatus = useCallback(async () => {
     try {
@@ -81,6 +91,7 @@ function DashboardPage() {
         getBrokerAccount(),
       ]);
       setPositions(positionsData.positions);
+      setPositionsAsOf(positionsData.as_of || null);
       setPositionsDataSource(positionsData.data_source || 'broker');
       setPositionsDegraded(Boolean(positionsData.degraded));
       setPositionsDegradedReason(positionsData.degraded_reason || '');
@@ -113,7 +124,7 @@ function DashboardPage() {
       setError(null);
       
       // Fetch status, positions, runner state, and analytics in parallel
-      const [statusData, positionsData, runnerData, analyticsData, summaryData, brokerAccountData, prefsData] = await Promise.all([
+      const [statusData, positionsData, runnerData, analyticsData, summaryData, brokerAccountData, prefsData, safety] = await Promise.all([
         getBackendStatus(),
         getPositions(),
         getRunnerStatus(),
@@ -121,11 +132,12 @@ function DashboardPage() {
         getPortfolioSummary(),
         getBrokerAccount(),
         getTradingPreferences(),
+        getSafetyStatus().catch(() => ({ kill_switch_active: false, last_broker_sync_at: null })),
       ]);
-      const safety = await getSafetyStatus().catch(() => ({ kill_switch_active: false, last_broker_sync_at: null }));
       
       setStatus(statusData);
       setPositions(positionsData.positions);
+      setPositionsAsOf(positionsData.as_of || null);
       setPositionsDataSource(positionsData.data_source || 'broker');
       setPositionsDegraded(Boolean(positionsData.degraded));
       setPositionsDegradedReason(positionsData.degraded_reason || '');
@@ -153,14 +165,13 @@ function DashboardPage() {
       setTradingPrefs(prefsData);
       setKillSwitchActive(Boolean(safety.kill_switch_active));
       void refreshKnownEtfSymbols();
-      const preflight = await getSafetyPreflight('AAPL').catch(() => ({ allowed: true, reason: '' }));
-      setBlockedReason(preflight.allowed ? '' : preflight.reason);
+      void refreshSafetyPreflight();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load data');
     } finally {
       setLoading(false);
     }
-  }, [analyticsDays, refreshKnownEtfSymbols]);
+  }, [analyticsDays, refreshKnownEtfSymbols, refreshSafetyPreflight]);
 
   useEffect(() => {
     void loadData();
@@ -172,6 +183,13 @@ function DashboardPage() {
     }, 5000);
     return () => clearInterval(interval);
   }, [loadRunnerStatus]);
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      void refreshSafetyPreflight();
+    }, 30000);
+    return () => clearInterval(interval);
+  }, [refreshSafetyPreflight]);
 
   useEffect(() => {
     const interval = setInterval(() => {
@@ -547,6 +565,10 @@ function DashboardPage() {
               </div>
             </div>
             <p className="mb-3 text-xs text-gray-400">Shows current holdings with market value and portfolio weight. ETF filtering is based on current ETF universe classification.</p>
+            <p className="mb-3 text-xs text-gray-500">
+              Data freshness: {positionsAsOf ? formatDateTime(positionsAsOf) : 'Not available'}
+              {positionsDataSource ? ` (${positionsDataSource})` : ''}
+            </p>
             {positionsDegraded && (
               <div className="mb-3 rounded border border-amber-700 bg-amber-900/30 px-3 py-2 text-xs text-amber-100">
                 Position marks are degraded ({positionsDataSource}). Live broker prices were unavailable.

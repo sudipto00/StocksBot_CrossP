@@ -96,6 +96,7 @@ def test_get_positions():
     assert "total_value" in data
     assert "total_pnl" in data
     assert "total_pnl_percent" in data
+    assert "as_of" in data
     assert isinstance(data["positions"], list)
 
 
@@ -170,8 +171,24 @@ def test_create_order_validation():
     assert response.status_code == 422  # Validation error
 
 
-def test_request_notification():
+def test_request_notification(monkeypatch):
     """Test notification request endpoint."""
+    prefs_response = client.post(
+        "/notifications/summary/preferences",
+        json={
+            "enabled": True,
+            "frequency": "daily",
+            "channel": "email",
+            "recipient": "notify@example.com",
+        },
+    )
+    assert prefs_response.status_code == 200
+
+    monkeypatch.setattr(
+        "services.notification_delivery.NotificationDeliveryService.send_summary",
+        lambda self, channel, recipient, subject, body: f"Email sent to {recipient}",
+    )
+
     notification_data = {
         "title": "Test Notification",
         "message": "This is a test",
@@ -181,7 +198,28 @@ def test_request_notification():
     assert response.status_code == 200
     data = response.json()
     assert data["success"] == True
-    assert "message" in data
+    assert "Email sent to notify@example.com" in data["message"]
+
+
+def test_create_ws_ticket_requires_api_auth_enabled(monkeypatch):
+    """Websocket ticket endpoint should be disabled when API auth is off."""
+    monkeypatch.setattr(api_routes, "_is_api_auth_required", lambda: False)
+    response = client.post("/auth/ws-ticket")
+    assert response.status_code == 400
+    assert "api auth is not enabled" in response.json()["detail"].lower()
+
+
+def test_ws_ticket_is_one_time_use(monkeypatch):
+    """Issued websocket tickets should be consumed once."""
+    monkeypatch.setattr(api_routes, "_is_api_auth_required", lambda: True)
+    with api_routes._ws_auth_ticket_lock:
+        api_routes._ws_auth_tickets.clear()
+
+    ticket_response = client.post("/auth/ws-ticket")
+    assert ticket_response.status_code == 200
+    ticket = ticket_response.json()["ticket"]
+    assert api_routes._consume_ws_auth_ticket(ticket) is True
+    assert api_routes._consume_ws_auth_ticket(ticket) is False
 
 
 # ============================================================================

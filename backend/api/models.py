@@ -95,6 +95,7 @@ class PositionsResponse(BaseModel):
     total_value: float = Field(default=0.0, description="Total portfolio value")
     total_pnl: float = Field(default=0.0, description="Total unrealized P&L")
     total_pnl_percent: float = Field(default=0.0, description="Total P&L percentage")
+    as_of: datetime = Field(default_factory=datetime.utcnow, description="Timestamp when positions snapshot was generated")
     data_source: str = Field(default="broker", description="Primary source for position payload")
     degraded: bool = Field(default=False, description="True when broker market marks were unavailable")
     degraded_reason: Optional[str] = Field(default=None, description="Reason for degraded fallback mode")
@@ -402,6 +403,13 @@ class RunnerActionResponse(BaseModel):
     success: bool = Field(..., description="Whether action was successful")
     message: str = Field(..., description="Action result message")
     status: str = Field(..., description="Current runner status")
+
+
+class WebSocketAuthTicketResponse(BaseModel):
+    """Short-lived websocket auth ticket."""
+    ticket: str = Field(..., description="One-time websocket auth ticket")
+    expires_at: datetime = Field(..., description="UTC expiration timestamp")
+    expires_in_seconds: int = Field(..., description="Ticket TTL in seconds")
 
 
 # ============================================================================

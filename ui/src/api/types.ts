@@ -93,6 +93,7 @@ export interface PositionsResponse {
   total_value: number;
   total_pnl: number;
   total_pnl_percent: number;
+  as_of?: string;
   data_source?: string;
   degraded?: boolean;
   degraded_reason?: string | null;
@@ -336,6 +337,12 @@ export interface RunnerActionResponse {
   success: boolean;
   message: string;
   status: string;
+}
+
+export interface WebSocketAuthTicketResponse {
+  ticket: string;
+  expires_at: string;
+  expires_in_seconds: number;
 }
 
 export interface SystemHealthSnapshot {

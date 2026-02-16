@@ -74,6 +74,7 @@ from .models import (
     # Runner models
     RunnerStatusResponse,
     RunnerActionResponse,
+    WebSocketAuthTicketResponse,
     # Strategy configuration models
     StrategyConfigResponse,
     StrategyConfigUpdateRequest,
@@ -288,6 +289,12 @@ _BROKER_SYNC_KEY = "last_broker_sync_at"
 _idempotency_cache: Dict[str, Dict[str, Any]] = {}
 _idempotency_lock = threading.Lock()
 _last_broker_sync_at: Optional[str] = None
+_ws_auth_tickets: Dict[str, float] = {}
+_ws_auth_ticket_lock = threading.Lock()
+_WS_AUTH_TICKET_TTL_SECONDS = 90
+_chart_points_cache: Dict[str, Dict[str, Any]] = {}
+_chart_points_cache_lock = threading.Lock()
+_CHART_POINTS_CACHE_TTL_SECONDS = 60
 
 _SUMMARY_NOTIFICATION_PREFERENCES_KEY = "summary_notification_preferences"
 _SUMMARY_NOTIFICATION_SCHEDULE_STATE_KEY = "summary_notification_schedule_state"
@@ -323,10 +330,7 @@ def _extract_api_key_from_headers(headers: Any) -> str:
 
 
 def _extract_api_key_from_websocket(websocket: WebSocket) -> str:
-    """Extract API key for websocket auth from query first, then headers."""
-    query_key = (websocket.query_params.get("api_key") or "").strip()
-    if query_key:
-        return query_key
+    """Extract API key for websocket auth from headers only."""
     return _extract_api_key_from_headers(websocket.headers)
 
 
@@ -362,6 +366,66 @@ def _idempotency_cache_set(endpoint: str, key: Optional[str], payload: Dict[str,
             "payload": payload,
             "expires_at": time.time() + ttl_seconds,
         }
+
+
+def _chart_cache_get(cache_key: str) -> Optional[List[Dict[str, Any]]]:
+    """Read cached screener chart points for a key when still fresh."""
+    now_ts = time.time()
+    with _chart_points_cache_lock:
+        entry = _chart_points_cache.get(cache_key)
+        if not entry:
+            return None
+        if float(entry.get("expires_at", 0.0)) <= now_ts:
+            _chart_points_cache.pop(cache_key, None)
+            return None
+        points = entry.get("points", [])
+    if not isinstance(points, list):
+        return None
+    return [dict(point) for point in points if isinstance(point, dict)]
+
+
+def _chart_cache_set(cache_key: str, points: List[Dict[str, Any]], ttl_seconds: int = _CHART_POINTS_CACHE_TTL_SECONDS) -> None:
+    """Store screener chart points in a short-lived in-memory cache."""
+    ttl = max(5, int(ttl_seconds))
+    normalized_points = [dict(point) for point in points if isinstance(point, dict)]
+    with _chart_points_cache_lock:
+        _chart_points_cache[cache_key] = {
+            "points": normalized_points,
+            "expires_at": time.time() + ttl,
+        }
+
+
+def _prune_ws_auth_tickets_locked(now_ts: float) -> None:
+    """Prune expired websocket auth tickets under caller-held lock."""
+    expired = [token for token, expires_at in _ws_auth_tickets.items() if expires_at <= now_ts]
+    for token in expired:
+        _ws_auth_tickets.pop(token, None)
+
+
+def _issue_ws_auth_ticket(ttl_seconds: int = _WS_AUTH_TICKET_TTL_SECONDS) -> tuple[str, datetime]:
+    """Issue a short-lived one-time websocket auth ticket."""
+    now_ts = time.time()
+    ttl = max(5, int(ttl_seconds))
+    expires_at_ts = now_ts + ttl
+    ticket = secrets.token_urlsafe(32)
+    with _ws_auth_ticket_lock:
+        _prune_ws_auth_tickets_locked(now_ts)
+        _ws_auth_tickets[ticket] = expires_at_ts
+    return ticket, datetime.fromtimestamp(expires_at_ts, tz=timezone.utc)
+
+
+def _consume_ws_auth_ticket(ticket: str) -> bool:
+    """Atomically validate and consume a websocket auth ticket."""
+    normalized = str(ticket or "").strip()
+    if not normalized:
+        return False
+    now_ts = time.time()
+    with _ws_auth_ticket_lock:
+        _prune_ws_auth_tickets_locked(now_ts)
+        expires_at_ts = _ws_auth_tickets.pop(normalized, None)
+    if expires_at_ts is None:
+        return False
+    return expires_at_ts > now_ts
 
 
 def _load_runtime_config(storage: StorageService) -> ConfigResponse:
@@ -1345,6 +1409,7 @@ async def get_positions(db: Session = Depends(get_db)):
     """
     Get current positions from broker, with local fallback if broker is unavailable.
     """
+    snapshot_as_of = datetime.now(timezone.utc)
     broker_positions: List[Dict[str, Any]] = []
     data_source = "broker"
     degraded = False
@@ -1433,6 +1498,7 @@ async def get_positions(db: Session = Depends(get_db)):
         total_value=total_value,
         total_pnl=total_pnl,
         total_pnl_percent=total_pnl_percent,
+        as_of=snapshot_as_of,
         data_source=data_source,
         degraded=degraded,
         degraded_reason=degraded_reason,
@@ -1549,12 +1615,19 @@ async def create_order(
 # ============================================================================
 
 @router.post("/notifications", response_model=NotificationResponse)
-async def request_notification(request: NotificationRequest):
+async def request_notification(request: NotificationRequest, db: Session = Depends(get_db)):
     """
     Request a notification to be sent to the user.
-    TODO: Integrate with notification service and system tray.
-    This is a placeholder.
+    Uses configured summary notification channel + recipient.
     """
+    storage = StorageService(db)
+    prefs = _load_summary_notification_preferences(storage)
+
+    if not prefs.enabled:
+        return NotificationResponse(success=False, message="Summary notifications are disabled")
+    if not prefs.recipient:
+        return NotificationResponse(success=False, message="Recipient is required")
+
     title = request.title.strip()
     message = request.message.strip()
     if not title:
@@ -1562,13 +1635,44 @@ async def request_notification(request: NotificationRequest):
     if not message:
         raise HTTPException(status_code=400, detail="message is required")
 
-    # Placeholder - just log for now
-    print(f"[NOTIFICATION] {request.severity.upper()}: {title} - {message}")
+    subject = f"[{request.severity.value.upper()}] {title}"
+    body = f"{title}\n\n{message}"
 
-    return NotificationResponse(
-        success=True,
-        message="Notification queued (placeholder)",
+    try:
+        delivery = NotificationDeliveryService()
+        delivery_result = delivery.send_summary(
+            channel=prefs.channel,
+            recipient=prefs.recipient,
+            subject=subject,
+            body=body,
+        )
+    except RuntimeError as exc:
+        storage.create_audit_log(
+            event_type="error",
+            description=f"Notification delivery failed ({prefs.channel.value})",
+            details={
+                "title": title,
+                "severity": request.severity.value,
+                "recipient": prefs.recipient,
+                "channel": prefs.channel.value,
+                "error": str(exc),
+            },
+        )
+        return NotificationResponse(success=False, message=f"Notification delivery failed: {exc}")
+
+    storage.create_audit_log(
+        event_type="config_updated",
+        description=f"Sent {prefs.channel.value} notification",
+        details={
+            "title": title,
+            "severity": request.severity.value,
+            "recipient": prefs.recipient,
+            "channel": prefs.channel.value,
+            "delivery": delivery_result,
+        },
     )
+
+    return NotificationResponse(success=True, message=delivery_result)
 
 
 @router.get("/notifications/summary/preferences", response_model=SummaryNotificationPreferencesResponse)
@@ -2289,12 +2393,27 @@ async def run_reconciliation(db: Session = Depends(get_db)):
     return {"success": True, **result}
 
 
+@router.post("/auth/ws-ticket", response_model=WebSocketAuthTicketResponse)
+async def create_ws_auth_ticket():
+    """Issue one-time websocket auth ticket for browser clients."""
+    if not _is_api_auth_required():
+        raise HTTPException(status_code=400, detail="API auth is not enabled")
+    ticket, expires_at = _issue_ws_auth_ticket()
+    return WebSocketAuthTicketResponse(
+        ticket=ticket,
+        expires_at=expires_at,
+        expires_in_seconds=_WS_AUTH_TICKET_TTL_SECONDS,
+    )
+
+
 @router.websocket("/ws/system-health")
 async def ws_system_health(websocket: WebSocket):
     """Realtime health snapshot stream for UI surfaces."""
     if _is_api_auth_required():
+        ticket = (websocket.query_params.get("ticket") or "").strip()
+        ticket_valid = _consume_ws_auth_ticket(ticket)
         provided_key = _extract_api_key_from_websocket(websocket)
-        if not _is_api_key_valid(provided_key):
+        if not ticket_valid and not _is_api_key_valid(provided_key):
             await websocket.close(code=4401)
             return
     await websocket.accept()
@@ -3627,6 +3746,34 @@ async def get_screener_results(
         target_position_size=target_position_size,
         dca_tranches=dca_tranches,
     )
+    seed_only_relaxed_fallback_applied = False
+    if (
+        final_mode == ScreenerMode.PRESET
+        and resolved_preset_universe_mode == PresetUniverseMode.SEED_ONLY
+        and len(optimized) == 0
+        and len(results) > 0
+    ):
+        relaxed = screener.optimize_assets(
+            results,
+            limit=final_limit,
+            min_dollar_volume=0.0,
+            max_spread_bps=2000.0,
+            max_sector_weight_pct=100.0,
+            regime=regime,
+            auto_regime_adjust=False,
+            current_holdings=holdings_snapshot,
+            buying_power=account_snapshot.get("buying_power", 0.0),
+            equity=account_snapshot.get("equity", 0.0),
+            weekly_budget=prefs.weekly_budget,
+            symbol_capabilities=symbol_capabilities,
+            require_broker_tradable=False,
+            require_fractionable=False,
+            target_position_size=target_position_size,
+            dca_tranches=dca_tranches,
+        )
+        if relaxed:
+            optimized = relaxed
+            seed_only_relaxed_fallback_applied = True
     
     assets, total_count, total_pages = _paginate_assets(optimized, page, page_size)
     
@@ -3655,6 +3802,7 @@ async def get_screener_results(
             "dca_tranches": dca_tranches,
             "seed_only": resolved_preset_universe_mode == PresetUniverseMode.SEED_ONLY,
             "preset_universe_mode": resolved_preset_universe_mode.value,
+            "seed_only_relaxed_fallback_applied": seed_only_relaxed_fallback_applied,
         },
     )
 
@@ -3754,6 +3902,33 @@ async def get_screener_preset(
         target_position_size=target_position_size,
         dca_tranches=dca_tranches,
     )
+    seed_only_relaxed_fallback_applied = False
+    if (
+        resolved_preset_universe_mode == PresetUniverseMode.SEED_ONLY
+        and len(optimized) == 0
+        and len(assets_raw) > 0
+    ):
+        relaxed = screener.optimize_assets(
+            assets_raw,
+            limit=limit,
+            min_dollar_volume=0.0,
+            max_spread_bps=2000.0,
+            max_sector_weight_pct=100.0,
+            regime=regime,
+            auto_regime_adjust=False,
+            current_holdings=holdings_snapshot,
+            buying_power=account_snapshot.get("buying_power", 0.0),
+            equity=account_snapshot.get("equity", 0.0),
+            weekly_budget=prefs.weekly_budget,
+            symbol_capabilities=symbol_capabilities,
+            require_broker_tradable=False,
+            require_fractionable=False,
+            target_position_size=target_position_size,
+            dca_tranches=dca_tranches,
+        )
+        if relaxed:
+            optimized = relaxed
+            seed_only_relaxed_fallback_applied = True
     assets, total_count, total_pages = _paginate_assets(optimized, page, page_size)
 
     return ScreenerResponse(
@@ -3781,6 +3956,7 @@ async def get_screener_preset(
             "dca_tranches": dca_tranches,
             "seed_only": resolved_preset_universe_mode == PresetUniverseMode.SEED_ONLY,
             "preset_universe_mode": resolved_preset_universe_mode.value,
+            "seed_only_relaxed_fallback_applied": seed_only_relaxed_fallback_applied,
         },
     )
 
@@ -4078,9 +4254,17 @@ async def get_symbol_chart(
     numeric_values = [take_profit_pct, trailing_stop_pct, atr_stop_mult, zscore_entry_threshold, dip_buy_threshold_pct]
     if any(not math.isfinite(value) for value in numeric_values):
         raise HTTPException(status_code=400, detail="Chart indicator values must be finite numbers")
+    config = _get_config_snapshot()
+    cache_key = (
+        f"{symbol}:{int(days)}:"
+        f"{str(config.broker).lower()}:{int(bool(config.paper_trading))}:{int(bool(config.strict_alpaca_data))}"
+    )
+    points = _chart_cache_get(cache_key)
     screener = _create_market_screener()
     try:
-        points = screener.get_symbol_chart(symbol=symbol, days=days)
+        if points is None:
+            points = screener.get_symbol_chart(symbol=symbol, days=days)
+            _chart_cache_set(cache_key, points)
         indicators = screener.get_chart_indicators(
             points=points,
             take_profit_pct=take_profit_pct,

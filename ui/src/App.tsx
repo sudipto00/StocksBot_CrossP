@@ -5,6 +5,7 @@ import AppTopBar from './components/AppTopBar';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import {
+  createWebSocketAuthTicket,
   getApiAuthKey,
   getAuditLogs,
   getPositions,
@@ -230,13 +231,20 @@ function App() {
     let ws: WebSocket | null = null;
     let retryTimer: number | null = null;
 
-    const connect = () => {
+    const connect = async () => {
       try {
         const wsUrl = BACKEND_URL.replace('http://', 'ws://').replace('https://', 'wss://');
         const apiKey = getApiAuthKey();
-        const wsPath = apiKey
-          ? `${wsUrl}/ws/system-health?api_key=${encodeURIComponent(apiKey)}`
-          : `${wsUrl}/ws/system-health`;
+        let wsPath = `${wsUrl}/ws/system-health`;
+        if (apiKey) {
+          try {
+            const ticketResponse = await createWebSocketAuthTicket();
+            wsPath = `${wsUrl}/ws/system-health?ticket=${encodeURIComponent(ticketResponse.ticket)}`;
+          } catch {
+            // Fall back for environments where API auth is disabled.
+            wsPath = `${wsUrl}/ws/system-health`;
+          }
+        }
         ws = new WebSocket(wsPath);
         ws.onmessage = (event) => {
           try {
@@ -247,17 +255,21 @@ function App() {
           }
         };
         ws.onclose = () => {
-          retryTimer = window.setTimeout(connect, 3000);
+          retryTimer = window.setTimeout(() => {
+            void connect();
+          }, 3000);
         };
         ws.onerror = () => {
           ws?.close();
         };
       } catch {
-        retryTimer = window.setTimeout(connect, 3000);
+        retryTimer = window.setTimeout(() => {
+          void connect();
+        }, 3000);
       }
     };
 
-    connect();
+    void connect();
     return () => {
       if (retryTimer) window.clearTimeout(retryTimer);
       ws?.close();

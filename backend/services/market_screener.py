@@ -289,8 +289,13 @@ class MarketScreener:
             "aggressive": ["QQQ", "IWM", "XLE", "XLK", "XLY", "EEM", "VWO", "XLF", "SPY", "DIA"],
         }
 
-        all_assets = self.get_active_stocks(200) if asset_type == "stock" else self.get_active_etfs(200)
+        # Pull a wider active universe so preset seed symbols have a better chance
+        # to resolve from live data before any fallback is needed.
+        active_universe_limit = max(200, min(800, limit * 8))
+        all_assets = self.get_active_stocks(active_universe_limit) if asset_type == "stock" else self.get_active_etfs(active_universe_limit)
         by_symbol = {asset["symbol"]: asset for asset in all_assets}
+        fallback_seed_assets = self._get_fallback_stocks(400) + self._get_fallback_etfs(200)
+        fallback_by_symbol = {asset["symbol"]: asset for asset in fallback_seed_assets}
 
         preset_map = stock_presets if asset_type == "stock" else etf_presets
         symbols = preset_map.get(preset)
@@ -307,7 +312,25 @@ class MarketScreener:
                 "Expected one of: seed_only, seed_guardrail_blend, guardrail_only"
             )
 
-        selected = [by_symbol[s] for s in symbols if s in by_symbol]
+        selected: List[Dict[str, Any]] = []
+        for symbol in symbols:
+            live_row = by_symbol.get(symbol)
+            if live_row:
+                selected.append(dict(live_row))
+                continue
+            fallback_row = fallback_by_symbol.get(symbol)
+            if fallback_row:
+                selected.append(dict(fallback_row))
+                continue
+            selected.append({
+                "symbol": symbol,
+                "name": symbol,
+                "asset_type": asset_type,
+                "volume": 0,
+                "price": 0.0,
+                "change_percent": 0.0,
+                "last_updated": datetime.now().isoformat(),
+            })
         if normalized_mode == "guardrail_only":
             selected = list(all_assets)
         elif normalized_mode == "seed_guardrail_blend" and len(selected) < limit:

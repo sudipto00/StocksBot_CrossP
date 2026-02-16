@@ -68,6 +68,8 @@ function daysForRange(range: ChartRange): number {
   return 320;
 }
 
+const CHART_CACHE_TTL_MS = 60_000;
+
 const USD_FORMATTER = new Intl.NumberFormat('en-US', {
   style: 'currency',
   currency: 'USD',
@@ -179,7 +181,7 @@ const ScreenerPage: React.FC = () => {
   const [chartData, setChartData] = useState<ChartPoint[]>([]);
   const [chartLoading, setChartLoading] = useState(false);
   const [chartError, setChartError] = useState<string | null>(null);
-  const [chartRange, setChartRange] = useState<ChartRange>('1y');
+  const [chartRange, setChartRange] = useState<ChartRange>('3m');
   const [chartIndicators, setChartIndicators] = useState<Record<string, number | boolean | null>>({});
   const [strategies, setStrategies] = useState<Strategy[]>([]);
   const [selectedStrategyId, setSelectedStrategyId] = useState<string>('');
@@ -212,6 +214,10 @@ const ScreenerPage: React.FC = () => {
   const [prefsLoaded, setPrefsLoaded] = useState(false);
   const chartSectionRef = useRef<HTMLDivElement | null>(null);
   const optimizeRequestIdRef = useRef(0);
+  const chartRequestIdRef = useRef(0);
+  const chartCacheRef = useRef(
+    new Map<string, { points: ChartPoint[]; indicators: Record<string, number | boolean | null>; fetchedAt: number }>()
+  );
   const [strategySignalParams, setStrategySignalParams] = useState({
     take_profit_pct: 5.0,
     trailing_stop_pct: 2.5,
@@ -257,10 +263,26 @@ const ScreenerPage: React.FC = () => {
   }, []);
 
   const fetchChart = useCallback(async (symbol: string) => {
+    const requestId = ++chartRequestIdRef.current;
     try {
       setChartLoading(true);
       setChartError(null);
-      setChartData([]);
+      const cacheKey = [
+        symbol,
+        chartRange,
+        strategySignalParams.take_profit_pct,
+        strategySignalParams.trailing_stop_pct,
+        strategySignalParams.atr_stop_mult,
+        strategySignalParams.zscore_entry_threshold,
+        strategySignalParams.dip_buy_threshold_pct,
+      ].join('|');
+      const cached = chartCacheRef.current.get(cacheKey);
+      if (cached && (Date.now() - cached.fetchedAt) <= CHART_CACHE_TTL_MS) {
+        setChartData(cached.points);
+        setChartIndicators(cached.indicators);
+        setChartLoading(false);
+        return;
+      }
       const params = new URLSearchParams({
         days: String(daysForRange(chartRange)),
         take_profit_pct: String(strategySignalParams.take_profit_pct),
@@ -275,15 +297,30 @@ const ScreenerPage: React.FC = () => {
         throw new Error(body?.detail || body?.message || `Failed to fetch chart (${response.status})`);
       }
       const data = await response.json();
-      setChartData(data.points || []);
-      setChartIndicators(data.indicators || {});
+      if (requestId !== chartRequestIdRef.current) {
+        return;
+      }
+      const nextPoints = data.points || [];
+      const nextIndicators = data.indicators || {};
+      setChartData(nextPoints);
+      setChartIndicators(nextIndicators);
+      chartCacheRef.current.set(cacheKey, {
+        points: nextPoints,
+        indicators: nextIndicators,
+        fetchedAt: Date.now(),
+      });
     } catch (err) {
+      if (requestId !== chartRequestIdRef.current) {
+        return;
+      }
       console.error('Error fetching chart:', err);
       setChartData([]);
       setChartIndicators({});
       setChartError(err instanceof Error ? err.message : 'Failed to load chart');
     } finally {
-      setChartLoading(false);
+      if (requestId === chartRequestIdRef.current) {
+        setChartLoading(false);
+      }
     }
   }, [chartRange, strategySignalParams]);
 
@@ -487,17 +524,23 @@ const ScreenerPage: React.FC = () => {
     }
   }, []);
 
-  const fetchSafety = useCallback(async () => {
+  const fetchSafetyStatus = useCallback(async () => {
     try {
       const safety = await getSafetyStatus();
       setKillSwitchActive(Boolean(safety.kill_switch_active));
-      const preflight = await getSafetyPreflight(selectedSymbol || 'AAPL');
-      setBlockedReason(preflight.allowed ? '' : preflight.reason);
     } catch {
       setKillSwitchActive(false);
+    }
+  }, []);
+
+  const fetchSafetyPreflight = useCallback(async (symbol?: string) => {
+    try {
+      const preflight = await getSafetyPreflight((symbol || 'AAPL').toUpperCase());
+      setBlockedReason(preflight.allowed ? '' : preflight.reason);
+    } catch {
       setBlockedReason('');
     }
-  }, [selectedSymbol]);
+  }, []);
 
   const handleApplyWorkspaceSettings = async () => {
     const validationErrors: string[] = [];
@@ -599,8 +642,13 @@ const ScreenerPage: React.FC = () => {
     fetchConfig();
     fetchPortfolioSummary();
     fetchBrokerAccount();
-    fetchSafety();
-  }, [fetchPreferences, fetchBudgetStatus, fetchStrategies, fetchConfig, fetchPortfolioSummary, fetchBrokerAccount, fetchSafety]);
+    fetchSafetyStatus();
+    fetchSafetyPreflight('AAPL');
+  }, [fetchPreferences, fetchBudgetStatus, fetchStrategies, fetchConfig, fetchPortfolioSummary, fetchBrokerAccount, fetchSafetyStatus, fetchSafetyPreflight]);
+
+  useEffect(() => {
+    void fetchSafetyPreflight(selectedSymbol || 'AAPL');
+  }, [selectedSymbol, fetchSafetyPreflight]);
 
   /* Restore workspace guardrails once preferences have been loaded from the API.
      First tries the localStorage snapshot (instant, no API call).

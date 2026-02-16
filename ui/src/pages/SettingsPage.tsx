@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { showSuccessNotification, showErrorNotification } from '../utils/notifications';
@@ -112,6 +112,23 @@ function SettingsPage() {
   // Validation errors
   const [validationErrors, setValidationErrors] = useState<Record<string, string>>({});
 
+  const refreshAuxiliarySettingsData = useCallback(async () => {
+    const [runtimeStatusResult, storageInfoResult] = await Promise.allSettled([
+      getBrokerCredentialsStatus(),
+      getMaintenanceStorage(),
+    ]);
+    if (runtimeStatusResult.status === 'fulfilled') {
+      setRuntimeCredentialStatus(runtimeStatusResult.value);
+    } else {
+      setRuntimeCredentialStatus(null);
+    }
+    if (storageInfoResult.status === 'fulfilled') {
+      setStorageInfo(storageInfoResult.value);
+    } else {
+      setStorageInfo(null);
+    }
+  }, []);
+
   const collectValidationErrors = (): Record<string, string> => {
     const errors: Record<string, string> = {};
     if (tickIntervalSeconds < SETTINGS_LIMITS.tickIntervalMin || tickIntervalSeconds > SETTINGS_LIMITS.tickIntervalMax) {
@@ -142,19 +159,14 @@ function SettingsPage() {
     return errors;
   };
 
-  useEffect(() => {
-    loadSettings();
-    void loadKeychainStatus();
-  }, []);
-
-  const loadSettings = async () => {
+  const loadSettings = useCallback(async () => {
     try {
       setLoading(true);
       setError(null);
       setSaveVerificationMessage(null);
-      
+
       const config = await getConfig();
-      
+
       setTradingEnabled(config.trading_enabled);
       setPaperTrading(config.paper_trading);
       setMaxPositionSize(config.max_position_size);
@@ -167,7 +179,18 @@ function SettingsPage() {
       setAuditExportDirectory(config.audit_export_directory || './audit_exports');
       setLogRetentionDays(config.log_retention_days || 30);
       setAuditRetentionDays(config.audit_retention_days || 90);
-      const prefs = await getTradingPreferences();
+      setLoading(false);
+
+      const [prefsResult, summaryPrefsResult, safetyResult] = await Promise.allSettled([
+        getTradingPreferences(),
+        getSummaryNotificationPreferences(),
+        getSafetyStatus().catch(() => ({ kill_switch_active: false, last_broker_sync_at: null })),
+      ]);
+      const prefs = prefsResult.status === 'fulfilled' ? prefsResult.value : null;
+      const summaryPrefs = summaryPrefsResult.status === 'fulfilled' ? summaryPrefsResult.value : null;
+      const safety = safetyResult.status === 'fulfilled' ? safetyResult.value : null;
+
+      if (prefs) {
       const normalizedAssetType: AssetTypePreference = prefs.asset_type === 'etf' ? 'etf' : 'stock';
       const normalizedUniverseMode: ScreenerModePreference =
         normalizedAssetType === 'stock' ? prefs.screener_mode : 'preset';
@@ -178,31 +201,24 @@ function SettingsPage() {
       setUniverseMode(normalizedUniverseMode);
       setStockPreset(prefs.stock_preset);
       setEtfPreset(prefs.etf_preset);
-      const summaryPrefs = await getSummaryNotificationPreferences();
-      setSummaryEnabled(summaryPrefs.enabled);
-      setSummaryFrequency(summaryPrefs.frequency);
-      setSummaryChannel(summaryPrefs.channel);
-      setSummaryRecipient(summaryPrefs.recipient || '');
-      const safety = await getSafetyStatus().catch(() => ({ kill_switch_active: false, last_broker_sync_at: null }));
-      setKillSwitchActive(Boolean(safety.kill_switch_active));
-      try {
-        setRuntimeCredentialStatus(await getBrokerCredentialsStatus());
-      } catch {
-        setRuntimeCredentialStatus(null);
       }
-      try {
-        const storage = await getMaintenanceStorage();
-        setStorageInfo(storage);
-      } catch {
-        setStorageInfo(null);
+
+      if (summaryPrefs) {
+        setSummaryEnabled(summaryPrefs.enabled);
+        setSummaryFrequency(summaryPrefs.frequency);
+        setSummaryChannel(summaryPrefs.channel);
+        setSummaryRecipient(summaryPrefs.recipient || '');
       }
+      if (safety) {
+        setKillSwitchActive(Boolean(safety.kill_switch_active));
+      }
+      void refreshAuxiliarySettingsData();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load settings');
       await showErrorNotification('Settings Error', 'Failed to load settings');
-    } finally {
       setLoading(false);
     }
-  };
+  }, [refreshAuxiliarySettingsData]);
 
   const validateSettings = (): boolean => {
     const errors = collectValidationErrors();
@@ -278,7 +294,7 @@ function SettingsPage() {
     }
   };
 
-  const loadKeychainStatus = async () => {
+  const loadKeychainStatus = useCallback(async () => {
     try {
       setKeychainStatusError(null);
       const status = await invoke<KeychainCredentialStatus>('get_alpaca_credentials_status');
@@ -290,7 +306,12 @@ function SettingsPage() {
       setKeychainStatusError('Keychain status unavailable in browser/dev mode.');
       setKeychainStatusCheckedAt(new Date().toISOString());
     }
-  };
+  }, []);
+
+  useEffect(() => {
+    void loadSettings();
+    void loadKeychainStatus();
+  }, [loadSettings, loadKeychainStatus]);
 
   const loadCredentialsForMode = async (mode: CredentialMode) => {
     try {
