@@ -28,7 +28,18 @@ function DashboardPage() {
   const [runnerLoading, setRunnerLoading] = useState(false);
   const [tradingPrefs, setTradingPrefs] = useState<TradingPreferences | null>(null);
   const [holdingFilter, setHoldingFilter] = useState<'all' | 'stock' | 'etf'>('all');
-  const [knownEtfSymbols, setKnownEtfSymbols] = useState<Set<string>>(new Set());
+  const [knownEtfSymbols, setKnownEtfSymbols] = useState<Set<string>>(() => {
+    if (typeof window === 'undefined') return new Set();
+    try {
+      const raw = window.localStorage.getItem('dashboard_known_etf_symbols');
+      if (!raw) return new Set();
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return new Set();
+      return new Set(parsed.map((symbol) => String(symbol || '').toUpperCase()).filter(Boolean));
+    } catch {
+      return new Set();
+    }
+  });
   const [killSwitchActive, setKillSwitchActive] = useState(false);
   const [blockedReason, setBlockedReason] = useState<string>('');
 
@@ -75,13 +86,28 @@ function DashboardPage() {
     }
   }, [analyticsDays]);
 
+  const refreshKnownEtfSymbols = useCallback(async () => {
+    try {
+      const etfUniverse = await getScreenerAssets('etf', 120).catch(() => ({ assets: [] }));
+      const symbols = new Set((etfUniverse.assets || []).map((asset) => asset.symbol.toUpperCase()));
+      if (symbols.size > 0) {
+        setKnownEtfSymbols(symbols);
+        if (typeof window !== 'undefined') {
+          window.localStorage.setItem('dashboard_known_etf_symbols', JSON.stringify(Array.from(symbols)));
+        }
+      }
+    } catch (err) {
+      console.error('Failed to refresh ETF universe cache:', err);
+    }
+  }, []);
+
   const loadData = useCallback(async () => {
     try {
       setLoading(true);
       setError(null);
       
       // Fetch status, positions, runner state, and analytics in parallel
-      const [statusData, positionsData, runnerData, analyticsData, summaryData, brokerAccountData, prefsData, etfUniverse] = await Promise.all([
+      const [statusData, positionsData, runnerData, analyticsData, summaryData, brokerAccountData, prefsData] = await Promise.all([
         getBackendStatus(),
         getPositions(),
         getRunnerStatus(),
@@ -89,7 +115,6 @@ function DashboardPage() {
         getPortfolioSummary(),
         getBrokerAccount(),
         getTradingPreferences(),
-        getScreenerAssets('etf', 200).catch(() => ({ assets: [] })),
       ]);
       const safety = await getSafetyStatus().catch(() => ({ kill_switch_active: false, last_broker_sync_at: null }));
       
@@ -117,8 +142,8 @@ function DashboardPage() {
       setSummary(summaryData);
       setBrokerAccount(brokerAccountData);
       setTradingPrefs(prefsData);
-      setKnownEtfSymbols(new Set((etfUniverse.assets || []).map((asset) => asset.symbol.toUpperCase())));
       setKillSwitchActive(Boolean(safety.kill_switch_active));
+      void refreshKnownEtfSymbols();
       const preflight = await getSafetyPreflight('AAPL').catch(() => ({ allowed: true, reason: '' }));
       setBlockedReason(preflight.allowed ? '' : preflight.reason);
     } catch (err) {
@@ -126,7 +151,7 @@ function DashboardPage() {
     } finally {
       setLoading(false);
     }
-  }, [analyticsDays]);
+  }, [analyticsDays, refreshKnownEtfSymbols]);
 
   useEffect(() => {
     void loadData();

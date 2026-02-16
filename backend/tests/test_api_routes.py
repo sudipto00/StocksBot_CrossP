@@ -36,12 +36,37 @@ def override_get_db():
 client = TestClient(app)
 
 
+def _reset_runtime_singletons() -> None:
+    """Reset process-level singleton state used by API routes."""
+    try:
+        runner = getattr(api_routes.runner_manager, "runner", None)
+        if runner is not None:
+            try:
+                runner.stop()
+            except Exception:
+                pass
+        api_routes.runner_manager.runner = None
+    except Exception:
+        pass
+    try:
+        api_routes._invalidate_broker_instance()
+    except Exception:
+        pass
+    try:
+        with api_routes._idempotency_lock:
+            api_routes._idempotency_cache.clear()
+    except Exception:
+        pass
+
+
 @pytest.fixture(autouse=True)
 def setup_database():
     """Create and drop test database for each test."""
     app.dependency_overrides[get_db] = override_get_db
+    _reset_runtime_singletons()
     Base.metadata.create_all(bind=engine)
     yield
+    _reset_runtime_singletons()
     Base.metadata.drop_all(bind=engine)
     app.dependency_overrides.pop(get_db, None)
 
@@ -736,3 +761,179 @@ def test_analytics_persists_snapshot_points():
     second_data = second.json()
     second_len = len(second_data["time_series"])
     assert second_len >= first_len
+
+
+# ============================================================================
+# Screener Preset Regression Tests
+# ============================================================================
+
+def test_screener_preset_micro_budget_stock_returns_assets():
+    """micro_budget stock preset should be accepted by screener preset endpoint."""
+    response = client.get(
+        "/screener/preset",
+        params={
+            "asset_type": "stock",
+            "preset": "micro_budget",
+            "limit": 20,
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["asset_type"] == "stock"
+    assert isinstance(data["assets"], list)
+    assert len(data["assets"]) > 0
+
+
+def test_screener_all_preset_mode_uses_micro_budget_preference():
+    """screener/all preset mode should not fail when stored stock_preset is micro_budget."""
+    prefs = client.post(
+        "/preferences",
+        json={
+            "asset_type": "stock",
+            "screener_mode": "preset",
+            "stock_preset": "micro_budget",
+            "weekly_budget": 50.0,
+        },
+    )
+    assert prefs.status_code == 200
+
+    response = client.get(
+        "/screener/all",
+        params={
+            "asset_type": "stock",
+            "screener_mode": "preset",
+            "limit": 20,
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["asset_type"] == "stock"
+    assert isinstance(data["assets"], list)
+    assert len(data["assets"]) > 0
+
+
+def test_screener_preset_seed_only_returns_seed_symbols_only():
+    """seed_only=true should disable preset backfill from active universe."""
+    response = client.get(
+        "/screener/preset",
+        params={
+            "asset_type": "stock",
+            "preset": "micro_budget",
+            "limit": 50,
+            "seed_only": "true",
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["asset_type"] == "stock"
+    seed_symbols = {"SPY", "INTC", "PFE", "CSCO", "KO", "VTI", "XLF", "DIS"}
+    returned_symbols = {row["symbol"] for row in data["assets"]}
+    assert returned_symbols
+    assert returned_symbols.issubset(seed_symbols)
+    assert data.get("applied_guardrails", {}).get("seed_only") is True
+
+
+def test_screener_all_preset_seed_only_uses_seed_universe():
+    """screener/all should pass seed_only through when running in preset mode."""
+    prefs = client.post(
+        "/preferences",
+        json={
+            "asset_type": "stock",
+            "screener_mode": "preset",
+            "stock_preset": "micro_budget",
+            "weekly_budget": 50.0,
+        },
+    )
+    assert prefs.status_code == 200
+
+    response = client.get(
+        "/screener/all",
+        params={
+            "asset_type": "stock",
+            "screener_mode": "preset",
+            "seed_only": "true",
+            "limit": 50,
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    seed_symbols = {"SPY", "INTC", "PFE", "CSCO", "KO", "VTI", "XLF", "DIS"}
+    returned_symbols = {row["symbol"] for row in data["assets"]}
+    assert returned_symbols
+    assert returned_symbols.issubset(seed_symbols)
+    assert data.get("applied_guardrails", {}).get("seed_only") is True
+
+
+def test_screener_preset_guardrail_only_uses_active_universe_candidates():
+    """preset_universe_mode=guardrail_only should not be constrained to seed symbols."""
+    response = client.get(
+        "/screener/preset",
+        params={
+            "asset_type": "stock",
+            "preset": "micro_budget",
+            "preset_universe_mode": "guardrail_only",
+            "limit": 40,
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    seed_symbols = {"SPY", "INTC", "PFE", "CSCO", "KO", "VTI", "XLF", "DIS"}
+    returned_symbols = {row["symbol"] for row in data["assets"]}
+    assert returned_symbols
+    assert any(symbol not in seed_symbols for symbol in returned_symbols)
+    assert data.get("applied_guardrails", {}).get("preset_universe_mode") == "guardrail_only"
+    assert data.get("applied_guardrails", {}).get("seed_only") is False
+
+
+def test_screener_all_preset_guardrail_only_passes_mode():
+    """screener/all should accept preset_universe_mode and expose it in guardrails payload."""
+    prefs = client.post(
+        "/preferences",
+        json={
+            "asset_type": "stock",
+            "screener_mode": "preset",
+            "stock_preset": "micro_budget",
+            "weekly_budget": 50.0,
+        },
+    )
+    assert prefs.status_code == 200
+
+    response = client.get(
+        "/screener/all",
+        params={
+            "asset_type": "stock",
+            "screener_mode": "preset",
+            "preset_universe_mode": "guardrail_only",
+            "limit": 40,
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data.get("applied_guardrails", {}).get("preset_universe_mode") == "guardrail_only"
+    assert data.get("applied_guardrails", {}).get("seed_only") is False
+
+
+def test_runner_preflight_returns_strategy_readiness():
+    """Runner preflight should summarize symbol eligibility for active strategies."""
+    created = client.post(
+        "/strategies",
+        json={
+            "name": "Preflight Test",
+            "symbols": ["AAPL", "MSFT"],
+        },
+    )
+    assert created.status_code == 200
+    strategy_id = created.json()["id"]
+
+    activated = client.put(f"/strategies/{strategy_id}", json={"status": "active"})
+    assert activated.status_code == 200
+
+    response = client.get("/runner/preflight")
+    assert response.status_code == 200
+    payload = response.json()
+    assert "runner_ready" in payload
+    assert "strategies" in payload
+    assert payload["summary"]["active_strategy_count"] >= 1
+    first = payload["strategies"][0]
+    assert first["symbol_count"] >= 1
+    assert "symbols" in first

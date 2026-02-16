@@ -55,6 +55,7 @@ import {
   SymbolChartResponse,
   AssetTypePreference,
   ScreenerModePreference,
+  PresetUniverseModePreference,
   StockPresetPreference,
   EtfPresetPreference,
 } from './types';
@@ -730,7 +731,8 @@ export async function runBacktest(
   });
   
   if (!response.ok) {
-    throw new Error(`Backend returned ${response.status}`);
+    const body = await response.json().catch(() => null);
+    throw new Error(body?.detail || `Backend returned ${response.status}`);
   }
   
   return response.json();
@@ -866,6 +868,8 @@ export async function getScreenerAssets(
     screenerMode?: ScreenerModePreference;
     stockPreset?: StockPresetPreference;
     etfPreset?: EtfPresetPreference;
+    presetUniverseMode?: PresetUniverseModePreference;
+    seedOnly?: boolean;
     minDollarVolume?: number;
     maxSpreadBps?: number;
     maxSectorWeightPct?: number;
@@ -901,6 +905,16 @@ export async function getScreenerAssets(
       ? (options.etfPreset || 'balanced')
       : (options.stockPreset || 'weekly_optimized');
     baseParams.append('preset', preset);
+    const universeMode = options.presetUniverseMode
+      || (typeof options.seedOnly === 'boolean'
+        ? (options.seedOnly ? 'seed_only' : 'seed_guardrail_blend')
+        : undefined);
+    if (universeMode) {
+      baseParams.append('preset_universe_mode', universeMode);
+    }
+    if (typeof options.seedOnly === 'boolean') {
+      baseParams.append('seed_only', String(options.seedOnly));
+    }
   } else if (mode === 'most_active') {
     baseParams.append('screener_mode', mode);
   }

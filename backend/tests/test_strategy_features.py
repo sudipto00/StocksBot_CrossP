@@ -371,6 +371,53 @@ class TestStrategyBacktesting:
         )
         assert response.status_code == 400
 
+    def test_backtest_emulate_live_requires_alpaca_broker(self, test_strategy):
+        """Live-equivalent backtest should require Alpaca broker mode."""
+        response = client.post(
+            f"/strategies/{test_strategy.id}/backtest",
+            json={
+                "start_date": "2024-01-01",
+                "end_date": "2024-03-31",
+                "initial_capital": 100000.0,
+                "emulate_live_trading": True,
+            },
+        )
+        assert response.status_code == 400
+        assert "requires Alpaca broker mode" in str(response.json().get("detail", ""))
+
+    def test_backtest_workspace_universe_respects_preset_mode(self, test_strategy):
+        """Workspace-backed backtests should include universe context diagnostics."""
+        prefs = client.post(
+            "/preferences",
+            json={
+                "asset_type": "stock",
+                "screener_mode": "preset",
+                "stock_preset": "micro_budget",
+                "weekly_budget": 100.0,
+            },
+        )
+        assert prefs.status_code == 200
+
+        response = client.post(
+            f"/strategies/{test_strategy.id}/backtest",
+            json={
+                "start_date": "2024-01-01",
+                "end_date": "2024-03-31",
+                "initial_capital": 10000.0,
+                "use_workspace_universe": True,
+                "preset_universe_mode": "seed_only",
+                "screener_mode": "preset",
+                "stock_preset": "micro_budget",
+                "screener_limit": 30,
+            },
+        )
+        assert response.status_code == 200
+        payload = response.json()
+        diagnostics = payload.get("diagnostics", {})
+        universe = diagnostics.get("universe_context", {})
+        assert universe.get("symbols_source") == "workspace_universe"
+        assert universe.get("preset_universe_mode") == "seed_only"
+
 
 class TestParameterTuning:
     """Tests for parameter tuning endpoints."""
@@ -461,3 +508,117 @@ class TestParameterTuning:
         
         assert position_size["value"] == 1500.0
         assert stop_loss["value"] == 3.0
+
+    def test_tune_dca_tranches(self, test_strategy):
+        """Test tuning the dca_tranches parameter."""
+        response = client.post(
+            f"/strategies/{test_strategy.id}/tune",
+            json={
+                "parameter_name": "dca_tranches",
+                "value": 2.0,
+            }
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["new_value"] == 2.0
+        assert data["success"] is True
+
+    def test_tune_max_consecutive_losses(self, test_strategy):
+        """Test tuning the max_consecutive_losses parameter."""
+        response = client.post(
+            f"/strategies/{test_strategy.id}/tune",
+            json={
+                "parameter_name": "max_consecutive_losses",
+                "value": 5.0,
+            }
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["new_value"] == 5.0
+        assert data["success"] is True
+
+    def test_tune_max_drawdown_pct(self, test_strategy):
+        """Test tuning the max_drawdown_pct parameter."""
+        response = client.post(
+            f"/strategies/{test_strategy.id}/tune",
+            json={
+                "parameter_name": "max_drawdown_pct",
+                "value": 25.0,
+            }
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["new_value"] == 25.0
+        assert data["success"] is True
+
+
+class TestMicroBudgetPreset:
+    """Tests for micro budget preset configuration."""
+
+    def test_micro_budget_preset_defaults(self):
+        """Micro budget stock preset should produce correct defaults."""
+        prefs = client.post(
+            "/preferences",
+            json={
+                "asset_type": "stock",
+                "screener_mode": "preset",
+                "stock_preset": "micro_budget",
+                "weekly_budget": 50.0,
+            },
+        )
+        assert prefs.status_code == 200
+
+        create = client.post(
+            "/strategies",
+            json={
+                "name": "Micro Strategy",
+                "symbols": ["SPY"],
+            },
+        )
+        assert create.status_code == 200
+        strategy_id = create.json()["id"]
+
+        response = client.get(f"/strategies/{strategy_id}/config")
+        assert response.status_code == 200
+        data = response.json()
+
+        param_map = {p["name"]: p["value"] for p in data["parameters"]}
+        # position_size may be capped by weekly budget constraints
+        assert param_map.get("position_size", 0) <= 75.0
+        assert param_map.get("position_size", 0) > 0
+        assert param_map.get("dca_tranches") == 2.0
+        assert param_map.get("max_consecutive_losses") == 2.0
+        assert param_map.get("max_drawdown_pct") == 10.0
+
+    def test_config_includes_new_parameters(self, test_strategy):
+        """Strategy config should include dca_tranches, max_consecutive_losses, max_drawdown_pct."""
+        response = client.get(f"/strategies/{test_strategy.id}/config")
+        assert response.status_code == 200
+        data = response.json()
+
+        param_names = [p["name"] for p in data["parameters"]]
+        assert "dca_tranches" in param_names
+        assert "max_consecutive_losses" in param_names
+        assert "max_drawdown_pct" in param_names
+
+    def test_backtest_with_dca_tranches(self, test_strategy):
+        """Backtest should accept dca_tranches parameter."""
+        response = client.post(
+            f"/strategies/{test_strategy.id}/backtest",
+            json={
+                "start_date": "2024-01-01",
+                "end_date": "2024-03-31",
+                "initial_capital": 5000.0,
+                "parameters": {
+                    "position_size": 500.0,
+                    "dca_tranches": 2.0,
+                    "max_consecutive_losses": 2.0,
+                    "max_drawdown_pct": 10.0,
+                },
+            },
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert isinstance(data["total_trades"], int)
+        params_used = data["diagnostics"].get("parameters_used", {})
+        assert params_used.get("dca_tranches") == 2.0

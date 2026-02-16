@@ -5,6 +5,7 @@ and performance analysis.
 """
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta, timezone, date as date_type
+import math
 from sqlalchemy.orm import Session
 
 from storage.service import StorageService
@@ -13,6 +14,7 @@ from config.strategy_config import (
     BacktestRequest,
     BacktestResult,
 )
+from engine.risk_manager import RiskManager
 from services.market_screener import MarketScreener
 
 # Default slippage applied to each fill (basis points).
@@ -150,6 +152,22 @@ class StrategyAnalyticsService:
         initial_capital = float(request.initial_capital)
         cash = initial_capital
         trade_id = 1
+        emulate_live_trading = bool(request.emulate_live_trading)
+        require_fractionable = bool(request.require_fractionable)
+        symbol_capabilities = request.symbol_capabilities if isinstance(request.symbol_capabilities, dict) else {}
+        max_position_size = max(1.0, float(request.max_position_size or params.get("position_size", 1000.0)))
+        daily_risk_limit = max(1.0, float(request.risk_limit_daily or max(50.0, initial_capital * 0.05)))
+        fee_bps = max(0.0, float(request.fee_bps or 0.0))
+        risk_manager = RiskManager(
+            max_position_size=max_position_size,
+            daily_loss_limit=daily_risk_limit,
+            max_portfolio_exposure=max(initial_capital * 2.0, max_position_size * 25.0),
+            max_symbol_concentration_pct=45.0,
+            max_open_positions=25,
+            max_consecutive_losses=max(1, int(params.get("max_consecutive_losses", 3))),
+            max_drawdown_pct=max(1.0, float(params.get("max_drawdown_pct", 15.0))),
+        )
+        risk_manager.update_equity(initial_capital)
         diagnostics: Dict[str, Any] = {
             "symbols_requested": len(symbols),
             "symbols_with_data": 0,
@@ -167,6 +185,11 @@ class StrategyAnalyticsService:
                 "risk_cap_too_low": 0,
                 "invalid_position_size": 0,
                 "cash_insufficient": 0,
+                "not_tradable": 0,
+                "not_fractionable": 0,
+                "daily_risk_limit": 0,
+                "risk_circuit_breaker": 0,
+                "risk_validation_failed": 0,
             },
             "exit_reasons": {
                 "stop_exit": 0,
@@ -175,7 +198,14 @@ class StrategyAnalyticsService:
                 "end_of_backtest": 0,
             },
             "parameters_used": {k: float(v) for k, v in params.items()},
+            "emulate_live_trading": emulate_live_trading,
+            "require_fractionable": require_fractionable,
+            "max_position_size_applied": max_position_size,
+            "risk_limit_daily_applied": daily_risk_limit,
+            "fee_bps_applied": fee_bps,
         }
+        if isinstance(request.universe_context, dict) and request.universe_context:
+            diagnostics["universe_context"] = dict(request.universe_context)
 
         lookback_days = max(320, (end_dt.date() - start_dt.date()).days + 320)
         screener = MarketScreener(
@@ -241,12 +271,14 @@ class StrategyAnalyticsService:
         equity_curve: List[Dict[str, Any]] = []
         slippage_bps = _DEFAULT_SLIPPAGE_BPS
         max_hold_days = int(params.get("max_hold_days", 10))
+        dca_tranches = max(1, min(3, int(params.get("dca_tranches", 1))))
 
         for day in sorted(all_dates):
             if day < start_dt.date() or day > end_dt.date():
                 continue
             diagnostics["trading_days_evaluated"] += 1
             day_ts = datetime.combine(day, datetime.min.time(), tzinfo=timezone.utc)
+            day_realized_pnl = 0.0
 
             for symbol in sorted(series_by_symbol.keys()):
                 point = date_index_by_symbol[symbol].get(day)
@@ -258,8 +290,62 @@ class StrategyAnalyticsService:
                 low = float(point["low"])
                 latest_price_by_symbol[symbol] = close
 
+                capability = symbol_capabilities.get(symbol, {})
+                broker_tradable = bool(capability.get("tradable", True))
+                fractionable = bool(capability.get("fractionable", True))
+
                 position = open_positions.get(symbol)
                 if position is not None:
+                    # --- DCA: add subsequent tranches on deeper dips ---
+                    tranches_filled = int(position.get("dca_tranches_filled", 1))
+                    tranches_total = int(position.get("dca_tranches_total", 1))
+                    if tranches_filled < tranches_total:
+                        avg_entry = float(position["entry_price"])
+                        dca_threshold = avg_entry * (1.0 - (tranches_filled * 1.0 / 100.0))
+                        if close <= dca_threshold and cash > 0:
+                            tranche_notional = compute_risk_based_position_size(
+                                equity=cash + sum(
+                                    float(p["qty"]) * latest_price_by_symbol.get(s, float(p["entry_price"]))
+                                    for s, p in open_positions.items()
+                                ),
+                                risk_per_trade_pct=params["risk_per_trade"],
+                                stop_loss_pct=params["stop_loss_pct"],
+                                position_size_cap=min(params["position_size"], max_position_size) / tranches_total,
+                                cash=cash,
+                            )
+                            entry_slippage_bps = self._effective_slippage_bps(
+                                base_bps=slippage_bps,
+                                close=close,
+                                high=high,
+                                low=low,
+                                emulate_live=emulate_live_trading,
+                            )
+                            fill_price = close * (1.0 + entry_slippage_bps / 10000.0)
+                            add_qty = tranche_notional / fill_price if fill_price > 0 else 0.0
+                            if emulate_live_trading and not fractionable:
+                                add_qty = float(math.floor(add_qty))
+                            fill_cost = add_qty * fill_price
+                            fill_fees = self._estimate_trade_fees(
+                                side="buy",
+                                notional=fill_cost,
+                                quantity=add_qty,
+                                fee_bps=fee_bps,
+                                emulate_live=emulate_live_trading,
+                            )
+                            if add_qty > 0 and (fill_cost + fill_fees) <= cash:
+                                old_qty = float(position["qty"])
+                                old_cost = float(position.get("total_cost", old_qty * avg_entry))
+                                new_qty = old_qty + add_qty
+                                new_cost = old_cost + fill_cost + fill_fees
+                                cash -= (fill_cost + fill_fees)
+                                position["qty"] = new_qty
+                                position["entry_price"] = new_cost / new_qty
+                                position["total_cost"] = new_cost
+                                position["fees_paid"] = float(position.get("fees_paid", 0.0)) + fill_fees
+                                position["dca_tranches_filled"] = tranches_filled + 1
+                                new_avg = new_cost / new_qty
+                                position["take_profit_price"] = new_avg * (1.0 + params["take_profit_pct"] / 100.0)
+
                     # --- Dynamic ATR stop recalculation ---
                     current_atr_pct = self._compute_atr_pct(series_by_symbol[symbol], day)
                     if current_atr_pct is not None and current_atr_pct > 0:
@@ -281,23 +367,55 @@ class StrategyAnalyticsService:
                     entry_date = datetime.fromisoformat(position["entry_date"]).date()
                     days_held = (day - entry_date).days
                     if days_held >= max_hold_days:
-                        exit_price = close * (1.0 - slippage_bps / 10000.0)
+                        exit_slippage_bps = self._effective_slippage_bps(
+                            base_bps=slippage_bps,
+                            close=close,
+                            high=high,
+                            low=low,
+                            emulate_live=emulate_live_trading,
+                        )
+                        exit_price = close * (1.0 - exit_slippage_bps / 10000.0)
                         exit_reason = "time_exit"
                     elif low <= effective_stop:
                         # Apply slippage to stop fills (fills slightly worse).
-                        exit_price = effective_stop * (1.0 - slippage_bps / 10000.0)
+                        exit_slippage_bps = self._effective_slippage_bps(
+                            base_bps=slippage_bps,
+                            close=close,
+                            high=high,
+                            low=low,
+                            emulate_live=emulate_live_trading,
+                        )
+                        exit_price = effective_stop * (1.0 - exit_slippage_bps / 10000.0)
                         exit_reason = "stop_exit"
                     elif high >= take_profit_price:
                         # TP fills can also experience minor slippage.
-                        exit_price = take_profit_price * (1.0 - slippage_bps / 10000.0)
+                        exit_slippage_bps = self._effective_slippage_bps(
+                            base_bps=slippage_bps,
+                            close=close,
+                            high=high,
+                            low=low,
+                            emulate_live=emulate_live_trading,
+                        )
+                        exit_price = take_profit_price * (1.0 - exit_slippage_bps / 10000.0)
                         exit_reason = "take_profit_exit"
 
                     if exit_price is not None:
                         diagnostics["exit_reasons"][exit_reason] = diagnostics["exit_reasons"].get(exit_reason, 0) + 1
                         qty = float(position["qty"])
                         entry_price = float(position["entry_price"])
-                        pnl = (exit_price - entry_price) * qty
-                        cash += qty * exit_price
+                        exit_notional = qty * exit_price
+                        exit_fees = self._estimate_trade_fees(
+                            side="sell",
+                            notional=exit_notional,
+                            quantity=qty,
+                            fee_bps=fee_bps,
+                            emulate_live=emulate_live_trading,
+                        )
+                        cost_basis = float(position.get("total_cost", entry_price * qty))
+                        pnl = (exit_notional - exit_fees) - cost_basis
+                        cash += (exit_notional - exit_fees)
+                        day_realized_pnl += pnl
+                        risk_manager.record_trade_result(pnl)
                         trades.append({
                             "id": trade_id,
                             "symbol": symbol,
@@ -310,6 +428,7 @@ class StrategyAnalyticsService:
                             "return_pct": round(((exit_price - entry_price) / entry_price) * 100.0 if entry_price > 0 else 0.0, 2),
                             "reason": exit_reason,
                             "days_held": days_held,
+                            "fees": round(float(position.get("fees_paid", 0.0)) + exit_fees, 4),
                         })
                         trade_id += 1
                         del open_positions[symbol]
@@ -318,6 +437,20 @@ class StrategyAnalyticsService:
                 if symbol in open_positions:
                     diagnostics["blocked_reasons"]["already_in_position"] += 1
                     continue
+
+                if emulate_live_trading:
+                    if not broker_tradable:
+                        diagnostics["blocked_reasons"]["not_tradable"] += 1
+                        continue
+                    if require_fractionable and not fractionable:
+                        diagnostics["blocked_reasons"]["not_fractionable"] += 1
+                        continue
+                    if day_realized_pnl <= -daily_risk_limit:
+                        diagnostics["blocked_reasons"]["daily_risk_limit"] += 1
+                        continue
+                    if risk_manager.circuit_breaker_active:
+                        diagnostics["blocked_reasons"]["risk_circuit_breaker"] += 1
+                        continue
 
                 diagnostics["entry_checks"] += 1
                 metrics = self._compute_signal_metrics(series_by_symbol[symbol], day, params)
@@ -337,29 +470,65 @@ class StrategyAnalyticsService:
                     float(pos["qty"]) * latest_price_by_symbol.get(sym, float(pos["entry_price"]))
                     for sym, pos in open_positions.items()
                 )
+                # DCA: first tranche uses position_size / dca_tranches
+                tranche_cap = min(params["position_size"], max_position_size) / dca_tranches
                 # Use shared risk-based position sizing.
                 target_notional = compute_risk_based_position_size(
                     equity=open_equity,
                     risk_per_trade_pct=params["risk_per_trade"],
                     stop_loss_pct=params["stop_loss_pct"],
-                    position_size_cap=params["position_size"],
+                    position_size_cap=tranche_cap,
                     cash=cash,
                 )
                 if target_notional < 1.0:
                     diagnostics["blocked_reasons"]["risk_cap_too_low"] += 1
                     continue
                 # Apply entry slippage (buy slightly higher).
-                fill_price = close * (1.0 + slippage_bps / 10000.0)
+                entry_slippage_bps = self._effective_slippage_bps(
+                    base_bps=slippage_bps,
+                    close=close,
+                    high=high,
+                    low=low,
+                    emulate_live=emulate_live_trading,
+                )
+                fill_price = close * (1.0 + entry_slippage_bps / 10000.0)
                 qty = target_notional / fill_price if fill_price > 0 else 0.0
+                if emulate_live_trading and not fractionable:
+                    qty = float(math.floor(qty))
                 if qty <= 0:
                     diagnostics["blocked_reasons"]["invalid_position_size"] += 1
                     continue
                 fill_notional = qty * fill_price
-                if fill_notional > cash:
+                fill_fees = self._estimate_trade_fees(
+                    side="buy",
+                    notional=fill_notional,
+                    quantity=qty,
+                    fee_bps=fee_bps,
+                    emulate_live=emulate_live_trading,
+                )
+                if emulate_live_trading:
+                    current_positions_for_risk = {
+                        sym: {
+                            "symbol": sym,
+                            "quantity": float(pos.get("qty", 0.0)),
+                            "market_value": float(pos.get("qty", 0.0)) * latest_price_by_symbol.get(sym, float(pos.get("entry_price", 0.0))),
+                        }
+                        for sym, pos in open_positions.items()
+                    }
+                    order_valid, _order_reason = risk_manager.validate_order(
+                        symbol=symbol,
+                        quantity=qty,
+                        price=fill_price,
+                        current_positions=current_positions_for_risk,
+                    )
+                    if not order_valid:
+                        diagnostics["blocked_reasons"]["risk_validation_failed"] += 1
+                        continue
+                if (fill_notional + fill_fees) > cash:
                     diagnostics["blocked_reasons"]["cash_insufficient"] += 1
                     continue
 
-                cash -= fill_notional
+                cash -= (fill_notional + fill_fees)
                 atr_pct = float(metrics["atr14_pct"])
                 atr_stop_price = fill_price * (1.0 - (params["atr_stop_mult"] * atr_pct / 100.0))
                 stop_loss_price = fill_price * (1.0 - params["stop_loss_pct"] / 100.0)
@@ -370,6 +539,10 @@ class StrategyAnalyticsService:
                     "atr_stop_price": min(atr_stop_price, stop_loss_price),
                     "take_profit_price": fill_price * (1.0 + params["take_profit_pct"] / 100.0),
                     "entry_date": day_ts.isoformat(),
+                    "dca_tranches_filled": 1,
+                    "dca_tranches_total": dca_tranches,
+                    "total_cost": fill_notional + fill_fees,
+                    "fees_paid": fill_fees,
                 }
                 diagnostics["entries_opened"] += 1
 
@@ -377,6 +550,7 @@ class StrategyAnalyticsService:
                 float(pos["qty"]) * latest_price_by_symbol.get(sym, float(pos["entry_price"]))
                 for sym, pos in open_positions.items()
             )
+            risk_manager.update_equity(cash + market_value)
             equity_curve.append({
                 "timestamp": day_ts.isoformat(),
                 "equity": round(cash + market_value, 2),
@@ -391,8 +565,18 @@ class StrategyAnalyticsService:
                 exit_price = close * (1.0 - slippage_bps / 10000.0)
                 qty = float(pos["qty"])
                 entry_price = float(pos["entry_price"])
-                pnl = (exit_price - entry_price) * qty
-                cash += qty * exit_price
+                exit_notional = qty * exit_price
+                exit_fees = self._estimate_trade_fees(
+                    side="sell",
+                    notional=exit_notional,
+                    quantity=qty,
+                    fee_bps=fee_bps,
+                    emulate_live=emulate_live_trading,
+                )
+                cost_basis = float(pos.get("total_cost", entry_price * qty))
+                pnl = (exit_notional - exit_fees) - cost_basis
+                cash += (exit_notional - exit_fees)
+                risk_manager.record_trade_result(pnl)
                 entry_date = datetime.fromisoformat(pos["entry_date"]).date()
                 days_held = (end_dt.date() - entry_date).days
                 diagnostics["exit_reasons"]["end_of_backtest"] += 1
@@ -408,6 +592,7 @@ class StrategyAnalyticsService:
                     "return_pct": round(((exit_price - entry_price) / entry_price) * 100.0 if entry_price > 0 else 0.0, 2),
                     "reason": "end_of_backtest",
                     "days_held": days_held,
+                    "fees": round(float(pos.get("fees_paid", 0.0)) + exit_fees, 4),
                 })
                 trade_id += 1
                 del open_positions[symbol]
@@ -433,6 +618,7 @@ class StrategyAnalyticsService:
         recovery_factor = self._calculate_recovery_factor(total_return, max_drawdown)
         calmar_ratio = self._calculate_calmar_ratio(equity_returns, max_drawdown)
         avg_hold_days = self._calculate_avg_hold_days(trades)
+        total_fees_paid = sum(float(t.get("fees", 0.0)) for t in trades)
 
         blocked_nonzero = [
             {"reason": reason, "count": count}
@@ -442,6 +628,16 @@ class StrategyAnalyticsService:
         blocked_nonzero.sort(key=lambda item: item["count"], reverse=True)
         diagnostics["top_blockers"] = blocked_nonzero[:5]
         diagnostics["symbols_without_data"] = sorted(set(diagnostics["symbols_without_data"]))
+        diagnostics["risk_metrics_end_state"] = risk_manager.get_risk_metrics()
+        diagnostics["symbol_capabilities_enforced"] = bool(symbol_capabilities)
+        if symbol_capabilities:
+            diagnostics["symbol_capabilities"] = {
+                symbol: {
+                    "tradable": bool((caps or {}).get("tradable", True)),
+                    "fractionable": bool((caps or {}).get("fractionable", True)),
+                }
+                for symbol, caps in symbol_capabilities.items()
+            }
         diagnostics["advanced_metrics"] = {
             "profit_factor": round(profit_factor, 3),
             "sortino_ratio": round(sortino_ratio, 3),
@@ -454,6 +650,7 @@ class StrategyAnalyticsService:
             "calmar_ratio": round(calmar_ratio, 3),
             "avg_hold_days": round(avg_hold_days, 1),
             "slippage_bps_applied": slippage_bps,
+            "fees_paid": round(total_fees_paid, 4),
         }
 
         return BacktestResult(
@@ -495,6 +692,9 @@ class StrategyAnalyticsService:
             "zscore_entry_threshold": -1.2,
             "dip_buy_threshold_pct": 1.5,
             "max_hold_days": 10.0,
+            "dca_tranches": 1.0,
+            "max_consecutive_losses": 3.0,
+            "max_drawdown_pct": 15.0,
         }
         resolved = dict(defaults)
         for key, value in overrides.items():
@@ -702,6 +902,52 @@ class StrategyAnalyticsService:
         if vol >= 0.015:
             return "high_volatility_range"
         return "range_bound"
+
+    def _effective_slippage_bps(
+        self,
+        base_bps: float,
+        close: float,
+        high: float,
+        low: float,
+        emulate_live: bool,
+    ) -> float:
+        """
+        Compute per-fill slippage in bps.
+
+        In live-emulation mode, widen slippage using half of the bar range to
+        better approximate execution uncertainty on historical bars.
+        """
+        base = max(0.0, float(base_bps))
+        if not emulate_live or close <= 0:
+            return base
+        bar_range_bps = max(0.0, ((high - low) / close) * 10000.0)
+        modeled = max(base, min(200.0, bar_range_bps * 0.5))
+        return modeled
+
+    def _estimate_trade_fees(
+        self,
+        side: str,
+        notional: float,
+        quantity: float,
+        fee_bps: float,
+        emulate_live: bool,
+    ) -> float:
+        """
+        Estimate execution costs.
+
+        - Optional generic fee bps on notional.
+        - In live emulation mode, apply sell-side SEC/TAF style regulatory fees.
+        """
+        gross = max(0.0, float(notional))
+        qty = max(0.0, float(quantity))
+        total_fees = gross * (max(0.0, float(fee_bps)) / 10000.0)
+        if emulate_live and side.lower() == "sell" and gross > 0 and qty > 0:
+            # SEC fee approximation (sell-side only): ~$8 per $1M notional.
+            sec_fee = gross * 0.000008
+            # FINRA TAF approximation (sell-side only): $0.000166/share, capped.
+            taf_fee = min(8.30, qty * 0.000166)
+            total_fees += sec_fee + taf_fee
+        return max(0.0, total_fees)
 
     # ------------------------------------------------------------------
     # Core statistical calculations

@@ -337,8 +337,243 @@ def test_paper_broker_get_market_data():
     """Test getting market data."""
     broker = PaperBroker()
     broker.connect()
-    
+
     data = broker.get_market_data("AAPL")
     assert "symbol" in data
     assert "price" in data
     assert data["symbol"] == "AAPL"
+
+
+# ============================================================================
+# Consecutive Loss Circuit Breaker Tests
+# ============================================================================
+
+def test_risk_manager_consecutive_loss_tracking():
+    """Test that consecutive losses are tracked correctly."""
+    risk_mgr = RiskManager(max_consecutive_losses=3)
+
+    # Record two losses - should not trigger
+    risk_mgr.record_trade_result(-50.0)
+    assert risk_mgr._consecutive_losses == 1
+    assert risk_mgr.circuit_breaker_active is False
+
+    risk_mgr.record_trade_result(-30.0)
+    assert risk_mgr._consecutive_losses == 2
+    assert risk_mgr.circuit_breaker_active is False
+
+    # Third loss triggers circuit breaker
+    risk_mgr.record_trade_result(-20.0)
+    assert risk_mgr._consecutive_losses == 3
+    assert risk_mgr.circuit_breaker_active is True
+    assert "consecutive" in risk_mgr.circuit_breaker_reason.lower()
+
+
+def test_risk_manager_consecutive_loss_reset_on_win():
+    """Test that a winning trade resets the consecutive loss counter."""
+    risk_mgr = RiskManager(max_consecutive_losses=3)
+
+    risk_mgr.record_trade_result(-50.0)
+    risk_mgr.record_trade_result(-30.0)
+    assert risk_mgr._consecutive_losses == 2
+
+    # A win resets the counter
+    risk_mgr.record_trade_result(100.0)
+    assert risk_mgr._consecutive_losses == 0
+    assert risk_mgr.circuit_breaker_active is False
+
+
+def test_risk_manager_consecutive_loss_deactivate_resets():
+    """Deactivating circuit breaker resets the consecutive loss counter."""
+    risk_mgr = RiskManager(max_consecutive_losses=2)
+
+    risk_mgr.record_trade_result(-50.0)
+    risk_mgr.record_trade_result(-30.0)
+    assert risk_mgr.circuit_breaker_active is True
+
+    risk_mgr.deactivate_circuit_breaker()
+    assert risk_mgr.circuit_breaker_active is False
+    assert risk_mgr._consecutive_losses == 0
+
+
+# ============================================================================
+# Drawdown Kill Switch Tests
+# ============================================================================
+
+def test_risk_manager_drawdown_tracking():
+    """Test equity drawdown monitoring."""
+    risk_mgr = RiskManager(max_drawdown_pct=10.0)
+
+    # Set peak equity
+    risk_mgr.update_equity(10000.0)
+    assert risk_mgr._peak_equity == 10000.0
+    assert risk_mgr.circuit_breaker_active is False
+
+    # Drop 5% - should not trigger
+    risk_mgr.update_equity(9500.0)
+    assert risk_mgr.circuit_breaker_active is False
+    assert risk_mgr._current_drawdown_pct == pytest.approx(5.0)
+
+
+def test_risk_manager_drawdown_triggers_kill_switch():
+    """Test that drawdown beyond threshold triggers circuit breaker."""
+    risk_mgr = RiskManager(max_drawdown_pct=10.0)
+
+    risk_mgr.update_equity(10000.0)
+
+    # Drop 10% - should trigger
+    risk_mgr.update_equity(9000.0)
+    assert risk_mgr.circuit_breaker_active is True
+    assert "drawdown" in risk_mgr.circuit_breaker_reason.lower()
+
+
+def test_risk_manager_drawdown_peak_updates():
+    """Peak equity should update when equity rises."""
+    risk_mgr = RiskManager(max_drawdown_pct=10.0)
+
+    risk_mgr.update_equity(10000.0)
+    assert risk_mgr._peak_equity == 10000.0
+
+    risk_mgr.update_equity(12000.0)
+    assert risk_mgr._peak_equity == 12000.0
+
+    # 8.3% drawdown from new peak - should not trigger
+    risk_mgr.update_equity(11000.0)
+    assert risk_mgr.circuit_breaker_active is False
+
+
+def test_risk_manager_metrics_include_new_fields():
+    """Risk metrics should include consecutive loss and drawdown tracking."""
+    risk_mgr = RiskManager(max_consecutive_losses=5, max_drawdown_pct=20.0)
+    risk_mgr.record_trade_result(-10.0)
+    risk_mgr.record_trade_result(50.0)
+    risk_mgr.update_equity(10000.0)
+
+    metrics = risk_mgr.get_risk_metrics()
+
+    assert "consecutive_losses" in metrics
+    assert "max_consecutive_losses" in metrics
+    assert metrics["max_consecutive_losses"] == 5
+    assert "total_wins" in metrics
+    assert metrics["total_wins"] == 1
+    assert "total_losses" in metrics
+    assert metrics["total_losses"] == 1
+    assert "peak_equity" in metrics
+    assert metrics["peak_equity"] == 10000.0
+    assert "current_drawdown_pct" in metrics
+    assert "max_drawdown_pct" in metrics
+    assert metrics["max_drawdown_pct"] == 20.0
+
+
+# ============================================================================
+# Budget Tracker Tests
+# ============================================================================
+
+def test_budget_tracker_basic():
+    """Test basic budget tracker functionality."""
+    from services.budget_tracker import WeeklyBudgetTracker
+
+    tracker = WeeklyBudgetTracker(weekly_budget=200.0)
+    status = tracker.get_budget_status()
+
+    assert status["weekly_budget"] == 200.0
+    assert status["used_budget"] == 0.0
+    assert status["remaining_budget"] == 200.0
+    assert status["trades_this_week"] == 0
+
+
+def test_budget_tracker_record_trade():
+    """Test recording a buy trade uses budget."""
+    from services.budget_tracker import WeeklyBudgetTracker
+
+    tracker = WeeklyBudgetTracker(weekly_budget=200.0)
+    result = tracker.record_trade(100.0, is_buy=True)
+    assert result is True
+
+    status = tracker.get_budget_status()
+    assert status["used_budget"] == 100.0
+    assert status["remaining_budget"] == 100.0
+    assert status["trades_this_week"] == 1
+
+
+def test_budget_tracker_reinvestment():
+    """Test profit reinvestment adds back to available budget."""
+    from services.budget_tracker import WeeklyBudgetTracker
+
+    tracker = WeeklyBudgetTracker(
+        weekly_budget=200.0,
+        reinvest_profits=True,
+        reinvest_pct=50.0,
+    )
+
+    # Use $150 of budget
+    tracker.record_trade(150.0, is_buy=True)
+    assert tracker.get_remaining_budget() == pytest.approx(50.0)
+
+    # Record a $40 profit - 50% reinvested = $20 freed up
+    tracker.record_trade(0, is_buy=False, realized_pnl=40.0)
+
+    status = tracker.get_budget_status()
+    assert status["reinvested_amount"] == pytest.approx(20.0)
+    # Remaining should be 50 + 20 = 70
+    assert status["remaining_budget"] == pytest.approx(70.0)
+
+
+def test_budget_tracker_no_reinvestment_on_loss():
+    """Losses should not trigger reinvestment."""
+    from services.budget_tracker import WeeklyBudgetTracker
+
+    tracker = WeeklyBudgetTracker(
+        weekly_budget=200.0,
+        reinvest_profits=True,
+        reinvest_pct=50.0,
+    )
+
+    tracker.record_trade(100.0, is_buy=True)
+    tracker.record_trade(0, is_buy=False, realized_pnl=-30.0)
+
+    status = tracker.get_budget_status()
+    assert status["reinvested_amount"] == 0.0
+    assert status["weekly_pnl"] == -30.0
+
+
+def test_budget_tracker_can_trade():
+    """Test budget limit enforcement."""
+    from services.budget_tracker import WeeklyBudgetTracker
+
+    tracker = WeeklyBudgetTracker(weekly_budget=100.0)
+
+    can, _ = tracker.can_trade(80.0)
+    assert can is True
+
+    tracker.record_trade(80.0, is_buy=True)
+
+    can, reason = tracker.can_trade(50.0)
+    assert can is False
+    assert "budget" in reason.lower()
+
+
+def test_budget_tracker_status_fields():
+    """Budget status should include all compounding/scaling fields."""
+    from services.budget_tracker import WeeklyBudgetTracker
+
+    tracker = WeeklyBudgetTracker(
+        weekly_budget=50.0,
+        reinvest_profits=True,
+        reinvest_pct=40.0,
+        auto_scale_budget=True,
+        auto_scale_pct=10.0,
+    )
+    status = tracker.get_budget_status()
+
+    assert "base_weekly_budget" in status
+    assert status["base_weekly_budget"] == 50.0
+    assert "reinvest_profits" in status
+    assert status["reinvest_profits"] is True
+    assert "reinvest_pct" in status
+    assert status["reinvest_pct"] == 40.0
+    assert "auto_scale_budget" in status
+    assert status["auto_scale_budget"] is True
+    assert "auto_scale_pct" in status
+    assert status["auto_scale_pct"] == 10.0
+    assert "cumulative_pnl" in status
+    assert "consecutive_profitable_weeks" in status

@@ -52,6 +52,13 @@ class BacktestRequest(BaseModel):
     initial_capital: float = 100000.0
     symbols: Optional[List[str]] = None
     parameters: Optional[Dict[str, float]] = None
+    emulate_live_trading: bool = False
+    symbol_capabilities: Optional[Dict[str, Dict[str, bool]]] = None
+    require_fractionable: bool = False
+    max_position_size: Optional[float] = None
+    risk_limit_daily: Optional[float] = None
+    fee_bps: float = 0.0
+    universe_context: Optional[Dict[str, Any]] = None
 
 
 class BacktestResult(BaseModel):
@@ -101,10 +108,10 @@ def get_default_parameters() -> List[StrategyParameter]:
         StrategyParameter(
             name="position_size",
             value=1000.0,
-            min_value=100.0,
+            min_value=50.0,
             max_value=10000.0,
-            step=100.0,
-            description="Size of each position in dollars"
+            step=25.0,
+            description="Size of each position in dollars (supports micro-budget sizing down to $50)"
         ),
         StrategyParameter(
             name="stop_loss_pct",
@@ -159,7 +166,7 @@ def get_default_parameters() -> List[StrategyParameter]:
             value=1.5,
             min_value=0.3,
             max_value=10.0,
-            step=0.25,
+            step=0.05,
             description="Percent below SMA50 required to consider dip buy"
         ),
         StrategyParameter(
@@ -169,5 +176,29 @@ def get_default_parameters() -> List[StrategyParameter]:
             max_value=60.0,
             step=1.0,
             description="Maximum days to hold a position before forced exit"
+        ),
+        StrategyParameter(
+            name="dca_tranches",
+            value=1.0,
+            min_value=1.0,
+            max_value=3.0,
+            step=1.0,
+            description="Number of DCA entry tranches (1=full entry, 2-3=split buys on deeper dips)"
+        ),
+        StrategyParameter(
+            name="max_consecutive_losses",
+            value=3.0,
+            min_value=1.0,
+            max_value=10.0,
+            step=1.0,
+            description="Halt trading after this many consecutive losing trades"
+        ),
+        StrategyParameter(
+            name="max_drawdown_pct",
+            value=15.0,
+            min_value=3.0,
+            max_value=50.0,
+            step=1.0,
+            description="Kill switch: halt trading when account drops this % from peak"
         ),
     ]

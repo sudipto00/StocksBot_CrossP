@@ -220,6 +220,7 @@ class RunnerManager:
                             "zscore_entry_threshold": float(merged_params.get("zscore_entry_threshold", -1.2)),
                             "dip_buy_threshold_pct": float(merged_params.get("dip_buy_threshold_pct", 1.5)),
                             "max_hold_days": int(merged_params.get("max_hold_days", 10)),
+                            "dca_tranches": int(merged_params.get("dca_tranches", 1)),
                             "alpaca_client": alpaca_client,
                             "require_real_data": require_real_data,
                         })
@@ -279,17 +280,18 @@ class RunnerManager:
         # trailing_stop_pct >= stop_loss_pct to avoid redundancy.
         # max_hold_days caps holding period for timely exits.
         stock_defaults = {
-            "weekly_optimized": {"position_size": 1200, "risk_per_trade": 1.5, "stop_loss_pct": 2.0, "take_profit_pct": 5.0, "trailing_stop_pct": 2.5, "atr_stop_mult": 2.0, "zscore_entry_threshold": -1.2, "dip_buy_threshold_pct": 1.5, "max_hold_days": 10},
-            "three_to_five_weekly": {"position_size": 1000, "risk_per_trade": 1.2, "stop_loss_pct": 2.5, "take_profit_pct": 6.0, "trailing_stop_pct": 2.8, "atr_stop_mult": 1.9, "zscore_entry_threshold": -1.3, "dip_buy_threshold_pct": 2.0, "max_hold_days": 7},
-            "monthly_optimized": {"position_size": 900, "risk_per_trade": 1.0, "stop_loss_pct": 3.5, "take_profit_pct": 8.0, "trailing_stop_pct": 3.5, "atr_stop_mult": 2.2, "zscore_entry_threshold": -1.5, "dip_buy_threshold_pct": 2.5, "max_hold_days": 30},
-            "small_budget_weekly": {"position_size": 500, "risk_per_trade": 0.8, "stop_loss_pct": 2.0, "take_profit_pct": 5.0, "trailing_stop_pct": 2.5, "atr_stop_mult": 1.8, "zscore_entry_threshold": -1.2, "dip_buy_threshold_pct": 1.5, "max_hold_days": 10},
+            "weekly_optimized": {"position_size": 1200, "risk_per_trade": 1.5, "stop_loss_pct": 2.0, "take_profit_pct": 5.0, "trailing_stop_pct": 2.5, "atr_stop_mult": 2.0, "zscore_entry_threshold": -1.2, "dip_buy_threshold_pct": 1.5, "max_hold_days": 10, "dca_tranches": 1, "max_consecutive_losses": 3, "max_drawdown_pct": 15.0},
+            "three_to_five_weekly": {"position_size": 1000, "risk_per_trade": 1.2, "stop_loss_pct": 2.5, "take_profit_pct": 6.0, "trailing_stop_pct": 2.8, "atr_stop_mult": 1.9, "zscore_entry_threshold": -1.3, "dip_buy_threshold_pct": 2.0, "max_hold_days": 7, "dca_tranches": 1, "max_consecutive_losses": 3, "max_drawdown_pct": 15.0},
+            "monthly_optimized": {"position_size": 900, "risk_per_trade": 1.0, "stop_loss_pct": 3.5, "take_profit_pct": 8.0, "trailing_stop_pct": 3.5, "atr_stop_mult": 2.2, "zscore_entry_threshold": -1.5, "dip_buy_threshold_pct": 2.5, "max_hold_days": 30, "dca_tranches": 1, "max_consecutive_losses": 3, "max_drawdown_pct": 15.0},
+            "small_budget_weekly": {"position_size": 500, "risk_per_trade": 0.8, "stop_loss_pct": 2.0, "take_profit_pct": 5.0, "trailing_stop_pct": 2.5, "atr_stop_mult": 1.8, "zscore_entry_threshold": -1.2, "dip_buy_threshold_pct": 1.5, "max_hold_days": 10, "dca_tranches": 1, "max_consecutive_losses": 3, "max_drawdown_pct": 15.0},
+            "micro_budget": {"position_size": 75, "risk_per_trade": 0.5, "stop_loss_pct": 1.5, "take_profit_pct": 4.0, "trailing_stop_pct": 2.0, "atr_stop_mult": 1.5, "zscore_entry_threshold": -1.0, "dip_buy_threshold_pct": 1.2, "max_hold_days": 7, "dca_tranches": 2, "max_consecutive_losses": 2, "max_drawdown_pct": 10.0},
         }
         # ETF presets — relaxed z-score/dip thresholds (ETFs move less than stocks).
         # Tighter stops with higher TP for better reward:risk.
         etf_defaults = {
-            "conservative": {"position_size": 1000, "risk_per_trade": 0.8, "stop_loss_pct": 2.0, "take_profit_pct": 5.0, "trailing_stop_pct": 2.5, "atr_stop_mult": 1.6, "zscore_entry_threshold": -1.0, "dip_buy_threshold_pct": 1.2, "max_hold_days": 12},
-            "balanced": {"position_size": 1000, "risk_per_trade": 1.0, "stop_loss_pct": 2.5, "take_profit_pct": 6.0, "trailing_stop_pct": 2.8, "atr_stop_mult": 1.9, "zscore_entry_threshold": -1.2, "dip_buy_threshold_pct": 1.5, "max_hold_days": 10},
-            "aggressive": {"position_size": 1300, "risk_per_trade": 1.4, "stop_loss_pct": 3.5, "take_profit_pct": 8.0, "trailing_stop_pct": 3.5, "atr_stop_mult": 2.0, "zscore_entry_threshold": -1.5, "dip_buy_threshold_pct": 2.0, "max_hold_days": 8},
+            "conservative": {"position_size": 1000, "risk_per_trade": 0.8, "stop_loss_pct": 2.0, "take_profit_pct": 5.0, "trailing_stop_pct": 2.5, "atr_stop_mult": 1.6, "zscore_entry_threshold": -1.0, "dip_buy_threshold_pct": 1.2, "max_hold_days": 12, "dca_tranches": 1, "max_consecutive_losses": 3, "max_drawdown_pct": 15.0},
+            "balanced": {"position_size": 1000, "risk_per_trade": 1.0, "stop_loss_pct": 2.5, "take_profit_pct": 6.0, "trailing_stop_pct": 2.8, "atr_stop_mult": 1.9, "zscore_entry_threshold": -1.2, "dip_buy_threshold_pct": 1.5, "max_hold_days": 10, "dca_tranches": 1, "max_consecutive_losses": 3, "max_drawdown_pct": 15.0},
+            "aggressive": {"position_size": 1300, "risk_per_trade": 1.4, "stop_loss_pct": 3.5, "take_profit_pct": 8.0, "trailing_stop_pct": 3.5, "atr_stop_mult": 2.0, "zscore_entry_threshold": -1.5, "dip_buy_threshold_pct": 2.0, "max_hold_days": 8, "dca_tranches": 1, "max_consecutive_losses": 3, "max_drawdown_pct": 15.0},
         }
         if asset_type == "etf":
             return etf_defaults.get(etf_preset, etf_defaults["balanced"])

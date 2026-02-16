@@ -16,6 +16,7 @@ class RiskProfile(str, Enum):
     CONSERVATIVE = "conservative"
     BALANCED = "balanced"
     AGGRESSIVE = "aggressive"
+    MICRO_BUDGET = "micro_budget"
 
 
 # Risk profile configurations for weekly trading with $200 budget.
@@ -69,6 +70,30 @@ RISK_PROFILES: Dict[str, Dict[str, Any]] = {
         "diversification_required": False,
         "hold_period_days": 5,
         "max_hold_days": 8,
+    },
+    "micro_budget": {
+        "name": "Micro Budget",
+        "description": "Optimized for micro accounts ($100 seed, $20-$50/week). "
+                       "DCA entries, tight stops, profit compounding",
+        "max_position_size": 75.0,
+        "max_positions": 2,
+        "position_size_percent": 0.35,
+        "stop_loss_percent": 0.015,
+        "take_profit_percent": 0.04,
+        "max_weekly_loss": 0.10,
+        "preferred_assets": ["etf", "large_cap_stocks"],
+        "min_volume": 1000000,
+        "volatility_threshold": "low",
+        "diversification_required": True,
+        "hold_period_days": 5,
+        "max_hold_days": 7,
+        "dca_tranches": 2,
+        "max_consecutive_losses": 2,
+        "max_drawdown_pct": 10.0,
+        "reinvest_profits": True,
+        "reinvest_pct": 50.0,
+        "auto_scale_budget": True,
+        "auto_scale_pct": 10.0,
     },
 }
 

@@ -492,6 +492,19 @@ export interface BacktestRequest {
   initial_capital?: number;
   symbols?: string[];
   parameters?: Record<string, number>;
+  emulate_live_trading?: boolean;
+  use_workspace_universe?: boolean;
+  asset_type?: 'stock' | 'etf';
+  screener_mode?: 'most_active' | 'preset';
+  stock_preset?: 'weekly_optimized' | 'three_to_five_weekly' | 'monthly_optimized' | 'small_budget_weekly' | 'micro_budget';
+  etf_preset?: 'conservative' | 'balanced' | 'aggressive';
+  screener_limit?: number;
+  seed_only?: boolean;
+  preset_universe_mode?: 'seed_only' | 'seed_guardrail_blend' | 'guardrail_only';
+  min_dollar_volume?: number;
+  max_spread_bps?: number;
+  max_sector_weight_pct?: number;
+  auto_regime_adjust?: boolean;
 }
 
 export interface BacktestTrade {
@@ -530,6 +543,7 @@ export interface BacktestAdvancedMetrics {
   calmar_ratio: number;
   avg_hold_days: number;
   slippage_bps_applied: number;
+  fees_paid?: number;
 }
 
 export interface BacktestDiagnostics {
@@ -586,9 +600,10 @@ export interface ParameterTuneResponse {
 // ============================================================================
 
 export type AssetTypePreference = 'stock' | 'etf';
-export type RiskProfilePreference = 'conservative' | 'balanced' | 'aggressive';
+export type RiskProfilePreference = 'conservative' | 'balanced' | 'aggressive' | 'micro_budget';
 export type ScreenerModePreference = 'most_active' | 'preset';
-export type StockPresetPreference = 'weekly_optimized' | 'three_to_five_weekly' | 'monthly_optimized' | 'small_budget_weekly';
+export type PresetUniverseModePreference = 'seed_only' | 'seed_guardrail_blend' | 'guardrail_only';
+export type StockPresetPreference = 'weekly_optimized' | 'three_to_five_weekly' | 'monthly_optimized' | 'small_budget_weekly' | 'micro_budget';
 export type EtfPresetPreference = 'conservative' | 'balanced' | 'aggressive';
 
 export interface TradingPreferences {
@@ -613,6 +628,7 @@ export interface TradingPreferencesUpdateRequest {
 
 export interface BudgetStatus {
   weekly_budget: number;
+  base_weekly_budget?: number;
   used_budget: number;
   remaining_budget: number;
   used_percent: number;
@@ -620,6 +636,13 @@ export interface BudgetStatus {
   weekly_pnl: number;
   week_start: string;
   days_remaining: number;
+  reinvested_amount?: number;
+  reinvest_profits?: boolean;
+  reinvest_pct?: number;
+  auto_scale_budget?: boolean;
+  auto_scale_pct?: number;
+  cumulative_pnl?: number;
+  consecutive_profitable_weeks?: number;
 }
 
 export interface PreferenceRecommendationGuardrails {

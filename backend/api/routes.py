@@ -83,9 +83,16 @@ from .models import (
     ParameterTuneResponse,
     StrategyParameter,
     ScreenerPreset,
+    AssetType,
+    ScreenerMode,
+    PresetUniverseMode,
+    StockPreset,
+    EtfPreset,
+    TradingPreferencesResponse,
 )
 from .runner_manager import runner_manager
 from services.strategy_analytics import StrategyAnalyticsService
+from services.market_screener import MarketScreener
 from config.strategy_config import get_default_parameters
 
 router = APIRouter()
@@ -504,6 +511,68 @@ def _load_holdings_snapshot(storage: StorageService, broker: Optional[BrokerInte
             "asset_type": "",
         })
     return holdings
+
+
+def _collect_symbol_capabilities(
+    broker: Optional[BrokerInterface],
+    assets: List[Dict[str, Any]],
+) -> Dict[str, Dict[str, bool]]:
+    """Resolve tradable/fractionable capabilities for symbols in the candidate universe."""
+    capabilities: Dict[str, Dict[str, bool]] = {}
+    if broker is None:
+        return capabilities
+    for asset in assets:
+        symbol = str(asset.get("symbol", "")).strip().upper()
+        if not symbol or symbol in capabilities:
+            continue
+        raw: Dict[str, Any] = {}
+        try:
+            raw_caps = broker.get_symbol_capabilities(symbol)
+            if isinstance(raw_caps, dict):
+                raw = raw_caps
+        except (RuntimeError, ValueError, TypeError, KeyError, AttributeError):
+            raw = {}
+
+        if "tradable" not in raw:
+            try:
+                raw["tradable"] = bool(broker.is_symbol_tradable(symbol))
+            except (RuntimeError, ValueError, TypeError, KeyError, AttributeError):
+                raw["tradable"] = True
+        if "fractionable" not in raw:
+            try:
+                raw["fractionable"] = bool(broker.is_symbol_fractionable(symbol))
+            except (RuntimeError, ValueError, TypeError, KeyError, AttributeError):
+                raw["fractionable"] = True
+
+        capabilities[symbol] = {
+            "tradable": bool(raw.get("tradable", True)),
+            "fractionable": bool(raw.get("fractionable", True)),
+        }
+    return capabilities
+
+
+def _should_require_fractionable_symbols(
+    asset_type: "AssetType",
+    prefs: "TradingPreferencesResponse",
+    account_snapshot: Dict[str, float],
+) -> bool:
+    """
+    Determine when screener should strictly require fractional-ready symbols.
+
+    Enforced for stock micro/small-budget workflows where fractional execution is
+    the key way to keep a broad, affordable universe.
+    """
+    if asset_type != AssetType.STOCK:
+        return False
+    weekly_budget = _safe_float(prefs.weekly_budget, 200.0)
+    buying_power = _safe_float(account_snapshot.get("buying_power", 0.0), 0.0)
+    equity = _safe_float(account_snapshot.get("equity", 0.0), 0.0)
+    return (
+        prefs.stock_preset == StockPreset.MICRO_BUDGET
+        or weekly_budget <= 300.0
+        or buying_power <= 5_000.0
+        or equity <= 20_000.0
+    )
 
 
 def _capture_portfolio_snapshot(storage: StorageService, broker: Optional[BrokerInterface]) -> Optional[Dict[str, float]]:
@@ -1707,6 +1776,195 @@ async def get_runner_status():
     return RunnerStatusResponse(**status)
 
 
+@router.get("/runner/preflight")
+async def get_runner_preflight(db: Session = Depends(get_db)):
+    """
+    Validate active strategies against live execution constraints before runner start.
+    """
+    storage = StorageService(db)
+    config = _load_runtime_config(storage)
+    _set_config_snapshot(config)
+    prefs = _load_trading_preferences(storage)
+    active_strategies = storage.get_active_strategies()
+    existing_position_count = len(storage.get_open_positions())
+
+    broker_error = ""
+    broker: Optional[BrokerInterface] = None
+    try:
+        broker = get_broker()
+    except RuntimeError as exc:
+        broker_error = str(exc)
+        broker = None
+
+    account_snapshot = _load_account_snapshot(broker)
+    equity = _safe_float(account_snapshot.get("equity", 0.0), 0.0)
+    buying_power = _safe_float(account_snapshot.get("buying_power", 0.0), 0.0)
+    weekly_budget = _safe_float(prefs.weekly_budget, 200.0)
+    budget_tracker = get_budget_tracker(weekly_budget)
+    budget_tracker.set_weekly_budget(weekly_budget)
+    remaining_weekly_budget = _safe_float(
+        budget_tracker.get_budget_status().get("remaining_budget", weekly_budget),
+        weekly_budget,
+    )
+    budget_candidates = [v for v in (buying_power, remaining_weekly_budget, equity * 0.20) if v > 0]
+    portfolio_budget_cap = min(budget_candidates) if budget_candidates else 0.0
+
+    capability_cache: Dict[str, Dict[str, bool]] = {}
+
+    def _symbol_capabilities(symbol: str) -> Dict[str, bool]:
+        normalized = str(symbol or "").strip().upper()
+        if not normalized:
+            return {"tradable": False, "fractionable": False}
+        if normalized in capability_cache:
+            return capability_cache[normalized]
+        raw = _collect_symbol_capabilities(broker, [{"symbol": normalized}]).get(normalized, {})
+        payload = {
+            "tradable": bool(raw.get("tradable", True)),
+            "fractionable": bool(raw.get("fractionable", True)),
+        }
+        capability_cache[normalized] = payload
+        return payload
+
+    preset_defaults = runner_manager._strategy_param_defaults_from_prefs({
+        "asset_type": prefs.asset_type.value,
+        "stock_preset": prefs.stock_preset.value,
+        "etf_preset": prefs.etf_preset.value,
+    })
+    allowed_params = set(preset_defaults.keys())
+    require_fractionable = _should_require_fractionable_symbols(prefs.asset_type, prefs, account_snapshot)
+
+    strategy_rows: List[Dict[str, Any]] = []
+    eligible_strategy_count = 0
+    total_symbols = 0
+    eligible_symbols = 0
+
+    for db_strategy in active_strategies:
+        strategy_config = db_strategy.config or {}
+        raw_symbols = strategy_config.get("symbols", [])
+        symbols = runner_manager._normalize_symbols(raw_symbols if isinstance(raw_symbols, list) else [])
+        params = strategy_config.get("parameters", {}) if isinstance(strategy_config.get("parameters", {}), dict) else {}
+        validated_params: Dict[str, float] = {}
+        for key, value in params.items():
+            if key not in allowed_params:
+                continue
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(numeric):
+                validated_params[key] = numeric
+        merged_params = {**preset_defaults, **validated_params}
+        dynamic_position_size = runner_manager._dynamic_position_size(
+            requested_position_size=float(merged_params.get("position_size", 1000.0)),
+            symbol_count=max(1, len(symbols)),
+            existing_position_count=existing_position_count,
+            remaining_weekly_budget=remaining_weekly_budget,
+            buying_power=buying_power,
+            equity=equity,
+            risk_per_trade_pct=float(merged_params.get("risk_per_trade", 1.0)),
+            stop_loss_pct=float(merged_params.get("stop_loss_pct", 2.0)),
+        )
+        dca_tranches = max(1, int(_safe_float(merged_params.get("dca_tranches", 1), 1)))
+        per_tranche_target = max(1.0, dynamic_position_size / dca_tranches)
+
+        symbol_rows: List[Dict[str, Any]] = []
+        strategy_eligible_symbols = 0
+        for symbol in symbols:
+            total_symbols += 1
+            capabilities = _symbol_capabilities(symbol)
+            broker_tradable = bool(capabilities.get("tradable", True))
+            fractionable = bool(capabilities.get("fractionable", True))
+            price = 0.0
+            if broker is not None:
+                try:
+                    quote = broker.get_market_data(symbol)
+                    price = max(0.0, _safe_float(quote.get("price", 0.0), 0.0))
+                except (RuntimeError, ValueError, TypeError, KeyError):
+                    price = 0.0
+
+            if fractionable:
+                required_ticket = (
+                    min(per_tranche_target, max(1.0, portfolio_budget_cap * 0.60))
+                    if portfolio_budget_cap > 0
+                    else per_tranche_target
+                )
+                affordable = portfolio_budget_cap <= 0 or portfolio_budget_cap >= 1.0
+            else:
+                required_ticket = max(price, per_tranche_target)
+                affordable = portfolio_budget_cap <= 0 or required_ticket <= portfolio_budget_cap * 1.10
+
+            eligible = broker_tradable and affordable and (fractionable or not require_fractionable)
+            reasons: List[str] = []
+            if not broker_tradable:
+                reasons.append("not broker tradable")
+            if require_fractionable and not fractionable:
+                reasons.append("not fractionable")
+            if not affordable:
+                reasons.append("budget constrained")
+
+            symbol_rows.append({
+                "symbol": symbol,
+                "price": round(price, 4),
+                "broker_tradable": broker_tradable,
+                "fractionable": fractionable,
+                "required_ticket": round(required_ticket, 2),
+                "affordable": affordable,
+                "eligible": eligible,
+                "reasons": reasons,
+            })
+            if eligible:
+                strategy_eligible_symbols += 1
+                eligible_symbols += 1
+
+        strategy_ready = len(symbols) > 0 and strategy_eligible_symbols > 0
+        if strategy_ready:
+            eligible_strategy_count += 1
+
+        strategy_rows.append({
+            "strategy_id": db_strategy.id,
+            "name": db_strategy.name,
+            "status": (
+                getattr(getattr(db_strategy, "status", "active"), "value", None)
+                or str(getattr(db_strategy, "status", "active"))
+            ),
+            "symbol_count": len(symbols),
+            "eligible_symbol_count": strategy_eligible_symbols,
+            "dynamic_position_size": dynamic_position_size,
+            "dca_tranches": dca_tranches,
+            "symbols": symbol_rows,
+            "ready": strategy_ready,
+        })
+
+    runner_ready = bool(
+        broker is not None
+        and not broker_error
+        and strategy_rows
+        and eligible_strategy_count == len(strategy_rows)
+    )
+
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "runner_ready": runner_ready,
+        "broker_ready": broker is not None and not broker_error,
+        "broker_error": broker_error,
+        "require_fractionable": require_fractionable,
+        "portfolio_context": {
+            "equity": equity,
+            "buying_power": buying_power,
+            "weekly_budget": weekly_budget,
+            "remaining_weekly_budget": remaining_weekly_budget,
+            "portfolio_budget_cap": portfolio_budget_cap,
+        },
+        "summary": {
+            "active_strategy_count": len(strategy_rows),
+            "ready_strategy_count": eligible_strategy_count,
+            "total_symbols": total_symbols,
+            "eligible_symbols": eligible_symbols,
+        },
+        "strategies": strategy_rows,
+    }
+
+
 @router.get("/maintenance/storage")
 async def get_storage_settings():
     """Get configured log/audit storage paths and a quick file inventory."""
@@ -2276,6 +2534,168 @@ def _adaptive_strategy_parameter_defaults(
     return defaults
 
 
+def _resolve_backtest_asset_type(
+    request_asset_type: Optional[str],
+    prefs: TradingPreferencesResponse,
+) -> AssetType:
+    """Resolve workspace asset type for backtest universe generation."""
+    if request_asset_type in {"stock", "etf"}:
+        return AssetType(request_asset_type)
+    if prefs.asset_type in (AssetType.STOCK, AssetType.ETF):
+        return prefs.asset_type
+    # AssetType.BOTH is unsupported for preset backtesting; choose stock default.
+    return AssetType.STOCK
+
+
+def _resolve_workspace_universe_for_backtest(
+    storage: StorageService,
+    screener: MarketScreener,
+    prefs: TradingPreferencesResponse,
+    request: BacktestRequest,
+    broker: Optional[BrokerInterface],
+    initial_capital: float,
+) -> tuple[List[str], Dict[str, Any]]:
+    """
+    Build a backtest symbol universe from screener workspace controls.
+
+    Mirrors Screener universe mode + guardrails so backtest and runner inputs stay aligned.
+    """
+    final_asset_type = _resolve_backtest_asset_type(request.asset_type, prefs)
+    requested_mode = request.screener_mode
+    if final_asset_type == AssetType.ETF:
+        final_mode = ScreenerMode.PRESET
+    elif requested_mode in {"most_active", "preset"}:
+        final_mode = ScreenerMode(requested_mode)
+    else:
+        final_mode = prefs.screener_mode if prefs.screener_mode in (ScreenerMode.MOST_ACTIVE, ScreenerMode.PRESET) else ScreenerMode.MOST_ACTIVE
+
+    final_limit = int(request.screener_limit) if request.screener_limit is not None else int(prefs.screener_limit)
+    final_limit = max(10, min(200, final_limit))
+    min_dollar_volume = _safe_float(request.min_dollar_volume, 10_000_000.0)
+    max_spread_bps = _safe_float(request.max_spread_bps, 50.0)
+    max_sector_weight_pct = _safe_float(request.max_sector_weight_pct, 45.0)
+    auto_regime_adjust = True if request.auto_regime_adjust is None else bool(request.auto_regime_adjust)
+
+    resolved_preset_universe_mode = "seed_guardrail_blend"
+    resolved_preset_name: Optional[str] = None
+
+    if final_mode == ScreenerMode.PRESET:
+        if final_asset_type == AssetType.STOCK:
+            resolved_preset_name = str(request.stock_preset or prefs.stock_preset.value).strip().lower()
+            valid_stock = {"weekly_optimized", "three_to_five_weekly", "monthly_optimized", "small_budget_weekly", "micro_budget"}
+            if resolved_preset_name not in valid_stock:
+                resolved_preset_name = prefs.stock_preset.value
+        else:
+            resolved_preset_name = str(request.etf_preset or prefs.etf_preset.value).strip().lower()
+            valid_etf = {"conservative", "balanced", "aggressive"}
+            if resolved_preset_name not in valid_etf:
+                resolved_preset_name = prefs.etf_preset.value
+
+        mode_candidate = (
+            str(request.preset_universe_mode).strip().lower()
+            if request.preset_universe_mode is not None
+            else ("seed_only" if bool(request.seed_only) else "seed_guardrail_blend")
+        )
+        if mode_candidate not in {"seed_only", "seed_guardrail_blend", "guardrail_only"}:
+            raise HTTPException(
+                status_code=400,
+                detail="preset_universe_mode must be one of: seed_only, seed_guardrail_blend, guardrail_only",
+            )
+        resolved_preset_universe_mode = mode_candidate
+
+        preset_guardrails = screener.get_preset_guardrails(final_asset_type.value, resolved_preset_name)
+        min_dollar_volume = max(min_dollar_volume, float(preset_guardrails["min_dollar_volume"]))
+        max_spread_bps = min(max_spread_bps, float(preset_guardrails["max_spread_bps"]))
+        max_sector_weight_pct = min(max_sector_weight_pct, float(preset_guardrails["max_sector_weight_pct"]))
+        assets_raw = screener.get_preset_assets(
+            final_asset_type.value,
+            resolved_preset_name,
+            final_limit,
+            seed_only=resolved_preset_universe_mode == "seed_only",
+            preset_universe_mode=resolved_preset_universe_mode,
+        )
+    else:
+        from services.market_screener import AssetType as ScreenerAssetType
+
+        assets_raw = screener.get_screener_results(
+            ScreenerAssetType(final_asset_type.value),
+            final_limit,
+        )
+
+    regime = screener.detect_market_regime()
+    strategy_defaults = _adaptive_strategy_parameter_defaults(storage, max(1, final_limit))
+    target_position_size = runner_manager._dynamic_position_size(
+        requested_position_size=_safe_float(strategy_defaults.get("position_size", 1000.0), 1000.0),
+        symbol_count=max(1, final_limit),
+        existing_position_count=0,
+        remaining_weekly_budget=_safe_float(prefs.weekly_budget, 200.0),
+        buying_power=max(0.0, float(initial_capital)),
+        equity=max(0.0, float(initial_capital)),
+        risk_per_trade_pct=_safe_float(strategy_defaults.get("risk_per_trade", 1.0), 1.0),
+        stop_loss_pct=_safe_float(strategy_defaults.get("stop_loss_pct", 2.0), 2.0),
+    )
+    dca_tranches = max(1, int(_safe_float(strategy_defaults.get("dca_tranches", 1), 1)))
+    synthetic_account = {
+        "equity": max(0.0, float(initial_capital)),
+        "buying_power": max(0.0, float(initial_capital)),
+    }
+    require_fractionable = _should_require_fractionable_symbols(final_asset_type, prefs, synthetic_account)
+    enforce_execution_capabilities = bool(final_asset_type == AssetType.STOCK and require_fractionable)
+    symbol_capabilities = (
+        _collect_symbol_capabilities(broker, assets_raw)
+        if enforce_execution_capabilities
+        else {}
+    )
+    optimized = screener.optimize_assets(
+        assets_raw,
+        limit=final_limit,
+        min_dollar_volume=min_dollar_volume,
+        max_spread_bps=max_spread_bps,
+        max_sector_weight_pct=max_sector_weight_pct,
+        regime=regime,
+        auto_regime_adjust=auto_regime_adjust,
+        current_holdings=[],
+        buying_power=max(0.0, float(initial_capital)),
+        equity=max(0.0, float(initial_capital)),
+        weekly_budget=_safe_float(prefs.weekly_budget, 200.0),
+        symbol_capabilities=symbol_capabilities,
+        require_broker_tradable=enforce_execution_capabilities,
+        require_fractionable=require_fractionable,
+        target_position_size=target_position_size,
+        dca_tranches=dca_tranches,
+    )
+    symbols = _normalize_symbols([str(asset.get("symbol", "")).upper() for asset in optimized if asset.get("symbol")])
+    selected_capabilities = {
+        symbol: {
+            "tradable": bool((symbol_capabilities.get(symbol) or {}).get("tradable", True)),
+            "fractionable": bool((symbol_capabilities.get(symbol) or {}).get("fractionable", True)),
+        }
+        for symbol in symbols
+    }
+    context = {
+        "symbols_source": "workspace_universe",
+        "asset_type": final_asset_type.value,
+        "screener_mode": final_mode.value,
+        "preset": resolved_preset_name,
+        "preset_universe_mode": resolved_preset_universe_mode if final_mode == ScreenerMode.PRESET else None,
+        "screener_limit": final_limit,
+        "guardrails": {
+            "min_dollar_volume": min_dollar_volume,
+            "max_spread_bps": max_spread_bps,
+            "max_sector_weight_pct": max_sector_weight_pct,
+            "auto_regime_adjust": auto_regime_adjust,
+        },
+        "market_regime": regime,
+        "data_source": screener.get_last_source(),
+        "require_fractionable": require_fractionable,
+        "require_broker_tradable": enforce_execution_capabilities,
+        "target_position_size": target_position_size,
+        "dca_tranches": dca_tranches,
+        "symbol_capabilities": selected_capabilities,
+    }
+    return symbols, context
+
+
 @router.get("/strategies/{strategy_id}/config", response_model=StrategyConfigResponse)
 async def get_strategy_config(strategy_id: str, db: Session = Depends(get_db)):
     """
@@ -2479,7 +2899,10 @@ async def run_strategy_backtest(
     if request.initial_capital < 100 or request.initial_capital > 100_000_000:
         raise HTTPException(status_code=400, detail="initial_capital must be within [100, 100000000]")
     
-    # Use strategy symbols if not provided in request
+    prefs = _load_trading_preferences(storage)
+    emulate_live_trading = bool(request.emulate_live_trading)
+
+    # Use strategy symbols if not provided in request.
     if not request.symbols and db_strategy.config:
         request.symbols = db_strategy.config.get('symbols', ['AAPL', 'MSFT'])
     if request.symbols:
@@ -2524,7 +2947,19 @@ async def run_strategy_backtest(
     # Run backtest with strict Alpaca-data enforcement when configured.
     _bt_config = _get_config_snapshot()
     _bt_mode = "paper" if _bt_config.paper_trading else "live"
-    _bt_require_real_data = bool(_bt_config.strict_alpaca_data and str(_bt_config.broker).lower() == "alpaca")
+    broker_name = str(_bt_config.broker or "").strip().lower()
+    if emulate_live_trading and broker_name != "alpaca":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Live-equivalent backtesting requires Alpaca broker mode. "
+                "Set broker=alpaca in Settings, then retry."
+            ),
+        )
+    _bt_require_real_data = bool(
+        emulate_live_trading
+        or (_bt_config.strict_alpaca_data and broker_name == "alpaca")
+    )
     _bt_creds = _resolve_alpaca_credentials_for_mode(_bt_mode)
     if _bt_require_real_data and not _bt_creds:
         raise HTTPException(
@@ -2534,6 +2969,92 @@ async def run_strategy_backtest(
                 "Load/save Alpaca keys in Settings before running backtests."
             ),
         )
+
+    broker_for_constraints: Optional[BrokerInterface] = None
+    if broker_name == "alpaca":
+        try:
+            broker_for_constraints = get_broker()
+        except RuntimeError as exc:
+            if emulate_live_trading:
+                raise HTTPException(status_code=400, detail=str(exc))
+
+    selected_symbols = list(request.symbols or [])
+    universe_context: Dict[str, Any] = {
+        "symbols_source": "strategy_symbols",
+        "symbols_requested": len(selected_symbols),
+    }
+    if request.use_workspace_universe:
+        try:
+            screener = MarketScreener(
+                alpaca_client=_bt_creds,
+                require_real_data=_bt_require_real_data,
+            )
+            selected_symbols, universe_context = _resolve_workspace_universe_for_backtest(
+                storage=storage,
+                screener=screener,
+                prefs=prefs,
+                request=request,
+                broker=broker_for_constraints,
+                initial_capital=float(request.initial_capital),
+            )
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc))
+        if not selected_symbols:
+            raise HTTPException(
+                status_code=400,
+                detail="Workspace universe resolution produced zero symbols. Adjust guardrails/preset/universe mode.",
+            )
+    if not selected_symbols:
+        raise HTTPException(status_code=400, detail="At least one valid symbol is required for backtest")
+
+    require_fractionable = False
+    symbol_capabilities: Dict[str, Dict[str, bool]] = {}
+    filtered_out: List[Dict[str, str]] = []
+    if emulate_live_trading:
+        asset_type_for_rules = _resolve_backtest_asset_type(request.asset_type, prefs)
+        if request.use_workspace_universe and universe_context.get("asset_type") in {"stock", "etf"}:
+            asset_type_for_rules = AssetType(str(universe_context["asset_type"]))
+        synthetic_account = {
+            "equity": float(request.initial_capital),
+            "buying_power": float(request.initial_capital),
+        }
+        require_fractionable = _should_require_fractionable_symbols(asset_type_for_rules, prefs, synthetic_account)
+        if broker_for_constraints is not None:
+            symbol_capabilities = _collect_symbol_capabilities(
+                broker_for_constraints,
+                [{"symbol": symbol} for symbol in selected_symbols],
+            )
+        enforced_symbols: List[str] = []
+        for symbol in selected_symbols:
+            capabilities = symbol_capabilities.get(symbol, {"tradable": True, "fractionable": True})
+            tradable = bool(capabilities.get("tradable", True))
+            fractionable = bool(capabilities.get("fractionable", True))
+            if not tradable:
+                filtered_out.append({"symbol": symbol, "reason": "not broker tradable"})
+                continue
+            if require_fractionable and not fractionable:
+                filtered_out.append({"symbol": symbol, "reason": "not fractionable"})
+                continue
+            enforced_symbols.append(symbol)
+        selected_symbols = enforced_symbols
+        if not selected_symbols:
+            raise HTTPException(
+                status_code=400,
+                detail="All candidate symbols were filtered by live execution rules (tradable/fractionable).",
+            )
+    universe_context["symbols_selected"] = len(selected_symbols)
+    if filtered_out:
+        universe_context["symbols_filtered_out"] = filtered_out[:50]
+
+    max_position_size = float(_bt_config.max_position_size)
+    risk_limit_daily = float(_bt_config.risk_limit_daily)
+    if broker_for_constraints is not None:
+        max_position_size, risk_limit_daily = _balance_adjusted_limits(
+            broker=broker_for_constraints,
+            requested_max_position_size=max_position_size,
+            requested_risk_limit_daily=risk_limit_daily,
+        )
+
     analytics = StrategyAnalyticsService(
         db,
         alpaca_creds=_bt_creds,
@@ -2546,8 +3067,15 @@ async def run_strategy_backtest(
         start_date=request.start_date,
         end_date=request.end_date,
         initial_capital=request.initial_capital,
-        symbols=request.symbols,
+        symbols=selected_symbols,
         parameters=resolved_parameters or None,
+        emulate_live_trading=emulate_live_trading,
+        symbol_capabilities=symbol_capabilities or None,
+        require_fractionable=require_fractionable,
+        max_position_size=max_position_size,
+        risk_limit_daily=risk_limit_daily,
+        fee_bps=0.0,
+        universe_context=universe_context,
     )
     
     try:
@@ -2564,6 +3092,9 @@ async def run_strategy_backtest(
             "end_date": request.end_date,
             "total_trades": result.total_trades,
             "win_rate": result.win_rate,
+            "emulate_live_trading": emulate_live_trading,
+            "symbols_source": universe_context.get("symbols_source"),
+            "symbols_selected": universe_context.get("symbols_selected"),
         },
     )
     
@@ -2672,7 +3203,7 @@ async def tune_strategy_parameter(
 from .models import (
     AssetType, ScreenerAsset, ScreenerResponse,
     SymbolChartResponse, SymbolChartPoint,
-    ScreenerMode, StockPreset, EtfPreset,
+    ScreenerMode, PresetUniverseMode, StockPreset, EtfPreset,
     RiskProfile, RiskProfileInfo, RiskProfilesResponse,
     TradingPreferencesRequest, TradingPreferencesResponse,
     BudgetStatus, BudgetUpdateRequest,
@@ -2828,6 +3359,8 @@ async def get_screener_results(
     asset_type: Optional[AssetType] = None,
     limit: Optional[int] = Query(default=None, ge=10, le=200),
     screener_mode: Optional[ScreenerMode] = None,
+    seed_only: bool = Query(default=False),
+    preset_universe_mode: Optional[PresetUniverseMode] = Query(default=None),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=25, ge=10, le=100),
     min_dollar_volume: float = Query(default=10_000_000, ge=0, le=1_000_000_000_000),
@@ -2866,8 +3399,13 @@ async def get_screener_results(
     
     screener = _create_market_screener()
     
+    resolved_preset_universe_mode = PresetUniverseMode.SEED_GUARDRAIL_BLEND
     try:
         if final_mode == ScreenerMode.PRESET and final_asset_type in (AssetType.STOCK, AssetType.ETF):
+            if preset_universe_mode is not None:
+                resolved_preset_universe_mode = preset_universe_mode
+            elif seed_only:
+                resolved_preset_universe_mode = PresetUniverseMode.SEED_ONLY
             preset = (
                 prefs.stock_preset.value
                 if final_asset_type == AssetType.STOCK
@@ -2877,7 +3415,13 @@ async def get_screener_results(
             min_dollar_volume = max(min_dollar_volume, float(preset_guardrails["min_dollar_volume"]))
             max_spread_bps = min(max_spread_bps, float(preset_guardrails["max_spread_bps"]))
             max_sector_weight_pct = min(max_sector_weight_pct, float(preset_guardrails["max_sector_weight_pct"]))
-            results = screener.get_preset_assets(final_asset_type.value, preset, final_limit)
+            results = screener.get_preset_assets(
+                final_asset_type.value,
+                preset,
+                final_limit,
+                seed_only=resolved_preset_universe_mode == PresetUniverseMode.SEED_ONLY,
+                preset_universe_mode=resolved_preset_universe_mode.value,
+            )
         else:
             # Import AssetType from market_screener
             from services.market_screener import AssetType as ScreenerAssetType
@@ -2886,6 +3430,16 @@ async def get_screener_results(
         regime = screener.detect_market_regime()
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
+    strategy_defaults = _adaptive_strategy_parameter_defaults(storage, max(1, final_limit))
+    target_position_size = _safe_float(strategy_defaults.get("position_size", 0.0), 0.0)
+    dca_tranches = max(1, int(_safe_float(strategy_defaults.get("dca_tranches", 1), 1)))
+    require_fractionable = _should_require_fractionable_symbols(final_asset_type, prefs, account_snapshot)
+    enforce_execution_capabilities = bool(final_asset_type == AssetType.STOCK and require_fractionable)
+    symbol_capabilities = (
+        _collect_symbol_capabilities(broker, results)
+        if enforce_execution_capabilities
+        else {}
+    )
     optimized = screener.optimize_assets(
         results,
         limit=final_limit,
@@ -2898,6 +3452,11 @@ async def get_screener_results(
         buying_power=account_snapshot.get("buying_power", 0.0),
         equity=account_snapshot.get("equity", 0.0),
         weekly_budget=prefs.weekly_budget,
+        symbol_capabilities=symbol_capabilities,
+        require_broker_tradable=enforce_execution_capabilities,
+        require_fractionable=require_fractionable,
+        target_position_size=target_position_size,
+        dca_tranches=dca_tranches,
     )
     
     assets, total_count, total_pages = _paginate_assets(optimized, page, page_size)
@@ -2921,6 +3480,12 @@ async def get_screener_results(
             "holdings_count": len(holdings_snapshot),
             "equity": account_snapshot.get("equity", 0.0),
             "buying_power": account_snapshot.get("buying_power", 0.0),
+            "require_broker_tradable": enforce_execution_capabilities,
+            "require_fractionable": require_fractionable,
+            "target_position_size": target_position_size,
+            "dca_tranches": dca_tranches,
+            "seed_only": resolved_preset_universe_mode == PresetUniverseMode.SEED_ONLY,
+            "preset_universe_mode": resolved_preset_universe_mode.value,
         },
     )
 
@@ -2930,6 +3495,8 @@ async def get_screener_preset(
     asset_type: AssetType,
     preset: ScreenerPreset,
     limit: int = Query(default=50, ge=10, le=200),
+    seed_only: bool = Query(default=False),
+    preset_universe_mode: Optional[PresetUniverseMode] = Query(default=None),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=25, ge=10, le=100),
     min_dollar_volume: float = Query(default=10_000_000, ge=0, le=1_000_000_000_000),
@@ -2946,6 +3513,7 @@ async def get_screener_preset(
     - three_to_five_weekly
     - monthly_optimized
     - small_budget_weekly
+    - micro_budget
 
     ETF presets:
     - conservative
@@ -2971,13 +3539,34 @@ async def get_screener_preset(
     min_dollar_volume = max(min_dollar_volume, float(preset_guardrails["min_dollar_volume"]))
     max_spread_bps = min(max_spread_bps, float(preset_guardrails["max_spread_bps"]))
     max_sector_weight_pct = min(max_sector_weight_pct, float(preset_guardrails["max_sector_weight_pct"]))
+    resolved_preset_universe_mode = (
+        preset_universe_mode
+        if preset_universe_mode is not None
+        else (PresetUniverseMode.SEED_ONLY if seed_only else PresetUniverseMode.SEED_GUARDRAIL_BLEND)
+    )
     try:
-        assets_raw = screener.get_preset_assets(asset_type.value, preset.value, limit)
+        assets_raw = screener.get_preset_assets(
+            asset_type.value,
+            preset.value,
+            limit,
+            seed_only=resolved_preset_universe_mode == PresetUniverseMode.SEED_ONLY,
+            preset_universe_mode=resolved_preset_universe_mode.value,
+        )
         regime = screener.detect_market_regime()
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
+    strategy_defaults = _adaptive_strategy_parameter_defaults(storage, max(1, limit))
+    target_position_size = _safe_float(strategy_defaults.get("position_size", 0.0), 0.0)
+    dca_tranches = max(1, int(_safe_float(strategy_defaults.get("dca_tranches", 1), 1)))
+    require_fractionable = _should_require_fractionable_symbols(asset_type, prefs, account_snapshot)
+    enforce_execution_capabilities = bool(asset_type == AssetType.STOCK and require_fractionable)
+    symbol_capabilities = (
+        _collect_symbol_capabilities(broker, assets_raw)
+        if enforce_execution_capabilities
+        else {}
+    )
     optimized = screener.optimize_assets(
         assets_raw,
         limit=limit,
@@ -2990,6 +3579,11 @@ async def get_screener_preset(
         buying_power=account_snapshot.get("buying_power", 0.0),
         equity=account_snapshot.get("equity", 0.0),
         weekly_budget=prefs.weekly_budget,
+        symbol_capabilities=symbol_capabilities,
+        require_broker_tradable=enforce_execution_capabilities,
+        require_fractionable=require_fractionable,
+        target_position_size=target_position_size,
+        dca_tranches=dca_tranches,
     )
     assets, total_count, total_pages = _paginate_assets(optimized, page, page_size)
 
@@ -3012,6 +3606,12 @@ async def get_screener_preset(
             "holdings_count": len(holdings_snapshot),
             "equity": account_snapshot.get("equity", 0.0),
             "buying_power": account_snapshot.get("buying_power", 0.0),
+            "require_broker_tradable": enforce_execution_capabilities,
+            "require_fractionable": require_fractionable,
+            "target_position_size": target_position_size,
+            "dca_tranches": dca_tranches,
+            "seed_only": resolved_preset_universe_mode == PresetUniverseMode.SEED_ONLY,
+            "preset_universe_mode": resolved_preset_universe_mode.value,
         },
     )
 
@@ -3125,7 +3725,7 @@ async def update_trading_preferences(request: TradingPreferencesRequest, db: Ses
 @router.get("/preferences/recommendation")
 async def get_preference_recommendation(
     equity: Optional[float] = Query(default=None, ge=100, le=100_000_000),
-    weekly_budget: Optional[float] = Query(default=None, ge=25, le=5_000_000),
+    weekly_budget: Optional[float] = Query(default=None, ge=50, le=5_000_000),
     target_trades_per_week: int = Query(default=4, ge=1, le=10),
     asset_type: Optional[AssetType] = Query(default=None),
     preset: Optional[ScreenerPreset] = Query(default=None),
@@ -3167,7 +3767,7 @@ async def get_preference_recommendation(
     if effective_weekly_budget <= 0:
         effective_weekly_budget = 200.0
 
-    stock_presets = {"weekly_optimized", "three_to_five_weekly", "monthly_optimized", "small_budget_weekly"}
+    stock_presets = {"weekly_optimized", "three_to_five_weekly", "monthly_optimized", "small_budget_weekly", "micro_budget"}
     etf_presets = {"conservative", "balanced", "aggressive"}
     requested_preset = preset.value if preset is not None else None
 
@@ -3179,6 +3779,8 @@ async def get_preference_recommendation(
     else:
         if requested_preset in stock_presets:
             effective_preset = requested_preset
+        elif effective_weekly_budget < 60 or effective_equity < 200:
+            effective_preset = "micro_budget"
         elif target_trades_per_week <= 3:
             effective_preset = "monthly_optimized"
         elif target_trades_per_week <= 5:
@@ -3190,6 +3792,7 @@ async def get_preference_recommendation(
         if effective_preset not in stock_presets:
             effective_preset = "weekly_optimized"
         risk_profile_by_preset = {
+            "micro_budget": "micro_budget",
             "small_budget_weekly": "conservative",
             "monthly_optimized": "balanced",
             "three_to_five_weekly": "balanced",

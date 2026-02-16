@@ -5,7 +5,7 @@ Fetches and filters most actively traded stocks and ETFs.
 Supports different asset types and volume-based screening.
 """
 
-from typing import List, Dict, Any, Optional, Literal
+from typing import List, Dict, Any, Optional, Literal, Tuple
 from datetime import datetime, timedelta
 import logging
 from enum import Enum
@@ -21,6 +21,11 @@ except Exception:
     StockHistoricalDataClient = None
     StockBarsRequest = None
     TimeFrame = None
+
+try:
+    from alpaca.trading.client import TradingClient
+except Exception:
+    TradingClient = None
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +58,7 @@ class MarketScreener:
         self._cache: Dict[str, Any] = {}
         self._cache_timeout = 300  # 5 minutes
         self._data_client = None
+        self._trading_client = None
         self._last_source = "fallback"
         runtime_api_key = None
         runtime_secret_key = None
@@ -66,12 +72,24 @@ class MarketScreener:
                     api_key=runtime_api_key,
                     secret_key=runtime_secret_key
                 )
+                if TradingClient:
+                    self._trading_client = TradingClient(
+                        api_key=runtime_api_key,
+                        secret_key=runtime_secret_key,
+                        paper=True,
+                    )
             elif has_alpaca_credentials():
                 settings = get_settings()
                 self._data_client = StockHistoricalDataClient(
                     api_key=settings.alpaca_api_key,
                     secret_key=settings.alpaca_secret_key
                 )
+                if TradingClient:
+                    self._trading_client = TradingClient(
+                        api_key=settings.alpaca_api_key,
+                        secret_key=settings.alpaca_secret_key,
+                        paper=True,
+                    )
         if self.require_real_data and self._data_client is None:
             raise RuntimeError(
                 "Strict Alpaca data mode is enabled but Alpaca data client could not be initialized"
@@ -211,7 +229,14 @@ class MarketScreener:
         """Return source used for latest screener pull."""
         return self._last_source
 
-    def get_preset_assets(self, asset_type: str, preset: str, limit: int = 50) -> List[Dict[str, Any]]:
+    def get_preset_assets(
+        self,
+        asset_type: str,
+        preset: str,
+        limit: int = 50,
+        seed_only: bool = False,
+        preset_universe_mode: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         """
         Get curated assets for a specific strategy preset.
 
@@ -219,6 +244,12 @@ class MarketScreener:
             asset_type: "stock" or "etf"
             preset: Preset name
             limit: Max results (10-200)
+            seed_only: Deprecated compatibility flag. When True and
+                preset_universe_mode is not provided, behaves like seed_only mode.
+            preset_universe_mode: One of:
+                - "seed_only": preset seeds only (no backfill)
+                - "seed_guardrail_blend": seed + active-universe backfill
+                - "guardrail_only": ignore seeds and use active universe only
         """
         limit = max(10, min(200, limit))
         asset_type = asset_type.lower()
@@ -232,6 +263,7 @@ class MarketScreener:
             "three_to_five_weekly": ["AAPL", "MSFT", "AMZN", "GOOGL", "JPM", "V", "WMT", "KO", "PEP", "DIS"],
             "monthly_optimized": ["MSFT", "AAPL", "GOOGL", "JPM", "V", "WMT", "PEP", "KO", "CSCO", "ORCL"],
             "small_budget_weekly": ["INTC", "PFE", "CSCO", "PYPL", "BABA", "NKE", "DIS", "KO", "XLF", "IWM"],
+            "micro_budget": ["SPY", "INTC", "PFE", "CSCO", "KO", "VTI", "XLF", "DIS"],
         }
         etf_presets = {
             "conservative": ["SPY", "VOO", "IVV", "AGG", "TLT", "XLP", "XLV", "VEA", "VTI", "DIA"],
@@ -247,8 +279,20 @@ class MarketScreener:
         if not symbols:
             raise ValueError(f"Unknown preset '{preset}' for asset type '{asset_type}'")
 
+        normalized_mode = (preset_universe_mode or "").strip().lower()
+        if not normalized_mode:
+            normalized_mode = "seed_only" if seed_only else "seed_guardrail_blend"
+        allowed_modes = {"seed_only", "seed_guardrail_blend", "guardrail_only"}
+        if normalized_mode not in allowed_modes:
+            raise ValueError(
+                f"Unknown preset_universe_mode '{normalized_mode}'. "
+                "Expected one of: seed_only, seed_guardrail_blend, guardrail_only"
+            )
+
         selected = [by_symbol[s] for s in symbols if s in by_symbol]
-        if len(selected) < limit:
+        if normalized_mode == "guardrail_only":
+            selected = list(all_assets)
+        elif normalized_mode == "seed_guardrail_blend" and len(selected) < limit:
             existing = {s["symbol"] for s in selected}
             for asset in all_assets:
                 if asset["symbol"] in existing:
@@ -264,26 +308,29 @@ class MarketScreener:
         if not self._data_client or not StockBarsRequest or not TimeFrame:
             raise RuntimeError("Alpaca data client unavailable")
 
-        fallback_assets = (
-            self._get_fallback_stocks(200)
-            if asset_class == "stock"
-            else self._get_fallback_etfs(200)
-        )
-        symbols = [asset["symbol"] for asset in fallback_assets]
-        by_symbol = {asset["symbol"]: asset for asset in fallback_assets}
+        symbols, seed_asset_rows = self._get_candidate_symbols_for_asset_class(asset_class)
+        if not symbols:
+            raise RuntimeError("No active symbols available from Alpaca universe")
+        by_symbol = {asset["symbol"]: asset for asset in seed_asset_rows}
 
         start = datetime.now() - timedelta(days=10)
-        req = StockBarsRequest(
-            symbol_or_symbols=symbols,
-            timeframe=TimeFrame.Day,
-            start=start,
-        )
-        bars_resp = self._data_client.get_stock_bars(req)
         bars_by_symbol: Dict[str, List[Any]] = {}
-        if hasattr(bars_resp, "data"):
-            bars_by_symbol = bars_resp.data or {}
-        elif isinstance(bars_resp, dict):
-            bars_by_symbol = bars_resp
+        for chunk_start in range(0, len(symbols), 200):
+            chunk = symbols[chunk_start:chunk_start + 200]
+            req = StockBarsRequest(
+                symbol_or_symbols=chunk,
+                timeframe=TimeFrame.Day,
+                start=start,
+            )
+            bars_resp = self._data_client.get_stock_bars(req)
+            if hasattr(bars_resp, "data"):
+                chunk_data = bars_resp.data or {}
+            elif isinstance(bars_resp, dict):
+                chunk_data = bars_resp
+            else:
+                chunk_data = {}
+            for symbol, bars in chunk_data.items():
+                bars_by_symbol[symbol] = bars
 
         ranked_assets: List[Dict[str, Any]] = []
         for symbol in symbols:
@@ -312,6 +359,75 @@ class MarketScreener:
 
         ranked_assets.sort(key=lambda x: x.get("volume", 0), reverse=True)
         return ranked_assets[:limit]
+
+    def _get_candidate_symbols_for_asset_class(self, asset_class: str) -> Tuple[List[str], List[Dict[str, Any]]]:
+        """Resolve candidate symbols using Alpaca tradable universe with fallback safety."""
+        fallback_assets = (
+            self._get_fallback_stocks(200)
+            if asset_class == "stock"
+            else self._get_fallback_etfs(200)
+        )
+        fallback_by_symbol = {asset["symbol"]: asset for asset in fallback_assets}
+        fallback_symbols = [asset["symbol"] for asset in fallback_assets]
+
+        if not self._trading_client:
+            return fallback_symbols, fallback_assets
+
+        try:
+            all_assets = self._trading_client.get_all_assets()
+        except Exception as exc:
+            if self.require_real_data:
+                raise RuntimeError(f"Failed to fetch Alpaca tradable asset universe: {exc}") from exc
+            logger.warning("Failed to fetch Alpaca tradable assets: %s", exc)
+            return fallback_symbols, fallback_assets
+
+        candidate_rows: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for asset in all_assets:
+            symbol = str(getattr(asset, "symbol", "") or "").strip().upper()
+            if not symbol or symbol in seen:
+                continue
+            # Keep only active, US-equity style tradable rows.
+            if not bool(getattr(asset, "tradable", False)):
+                continue
+            if str(getattr(asset, "status", "")).lower() not in {"active", "assetstatus.active"}:
+                continue
+            asset_class_name = str(getattr(asset, "asset_class", "")).lower()
+            if asset_class_name and "us_equity" not in asset_class_name and "us-equity" not in asset_class_name:
+                continue
+            is_probable_etf = self._is_probable_etf_asset(symbol, str(getattr(asset, "name", "") or ""))
+            if asset_class == "etf" and not is_probable_etf:
+                continue
+            if asset_class == "stock" and is_probable_etf:
+                continue
+            seen.add(symbol)
+            fallback_row = fallback_by_symbol.get(symbol)
+            candidate_rows.append({
+                "symbol": symbol,
+                "name": str(getattr(asset, "name", "") or (fallback_row or {}).get("name", symbol)),
+                "asset_type": asset_class,
+                "volume": int((fallback_row or {}).get("volume", 0)),
+                "price": float((fallback_row or {}).get("price", 0.0)),
+                "change_percent": float((fallback_row or {}).get("change_percent", 0.0)),
+                "last_updated": datetime.now().isoformat(),
+            })
+            # Keep request payload bounded so bar pulls stay practical.
+            if len(candidate_rows) >= 1500:
+                break
+
+        if not candidate_rows:
+            if self.require_real_data:
+                raise RuntimeError(f"No Alpaca tradable symbols found for asset class {asset_class}")
+            return fallback_symbols, fallback_assets
+
+        symbols = [row["symbol"] for row in candidate_rows]
+        return symbols, candidate_rows
+
+    def _is_probable_etf_asset(self, symbol: str, name: str) -> bool:
+        """Heuristic ETF classifier for Alpaca asset metadata."""
+        text = f"{symbol} {name}".lower()
+        etf_terms = (" etf", "fund", "trust", "index", "ishares", "vanguard", "spdr", "invesco")
+        return any(term in text for term in etf_terms)
 
     def detect_market_regime(self) -> str:
         """Detect simple market regime from SPY trend and volatility."""
@@ -344,6 +460,7 @@ class MarketScreener:
             "stock:three_to_five_weekly": {"min_dollar_volume": 12_000_000, "max_spread_bps": 45, "max_sector_weight_pct": 45},
             "stock:monthly_optimized": {"min_dollar_volume": 8_000_000, "max_spread_bps": 60, "max_sector_weight_pct": 50},
             "stock:small_budget_weekly": {"min_dollar_volume": 5_000_000, "max_spread_bps": 80, "max_sector_weight_pct": 55},
+            "stock:micro_budget": {"min_dollar_volume": 2_000_000, "max_spread_bps": 150, "max_sector_weight_pct": 60},
             "etf:conservative": {"min_dollar_volume": 15_000_000, "max_spread_bps": 30, "max_sector_weight_pct": 35},
             "etf:balanced": {"min_dollar_volume": 10_000_000, "max_spread_bps": 40, "max_sector_weight_pct": 40},
             "etf:aggressive": {"min_dollar_volume": 7_000_000, "max_spread_bps": 55, "max_sector_weight_pct": 45},
@@ -363,6 +480,12 @@ class MarketScreener:
         buying_power: float = 0.0,
         equity: float = 0.0,
         weekly_budget: float = 0.0,
+        symbol_capabilities: Optional[Dict[str, Dict[str, Any]]] = None,
+        require_broker_tradable: bool = False,
+        require_fractionable: bool = False,
+        target_position_size: float = 0.0,
+        dca_tranches: int = 1,
+        min_fractional_notional: float = 1.0,
     ) -> List[Dict[str, Any]]:
         """Apply scoring and guardrails (liquidity/spread/sector concentration)."""
 
@@ -395,26 +518,63 @@ class MarketScreener:
         safe_weekly_budget = _safe_non_negative(weekly_budget)
         budget_candidates = [value for value in (safe_buying_power, safe_weekly_budget, safe_equity * 0.20) if value > 0]
         portfolio_budget_cap = min(budget_candidates) if budget_candidates else 0.0
+        capability_map = symbol_capabilities if isinstance(symbol_capabilities, dict) else {}
+        safe_min_fractional_notional = max(1.0, _safe_non_negative(min_fractional_notional))
+        safe_dca_tranches = max(1, int(_safe_non_negative(dca_tranches) or 1))
+        safe_target_position_size = _safe_non_negative(target_position_size)
+        if safe_target_position_size <= 0:
+            if safe_weekly_budget > 0:
+                safe_target_position_size = max(safe_min_fractional_notional, safe_weekly_budget * 0.5)
+            elif portfolio_budget_cap > 0:
+                safe_target_position_size = max(safe_min_fractional_notional, portfolio_budget_cap * 0.4)
+            else:
+                safe_target_position_size = 100.0
+        per_tranche_target = max(safe_min_fractional_notional, safe_target_position_size / safe_dca_tranches)
 
         candidates = self._enrich_assets(assets)
         for asset in candidates:
             dollar_volume = float(asset.get("dollar_volume", 0.0))
             spread = float(asset.get("spread_bps", 999.0))
             symbol = str(asset.get("symbol", "")).upper()
-            estimated_ticket = max(1.0, float(asset.get("price", 0.0))) * 3.0
-            affordable = (
-                portfolio_budget_cap <= 0
-                or estimated_ticket <= portfolio_budget_cap * 1.5
-                or symbol in held_symbols
-            )
+            price = max(0.0, float(asset.get("price", 0.0)))
+            capability = capability_map.get(symbol, {}) if isinstance(capability_map.get(symbol, {}), dict) else {}
+            broker_tradable = bool(capability.get("tradable", True))
+            fractionable = bool(capability.get("fractionable", True))
+            if fractionable:
+                if portfolio_budget_cap > 0:
+                    estimated_ticket = min(
+                        per_tranche_target,
+                        max(safe_min_fractional_notional, portfolio_budget_cap * 0.60),
+                    )
+                else:
+                    estimated_ticket = per_tranche_target
+                raw_affordable = portfolio_budget_cap <= 0 or portfolio_budget_cap >= safe_min_fractional_notional
+            else:
+                estimated_ticket = max(price, per_tranche_target)
+                raw_affordable = portfolio_budget_cap <= 0 or estimated_ticket <= portfolio_budget_cap * 1.10
+            if symbol in held_symbols:
+                raw_affordable = True
+            execution_ready = raw_affordable
+            if require_broker_tradable and not broker_tradable:
+                execution_ready = False
+            if require_fractionable and not fractionable:
+                execution_ready = False
+            affordable = execution_ready
             tradable = dollar_volume >= min_dollar_volume and spread <= max_spread_bps and affordable
             asset["tradable"] = tradable
+            asset["broker_tradable"] = broker_tradable
+            asset["fractionable"] = fractionable
+            asset["execution_ticket"] = round(estimated_ticket, 2)
             base_score = float(asset.get("score", 0.0))
             adjusted_score = base_score
             if symbol in held_symbols:
                 adjusted_score += 3.0
             if portfolio_budget_cap > 0 and estimated_ticket > portfolio_budget_cap:
                 adjusted_score -= min(20.0, ((estimated_ticket / portfolio_budget_cap) - 1.0) * 10.0)
+            if require_fractionable and not fractionable:
+                adjusted_score -= 25.0
+            if require_broker_tradable and not broker_tradable:
+                adjusted_score -= 25.0
             asset["_score_adjusted"] = round(adjusted_score, 2)
             if tradable:
                 asset["selection_reason"] = (
@@ -424,13 +584,19 @@ class MarketScreener:
                 )
                 if symbol in held_symbols:
                     asset["selection_reason"] += "; continuity boost"
+                if fractionable:
+                    asset["selection_reason"] += "; fractional-ready"
             else:
                 reasons = []
                 if dollar_volume < min_dollar_volume:
                     reasons.append("low dollar volume")
                 if spread > max_spread_bps:
                     reasons.append("wide spread")
-                if not affordable:
+                if require_broker_tradable and not broker_tradable:
+                    reasons.append("not broker tradable")
+                if require_fractionable and not fractionable:
+                    reasons.append("not fractionable")
+                if not raw_affordable and symbol not in held_symbols:
                     reasons.append("budget constrained")
                 asset["selection_reason"] = "Filtered: " + ", ".join(reasons)
 

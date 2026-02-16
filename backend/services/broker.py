@@ -207,6 +207,22 @@ class BrokerInterface(ABC):
         """
         return True
 
+    def is_symbol_fractionable(self, symbol: str) -> bool:
+        """
+        Optional: whether symbol supports fractional-share market orders.
+        Default True for brokers that do not expose asset metadata.
+        """
+        return True
+
+    def get_symbol_capabilities(self, symbol: str) -> Dict[str, bool]:
+        """
+        Optional: fetch execution capabilities for a symbol.
+        """
+        return {
+            "tradable": bool(self.is_symbol_tradable(symbol)),
+            "fractionable": bool(self.is_symbol_fractionable(symbol)),
+        }
+
     def get_next_market_open(self) -> Optional[datetime]:
         """
         Optional: next regular market open time.

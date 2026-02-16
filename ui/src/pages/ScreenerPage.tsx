@@ -25,11 +25,11 @@ interface Asset {
 
 interface Preferences {
   asset_type: 'stock' | 'etf';
-  risk_profile: 'conservative' | 'balanced' | 'aggressive';
+  risk_profile: 'conservative' | 'balanced' | 'aggressive' | 'micro_budget';
   weekly_budget: number;
   screener_limit: number;
   screener_mode: 'most_active' | 'preset';
-  stock_preset: 'weekly_optimized' | 'three_to_five_weekly' | 'monthly_optimized' | 'small_budget_weekly';
+  stock_preset: 'weekly_optimized' | 'three_to_five_weekly' | 'monthly_optimized' | 'small_budget_weekly' | 'micro_budget';
   etf_preset: 'conservative' | 'balanced' | 'aggressive';
 }
 
@@ -55,11 +55,12 @@ const BACKEND_URL =
   (import.meta as { env?: { VITE_BACKEND_URL?: string } }).env?.VITE_BACKEND_URL ||
   'http://127.0.0.1:8000';
 type ScreenerMode = 'most_active' | 'preset';
-type StockPreset = 'weekly_optimized' | 'three_to_five_weekly' | 'monthly_optimized' | 'small_budget_weekly';
+type StockPreset = 'weekly_optimized' | 'three_to_five_weekly' | 'monthly_optimized' | 'small_budget_weekly' | 'micro_budget';
 type EtfPreset = 'conservative' | 'balanced' | 'aggressive';
 type PresetType = StockPreset | EtfPreset;
+type PresetUniverseMode = 'seed_only' | 'seed_guardrail_blend' | 'guardrail_only';
 type ChartRange = '1m' | '3m' | '1y';
-type RiskProfile = 'conservative' | 'balanced' | 'aggressive';
+type RiskProfile = 'conservative' | 'balanced' | 'aggressive' | 'micro_budget';
 
 function daysForRange(range: ChartRange): number {
   if (range === '1m') return 30;
@@ -89,7 +90,7 @@ const WORKSPACE_LIMITS = {
   weeklyBudgetMin: 50,
   weeklyBudgetMax: 1_000_000,
   maxPositionMin: 1,
-  maxPositionMax: 5_000_000,
+  maxPositionMax: 10_000_000,
   riskDailyMin: 1,
   riskDailyMax: 1_000_000,
   minDollarVolumeMin: 0,
@@ -101,6 +102,8 @@ const WORKSPACE_LIMITS = {
 };
 const WORKSPACE_LAST_APPLIED_AT_KEY = 'stocksbot.workspace.lastAppliedAt';
 const WORKSPACE_SNAPSHOT_KEY = 'stocksbot.workspace.snapshot';
+const SCREENER_PRESET_UNIVERSE_MODE_KEY = 'stocksbot.screener.preset.universeMode';
+const SCREENER_PRESET_SEED_ONLY_KEY = 'stocksbot.screener.preset.seedOnly';
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
@@ -126,6 +129,8 @@ function persistWorkspaceSnapshot(snapshot: {
   screener_mode: ScreenerMode;
   stock_preset: StockPreset;
   etf_preset: EtfPreset;
+  preset_universe_mode: PresetUniverseMode;
+  seed_only_preset: boolean;
   screener_limit: number;
   min_dollar_volume: number;
   max_spread_bps: number;
@@ -154,6 +159,20 @@ const ScreenerPage: React.FC = () => {
   const [budgetStatus, setBudgetStatus] = useState<BudgetStatus | null>(null);
   const [screenerMode, setScreenerMode] = useState<ScreenerMode>('most_active');
   const [preset, setPreset] = useState<PresetType>('weekly_optimized');
+  const [presetUniverseMode, setPresetUniverseMode] = useState<PresetUniverseMode>(() => {
+    if (typeof window === 'undefined') return 'seed_guardrail_blend';
+    try {
+      const storedMode = window.localStorage.getItem(SCREENER_PRESET_UNIVERSE_MODE_KEY);
+      if (storedMode === 'seed_only' || storedMode === 'seed_guardrail_blend' || storedMode === 'guardrail_only') {
+        return storedMode;
+      }
+      return window.localStorage.getItem(SCREENER_PRESET_SEED_ONLY_KEY) === 'true'
+        ? 'seed_only'
+        : 'seed_guardrail_blend';
+    } catch {
+      return 'seed_guardrail_blend';
+    }
+  });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [selectedSymbol, setSelectedSymbol] = useState<string | null>(null);
@@ -190,6 +209,7 @@ const ScreenerPage: React.FC = () => {
   const [blockedReason, setBlockedReason] = useState('');
   const [optimizingWorkspace, setOptimizingWorkspace] = useState(false);
   const [portfolioOptimizationSummary, setPortfolioOptimizationSummary] = useState<string | null>(null);
+  const [prefsLoaded, setPrefsLoaded] = useState(false);
   const chartSectionRef = useRef<HTMLDivElement | null>(null);
   const optimizeRequestIdRef = useRef(0);
   const [strategySignalParams, setStrategySignalParams] = useState({
@@ -219,6 +239,7 @@ const ScreenerPage: React.FC = () => {
       } else {
         setPreset(data.etf_preset || 'balanced');
       }
+      setPrefsLoaded(true);
     } catch (err) {
       console.error('Error fetching preferences:', err);
     }
@@ -278,8 +299,9 @@ const ScreenerPage: React.FC = () => {
       let url = `${BACKEND_URL}/screener/all?asset_type=${preferences.asset_type}&limit=${preferences.screener_limit}&screener_mode=${screenerMode}`;
       let dataSource: string = screenerMode;
       if (screenerMode === 'preset') {
-        url = `${BACKEND_URL}/screener/preset?asset_type=${preferences.asset_type}&preset=${preset}&limit=${preferences.screener_limit}`;
-        dataSource = `${preferences.asset_type}_preset:${preset}`;
+        const seedOnly = presetUniverseMode === 'seed_only';
+        url = `${BACKEND_URL}/screener/preset?asset_type=${preferences.asset_type}&preset=${preset}&limit=${preferences.screener_limit}&seed_only=${seedOnly}&preset_universe_mode=${presetUniverseMode}`;
+        dataSource = `${preferences.asset_type}_preset:${preset}:${presetUniverseMode}`;
       }
       url = `${url}&page=${currentPage}&page_size=${pageSize}&min_dollar_volume=${minDollarVolume}&max_spread_bps=${maxSpreadBps}&max_sector_weight_pct=${maxSectorWeightPct}&auto_regime_adjust=${autoRegimeAdjust}`;
       const response = await authFetch(url);
@@ -315,7 +337,7 @@ const ScreenerPage: React.FC = () => {
     } finally {
       setLoading(false);
     }
-  }, [preferences.asset_type, preferences.screener_limit, screenerMode, preset, currentPage, pageSize, minDollarVolume, maxSpreadBps, maxSectorWeightPct, autoRegimeAdjust]);
+  }, [preferences.asset_type, preferences.screener_limit, screenerMode, preset, presetUniverseMode, currentPage, pageSize, minDollarVolume, maxSpreadBps, maxSectorWeightPct, autoRegimeAdjust]);
 
   const updatePreferences = async (updates: Partial<Preferences>): Promise<Preferences | null> => {
     try {
@@ -351,6 +373,7 @@ const ScreenerPage: React.FC = () => {
     if (selectedPreset === 'monthly_optimized') return 2;
     if (selectedPreset === 'three_to_five_weekly') return 4;
     if (selectedPreset === 'small_budget_weekly') return 3;
+    if (selectedPreset === 'micro_budget') return 1;
     return 6;
   };
 
@@ -412,6 +435,8 @@ const ScreenerPage: React.FC = () => {
         screener_mode: assetType === 'stock' ? mode : 'preset',
         stock_preset: snapshotPrefs.stock_preset,
         etf_preset: snapshotPrefs.etf_preset,
+        preset_universe_mode: presetUniverseMode,
+        seed_only_preset: presetUniverseMode === 'seed_only',
         screener_limit: snapshotPrefs.screener_limit,
         min_dollar_volume: nextMinDollar,
         max_spread_bps: nextSpread,
@@ -431,7 +456,7 @@ const ScreenerPage: React.FC = () => {
         setOptimizingWorkspace(false);
       }
     }
-  }, [autoRegimeAdjust, preferences.asset_type, preferences.etf_preset, preferences.screener_limit, preferences.stock_preset, preferences.weekly_budget, screenerMode]);
+  }, [autoRegimeAdjust, preferences.asset_type, preferences.etf_preset, preferences.screener_limit, preferences.stock_preset, preferences.weekly_budget, screenerMode, presetUniverseMode]);
 
   const fetchConfig = useCallback(async () => {
     try {
@@ -533,6 +558,8 @@ const ScreenerPage: React.FC = () => {
         screener_mode: effectiveScreenerMode,
         stock_preset: preferences.stock_preset,
         etf_preset: preferences.etf_preset,
+        preset_universe_mode: presetUniverseMode,
+        seed_only_preset: presetUniverseMode === 'seed_only',
         screener_limit: preferences.screener_limit,
         min_dollar_volume: minDollarVolume,
         max_spread_bps: maxSpreadBps,
@@ -575,9 +602,61 @@ const ScreenerPage: React.FC = () => {
     fetchSafety();
   }, [fetchPreferences, fetchBudgetStatus, fetchStrategies, fetchConfig, fetchPortfolioSummary, fetchBrokerAccount, fetchSafety]);
 
+  /* Restore workspace guardrails once preferences have been loaded from the API.
+     First tries the localStorage snapshot (instant, no API call).
+     Falls back to auto-optimization (fetches preset-specific guardrails from backend). */
+  useEffect(() => {
+    if (!prefsLoaded) return;
+
+    // Try to restore from localStorage snapshot
+    try {
+      const raw = window.localStorage.getItem(WORKSPACE_SNAPSHOT_KEY);
+      if (raw) {
+        const snapshot = JSON.parse(raw);
+        const currentPreset = preferences.asset_type === 'etf' ? preferences.etf_preset : preferences.stock_preset;
+        if (
+          snapshot.asset_type === preferences.asset_type &&
+          (snapshot.stock_preset === currentPreset || snapshot.etf_preset === currentPreset)
+        ) {
+          if (
+            snapshot.preset_universe_mode === 'seed_only'
+            || snapshot.preset_universe_mode === 'seed_guardrail_blend'
+            || snapshot.preset_universe_mode === 'guardrail_only'
+          ) {
+            setPresetUniverseMode(snapshot.preset_universe_mode);
+          } else if (typeof snapshot.seed_only_preset === 'boolean') {
+            setPresetUniverseMode(snapshot.seed_only_preset ? 'seed_only' : 'seed_guardrail_blend');
+          }
+          if (Number.isFinite(snapshot.min_dollar_volume)) setMinDollarVolume(snapshot.min_dollar_volume);
+          if (Number.isFinite(snapshot.max_spread_bps)) setMaxSpreadBps(snapshot.max_spread_bps);
+          if (Number.isFinite(snapshot.max_sector_weight_pct)) setMaxSectorWeightPct(snapshot.max_sector_weight_pct);
+          if (typeof snapshot.auto_regime_adjust === 'boolean') setAutoRegimeAdjust(snapshot.auto_regime_adjust);
+          return; // Restored successfully
+        }
+      }
+    } catch { /* ignore parse errors */ }
+
+    // No matching snapshot — fetch preset-specific guardrails from backend
+    void applyAdaptiveOptimization();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [prefsLoaded]);
+
   useEffect(() => {
     fetchAssets();
   }, [fetchAssets]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    try {
+      window.localStorage.setItem(SCREENER_PRESET_UNIVERSE_MODE_KEY, presetUniverseMode);
+      window.localStorage.setItem(
+        SCREENER_PRESET_SEED_ONLY_KEY,
+        String(presetUniverseMode === 'seed_only'),
+      );
+    } catch {
+      // Best effort only.
+    }
+  }, [presetUniverseMode]);
 
   useEffect(() => {
     if (selectedSymbol) {
@@ -644,14 +723,20 @@ const ScreenerPage: React.FC = () => {
   };
 
   const formatPercent = (value: number) => `${value >= 0 ? '+' : ''}${value.toFixed(2)}%`;
+  const presetUniverseModeLabel =
+    presetUniverseMode === 'seed_only'
+      ? 'Seed Only'
+      : presetUniverseMode === 'guardrail_only'
+      ? 'Guardrail Universe Only'
+      : 'Seed + Guardrail Blend';
   const activePresetLabel = preferences.asset_type === 'etf' ? preferences.etf_preset : preferences.stock_preset;
   const activeUniverseLabel =
     preferences.asset_type === 'stock'
       ? screenerMode === 'most_active'
         ? `Most Active (${preferences.screener_limit})`
-        : `Stock Preset: ${activePresetLabel}`
+        : `Stock Preset: ${activePresetLabel} (${presetUniverseModeLabel})`
       : preferences.asset_type === 'etf'
-      ? `ETF Preset: ${activePresetLabel}`
+      ? `ETF Preset: ${activePresetLabel} (${presetUniverseModeLabel})`
       : `Stock Preset: ${activePresetLabel}`;
 
   const stockPresets: Array<{ value: StockPreset; label: string }> = [
@@ -659,6 +744,7 @@ const ScreenerPage: React.FC = () => {
     { value: 'three_to_five_weekly', label: '3-5 Trades / Week' },
     { value: 'monthly_optimized', label: 'Monthly Optimized' },
     { value: 'small_budget_weekly', label: 'Small Budget Weekly' },
+    { value: 'micro_budget', label: 'Micro Budget ($20-50/wk)' },
   ];
   const etfPresets: Array<{ value: EtfPreset; label: string }> = [
     { value: 'conservative', label: 'Conservative' },
@@ -676,7 +762,13 @@ const ScreenerPage: React.FC = () => {
       ? 'Mixed (Alpaca + Fallback)'
       : lastDataSource === 'most_active'
       ? 'Most Active'
-      : lastDataSource.replace('_preset:', ' Preset: ').replace('stock', 'Stock').replace('etf', 'ETF');
+      : lastDataSource
+          .replace('_preset:', ' Preset: ')
+          .replace(':seed_only', ' (Seed Only)')
+          .replace(':seed_guardrail_blend', ' (Seed + Guardrail Blend)')
+          .replace(':guardrail_only', ' (Guardrail Universe Only)')
+          .replace('stock', 'Stock')
+          .replace('etf', 'ETF');
   const safePage = Math.max(1, Math.min(currentPage, totalPages));
   const pageStartLabel = totalAssetCount === 0 ? 0 : (safePage - 1) * pageSize + 1;
   const pageEndLabel = totalAssetCount === 0 ? 0 : Math.min((safePage - 1) * pageSize + assets.length, totalAssetCount);
@@ -913,6 +1005,29 @@ const ScreenerPage: React.FC = () => {
               </div>
             )}
 
+            {((preferences.asset_type === 'stock' && screenerMode === 'preset') || preferences.asset_type === 'etf') && (
+              <div>
+                <label className="block text-sm font-medium text-gray-200 mb-2">Step 2: Preset Universe</label>
+                <select
+                  value={presetUniverseMode}
+                  onChange={(e) => {
+                    const nextMode = e.target.value as PresetUniverseMode;
+                    setPresetUniverseMode(nextMode);
+                    setCurrentPage(1);
+                    setSelectedSymbol(null);
+                    setChartData([]);
+                    setChartError(null);
+                  }}
+                  className="w-full px-3 py-2 bg-gray-700 text-white border border-gray-600 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                >
+                  <option value="seed_only">Seed Only</option>
+                  <option value="seed_guardrail_blend">Seed + Guardrail Blend</option>
+                  <option value="guardrail_only">Guardrail Universe Only</option>
+                </select>
+                <p className="mt-1 text-xs text-gray-500">Choose whether presets use fixed seeds, blended seeds + ranking, or only guardrail-ranked active universe symbols.</p>
+              </div>
+            )}
+
             {preferences.asset_type === 'stock' && screenerMode === 'most_active' && (
               <div>
                 <label className="block text-sm font-medium text-gray-200 mb-2">Step 2: Most Active Count <HelpTooltip text="Number of top active stock symbols to include." /></label>
@@ -941,19 +1056,24 @@ const ScreenerPage: React.FC = () => {
               <label className="block text-sm font-medium text-gray-200 mb-2">Step 3: Weekly Budget ($)</label>
               <input
                 type="number"
-                min={50}
-                max={1000}
-                step={50}
+                min={WORKSPACE_LIMITS.weeklyBudgetMin}
+                max={WORKSPACE_LIMITS.weeklyBudgetMax}
+                step={5}
                 value={preferences.weekly_budget}
-                onChange={(e) => updatePreferences({ weekly_budget: parseFloat(e.target.value) || 200 })}
+                onChange={(e) => {
+                  const raw = parseFloat(e.target.value);
+                  if (Number.isFinite(raw)) {
+                    setPreferences((prev) => ({ ...prev, weekly_budget: raw }));
+                  }
+                }}
                 onBlur={(e) => {
                   const parsed = Number.parseFloat(e.target.value);
-                  const value = Number.isFinite(parsed) ? clamp(parsed, WORKSPACE_LIMITS.weeklyBudgetMin, WORKSPACE_LIMITS.weeklyBudgetMax) : 200;
+                  const value = Number.isFinite(parsed) ? clamp(parsed, WORKSPACE_LIMITS.weeklyBudgetMin, WORKSPACE_LIMITS.weeklyBudgetMax) : WORKSPACE_LIMITS.weeklyBudgetMin;
                   updatePreferences({ weekly_budget: value });
                 }}
                 className="w-full px-3 py-2 bg-gray-700 text-white border border-gray-600 rounded-md"
               />
-              <p className="mt-1 text-xs text-gray-500">Maximum new budget allocated for trading each week.</p>
+              <p className="mt-1 text-xs text-gray-500">Maximum new budget allocated for trading each week (min ${WORKSPACE_LIMITS.weeklyBudgetMin}).</p>
             </div>
 
             <div>

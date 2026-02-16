@@ -120,7 +120,7 @@ def test_set_weekly_budget():
 
 def test_get_week_summary():
     """Test getting week summary."""
-    tracker = WeeklyBudgetTracker(weekly_budget=200.0)
+    tracker = WeeklyBudgetTracker(weekly_budget=200.0, reinvest_profits=False)
     
     # Record some trades
     tracker.record_trade(50.0, is_buy=True)

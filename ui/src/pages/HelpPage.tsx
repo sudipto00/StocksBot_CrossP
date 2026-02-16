@@ -87,6 +87,17 @@ const budgetExamples = [
     expectedTrades: '2 - 3 / week',
     notes: 'Mix of broad-market and sector ETFs. Balanced preset gives exposure to QQQ, IWM, and sector rotators alongside SPY core. Good for growing capital steadily.',
   },
+  {
+    label: 'Micro Budget',
+    initial: '$100',
+    weekly: '$20 - $50',
+    assetType: 'Stocks',
+    preset: 'Micro Budget',
+    riskProfile: 'Micro Budget',
+    positionSize: '$25 - $75',
+    expectedTrades: '1 / week',
+    notes: 'Designed for the smallest accounts. Uses DCA split entries (2 tranches), tight 1.5% stop loss, 10% max drawdown kill switch, and automatic profit reinvestment. Consecutive-loss circuit breaker halts after 2 losses. Budget auto-scales after profitable weeks.',
+  },
 ];
 
 /* ─────────────────────────────────────────────────────────────────────────────
@@ -121,6 +132,13 @@ const stockPresetUniverses = [
     goal: 'Cost-aware weekly basket tuned for smaller accounts.',
     bestFor: '$100-$300 accounts. Lower-priced stocks keep position sizes affordable.',
     symbols: ['INTC', 'PFE', 'CSCO', 'PYPL', 'BABA', 'NKE', 'DIS', 'KO', 'XLF', 'IWM'],
+  },
+  {
+    preset: 'Micro Budget',
+    key: 'micro_budget',
+    goal: 'Optimized for micro accounts with DCA entries and profit compounding.',
+    bestFor: '$20-$50/week accounts. Tightest risk controls, 2-tranche DCA, auto budget scaling.',
+    symbols: ['SPY', 'INTC', 'PFE', 'CSCO', 'KO', 'VTI', 'XLF', 'DIS'],
   },
 ];
 
@@ -167,7 +185,7 @@ const presetSettingsRows = [
     goal: 'Higher activity, momentum-leaning weekly cadence.',
     riskProfile: 'Auto-Optimize target: aggressive.',
     screener: 'min_dollar_volume 20M, max_spread_bps 35, max_sector_weight_pct 40.',
-    strategy: 'position_size 1200; risk 1.5%; SL 2.0%; TP 5.0%; trail 2.5%; ATR 2.0; z-score -1.2; dip 1.5%; hold 10d.',
+    strategy: 'position_size 1200; risk 1.5%; SL 2.0%; TP 5.0%; trail 2.5%; ATR 2.0; z-score -1.2; dip 1.5%; hold 10d; DCA 1; max_losses 3; max_DD 15%.',
   },
   {
     sequence: '3) Stocks > 3-5 Trades/Week',
@@ -175,7 +193,7 @@ const presetSettingsRows = [
     goal: 'Balanced weekly turnover and diversification.',
     riskProfile: 'Auto-Optimize target: balanced.',
     screener: 'min_dollar_volume 12M, max_spread_bps 45, max_sector_weight_pct 45.',
-    strategy: 'position_size 1000; risk 1.2%; SL 2.5%; TP 6.0%; trail 2.8%; ATR 1.9; z-score -1.3; dip 2.0%; hold 7d.',
+    strategy: 'position_size 1000; risk 1.2%; SL 2.5%; TP 6.0%; trail 2.8%; ATR 1.9; z-score -1.3; dip 2.0%; hold 7d; DCA 1; max_losses 3; max_DD 15%.',
   },
   {
     sequence: '4) Stocks > Monthly Optimized',
@@ -183,7 +201,7 @@ const presetSettingsRows = [
     goal: 'Lower-turnover swing profile with longer hold window.',
     riskProfile: 'Auto-Optimize target: balanced.',
     screener: 'min_dollar_volume 8M, max_spread_bps 60, max_sector_weight_pct 50.',
-    strategy: 'position_size 900; risk 1.0%; SL 3.5%; TP 8.0%; trail 3.5%; ATR 2.2; z-score -1.5; dip 2.5%; hold 30d.',
+    strategy: 'position_size 900; risk 1.0%; SL 3.5%; TP 8.0%; trail 3.5%; ATR 2.2; z-score -1.5; dip 2.5%; hold 30d; DCA 1; max_losses 3; max_DD 15%.',
   },
   {
     sequence: '5) Stocks > Small Budget Weekly',
@@ -191,31 +209,39 @@ const presetSettingsRows = [
     goal: 'Budget-sensitive weekly execution with tighter sizing.',
     riskProfile: 'Auto-Optimize target: conservative.',
     screener: 'min_dollar_volume 5M, max_spread_bps 80, max_sector_weight_pct 55.',
-    strategy: 'position_size 500; risk 0.8%; SL 2.0%; TP 5.0%; trail 2.5%; ATR 1.8; z-score -1.2; dip 1.5%; hold 10d.',
+    strategy: 'position_size 500; risk 0.8%; SL 2.0%; TP 5.0%; trail 2.5%; ATR 1.8; z-score -1.2; dip 1.5%; hold 10d; DCA 1; max_losses 3; max_DD 15%.',
   },
   {
-    sequence: '6) ETFs > Conservative',
+    sequence: '6) Stocks > Micro Budget',
+    mode: 'Stock Preset (micro_budget)',
+    goal: 'Micro account optimization with DCA, compounding, and strict risk controls.',
+    riskProfile: 'Auto-Optimize target: micro_budget.',
+    screener: 'min_dollar_volume 2M, max_spread_bps 150, max_sector_weight_pct 60.',
+    strategy: 'position_size 75; risk 0.5%; SL 1.5%; TP 4.0%; trail 2.0%; ATR 1.5; z-score -1.0; dip 1.2%; hold 7d; DCA 2; max_losses 2; max_DD 10%.',
+  },
+  {
+    sequence: '7) ETFs > Conservative',
     mode: 'ETF Preset (conservative)',
     goal: 'Defensive ETF profile with stricter liquidity/sector limits.',
     riskProfile: 'Directly set to conservative.',
     screener: 'min_dollar_volume 15M, max_spread_bps 30, max_sector_weight_pct 35.',
-    strategy: 'position_size 1000; risk 0.8%; SL 2.0%; TP 5.0%; trail 2.5%; ATR 1.6; z-score -1.0; dip 1.2%; hold 12d.',
+    strategy: 'position_size 1000; risk 0.8%; SL 2.0%; TP 5.0%; trail 2.5%; ATR 1.6; z-score -1.0; dip 1.2%; hold 12d; DCA 1; max_losses 3; max_DD 15%.',
   },
   {
-    sequence: '7) ETFs > Balanced',
+    sequence: '8) ETFs > Balanced',
     mode: 'ETF Preset (balanced)',
     goal: 'Moderate ETF mix balancing rotation and drawdown control.',
     riskProfile: 'Directly set to balanced.',
     screener: 'min_dollar_volume 10M, max_spread_bps 40, max_sector_weight_pct 40.',
-    strategy: 'position_size 1000; risk 1.0%; SL 2.5%; TP 6.0%; trail 2.8%; ATR 1.9; z-score -1.2; dip 1.5%; hold 10d.',
+    strategy: 'position_size 1000; risk 1.0%; SL 2.5%; TP 6.0%; trail 2.8%; ATR 1.9; z-score -1.2; dip 1.5%; hold 10d; DCA 1; max_losses 3; max_DD 15%.',
   },
   {
-    sequence: '8) ETFs > Aggressive',
+    sequence: '9) ETFs > Aggressive',
     mode: 'ETF Preset (aggressive)',
     goal: 'Higher-beta ETF profile seeking larger moves.',
     riskProfile: 'Directly set to aggressive.',
     screener: 'min_dollar_volume 7M, max_spread_bps 55, max_sector_weight_pct 45.',
-    strategy: 'position_size 1300; risk 1.4%; SL 3.5%; TP 8.0%; trail 3.5%; ATR 2.0; z-score -1.5; dip 2.0%; hold 8d.',
+    strategy: 'position_size 1300; risk 1.4%; SL 3.5%; TP 8.0%; trail 3.5%; ATR 2.0; z-score -1.5; dip 2.0%; hold 8d; DCA 1; max_losses 3; max_DD 15%.',
   },
 ];
 
@@ -294,6 +320,21 @@ const strategyParameterDefinitions = [
     meaning: 'Maximum number of trading days to hold a position. Forces exit if neither stop loss nor take profit has triggered.',
     example: '10 days = roughly 2 calendar weeks of holding.',
   },
+  {
+    name: 'DCA Tranches',
+    meaning: 'Number of split entries when opening a position (Dollar-Cost Averaging). Instead of buying all at once, the position is divided into 1-3 equal entries over successive dip signals to get a better average price.',
+    example: '2 tranches on a $100 position = two $50 buys at different dip points.',
+  },
+  {
+    name: 'Max Consecutive Losses',
+    meaning: 'Circuit breaker threshold. If this many trades in a row result in losses, the strategy halts new entries until manually reset or a winning trade occurs.',
+    example: '2 means after 2 consecutive losing trades, the bot pauses to prevent a losing streak from draining capital.',
+  },
+  {
+    name: 'Max Drawdown (%)',
+    meaning: 'Kill switch threshold based on peak equity drawdown. If your account drops this percentage from its highest point, all new trading is halted.',
+    example: '10% max drawdown on a $500 peak = trading halts if equity falls to $450.',
+  },
 ];
 
 /* ─────────────────────────────────────────────────────────────────────────────
@@ -304,9 +345,9 @@ const controlDefinitions = [
   { name: 'Asset Type', location: 'Screener', meaning: 'Switches between Stocks and ETFs. ETFs use Preset mode only.', range: 'Stocks or ETFs' },
   { name: 'Universe Source', location: 'Screener (Stocks)', meaning: 'Choose Most Active (dynamic) or Strategy Preset (curated) stock universe.', range: 'Most Active or Preset' },
   { name: 'Most Active Count', location: 'Screener (Stocks + Most Active)', meaning: 'Number of ranked active stocks to fetch and screen.', range: '10-200' },
-  { name: 'Preset', location: 'Screener', meaning: 'Selects a curated seed universe and default risk/strategy profile.', range: 'Stock: 4, ETF: 3' },
-  { name: 'Weekly Budget ($)', location: 'Screener', meaning: 'Maximum amount you plan to invest each week. Used for sizing and optimization.', range: '$50-$1,000,000' },
-  { name: 'Max Position Size ($)', location: 'Screener + Settings', meaning: 'Per-position dollar cap. Runner may size lower based on buying power.', range: '$1-$5,000,000' },
+  { name: 'Preset', location: 'Screener', meaning: 'Selects a curated seed universe and default risk/strategy profile.', range: 'Stock: 5 (incl. Micro Budget), ETF: 3' },
+  { name: 'Weekly Budget ($)', location: 'Screener', meaning: 'Maximum amount you plan to invest each week. Used for sizing and optimization. Micro Budget preset supports as low as $20/week.', range: '$50-$1,000,000' },
+  { name: 'Max Position Size ($)', location: 'Screener + Settings', meaning: 'Per-position dollar cap. Runner may size lower based on buying power.', range: '$1-$10,000,000' },
   { name: 'Daily Loss Limit ($)', location: 'Screener + Settings', meaning: 'If daily losses reach this amount, new orders are blocked for the day.', range: '$1-$1,000,000' },
   { name: 'Min Dollar Volume ($)', location: 'Screener', meaning: 'Liquidity floor. Stocks trading less than this daily volume are excluded.', range: '$0-$1T' },
   { name: 'Max Spread (bps)', location: 'Screener', meaning: 'Trading cost filter. Stocks with wider bid-ask spreads are excluded.', range: '1-2000' },
@@ -385,6 +426,14 @@ const faqItems = [
   {
     q: 'Can I really start trading with just $100?',
     a: 'Yes. Use the "Small Budget Weekly" stock preset and set position sizes to $50-$80. Alpaca supports fractional shares, so even high-priced stocks like AAPL can be purchased in small dollar amounts. Always start with paper trading to validate your setup before risking real money.',
+  },
+  {
+    q: 'What is the Micro Budget preset?',
+    a: 'Micro Budget is optimized for accounts with $20-$50/week. It uses the tightest risk controls: $75 max position size, 2-tranche DCA entries, 1.5% stop loss, 10% max drawdown kill switch, and a 2-loss circuit breaker. It also enables automatic profit reinvestment (50%) and budget auto-scaling after profitable weeks.',
+  },
+  {
+    q: 'What are DCA tranches?',
+    a: 'DCA (Dollar-Cost Averaging) tranches split your position entry into multiple buys. Instead of buying $100 all at once, 2 tranches means two $50 buys at different dip signals, giving you a better average entry price. The Micro Budget preset uses 2 tranches by default; all other presets use 1 (no split).',
   },
   {
     q: 'Should I choose Stocks or ETFs?',
@@ -712,9 +761,10 @@ function exportHelpPdf() {
     '<strong>Alpaca credentials</strong> for paper/live are stored in macOS Keychain and auto-loaded on startup.',
     '<strong>Strict Alpaca Data Mode</strong> (default on) makes screener/chart/backtest/runner fail fast when real data is unavailable.',
     '<strong>Backend API-key auth</strong> is optional. Local desktop usage keeps it disabled by default.',
-    '<strong>Risk profile</strong> (Conservative/Balanced/Aggressive) defines sizing behavior and guardrail defaults.',
-    '<strong>Weekly budget</strong> and screener preferences drive symbol selection and allocation.',
-    '<strong>Safety Controls:</strong> Kill Switch (blocks new orders) and Panic Stop (emergency liquidation).',
+    '<strong>Risk profile</strong> (Conservative/Balanced/Aggressive/Micro Budget) defines sizing behavior and guardrail defaults.',
+    '<strong>Weekly budget</strong> and screener preferences drive symbol selection and allocation. Minimum $50 (Micro Budget supports $20-$50/week).',
+    '<strong>Safety Controls:</strong> Kill Switch, Panic Stop, Consecutive-Loss Circuit Breaker, and Drawdown Kill Switch.',
+    '<strong>Budget Features:</strong> Profit Reinvestment, Auto-Scaling Budget, and DCA split entries are configurable per strategy.',
     '<strong>Storage &amp; Retention</strong> includes cleanup actions and log/audit file visibility.',
     '<strong>Notifications:</strong> Desktop alerts, email/SMS summary delivery configuration.',
   ]));
@@ -753,10 +803,15 @@ function exportHelpPdf() {
       ['Trailing Stop', 'Per trade', 'Dynamic stop that follows price upward and locks in gains.'],
       ['Daily Loss Limit', 'Account', 'Blocks new orders if daily losses reach configured limit.'],
       ['Max Position Size', 'Per trade', 'Caps dollar amount per position to prevent overconcentration.'],
+      ['Consecutive-Loss Circuit Breaker', 'Per strategy', 'Halts new entries after N consecutive losing trades. Resets on a win or manual reset. Micro Budget defaults to 2.'],
+      ['Drawdown Kill Switch', 'Account', 'Halts all trading when account equity drops a set percentage from its peak. Micro Budget defaults to 10%.'],
       ['Kill Switch', 'Global', 'Blocks ALL new orders until disabled. Existing positions stay open.'],
       ['Panic Stop', 'Emergency', 'Stops runner AND liquidates all positions.'],
+      ['DCA / Split Entries', 'Per trade', 'Splits position entry into 1-3 tranches over successive dip signals for better average price.'],
+      ['Profit Reinvestment', 'Account', 'Automatically reinvests a percentage of realized profits back into the weekly trading budget.'],
+      ['Auto-Scaling Budget', 'Account', 'Gradually increases weekly budget after consecutive profitable weeks.'],
     ])}
-    ${callout('Important', 'For small accounts, use stop_loss 1.5-2%, risk_per_trade 0.5-0.8%, daily loss limit $5-$15.')}
+    ${callout('Important', 'For small accounts, use stop_loss 1.5-2%, risk_per_trade 0.5-0.8%, daily loss limit $5-$15. The Micro Budget preset configures all of these automatically.')}
   `);
 
   const troubleshootHtml = section('Troubleshooting', `
@@ -826,15 +881,28 @@ function exportHelpPdf() {
 </body>
 </html>`;
 
-  const blob = new Blob([html], { type: 'text/html' });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement('a');
-  link.href = url;
-  link.download = `StocksBot_Help_Guide_${fileDate}.html`;
-  document.body.appendChild(link);
-  link.click();
-  document.body.removeChild(link);
-  URL.revokeObjectURL(url);
+  /* Open in a new window and trigger the system print dialog.
+     On macOS, the print dialog has a built-in "Save as PDF" button. */
+  const printWindow = window.open('', '_blank', 'width=900,height=700');
+  if (printWindow) {
+    printWindow.document.open();
+    printWindow.document.write(html);
+    printWindow.document.close();
+    /* Small delay so the content renders before the print dialog opens */
+    printWindow.addEventListener('load', () => printWindow.print());
+    setTimeout(() => printWindow.print(), 500);
+  } else {
+    /* Fallback: download as HTML file if popup blocked */
+    const blob = new Blob([html], { type: 'text/html' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `StocksBot_Help_Guide_${fileDate}.html`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  }
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
@@ -1421,9 +1489,10 @@ function HelpPage() {
           <li><strong>Alpaca credentials</strong> for paper/live are stored in macOS Keychain and auto-loaded on startup.</li>
           <li><strong>Strict Alpaca Data Mode</strong> (default on) makes screener/chart/backtest/runner fail fast when real Alpaca data is unavailable.</li>
           <li><strong>Backend API-key auth</strong> is optional. Local desktop usage keeps it disabled by default.</li>
-          <li><strong>Risk profile</strong> (Conservative/Balanced/Aggressive) defines sizing behavior and guardrail defaults.</li>
-          <li><strong>Weekly budget</strong> and screener preferences drive symbol selection and allocation.</li>
-          <li><strong>Safety Controls</strong>: Kill Switch (blocks new orders) and Panic Stop (emergency liquidation).</li>
+          <li><strong>Risk profile</strong> (Conservative / Balanced / Aggressive / Micro Budget) defines sizing behavior and guardrail defaults.</li>
+          <li><strong>Weekly budget</strong> and screener preferences drive symbol selection and allocation. Supports amounts as low as $20/week for micro accounts.</li>
+          <li><strong>Budget features</strong>: Profit Reinvestment rolls realized gains back into budget; Auto-Scaling gradually increases budget after consecutive profitable weeks.</li>
+          <li><strong>Safety Controls</strong>: Kill Switch (blocks new orders), Panic Stop (emergency liquidation), Consecutive-Loss Circuit Breaker, and Drawdown Kill Switch.</li>
           <li><strong>Storage & Retention</strong> includes cleanup actions and log/audit file visibility.</li>
           <li><strong>Notifications</strong>: Desktop alerts, email/SMS summary delivery configuration.</li>
         </ul>
@@ -1578,6 +1647,14 @@ function HelpPage() {
               <p className="text-xs">Caps how much money goes into any single position. Prevents overconcentration in one stock.</p>
             </div>
             <div className="rounded bg-red-950/30 border border-red-800/40 p-3">
+              <p className="font-semibold text-red-200 mb-1">Consecutive-Loss Circuit Breaker</p>
+              <p className="text-xs">Halts new entries after N consecutive losing trades. Prevents losing streaks from draining capital. Resets on a win or manual deactivation. Micro Budget defaults to 2.</p>
+            </div>
+            <div className="rounded bg-red-950/30 border border-red-800/40 p-3">
+              <p className="font-semibold text-red-200 mb-1">Drawdown Kill Switch</p>
+              <p className="text-xs">Monitors account equity vs. its peak. If equity drops by the configured percentage, all new trading halts. Micro Budget defaults to 10%.</p>
+            </div>
+            <div className="rounded bg-red-950/30 border border-red-800/40 p-3">
               <p className="font-semibold text-red-200 mb-1">Kill Switch (global)</p>
               <p className="text-xs">Instantly blocks ALL new order submissions. Existing positions remain open. Toggle in Settings.</p>
             </div>
@@ -1585,11 +1662,19 @@ function HelpPage() {
               <p className="font-semibold text-red-200 mb-1">Panic Stop (emergency)</p>
               <p className="text-xs">Stops the runner AND liquidates all open positions. Use only in emergencies. Available from Dashboard and Strategy pages.</p>
             </div>
+            <div className="rounded bg-red-950/30 border border-red-800/40 p-3">
+              <p className="font-semibold text-red-200 mb-1">DCA / Split Entries</p>
+              <p className="text-xs">Divides position entry into 1-3 tranches across successive dip signals for a better average price. Reduces timing risk on entries.</p>
+            </div>
+            <div className="rounded bg-red-950/30 border border-red-800/40 p-3">
+              <p className="font-semibold text-red-200 mb-1">Profit Reinvestment &amp; Auto-Scaling</p>
+              <p className="text-xs">Reinvests a percentage of realized profits back into the weekly budget. Auto-scaling gradually increases budget after consecutive profitable weeks.</p>
+            </div>
           </div>
 
           <Callout type="warning">
-            For small accounts, set conservative risk limits. A single large loss on a $200 account is much harder
-            to recover from than on a $10,000 account. Use stop_loss 1.5-2%, risk_per_trade 0.5-0.8%, and daily loss limit $5-$15.
+            For small accounts, use the Micro Budget preset which automatically configures tight risk controls:
+            1.5% stop loss, 0.5% risk per trade, 2-loss circuit breaker, and 10% drawdown kill switch.
           </Callout>
         </div>
       </CollapsibleSection>

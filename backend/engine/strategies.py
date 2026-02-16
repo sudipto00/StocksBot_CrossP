@@ -236,6 +236,7 @@ class MetricsDrivenStrategy(StrategyInterface):
         self.zscore_entry_threshold = float(config.get("zscore_entry_threshold", -1.2))
         self.dip_buy_threshold_pct = float(config.get("dip_buy_threshold_pct", 1.5))
         self.max_hold_days = int(config.get("max_hold_days", 10))
+        self.dca_tranches = max(1, min(3, int(config.get("dca_tranches", 1))))
         # Only range_bound for dip-buy mean-reversion strategies.
         self.allowed_regimes = set(config.get("allowed_regimes", ["range_bound"]))
 
@@ -287,7 +288,9 @@ class MetricsDrivenStrategy(StrategyInterface):
                 zscore_signal = (zscore_val is not None and float(zscore_val) <= self.zscore_entry_threshold)
                 entry_signal = dip_buy_signal or zscore_signal
                 if entry_signal and regime in self.allowed_regimes:
-                    qty = self.position_size / price  # fractional shares OK
+                    # DCA: split entry into tranches
+                    tranche_size = self.position_size / self.dca_tranches
+                    qty = tranche_size / price  # fractional shares OK
                     atr_pct = float(indicators.get("atr14_pct", 0.0))
                     atr_stop_price = price * (1.0 - (self.atr_stop_mult * atr_pct / 100.0))
                     stop_loss_price = price * (1.0 - self.stop_loss_pct / 100.0)
@@ -298,15 +301,47 @@ class MetricsDrivenStrategy(StrategyInterface):
                         "atr_stop_price": min(atr_stop_price, stop_loss_price),
                         "take_profit_price": price * (1.0 + self.take_profit_pct / 100.0),
                         "entry_tick": self._tick_count,
+                        "dca_tranches_filled": 1,
+                        "dca_tranches_total": self.dca_tranches,
+                        "total_cost": qty * price,
                     }
                     signals.append({
                         "symbol": symbol,
                         "signal": Signal.BUY,
                         "quantity": qty,
                         "order_type": "market",
-                        "reason": f"Dip+zscore entry (regime={regime}, z={zscore_val})",
+                        "reason": f"Dip+zscore entry tranche 1/{self.dca_tranches} (regime={regime}, z={zscore_val})",
                     })
                 continue
+
+            # --- DCA: add subsequent tranches on deeper dips ---
+            tranches_filled = int(position.get("dca_tranches_filled", 1))
+            tranches_total = int(position.get("dca_tranches_total", 1))
+            if tranches_filled < tranches_total:
+                entry_price = float(position["entry_price"])
+                # Each subsequent tranche requires an additional 1% dip from avg entry
+                dca_threshold = entry_price * (1.0 - (tranches_filled * 1.0 / 100.0))
+                if price <= dca_threshold:
+                    tranche_size = self.position_size / tranches_total
+                    add_qty = tranche_size / price
+                    old_qty = float(position["qty"])
+                    old_cost = float(position.get("total_cost", old_qty * entry_price))
+                    new_qty = old_qty + add_qty
+                    new_cost = old_cost + (add_qty * price)
+                    position["qty"] = new_qty
+                    position["entry_price"] = new_cost / new_qty  # new avg price
+                    position["total_cost"] = new_cost
+                    position["dca_tranches_filled"] = tranches_filled + 1
+                    # Recalculate take profit from new avg entry
+                    new_avg = new_cost / new_qty
+                    position["take_profit_price"] = new_avg * (1.0 + self.take_profit_pct / 100.0)
+                    signals.append({
+                        "symbol": symbol,
+                        "signal": Signal.BUY,
+                        "quantity": add_qty,
+                        "order_type": "market",
+                        "reason": f"DCA tranche {tranches_filled + 1}/{tranches_total} at ${price:.2f}",
+                    })
 
             # --- Dynamic ATR stop: recalculate and ratchet upward ---
             current_atr_pct = float(indicators.get("atr14_pct", 0.0))

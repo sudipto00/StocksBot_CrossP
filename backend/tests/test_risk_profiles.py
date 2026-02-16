@@ -53,10 +53,11 @@ def test_get_all_profiles():
     """Test getting all profiles."""
     profiles = get_all_profiles()
     
-    assert len(profiles) == 3
+    assert len(profiles) == 4
     assert "conservative" in profiles
     assert "balanced" in profiles
     assert "aggressive" in profiles
+    assert "micro_budget" in profiles
 
 
 def test_get_position_size_conservative():

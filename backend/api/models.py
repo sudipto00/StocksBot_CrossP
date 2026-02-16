@@ -2,7 +2,7 @@
 API Data Models and Contracts.
 Defines Pydantic models for request/response validation.
 """
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Literal
 from datetime import datetime
 from enum import Enum
 import re
@@ -451,6 +451,41 @@ class BacktestRequest(BaseModel):
     initial_capital: float = Field(default=100000.0, description="Initial capital")
     symbols: Optional[List[str]] = Field(None, description="Symbols to backtest")
     parameters: Optional[Dict[str, float]] = Field(None, description="Strategy parameters")
+    # Live-equivalence controls (optional for backward compatibility).
+    emulate_live_trading: bool = Field(
+        default=False,
+        description="When true, enforce live-like backtest constraints and strict real data.",
+    )
+    use_workspace_universe: bool = Field(
+        default=False,
+        description="When true, resolve symbols from current screener workspace preferences/guardrails.",
+    )
+    asset_type: Optional[Literal["stock", "etf"]] = Field(
+        default=None,
+        description="Optional workspace asset type override for backtest universe resolution.",
+    )
+    screener_mode: Optional[Literal["most_active", "preset"]] = Field(
+        default=None,
+        description="Optional workspace screener mode override for backtest universe resolution.",
+    )
+    stock_preset: Optional[Literal["weekly_optimized", "three_to_five_weekly", "monthly_optimized", "small_budget_weekly", "micro_budget"]] = Field(
+        default=None,
+        description="Optional stock preset override for workspace universe backtests.",
+    )
+    etf_preset: Optional[Literal["conservative", "balanced", "aggressive"]] = Field(
+        default=None,
+        description="Optional ETF preset override for workspace universe backtests.",
+    )
+    screener_limit: Optional[int] = Field(default=None, ge=10, le=200, description="Universe size cap for workspace-backed runs.")
+    seed_only: Optional[bool] = Field(default=None, description="Compatibility flag for preset universe mode.")
+    preset_universe_mode: Optional[Literal["seed_only", "seed_guardrail_blend", "guardrail_only"]] = Field(
+        default=None,
+        description="Preset universe mode when screener_mode=preset.",
+    )
+    min_dollar_volume: Optional[float] = Field(default=None, ge=0, description="Guardrail override: minimum dollar volume.")
+    max_spread_bps: Optional[float] = Field(default=None, ge=1, description="Guardrail override: max spread in bps.")
+    max_sector_weight_pct: Optional[float] = Field(default=None, ge=5, le=100, description="Guardrail override: sector concentration cap.")
+    auto_regime_adjust: Optional[bool] = Field(default=None, description="Guardrail override: enable regime-based adjustment.")
 
 
 class BacktestResponse(BaseModel):
@@ -506,6 +541,7 @@ class ScreenerPreset(str, Enum):
     THREE_TO_FIVE_WEEKLY = "three_to_five_weekly"
     MONTHLY_OPTIMIZED = "monthly_optimized"
     SMALL_BUDGET_WEEKLY = "small_budget_weekly"
+    MICRO_BUDGET = "micro_budget"
     CONSERVATIVE = "conservative"
     BALANCED = "balanced"
     AGGRESSIVE = "aggressive"
@@ -517,12 +553,20 @@ class ScreenerMode(str, Enum):
     PRESET = "preset"
 
 
+class PresetUniverseMode(str, Enum):
+    """Universe construction modes for preset screener workflows."""
+    SEED_ONLY = "seed_only"
+    SEED_GUARDRAIL_BLEND = "seed_guardrail_blend"
+    GUARDRAIL_ONLY = "guardrail_only"
+
+
 class StockPreset(str, Enum):
     """Stock strategy presets."""
     WEEKLY_OPTIMIZED = "weekly_optimized"
     THREE_TO_FIVE_WEEKLY = "three_to_five_weekly"
     MONTHLY_OPTIMIZED = "monthly_optimized"
     SMALL_BUDGET_WEEKLY = "small_budget_weekly"
+    MICRO_BUDGET = "micro_budget"
 
 
 class EtfPreset(str, Enum):
@@ -546,6 +590,9 @@ class ScreenerAsset(BaseModel):
     dollar_volume: Optional[float] = Field(default=None, description="Estimated dollar volume")
     spread_bps: Optional[float] = Field(default=None, description="Estimated spread in basis points")
     tradable: Optional[bool] = Field(default=True, description="Whether symbol passed execution guardrails")
+    broker_tradable: Optional[bool] = Field(default=None, description="Whether broker reports symbol tradable")
+    fractionable: Optional[bool] = Field(default=None, description="Whether broker supports fractional orders")
+    execution_ticket: Optional[float] = Field(default=None, description="Estimated executable ticket size in dollars")
     selection_reason: Optional[str] = Field(default=None, description="Explainability note for selection")
 
 
@@ -587,6 +634,7 @@ class RiskProfile(str, Enum):
     CONSERVATIVE = "conservative"
     BALANCED = "balanced"
     AGGRESSIVE = "aggressive"
+    MICRO_BUDGET = "micro_budget"
 
 
 class RiskProfileInfo(BaseModel):
@@ -635,6 +683,7 @@ class TradingPreferencesResponse(BaseModel):
 class BudgetStatus(BaseModel):
     """Weekly budget status."""
     weekly_budget: float = Field(..., description="Total weekly budget")
+    base_weekly_budget: float = Field(default=0.0, description="Original weekly budget before auto-scaling")
     used_budget: float = Field(..., description="Budget used this week")
     remaining_budget: float = Field(..., description="Budget remaining this week")
     used_percent: float = Field(..., description="Percentage of budget used")
@@ -642,6 +691,13 @@ class BudgetStatus(BaseModel):
     weekly_pnl: float = Field(..., description="Weekly profit/loss")
     week_start: str = Field(..., description="Current week start date")
     days_remaining: int = Field(..., description="Days remaining in week")
+    reinvested_amount: float = Field(default=0.0, description="Profits reinvested this week")
+    reinvest_profits: bool = Field(default=True, description="Whether profit reinvestment is enabled")
+    reinvest_pct: float = Field(default=50.0, description="Percentage of profits to reinvest")
+    auto_scale_budget: bool = Field(default=False, description="Whether auto-scaling is enabled")
+    auto_scale_pct: float = Field(default=10.0, description="Auto-scale percentage per profitable streak")
+    cumulative_pnl: float = Field(default=0.0, description="Cumulative P&L across all weeks")
+    consecutive_profitable_weeks: int = Field(default=0, description="Current streak of profitable weeks")
 
 
 class BudgetUpdateRequest(BaseModel):

@@ -6,7 +6,7 @@ Supports both paper trading and live trading via API credentials.
 """
 
 from typing import Dict, List, Optional, Any, Callable
-from datetime import datetime
+from datetime import datetime, timedelta
 import logging
 import threading
 
@@ -69,6 +69,8 @@ class AlpacaBroker(BrokerInterface):
         self._trade_stream_thread: Optional[threading.Thread] = None
         self._trade_stream_running = False
         self._trade_update_callback: Optional[Callable[[Dict[str, Any]], None]] = None
+        self._asset_capabilities_cache: Dict[str, Dict[str, Any]] = {}
+        self._asset_capabilities_ttl = timedelta(minutes=15)
     
     def connect(self) -> bool:
         """
@@ -115,6 +117,7 @@ class AlpacaBroker(BrokerInterface):
         self._connected = False
         self._trading_client = None
         self._data_client = None
+        self._asset_capabilities_cache = {}
         logger.info("Disconnected from Alpaca")
         return True
     
@@ -165,13 +168,54 @@ class AlpacaBroker(BrokerInterface):
 
     def is_symbol_tradable(self, symbol: str) -> bool:
         """Return whether Alpaca marks the asset as tradable."""
+        return bool(self.get_symbol_capabilities(symbol).get("tradable", False))
+
+    def is_symbol_fractionable(self, symbol: str) -> bool:
+        """Return whether Alpaca marks the asset as fractionable."""
+        return bool(self.get_symbol_capabilities(symbol).get("fractionable", False))
+
+    def get_symbol_capabilities(self, symbol: str) -> Dict[str, bool]:
+        """Fetch tradable/fractionable metadata from Alpaca asset details."""
+        normalized = str(symbol or "").strip().upper()
+        if not normalized:
+            return {"tradable": False, "fractionable": False}
         if not self.is_connected():
-            return False
+            return {"tradable": False, "fractionable": False}
+        raw = self._get_asset_capabilities(normalized)
+        return {
+            "tradable": bool(raw.get("tradable", False)),
+            "fractionable": bool(raw.get("fractionable", False)),
+        }
+
+    def _get_asset_capabilities(self, symbol: str) -> Dict[str, Any]:
+        now = datetime.utcnow()
+        cached = self._asset_capabilities_cache.get(symbol)
+        if cached:
+            expires_at = cached.get("expires_at")
+            if isinstance(expires_at, datetime) and expires_at > now:
+                return dict(cached.get("data", {}))
         try:
             asset = self._trading_client.get_asset(symbol)
-            return bool(getattr(asset, "tradable", False))
+            payload = {
+                "tradable": bool(getattr(asset, "tradable", False)),
+                "fractionable": bool(getattr(asset, "fractionable", False)),
+                "shortable": bool(getattr(asset, "shortable", False)),
+                "easy_to_borrow": bool(getattr(asset, "easy_to_borrow", False)),
+                "marginable": bool(getattr(asset, "marginable", False)),
+            }
         except (RuntimeError, APIError, OSError):
-            return False
+            payload = {
+                "tradable": False,
+                "fractionable": False,
+                "shortable": False,
+                "easy_to_borrow": False,
+                "marginable": False,
+            }
+        self._asset_capabilities_cache[symbol] = {
+            "data": payload,
+            "expires_at": now + self._asset_capabilities_ttl,
+        }
+        return dict(payload)
 
     def get_next_market_open(self) -> Optional[datetime]:
         """Return next market-open timestamp from Alpaca clock when available."""

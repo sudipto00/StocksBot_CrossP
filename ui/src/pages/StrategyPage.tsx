@@ -51,6 +51,8 @@ const STRATEGY_LIMITS = {
 };
 const WORKSPACE_LAST_APPLIED_AT_KEY = 'stocksbot.workspace.lastAppliedAt';
 const WORKSPACE_SNAPSHOT_KEY = 'stocksbot.workspace.snapshot';
+const SCREENER_PRESET_UNIVERSE_MODE_KEY = 'stocksbot.screener.preset.universeMode';
+const SCREENER_PRESET_SEED_ONLY_KEY = 'stocksbot.screener.preset.seedOnly';
 const USD_FORMATTER = new Intl.NumberFormat('en-US', {
   style: 'currency',
   currency: 'USD',
@@ -75,8 +77,10 @@ interface RunnerInputSummary {
 interface WorkspaceSnapshot {
   asset_type?: AssetTypePreference;
   screener_mode?: 'most_active' | 'preset';
-  stock_preset?: 'weekly_optimized' | 'three_to_five_weekly' | 'monthly_optimized' | 'small_budget_weekly';
+  stock_preset?: 'weekly_optimized' | 'three_to_five_weekly' | 'monthly_optimized' | 'small_budget_weekly' | 'micro_budget';
   etf_preset?: 'conservative' | 'balanced' | 'aggressive';
+  preset_universe_mode?: 'seed_only' | 'seed_guardrail_blend' | 'guardrail_only';
+  seed_only_preset?: boolean;
   screener_limit?: number;
   min_dollar_volume?: number;
   max_spread_bps?: number;
@@ -153,6 +157,21 @@ function readWorkspaceSnapshot(): WorkspaceSnapshot | null {
     return parsed && typeof parsed === 'object' ? parsed : null;
   } catch {
     return null;
+  }
+}
+
+function readPresetUniverseModeSetting(): 'seed_only' | 'seed_guardrail_blend' | 'guardrail_only' {
+  if (typeof window === 'undefined') return 'seed_guardrail_blend';
+  try {
+    const storedMode = window.localStorage.getItem(SCREENER_PRESET_UNIVERSE_MODE_KEY);
+    if (storedMode === 'seed_only' || storedMode === 'seed_guardrail_blend' || storedMode === 'guardrail_only') {
+      return storedMode;
+    }
+    return window.localStorage.getItem(SCREENER_PRESET_SEED_ONLY_KEY) === 'true'
+      ? 'seed_only'
+      : 'seed_guardrail_blend';
+  } catch {
+    return 'seed_guardrail_blend';
   }
 }
 
@@ -758,18 +777,39 @@ function StrategyPage() {
         acc[param.name] = bounded;
         return acc;
       }, {} as Record<string, number>);
+      const workspacePresetUniverseMode = (
+        workspaceSnapshot?.preset_universe_mode
+        || (typeof workspaceSnapshot?.seed_only_preset === 'boolean'
+          ? (workspaceSnapshot.seed_only_preset ? 'seed_only' : 'seed_guardrail_blend')
+          : readPresetUniverseModeSetting())
+      );
       const result = await runBacktest(selectedStrategy.id, {
         start_date: backtestStartDate,
         end_date: backtestEndDate,
         initial_capital: initialCapital,
         symbols,
         parameters,
+        emulate_live_trading: true,
+        use_workspace_universe: true,
+        asset_type: currentPrefs?.asset_type,
+        screener_mode: currentPrefs?.asset_type === 'etf' ? 'preset' : currentPrefs?.screener_mode,
+        stock_preset: currentPrefs?.stock_preset,
+        etf_preset: currentPrefs?.etf_preset,
+        screener_limit: currentPrefs?.screener_limit,
+        preset_universe_mode: workspacePresetUniverseMode,
+        seed_only: workspacePresetUniverseMode === 'seed_only',
+        min_dollar_volume: effectiveMinDollarVolume,
+        max_spread_bps: effectiveMaxSpreadBps,
+        max_sector_weight_pct: effectiveMaxSectorWeightPct,
+        auto_regime_adjust: effectiveAutoRegimeAdjust,
       });
       setBacktestResult(result);
       setBacktestCompletedAt(new Date().toISOString());
       await showSuccessNotification('Backtest Complete', `Completed ${result.total_trades} trades`);
     } catch (err) {
-      await showErrorNotification('Backtest Error', 'Failed to run backtest');
+      const message = err instanceof Error ? err.message : 'Failed to run backtest';
+      setBacktestError(message);
+      await showErrorNotification('Backtest Error', message);
     } finally {
       setBacktestLoading(false);
     }
@@ -796,10 +836,18 @@ function StrategyPage() {
         prefs.asset_type === 'stock'
           ? (useSnapshot?.screener_mode || prefs.screener_mode)
           : 'preset';
+      const presetUniverseMode = (
+        useSnapshot?.preset_universe_mode
+        || (typeof useSnapshot?.seed_only_preset === 'boolean'
+          ? (useSnapshot.seed_only_preset ? 'seed_only' : 'seed_guardrail_blend')
+          : readPresetUniverseModeSetting())
+      );
       const response = await getScreenerAssets(prefs.asset_type as AssetTypePreference, prefs.screener_limit, {
         screenerMode,
         stockPreset: prefs.stock_preset,
         etfPreset: prefs.etf_preset,
+        presetUniverseMode: screenerMode === 'preset' ? presetUniverseMode : undefined,
+        seedOnly: screenerMode === 'preset' ? presetUniverseMode === 'seed_only' : undefined,
         minDollarVolume: useSnapshot?.min_dollar_volume,
         maxSpreadBps: useSnapshot?.max_spread_bps,
         maxSectorWeightPct: useSnapshot?.max_sector_weight_pct,
@@ -809,11 +857,16 @@ function StrategyPage() {
         .slice(0, STRATEGY_LIMITS.maxSymbols);
       if (symbols.length > 0) {
         setFormSymbols(symbols.join(', '));
+        const presetUniverseLabel = presetUniverseMode === 'seed_only'
+          ? 'Seed Only'
+          : presetUniverseMode === 'guardrail_only'
+          ? 'Guardrail Universe Only'
+          : 'Seed + Guardrail Blend';
         const sourceLabel = prefs.asset_type === 'stock'
           ? screenerMode === 'most_active'
             ? `Stocks Most Active (${prefs.screener_limit})`
-            : `Stock Preset (${prefs.stock_preset})`
-          : `ETF Preset (${prefs.etf_preset})`;
+            : `Stock Preset (${prefs.stock_preset}, ${presetUniverseLabel})`
+          : `ETF Preset (${prefs.etf_preset}, ${presetUniverseLabel})`;
         setPrefillMessage(`Prefilled ${symbols.length} symbols from ${sourceLabel}.`);
       } else {
         setPrefillMessage('No symbols were returned from the current Screener selection.');

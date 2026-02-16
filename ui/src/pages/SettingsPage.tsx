@@ -923,15 +923,16 @@ function SettingsPage() {
           {/* Active Preset Trading Parameters */}
           {(() => {
             const stockPresets: Record<string, Record<string, number>> = {
-              weekly_optimized: { position_size: 1200, stop_loss_pct: 2.0, take_profit_pct: 5.0, trailing_stop_pct: 2.5, max_hold_days: 10, risk_per_trade: 1.5 },
-              three_to_five_weekly: { position_size: 1000, stop_loss_pct: 2.5, take_profit_pct: 6.0, trailing_stop_pct: 2.8, max_hold_days: 7, risk_per_trade: 1.2 },
-              monthly_optimized: { position_size: 900, stop_loss_pct: 3.5, take_profit_pct: 8.0, trailing_stop_pct: 3.5, max_hold_days: 30, risk_per_trade: 1.0 },
-              small_budget_weekly: { position_size: 500, stop_loss_pct: 2.0, take_profit_pct: 5.0, trailing_stop_pct: 2.5, max_hold_days: 10, risk_per_trade: 0.8 },
+              weekly_optimized: { position_size: 1200, risk_per_trade: 1.5, stop_loss_pct: 2.0, take_profit_pct: 5.0, trailing_stop_pct: 2.5, atr_stop_mult: 2.0, zscore_entry_threshold: -1.2, dip_buy_threshold_pct: 1.5, max_hold_days: 10, dca_tranches: 1, max_consecutive_losses: 3, max_drawdown_pct: 15.0 },
+              three_to_five_weekly: { position_size: 1000, risk_per_trade: 1.2, stop_loss_pct: 2.5, take_profit_pct: 6.0, trailing_stop_pct: 2.8, atr_stop_mult: 1.9, zscore_entry_threshold: -1.3, dip_buy_threshold_pct: 2.0, max_hold_days: 7, dca_tranches: 1, max_consecutive_losses: 3, max_drawdown_pct: 15.0 },
+              monthly_optimized: { position_size: 900, risk_per_trade: 1.0, stop_loss_pct: 3.5, take_profit_pct: 8.0, trailing_stop_pct: 3.5, atr_stop_mult: 2.2, zscore_entry_threshold: -1.5, dip_buy_threshold_pct: 2.5, max_hold_days: 30, dca_tranches: 1, max_consecutive_losses: 3, max_drawdown_pct: 15.0 },
+              small_budget_weekly: { position_size: 500, risk_per_trade: 0.8, stop_loss_pct: 2.0, take_profit_pct: 5.0, trailing_stop_pct: 2.5, atr_stop_mult: 1.8, zscore_entry_threshold: -1.2, dip_buy_threshold_pct: 1.5, max_hold_days: 10, dca_tranches: 1, max_consecutive_losses: 3, max_drawdown_pct: 15.0 },
+              micro_budget: { position_size: 75, risk_per_trade: 0.5, stop_loss_pct: 1.5, take_profit_pct: 4.0, trailing_stop_pct: 2.0, atr_stop_mult: 1.5, zscore_entry_threshold: -1.0, dip_buy_threshold_pct: 1.2, max_hold_days: 7, dca_tranches: 2, max_consecutive_losses: 2, max_drawdown_pct: 10.0 },
             };
             const etfPresets: Record<string, Record<string, number>> = {
-              conservative: { position_size: 1000, stop_loss_pct: 2.0, take_profit_pct: 5.0, trailing_stop_pct: 2.5, max_hold_days: 12, risk_per_trade: 0.8 },
-              balanced: { position_size: 1000, stop_loss_pct: 2.5, take_profit_pct: 6.0, trailing_stop_pct: 2.8, max_hold_days: 10, risk_per_trade: 1.0 },
-              aggressive: { position_size: 1300, stop_loss_pct: 3.5, take_profit_pct: 8.0, trailing_stop_pct: 3.5, max_hold_days: 8, risk_per_trade: 1.4 },
+              conservative: { position_size: 1000, risk_per_trade: 0.8, stop_loss_pct: 2.0, take_profit_pct: 5.0, trailing_stop_pct: 2.5, atr_stop_mult: 1.6, zscore_entry_threshold: -1.0, dip_buy_threshold_pct: 1.2, max_hold_days: 12, dca_tranches: 1, max_consecutive_losses: 3, max_drawdown_pct: 15.0 },
+              balanced: { position_size: 1000, risk_per_trade: 1.0, stop_loss_pct: 2.5, take_profit_pct: 6.0, trailing_stop_pct: 2.8, atr_stop_mult: 1.9, zscore_entry_threshold: -1.2, dip_buy_threshold_pct: 1.5, max_hold_days: 10, dca_tranches: 1, max_consecutive_losses: 3, max_drawdown_pct: 15.0 },
+              aggressive: { position_size: 1300, risk_per_trade: 1.4, stop_loss_pct: 3.5, take_profit_pct: 8.0, trailing_stop_pct: 3.5, atr_stop_mult: 2.0, zscore_entry_threshold: -1.5, dip_buy_threshold_pct: 2.0, max_hold_days: 8, dca_tranches: 1, max_consecutive_losses: 3, max_drawdown_pct: 15.0 },
             };
             const activePreset = assetType === 'etf'
               ? etfPresets[etfPreset] || etfPresets.balanced
@@ -947,6 +948,12 @@ function SettingsPage() {
                   <div><span className="text-gray-500">Trail:</span> <span className="text-white">{activePreset.trailing_stop_pct}%</span></div>
                   <div><span className="text-gray-500">Hold:</span> <span className="text-white">{activePreset.max_hold_days}d</span></div>
                   <div><span className="text-gray-500">TP:SL:</span> <span className={parseFloat(tpSlRatio) >= 2.0 ? 'text-green-400' : 'text-yellow-400'}>{tpSlRatio}:1</span></div>
+                  <div><span className="text-gray-500">ATR Mult:</span> <span className="text-white">{activePreset.atr_stop_mult}x</span></div>
+                  <div><span className="text-gray-500">Z-Score:</span> <span className="text-white">{activePreset.zscore_entry_threshold}</span></div>
+                  <div><span className="text-gray-500">Dip:</span> <span className="text-white">{activePreset.dip_buy_threshold_pct}%</span></div>
+                  <div><span className="text-gray-500">DCA:</span> <span className="text-white">{activePreset.dca_tranches}x</span></div>
+                  <div><span className="text-gray-500">Max Losses:</span> <span className="text-white">{activePreset.max_consecutive_losses}</span></div>
+                  <div><span className="text-gray-500">Max DD:</span> <span className="text-white">{activePreset.max_drawdown_pct}%</span></div>
                 </div>
               </div>
             );
@@ -1063,27 +1070,27 @@ function SettingsPage() {
 
       <CollapsibleSection title="Feature Highlights" summary="Current and upcoming capabilities" defaultOpen={false}>
       <div className="bg-blue-900/20 border border-blue-700 rounded-lg p-6 mb-6">
-        <h4 className="text-lg font-semibold text-blue-400 mb-2">New Features Available!</h4>
+        <h4 className="text-lg font-semibold text-blue-400 mb-2">Features Available</h4>
         <ul className="text-blue-200/80 text-sm space-y-1">
           <li>✓ Market Screener - View most actively traded stocks and ETFs</li>
-          <li>✓ Risk Profiles - Conservative, Balanced, and Aggressive strategies</li>
-          <li>✓ Weekly Budget Tracking - Manage up to $200/week trading budget</li>
+          <li>✓ Risk Profiles - Conservative, Balanced, Aggressive, and Micro Budget</li>
+          <li>✓ Weekly Budget Tracking - Configurable weekly trading budget</li>
           <li>✓ Asset Type Preferences - Choose stocks or ETFs</li>
+          <li>✓ DCA / Split Entries - Dollar-cost average into positions with 1-3 tranches</li>
+          <li>✓ Profit Reinvestment - Compound realized gains back into weekly budget</li>
+          <li>✓ Auto-Scaling Budget - Budget grows after consecutive profitable weeks</li>
+          <li>✓ Consecutive-Loss Circuit Breaker - Halts trading after N losing trades</li>
+          <li>✓ Drawdown Kill Switch - Halts trading when account drops below peak threshold</li>
+          <li>✓ Micro Budget Preset - Optimized for $20-$50/week accounts</li>
         </ul>
-        <p className="text-blue-200/60 text-sm mt-3">
-          Visit the new Screener page to explore these features!
-        </p>
       </div>
 
       <div className="bg-gray-800/50 border border-gray-700 rounded-lg p-6">
         <h4 className="text-lg font-semibold text-gray-400 mb-2">Future Enhancements</h4>
         <ul className="text-gray-500 text-sm space-y-1">
-          <li>• API key management (encrypted storage)</li>
-          <li>• Notification preferences (email, push, etc.)</li>
           <li>• UI theme customization</li>
           <li>• Data export settings</li>
           <li>• Backup and restore</li>
-          <li>• Advanced risk parameters</li>
         </ul>
       </div>
       </CollapsibleSection>

@@ -168,6 +168,56 @@ def test_optimize_assets_accepts_portfolio_context_kwargs():
     assert all("symbol" in item for item in optimized)
 
 
+def test_optimize_assets_enforces_tradable_and_fractionable_for_micro_workflows():
+    """When strict execution filters are enabled, non-fractionable symbols should be excluded."""
+    screener = MarketScreener()
+    assets = [
+        {
+            "symbol": "AAA",
+            "name": "High Price Non Fractionable",
+            "asset_type": "stock",
+            "volume": 25_000_000,
+            "price": 500.0,
+            "change_percent": 1.2,
+            "last_updated": "2026-01-01T00:00:00",
+        },
+        {
+            "symbol": "BBB",
+            "name": "High Price Fractionable",
+            "asset_type": "stock",
+            "volume": 25_000_000,
+            "price": 500.0,
+            "change_percent": 1.0,
+            "last_updated": "2026-01-01T00:00:00",
+        },
+    ]
+
+    optimized = screener.optimize_assets(
+        assets=assets,
+        limit=2,
+        min_dollar_volume=1_000_000,
+        max_spread_bps=200,
+        max_sector_weight_pct=100,
+        regime="range_bound",
+        auto_regime_adjust=False,
+        buying_power=50,
+        equity=500,
+        weekly_budget=50,
+        symbol_capabilities={
+            "AAA": {"tradable": True, "fractionable": False},
+            "BBB": {"tradable": True, "fractionable": True},
+        },
+        require_broker_tradable=True,
+        require_fractionable=True,
+        target_position_size=30,
+        dca_tranches=1,
+    )
+
+    symbols = [row["symbol"] for row in optimized]
+    assert "BBB" in symbols
+    assert "AAA" not in symbols
+
+
 def test_chart_indicators_use_true_atr_from_ohlc():
     """ATR should use true range from high/low/previous-close, not close-to-close proxy only."""
     screener = MarketScreener()
@@ -185,3 +235,46 @@ def test_chart_indicators_use_true_atr_from_ohlc():
     # [7, 5, 7, 3] => ATR abs = 5.5; ATR% = 5.5 / 107 * 100 = 5.1402
     assert indicators["atr14"] == pytest.approx(5.5, rel=1e-6)
     assert indicators["atr14_pct"] == pytest.approx(5.1402, rel=1e-6)
+
+
+def test_get_preset_assets_seed_only_disables_backfill():
+    """seed_only should limit output to preset seed symbols only (no active-universe backfill)."""
+    screener = MarketScreener()
+    assets = screener.get_preset_assets(
+        asset_type="stock",
+        preset="micro_budget",
+        limit=50,
+        seed_only=True,
+    )
+    symbols = {row["symbol"] for row in assets}
+    seed_symbols = {"SPY", "INTC", "PFE", "CSCO", "KO", "VTI", "XLF", "DIS"}
+    assert symbols
+    assert symbols.issubset(seed_symbols)
+    assert len(assets) <= len(seed_symbols)
+
+
+def test_get_preset_assets_guardrail_only_ignores_seed_subset():
+    """guardrail_only should use active-universe candidates, not seed list only."""
+    screener = MarketScreener()
+    assets = screener.get_preset_assets(
+        asset_type="stock",
+        preset="micro_budget",
+        limit=30,
+        preset_universe_mode="guardrail_only",
+    )
+    symbols = {row["symbol"] for row in assets}
+    seed_symbols = {"SPY", "INTC", "PFE", "CSCO", "KO", "VTI", "XLF", "DIS"}
+    assert symbols
+    assert any(symbol not in seed_symbols for symbol in symbols)
+
+
+def test_get_preset_assets_rejects_unknown_universe_mode():
+    """Invalid preset universe mode should fail fast."""
+    screener = MarketScreener()
+    with pytest.raises(ValueError):
+        screener.get_preset_assets(
+            asset_type="stock",
+            preset="micro_budget",
+            limit=20,
+            preset_universe_mode="invalid_mode",
+        )

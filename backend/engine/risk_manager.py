@@ -31,29 +31,46 @@ class RiskManager:
         max_portfolio_exposure: float = 100000.0,
         max_symbol_concentration_pct: float = 45.0,
         max_open_positions: int = 25,
+        max_consecutive_losses: int = 3,
+        max_drawdown_pct: float = 15.0,
     ):
         """
         Initialize risk manager.
-        
+
         Args:
             max_position_size: Maximum position size in dollars
             daily_loss_limit: Maximum daily loss allowed
             max_portfolio_exposure: Maximum total portfolio exposure
             max_symbol_concentration_pct: Max single-symbol concentration (% of exposure)
             max_open_positions: Max unique symbols allowed
+            max_consecutive_losses: Halt trading after N consecutive losing trades
+            max_drawdown_pct: Halt trading when account drops this % from peak equity
         """
         self.max_position_size = max(1.0, float(max_position_size))
         self.daily_loss_limit = max(1.0, float(daily_loss_limit))
         self.max_portfolio_exposure = max(1.0, float(max_portfolio_exposure))
         self.max_symbol_concentration_pct = min(100.0, max(1.0, float(max_symbol_concentration_pct)))
         self.max_open_positions = max(1, int(max_open_positions))
-        
+        self.max_consecutive_losses = max(1, int(max_consecutive_losses))
+        self.max_drawdown_pct = max(1.0, min(50.0, float(max_drawdown_pct)))
+
         # Track daily stats
         self.daily_pnl: float = 0.0
         self.daily_reset_time = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-        
+
         # Circuit breaker
         self.circuit_breaker_active = False
+        self.circuit_breaker_reason: str = ""
+
+        # Consecutive loss tracking
+        self._consecutive_losses: int = 0
+        self._total_losses: int = 0
+        self._total_wins: int = 0
+
+        # Drawdown tracking
+        self._peak_equity: float = 0.0
+        self._current_equity: float = 0.0
+        self._current_drawdown_pct: float = 0.0
         
     def validate_order(
         self,
@@ -132,18 +149,63 @@ class RiskManager:
 
         return True, None
     
+    def record_trade_result(self, pnl: float) -> None:
+        """
+        Record a trade result for consecutive-loss tracking.
+
+        Args:
+            pnl: Realized P&L of the closed trade
+        """
+        if pnl < 0:
+            self._consecutive_losses += 1
+            self._total_losses += 1
+            if self._consecutive_losses >= self.max_consecutive_losses:
+                self.activate_circuit_breaker(
+                    f"Consecutive loss limit reached ({self._consecutive_losses} "
+                    f"losses in a row, limit={self.max_consecutive_losses})"
+                )
+        else:
+            self._consecutive_losses = 0
+            if pnl > 0:
+                self._total_wins += 1
+
+    def update_equity(self, equity: float) -> None:
+        """
+        Update current equity for drawdown monitoring.
+
+        Args:
+            equity: Current account equity
+        """
+        if equity <= 0:
+            return
+        self._current_equity = equity
+        if equity > self._peak_equity:
+            self._peak_equity = equity
+
+        if self._peak_equity > 0:
+            self._current_drawdown_pct = (
+                (self._peak_equity - equity) / self._peak_equity
+            ) * 100.0
+        else:
+            self._current_drawdown_pct = 0.0
+
+        if self._current_drawdown_pct >= self.max_drawdown_pct:
+            self.activate_circuit_breaker(
+                f"Account drawdown kill switch triggered: "
+                f"{self._current_drawdown_pct:.1f}% drawdown from peak "
+                f"(limit={self.max_drawdown_pct:.1f}%)"
+            )
+
     def update_daily_pnl(self, pnl: float) -> None:
         """
         Update daily P&L.
-        
+
         Args:
             pnl: P&L to add
-            
-        TODO: Implement actual P&L tracking from positions
         """
         self._reset_daily_stats_if_needed()
         self.daily_pnl += pnl
-        
+
         # Check if we need to activate circuit breaker
         if self.daily_pnl < -self.daily_loss_limit:
             self.activate_circuit_breaker("Daily loss limit exceeded")
@@ -151,25 +213,19 @@ class RiskManager:
     def activate_circuit_breaker(self, reason: str) -> None:
         """
         Activate circuit breaker to halt trading.
-        
+
         Args:
             reason: Reason for activation
-            
-        TODO: Implement circuit breaker activation
-        TODO: Send notifications
-        TODO: Close positions if configured
         """
         self.circuit_breaker_active = True
+        self.circuit_breaker_reason = reason
         print(f"[RISK MANAGER] Circuit breaker activated: {reason}")
-    
+
     def deactivate_circuit_breaker(self) -> None:
-        """
-        Deactivate circuit breaker.
-        
-        TODO: Require manual confirmation
-        TODO: Log deactivation
-        """
+        """Deactivate circuit breaker and reset consecutive loss counter."""
         self.circuit_breaker_active = False
+        self.circuit_breaker_reason = ""
+        self._consecutive_losses = 0
         print("[RISK MANAGER] Circuit breaker deactivated")
     
     def get_risk_metrics(self) -> Dict[str, Any]:
@@ -188,10 +244,21 @@ class RiskManager:
             "daily_pnl_percent": (self.daily_pnl / self.daily_loss_limit * 100) if self.daily_loss_limit > 0 else 0,
             "daily_loss_remaining": max(0.0, self.daily_loss_limit + self.daily_pnl),
             "circuit_breaker_active": self.circuit_breaker_active,
+            "circuit_breaker_reason": self.circuit_breaker_reason,
             "max_position_size": self.max_position_size,
             "max_portfolio_exposure": self.max_portfolio_exposure,
             "max_symbol_concentration_pct": self.max_symbol_concentration_pct,
             "max_open_positions": self.max_open_positions,
+            # Consecutive loss tracking
+            "consecutive_losses": self._consecutive_losses,
+            "max_consecutive_losses": self.max_consecutive_losses,
+            "total_wins": self._total_wins,
+            "total_losses": self._total_losses,
+            # Drawdown tracking
+            "peak_equity": self._peak_equity,
+            "current_equity": self._current_equity,
+            "current_drawdown_pct": round(self._current_drawdown_pct, 2),
+            "max_drawdown_pct": self.max_drawdown_pct,
         }
     
     def _reset_daily_stats_if_needed(self) -> None:
