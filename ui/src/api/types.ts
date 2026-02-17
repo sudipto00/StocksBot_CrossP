@@ -298,6 +298,7 @@ export interface RunnerState {
   strategies: unknown[];
   tick_interval: number;
   broker_connected: boolean;
+  runner_thread_alive?: boolean;
   poll_success_count?: number;
   poll_error_count?: number;
   last_poll_error?: string;
@@ -310,6 +311,7 @@ export interface RunnerState {
   last_catchup_at?: string | null;
   resume_count?: number;
   market_session_open?: boolean | null;
+  last_state_persisted_at?: string | null;
 }
 
 export interface RunnerStatusResponse {
@@ -317,6 +319,7 @@ export interface RunnerStatusResponse {
   strategies: unknown[];
   tick_interval: number;
   broker_connected: boolean;
+  runner_thread_alive?: boolean;
   poll_success_count: number;
   poll_error_count: number;
   last_poll_error: string;
@@ -331,12 +334,28 @@ export interface RunnerStatusResponse {
   last_catchup_at?: string | null;
   resume_count?: number;
   market_session_open?: boolean | null;
+  last_state_persisted_at?: string | null;
 }
 
 export interface RunnerActionResponse {
   success: boolean;
   message: string;
   status: string;
+}
+
+export interface RunnerStartRequest {
+  use_workspace_universe?: boolean;
+  asset_type?: 'stock' | 'etf';
+  screener_mode?: 'most_active' | 'preset';
+  stock_preset?: 'weekly_optimized' | 'three_to_five_weekly' | 'monthly_optimized' | 'small_budget_weekly' | 'micro_budget';
+  etf_preset?: 'conservative' | 'balanced' | 'aggressive';
+  screener_limit?: number;
+  seed_only?: boolean;
+  preset_universe_mode?: 'seed_only' | 'seed_guardrail_blend' | 'guardrail_only';
+  min_dollar_volume?: number;
+  max_spread_bps?: number;
+  max_sector_weight_pct?: number;
+  auto_regime_adjust?: boolean;
 }
 
 export interface WebSocketAuthTicketResponse {
@@ -502,6 +521,8 @@ export interface BacktestRequest {
   start_date: string;
   end_date: string;
   initial_capital?: number;
+  contribution_amount?: number;
+  contribution_frequency?: 'none' | 'weekly' | 'monthly';
   symbols?: string[];
   parameters?: Record<string, number>;
   emulate_live_trading?: boolean;
@@ -601,6 +622,11 @@ export interface BacktestDiagnostics {
   exit_reasons: Record<string, number>;
   top_blockers: BacktestBlockerCount[];
   parameters_used: Record<string, number>;
+  contribution_amount?: number;
+  contribution_frequency?: 'none' | 'weekly' | 'monthly';
+  contribution_events?: number;
+  capital_contributions_total?: number;
+  capital_base_for_return?: number;
   advanced_metrics?: BacktestAdvancedMetrics;
   live_parity?: BacktestLiveParityReport;
 }
@@ -622,6 +648,133 @@ export interface BacktestResult {
   trades: BacktestTrade[];
   equity_curve: BacktestEquityPoint[];
   diagnostics?: BacktestDiagnostics;
+}
+
+export interface StrategyOptimizationRequest {
+  start_date: string;
+  end_date: string;
+  initial_capital?: number;
+  contribution_amount?: number;
+  contribution_frequency?: 'none' | 'weekly' | 'monthly';
+  symbols?: string[];
+  parameters?: Record<string, number>;
+  emulate_live_trading?: boolean;
+  use_workspace_universe?: boolean;
+  asset_type?: 'stock' | 'etf';
+  screener_mode?: 'most_active' | 'preset';
+  stock_preset?: 'weekly_optimized' | 'three_to_five_weekly' | 'monthly_optimized' | 'small_budget_weekly' | 'micro_budget';
+  etf_preset?: 'conservative' | 'balanced' | 'aggressive';
+  screener_limit?: number;
+  seed_only?: boolean;
+  preset_universe_mode?: 'seed_only' | 'seed_guardrail_blend' | 'guardrail_only';
+  min_dollar_volume?: number;
+  max_spread_bps?: number;
+  max_sector_weight_pct?: number;
+  auto_regime_adjust?: boolean;
+  iterations?: number;
+  min_trades?: number;
+  objective?: 'balanced' | 'sharpe' | 'return';
+  strict_min_trades?: boolean;
+  walk_forward_enabled?: boolean;
+  walk_forward_folds?: number;
+  random_seed?: number;
+}
+
+export interface StrategyOptimizationCandidate {
+  rank: number;
+  score: number;
+  meets_min_trades: boolean;
+  symbol_count: number;
+  sharpe_ratio: number;
+  total_return: number;
+  max_drawdown: number;
+  win_rate: number;
+  total_trades: number;
+  parameters: Record<string, number>;
+}
+
+export interface StrategyOptimizationWalkForwardFold {
+  fold_index: number;
+  train_start: string;
+  train_end: string;
+  test_start: string;
+  test_end: string;
+  score: number;
+  total_return: number;
+  sharpe_ratio: number;
+  max_drawdown: number;
+  win_rate: number;
+  total_trades: number;
+  meets_min_trades: boolean;
+}
+
+export interface StrategyOptimizationWalkForwardReport {
+  enabled: boolean;
+  objective: string;
+  strict_min_trades: boolean;
+  min_trades_target: number;
+  folds_requested: number;
+  folds_completed: number;
+  pass_rate_pct: number;
+  average_score: number;
+  average_return: number;
+  average_sharpe: number;
+  worst_fold_return: number;
+  folds: StrategyOptimizationWalkForwardFold[];
+  notes: string[];
+}
+
+export interface StrategyOptimizationResult {
+  strategy_id: string;
+  requested_iterations: number;
+  evaluated_iterations: number;
+  objective: string;
+  score: number;
+  min_trades_target: number;
+  strict_min_trades: boolean;
+  best_candidate_meets_min_trades: boolean;
+  recommended_parameters: Record<string, number>;
+  recommended_symbols: string[];
+  top_candidates: StrategyOptimizationCandidate[];
+  best_result: BacktestResult;
+  walk_forward?: StrategyOptimizationWalkForwardReport | null;
+  notes: string[];
+}
+
+export type StrategyOptimizationJobState = 'queued' | 'running' | 'completed' | 'failed' | 'canceled';
+
+export interface StrategyOptimizationJobStartResponse {
+  job_id: string;
+  strategy_id: string;
+  status: StrategyOptimizationJobState;
+  created_at: string;
+}
+
+export interface StrategyOptimizationJobStatus {
+  job_id: string;
+  strategy_id: string;
+  status: StrategyOptimizationJobState;
+  progress_pct: number;
+  completed_iterations: number;
+  total_iterations: number;
+  elapsed_seconds: number;
+  eta_seconds?: number | null;
+  avg_seconds_per_iteration?: number | null;
+  message: string;
+  cancel_requested: boolean;
+  error?: string | null;
+  created_at: string;
+  started_at?: string | null;
+  completed_at?: string | null;
+  result?: StrategyOptimizationResult | null;
+}
+
+export interface StrategyOptimizationJobCancelResponse {
+  success: boolean;
+  job_id: string;
+  strategy_id: string;
+  status: StrategyOptimizationJobState;
+  message: string;
 }
 
 export interface ParameterTuneRequest {

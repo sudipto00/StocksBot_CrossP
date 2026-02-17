@@ -11,11 +11,24 @@ interface EquityCurveChartProps {
  * Displays portfolio value over time as a line chart.
  */
 function EquityCurveChart({ data, initialCapital }: EquityCurveChartProps) {
-  // Format data for recharts
-  const chartData = data.map((point) => ({
-    timestamp: new Date(point.timestamp).toLocaleDateString(),
-    value: point.value,
-  }));
+  const formatTimestamp = (ts: number, detailed: boolean): string => {
+    const date = new Date(ts);
+    const options: Intl.DateTimeFormatOptions = detailed
+      ? { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }
+      : { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' };
+    return date.toLocaleString(undefined, options);
+  };
+
+  // Preserve full timestamp precision to avoid collapsing intraday points into one date label.
+  const chartData = data
+    .map((point, index) => {
+      const ts = new Date(point.timestamp).getTime();
+      return {
+        ts: Number.isFinite(ts) ? ts : index,
+        value: point.value,
+      };
+    })
+    .sort((a, b) => a.ts - b.ts);
 
   // If no data, show empty state
   if (chartData.length === 0) {
@@ -43,9 +56,14 @@ function EquityCurveChart({ data, initialCapital }: EquityCurveChartProps) {
         <LineChart data={chartData} margin={{ top: 5, right: 30, left: 20, bottom: 5 }}>
           <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
           <XAxis
-            dataKey="timestamp"
+            dataKey="ts"
+            type="number"
+            scale="time"
+            domain={['dataMin', 'dataMax']}
             stroke="#9CA3AF"
             style={{ fontSize: '12px' }}
+            tickFormatter={(value) => formatTimestamp(Number(value), false)}
+            minTickGap={24}
           />
           <YAxis
             stroke="#9CA3AF"
@@ -60,6 +78,7 @@ function EquityCurveChart({ data, initialCapital }: EquityCurveChartProps) {
               borderRadius: '0.5rem',
               color: '#F9FAFB',
             }}
+            labelFormatter={(value) => formatTimestamp(Number(value), true)}
             formatter={(value: number | undefined) => {
               if (value === undefined) return ['N/A', 'Portfolio Value'];
               return [`$${value.toLocaleString()}`, 'Portfolio Value'];

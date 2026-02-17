@@ -448,20 +448,22 @@ const ScreenerPage: React.FC = () => {
       setMaxSectorWeightPct(nextSector);
       setMaxPositionSize(nextMaxPosition);
       setRiskLimitDaily(nextRiskDaily);
-      await updateConfig({
-        max_position_size: nextMaxPosition,
-        risk_limit_daily: nextRiskDaily,
-      });
-      const updatedPrefs = await updatePreferences({
-        asset_type: assetType,
-        risk_profile: recommendation.risk_profile,
-        screener_mode: assetType === 'stock' ? mode : 'preset',
-        stock_preset: assetType === 'stock' && mode === 'preset' ? (presetValue as StockPreset) : preferences.stock_preset,
-        etf_preset: assetType === 'etf' ? (presetValue as EtfPreset) : preferences.etf_preset,
-        screener_limit: assetType === 'stock' && mode === 'most_active'
-          ? Math.max(10, Math.min(200, Math.round((preferences.screener_limit + nextScreenerLimit) / 2)))
-          : preferences.screener_limit,
-      });
+      const [, updatedPrefs] = await Promise.all([
+        updateConfig({
+          max_position_size: nextMaxPosition,
+          risk_limit_daily: nextRiskDaily,
+        }),
+        updatePreferences({
+          asset_type: assetType,
+          risk_profile: recommendation.risk_profile,
+          screener_mode: assetType === 'stock' ? mode : 'preset',
+          stock_preset: assetType === 'stock' && mode === 'preset' ? (presetValue as StockPreset) : preferences.stock_preset,
+          etf_preset: assetType === 'etf' ? (presetValue as EtfPreset) : preferences.etf_preset,
+          screener_limit: assetType === 'stock' && mode === 'most_active'
+            ? Math.max(10, Math.min(200, Math.round((preferences.screener_limit + nextScreenerLimit) / 2)))
+            : preferences.screener_limit,
+        }),
+      ]);
       const snapshotPrefs = updatedPrefs || {
         stock_preset: preferences.stock_preset,
         etf_preset: preferences.etf_preset,

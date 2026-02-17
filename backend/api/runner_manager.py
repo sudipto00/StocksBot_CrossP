@@ -43,6 +43,55 @@ class RunnerManager:
         
         self.runner: Optional[StrategyRunner] = None
         self._initialized = True
+
+    @staticmethod
+    def _runner_thread_alive(runner: StrategyRunner) -> bool:
+        """Best-effort runner thread liveness check."""
+        try:
+            return bool(runner.is_thread_alive())
+        except Exception:
+            return False
+
+    def _normalize_stale_runner_state(self, runner: StrategyRunner) -> None:
+        """
+        Normalize stale active status when thread is not alive.
+        Prevents UI/start controls from being stuck in RUNNING/SLEEPING forever.
+        """
+        alive = self._runner_thread_alive(runner)
+        if alive:
+            return
+        if runner.status not in (StrategyStatus.RUNNING, StrategyStatus.SLEEPING, StrategyStatus.PAUSED):
+            return
+        runner.status = StrategyStatus.STOPPED
+        runner.sleeping = False
+        runner.sleep_since = None
+        runner.next_market_open_at = None
+        runner.market_session_open = None
+        if not str(runner.last_poll_error or "").strip():
+            runner.last_poll_error = "Runner thread inactive; status reset to stopped"
+        try:
+            runner._persist_sleep_state()  # noqa: SLF001
+            runner._persist_runtime_state()  # noqa: SLF001
+        except Exception:
+            pass
+
+    @staticmethod
+    def _load_persisted_runtime_state() -> Dict[str, Any]:
+        """Read last persisted runner runtime state for status continuity."""
+        session = SessionLocal()
+        try:
+            storage = StorageService(session)
+            entry = storage.config.get_by_key("runner_runtime_state")
+            if not entry or not entry.value:
+                return {}
+            raw = json.loads(entry.value)
+            if isinstance(raw, dict):
+                return raw
+            return {}
+        except Exception:
+            return {}
+        finally:
+            session.close()
     
     def get_or_create_runner(
         self,
@@ -102,6 +151,7 @@ class RunnerManager:
         streaming_enabled: bool = False,
         alpaca_client: Optional[Dict[str, str]] = None,
         require_real_data: bool = False,
+        symbol_universe_override: Optional[list[str]] = None,
     ) -> Dict[str, Any]:
         """
         Start the strategy runner.
@@ -125,7 +175,8 @@ class RunnerManager:
                 streaming_enabled=streaming_enabled,
             )
             
-            if runner.status in (StrategyStatus.RUNNING, StrategyStatus.SLEEPING):
+            self._normalize_stale_runner_state(runner)
+            if runner.status in (StrategyStatus.RUNNING, StrategyStatus.SLEEPING) and self._runner_thread_alive(runner):
                 return {
                     "success": False,
                     "message": f"Runner already active ({runner.status.value})",
@@ -176,10 +227,13 @@ class RunnerManager:
                 )
                 existing_positions = storage.get_open_positions()
                 existing_position_count = len(existing_positions)
+                override_symbols = self._normalize_symbols(symbol_universe_override or [])
                 for db_strategy in active_strategies:
                     config = db_strategy.config or {}
                     raw_symbols = config.get("symbols", [])
-                    symbols = self._normalize_symbols(raw_symbols if isinstance(raw_symbols, list) else [])
+                    symbols = list(override_symbols) if override_symbols else self._normalize_symbols(
+                        raw_symbols if isinstance(raw_symbols, list) else []
+                    )
                     if not symbols:
                         skipped_invalid.append(db_strategy.name)
                         continue
@@ -248,6 +302,8 @@ class RunnerManager:
                         'account_buying_power': account_buying_power,
                         'remaining_weekly_budget': remaining_weekly_budget,
                         'existing_position_count': existing_position_count,
+                        'workspace_universe_override': bool(override_symbols),
+                        'workspace_override_symbol_count': len(override_symbols),
                     }
                 )
             finally:
@@ -260,7 +316,14 @@ class RunnerManager:
             if success:
                 return {
                     "success": True,
-                    "message": f"Runner started with {strategy_count} strategies",
+                    "message": (
+                        f"Runner started with {strategy_count} strategies"
+                        + (
+                            f" using workspace universe override ({len(symbol_universe_override or [])} symbols)"
+                            if symbol_universe_override
+                            else ""
+                        )
+                    ),
                     "status": runner.status.value
                 }
             else:
@@ -465,29 +528,36 @@ class RunnerManager:
         Returns:
             Dict with status information
         """
-        if self.runner is None:
-            return {
-                "status": "stopped",
-                "strategies": [],
-                "tick_interval": 60.0,
-                "broker_connected": False,
-                "poll_success_count": 0,
-                "poll_error_count": 0,
-                "last_poll_error": "",
-                "last_poll_at": None,
-                "last_successful_poll_at": None,
-                "last_reconciliation_at": None,
-                "last_reconciliation_discrepancies": 0,
-                "sleeping": False,
-                "sleep_since": None,
-                "next_market_open_at": None,
-                "last_resume_at": None,
-                "last_catchup_at": None,
-                "resume_count": 0,
-                "market_session_open": None,
-            }
-        
-        return self.runner.get_status()
+        with self._lock:
+            if self.runner is None:
+                persisted = self._load_persisted_runtime_state()
+                return {
+                    "status": "stopped",
+                    "strategies": [],
+                    "tick_interval": 60.0,
+                    "broker_connected": bool(persisted.get("broker_connected", False)),
+                    "runner_thread_alive": False,
+                    "poll_success_count": int(persisted.get("poll_success_count", 0)),
+                    "poll_error_count": int(persisted.get("poll_error_count", 0)),
+                    "last_poll_error": str(persisted.get("last_poll_error") or ""),
+                    "last_poll_at": persisted.get("last_poll_at"),
+                    "last_successful_poll_at": persisted.get("last_successful_poll_at"),
+                    "last_reconciliation_at": persisted.get("last_reconciliation_at"),
+                    "last_reconciliation_discrepancies": int(persisted.get("last_reconciliation_discrepancies", 0)),
+                    "sleeping": False,
+                    "sleep_since": None,
+                    "next_market_open_at": None,
+                    "last_resume_at": persisted.get("last_resume_at"),
+                    "last_catchup_at": persisted.get("last_catchup_at"),
+                    "resume_count": int(persisted.get("resume_count", 0)),
+                    "market_session_open": persisted.get("market_session_open"),
+                    "last_state_persisted_at": persisted.get("persisted_at"),
+                }
+
+            self._normalize_stale_runner_state(self.runner)
+            status = self.runner.get_status()
+            status["runner_thread_alive"] = self._runner_thread_alive(self.runner)
+            return status
 
 
 # Global singleton instance

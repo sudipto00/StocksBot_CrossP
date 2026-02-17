@@ -50,6 +50,8 @@ class BacktestRequest(BaseModel):
     start_date: str  # ISO format date
     end_date: str  # ISO format date
     initial_capital: float = 100000.0
+    contribution_amount: float = 0.0
+    contribution_frequency: str = "none"
     symbols: Optional[List[str]] = None
     parameters: Optional[Dict[str, float]] = None
     emulate_live_trading: bool = False

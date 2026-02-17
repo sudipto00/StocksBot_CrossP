@@ -74,6 +74,7 @@ from .models import (
     # Runner models
     RunnerStatusResponse,
     RunnerActionResponse,
+    RunnerStartRequest,
     WebSocketAuthTicketResponse,
     # Strategy configuration models
     StrategyConfigResponse,
@@ -83,6 +84,13 @@ from .models import (
     BacktestResponse,
     ParameterTuneRequest,
     ParameterTuneResponse,
+    StrategyOptimizationRequest,
+    StrategyOptimizationResponse,
+    StrategyOptimizationCandidate,
+    StrategyOptimizationWalkForwardReport,
+    StrategyOptimizationJobStartResponse,
+    StrategyOptimizationJobStatusResponse,
+    StrategyOptimizationJobCancelResponse,
     StrategyParameter,
     ScreenerPreset,
     AssetType,
@@ -94,6 +102,11 @@ from .models import (
 )
 from .runner_manager import runner_manager
 from services.strategy_analytics import StrategyAnalyticsService
+from services.strategy_optimizer import (
+    StrategyOptimizerService,
+    OptimizationContext,
+    OptimizationCancelledError,
+)
 from services.market_screener import MarketScreener
 from config.strategy_config import get_default_parameters
 
@@ -140,6 +153,10 @@ def _set_runtime_credentials(mode: str, api_key: str, secret_key: str) -> None:
     with _state_lock:
         _runtime_broker_credentials[mode]["api_key"] = api_key
         _runtime_broker_credentials[mode]["secret_key"] = secret_key
+    with _market_screener_instances_lock:
+        _market_screener_instances.clear()
+    with _preference_recommendation_cache_lock:
+        _preference_recommendation_cache.clear()
 
 
 def _resolve_alpaca_credentials_for_mode(mode: str) -> Optional[Dict[str, str]]:
@@ -165,6 +182,10 @@ def _invalidate_broker_instance() -> None:
     with _state_lock:
         stale_broker = _broker_instance
         _broker_instance = None
+    with _market_screener_instances_lock:
+        _market_screener_instances.clear()
+    with _preference_recommendation_cache_lock:
+        _preference_recommendation_cache.clear()
     if stale_broker is not None:
         try:
             stale_broker.disconnect()
@@ -205,7 +226,7 @@ def get_broker() -> BrokerInterface:
             )
             broker_name = "alpaca"
         else:
-            broker = PaperBroker()
+            broker = PaperBroker(simulate_market_hours=_paper_market_hours_enabled_for_runtime())
             broker_name = "paper"
 
         if not broker.connect():
@@ -238,7 +259,7 @@ def get_order_execution_service(
         broker = get_broker()
     else:
         # Use local paper broker while trading is disabled to avoid credential-gated failures.
-        broker = PaperBroker()
+        broker = PaperBroker(simulate_market_hours=_paper_market_hours_enabled_for_runtime())
         broker.connect()
     
     # Keep budget checks opt-in at endpoint level to avoid global-state bleed
@@ -295,6 +316,17 @@ _WS_AUTH_TICKET_TTL_SECONDS = 90
 _chart_points_cache: Dict[str, Dict[str, Any]] = {}
 _chart_points_cache_lock = threading.Lock()
 _CHART_POINTS_CACHE_TTL_SECONDS = 60
+_broker_account_cache: Optional[Dict[str, Any]] = None
+_broker_account_cache_lock = threading.Lock()
+_BROKER_ACCOUNT_CACHE_TTL_SECONDS = 8
+_market_screener_instances: Dict[str, MarketScreener] = {}
+_market_screener_instances_lock = threading.Lock()
+_preference_recommendation_cache: Dict[str, Dict[str, Any]] = {}
+_preference_recommendation_cache_lock = threading.Lock()
+_PREFERENCE_RECOMMENDATION_CACHE_TTL_SECONDS = 10
+_optimizer_jobs: Dict[str, Dict[str, Any]] = {}
+_optimizer_jobs_lock = threading.Lock()
+_OPTIMIZER_MAX_JOB_HISTORY = 40
 
 _SUMMARY_NOTIFICATION_PREFERENCES_KEY = "summary_notification_preferences"
 _SUMMARY_NOTIFICATION_SCHEDULE_STATE_KEY = "summary_notification_schedule_state"
@@ -393,6 +425,163 @@ def _chart_cache_set(cache_key: str, points: List[Dict[str, Any]], ttl_seconds: 
             "points": normalized_points,
             "expires_at": time.time() + ttl,
         }
+
+
+def _broker_account_cache_get(cache_key: str) -> Optional[Dict[str, Any]]:
+    """Return cached broker-account payload when still fresh."""
+    now_ts = time.time()
+    with _broker_account_cache_lock:
+        entry = _broker_account_cache
+        if not entry:
+            return None
+        if str(entry.get("cache_key")) != str(cache_key):
+            return None
+        if float(entry.get("expires_at", 0.0)) <= now_ts:
+            return None
+        payload = entry.get("payload")
+    return dict(payload) if isinstance(payload, dict) else None
+
+
+def _broker_account_cache_set(cache_key: str, payload: Dict[str, Any], ttl_seconds: int = _BROKER_ACCOUNT_CACHE_TTL_SECONDS) -> None:
+    """Store broker-account payload in short-lived memory cache."""
+    ttl = max(2, int(ttl_seconds))
+    with _broker_account_cache_lock:
+        global _broker_account_cache
+        _broker_account_cache = {
+            "cache_key": str(cache_key),
+            "payload": dict(payload),
+            "expires_at": time.time() + ttl,
+        }
+
+
+def _preference_recommendation_cache_get(cache_key: str) -> Optional[Dict[str, Any]]:
+    """Read cached recommendation payload when still fresh."""
+    now_ts = time.time()
+    with _preference_recommendation_cache_lock:
+        entry = _preference_recommendation_cache.get(cache_key)
+        if not entry:
+            return None
+        if float(entry.get("expires_at", 0.0)) <= now_ts:
+            _preference_recommendation_cache.pop(cache_key, None)
+            return None
+        payload = entry.get("payload")
+    return dict(payload) if isinstance(payload, dict) else None
+
+
+def _preference_recommendation_cache_set(
+    cache_key: str,
+    payload: Dict[str, Any],
+    ttl_seconds: int = _PREFERENCE_RECOMMENDATION_CACHE_TTL_SECONDS,
+) -> None:
+    """Store recommendation payload in short-lived memory cache."""
+    ttl = max(2, int(ttl_seconds))
+    with _preference_recommendation_cache_lock:
+        _preference_recommendation_cache[cache_key] = {
+            "payload": dict(payload),
+            "expires_at": time.time() + ttl,
+        }
+
+
+def _optimizer_prune_jobs_locked() -> None:
+    """Keep optimizer in-memory job history bounded."""
+    if len(_optimizer_jobs) <= _OPTIMIZER_MAX_JOB_HISTORY:
+        return
+    completed = [
+        (job_id, row)
+        for job_id, row in _optimizer_jobs.items()
+        if str(row.get("status")) in {"completed", "failed", "canceled"}
+    ]
+    completed.sort(
+        key=lambda item: str(item[1].get("completed_at") or item[1].get("created_at") or "")
+    )
+    while len(_optimizer_jobs) > _OPTIMIZER_MAX_JOB_HISTORY and completed:
+        job_id, _ = completed.pop(0)
+        _optimizer_jobs.pop(job_id, None)
+
+
+def _optimizer_create_job(strategy_id: str, request_payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Create and register a queued optimizer job."""
+    created_at = datetime.now(timezone.utc).isoformat()
+    job_id = secrets.token_hex(12)
+    row = {
+        "job_id": job_id,
+        "strategy_id": strategy_id,
+        "status": "queued",
+        "progress_pct": 0.0,
+        "completed_iterations": 0,
+        "total_iterations": 0,
+        "elapsed_seconds": 0.0,
+        "eta_seconds": None,
+        "avg_seconds_per_iteration": None,
+        "message": "Queued",
+        "cancel_requested": False,
+        "error": None,
+        "created_at": created_at,
+        "started_at": None,
+        "completed_at": None,
+        "request": dict(request_payload),
+        "result": None,
+    }
+    with _optimizer_jobs_lock:
+        _optimizer_jobs[job_id] = row
+        _optimizer_prune_jobs_locked()
+    return dict(row)
+
+
+def _optimizer_get_job(job_id: str) -> Optional[Dict[str, Any]]:
+    """Get optimizer job snapshot by ID."""
+    with _optimizer_jobs_lock:
+        row = _optimizer_jobs.get(job_id)
+        return dict(row) if row else None
+
+
+def _optimizer_update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Atomically update optimizer job fields and return snapshot."""
+    with _optimizer_jobs_lock:
+        row = _optimizer_jobs.get(job_id)
+        if row is None:
+            return None
+        row.update(updates)
+        return dict(row)
+
+
+def _optimizer_progress_snapshot(row: Dict[str, Any]) -> StrategyOptimizationJobStatusResponse:
+    """Normalize optimizer in-memory row to API response model."""
+    result_payload = row.get("result")
+    result_model: Optional[StrategyOptimizationResponse] = None
+    if isinstance(result_payload, StrategyOptimizationResponse):
+        result_model = result_payload
+    elif isinstance(result_payload, dict):
+        try:
+            result_model = StrategyOptimizationResponse(**result_payload)
+        except Exception:
+            result_model = None
+    return StrategyOptimizationJobStatusResponse(
+        job_id=str(row.get("job_id")),
+        strategy_id=str(row.get("strategy_id")),
+        status=str(row.get("status") or "failed"),  # type: ignore[arg-type]
+        progress_pct=float(row.get("progress_pct") or 0.0),
+        completed_iterations=int(row.get("completed_iterations") or 0),
+        total_iterations=int(row.get("total_iterations") or 0),
+        elapsed_seconds=float(row.get("elapsed_seconds") or 0.0),
+        eta_seconds=(
+            float(row["eta_seconds"])
+            if isinstance(row.get("eta_seconds"), (int, float))
+            else None
+        ),
+        avg_seconds_per_iteration=(
+            float(row["avg_seconds_per_iteration"])
+            if isinstance(row.get("avg_seconds_per_iteration"), (int, float))
+            else None
+        ),
+        message=str(row.get("message") or ""),
+        cancel_requested=bool(row.get("cancel_requested")),
+        error=str(row["error"]) if row.get("error") else None,
+        created_at=str(row.get("created_at") or ""),
+        started_at=str(row["started_at"]) if row.get("started_at") else None,
+        completed_at=str(row["completed_at"]) if row.get("completed_at") else None,
+        result=result_model,
+    )
 
 
 def _prune_ws_auth_tickets_locked(now_ts: float) -> None:
@@ -585,6 +774,14 @@ def _load_holdings_snapshot(storage: StorageService, broker: Optional[BrokerInte
     return holdings
 
 
+def _paper_market_hours_enabled_for_runtime() -> bool:
+    """
+    Enable market-hours simulation in normal runtime, disable under pytest.
+    Keeps tests deterministic and independent of wall-clock market session.
+    """
+    return "PYTEST_CURRENT_TEST" not in os.environ
+
+
 def _collect_symbol_capabilities(
     broker: Optional[BrokerInterface],
     assets: List[Dict[str, Any]],
@@ -652,7 +849,28 @@ def _capture_portfolio_snapshot(storage: StorageService, broker: Optional[Broker
     if broker is None:
         return None
 
+    def _snapshot_to_payload(snapshot_row: Any) -> Dict[str, float]:
+        return {
+            "equity": _safe_float(getattr(snapshot_row, "equity", 0.0), 0.0),
+            "cash": _safe_float(getattr(snapshot_row, "cash", 0.0), 0.0),
+            "buying_power": _safe_float(getattr(snapshot_row, "buying_power", 0.0), 0.0),
+            "market_value": _safe_float(getattr(snapshot_row, "market_value", 0.0), 0.0),
+            "unrealized_pnl": _safe_float(getattr(snapshot_row, "unrealized_pnl", 0.0), 0.0),
+            "realized_pnl_total": _safe_float(getattr(snapshot_row, "realized_pnl_total", 0.0), 0.0),
+            "open_positions": float(_safe_float(getattr(snapshot_row, "open_positions", 0.0), 0.0)),
+        }
+
     now_utc = datetime.now(timezone.utc)
+    latest = storage.get_latest_portfolio_snapshot()
+    try:
+        market_open = bool(broker.is_market_open())
+    except (RuntimeError, ValueError, TypeError, KeyError):
+        market_open = True
+
+    # Keep equity curve stable off-hours by reusing the last persisted snapshot.
+    if not market_open and latest is not None:
+        return _snapshot_to_payload(latest)
+
     account_snapshot = _load_account_snapshot(broker)
     holdings_snapshot = _load_holdings_snapshot(storage, broker)
     market_value = sum(_safe_float(h.get("market_value", 0.0), 0.0) for h in holdings_snapshot)
@@ -668,7 +886,6 @@ def _capture_portfolio_snapshot(storage: StorageService, broker: Optional[Broker
     realized_pnl_total = sum(_safe_float(trade.realized_pnl, 0.0) for trade in trades)
 
     # Avoid duplicate writes when repeated UI polling samples within a few seconds.
-    latest = storage.get_latest_portfolio_snapshot()
     if latest is not None and latest.timestamp is not None:
         latest_ts = _ensure_utc_datetime(latest.timestamp)
         if latest_ts is not None and (now_utc - latest_ts).total_seconds() < 5:
@@ -677,15 +894,7 @@ def _capture_portfolio_snapshot(storage: StorageService, broker: Optional[Broker
                 and abs(_safe_float(latest.market_value, 0.0) - market_value) < 1e-9
                 and abs(_safe_float(latest.realized_pnl_total, 0.0) - realized_pnl_total) < 1e-9
             ):
-                return {
-                    "equity": _safe_float(latest.equity, 0.0),
-                    "cash": _safe_float(latest.cash, 0.0),
-                    "buying_power": _safe_float(latest.buying_power, 0.0),
-                    "market_value": _safe_float(latest.market_value, 0.0),
-                    "unrealized_pnl": _safe_float(latest.unrealized_pnl, 0.0),
-                    "realized_pnl_total": _safe_float(latest.realized_pnl_total, 0.0),
-                    "open_positions": float(_safe_float(latest.open_positions, 0.0)),
-                }
+                return _snapshot_to_payload(latest)
 
     snapshot = storage.record_portfolio_snapshot(
         equity=_safe_float(account_snapshot.get("equity", 0.0), 0.0),
@@ -697,15 +906,7 @@ def _capture_portfolio_snapshot(storage: StorageService, broker: Optional[Broker
         open_positions=len(holdings_snapshot),
         timestamp=now_utc,
     )
-    return {
-        "equity": _safe_float(snapshot.equity, 0.0),
-        "cash": _safe_float(snapshot.cash, 0.0),
-        "buying_power": _safe_float(snapshot.buying_power, 0.0),
-        "market_value": _safe_float(snapshot.market_value, 0.0),
-        "unrealized_pnl": _safe_float(snapshot.unrealized_pnl, 0.0),
-        "realized_pnl_total": _safe_float(snapshot.realized_pnl_total, 0.0),
-        "open_positions": float(_safe_float(snapshot.open_positions, 0.0)),
-    }
+    return _snapshot_to_payload(snapshot)
 
 
 def _normalize_symbols(raw_symbols: List[str], max_symbols: int = 200) -> List[str]:
@@ -730,7 +931,11 @@ def _execution_block_reason(symbol: str, broker: BrokerInterface) -> Optional[st
     """Return first blocking safety reason for execution, if any."""
     config = _get_config_snapshot()
     if not bool(config.trading_enabled):
-        return "Trading is disabled in Settings"
+        mode = "paper" if bool(config.paper_trading) else "live"
+        return (
+            "Trading is disabled in Settings. "
+            f"{mode.title()} mode only selects the account mode; it does not enable execution."
+        )
     if get_global_kill_switch():
         return "Trading is blocked: kill switch is active"
     if not broker.is_connected():
@@ -1357,7 +1562,7 @@ async def set_broker_credentials(request: BrokerCredentialsRequest):
 
 
 @router.get("/broker/account", response_model=BrokerAccountResponse)
-async def get_broker_account():
+async def get_broker_account(db: Session = Depends(get_db)):
     """
     Get active broker account balances (cash/equity/buying power).
     Returns an informative disconnected payload if unavailable.
@@ -1365,15 +1570,43 @@ async def get_broker_account():
     status = await get_broker_credentials_status()
     config = _get_config_snapshot()
     mode = "paper" if config.paper_trading else "live"
+    cache_key = f"{str(config.broker).lower()}:{mode}:{int(bool(config.strict_alpaca_data))}:{int(bool(status.using_runtime_credentials))}"
+    cached = _broker_account_cache_get(cache_key)
+    if cached is not None:
+        return BrokerAccountResponse(**cached)
     try:
         broker = get_broker()
         config = _get_config_snapshot()
+        market_open = True
+        try:
+            market_open = bool(broker.is_market_open())
+        except (RuntimeError, ValueError, TypeError, KeyError):
+            market_open = True
+
+        if not market_open:
+            storage = StorageService(db)
+            latest = storage.get_latest_portfolio_snapshot()
+            if latest is not None:
+                response = BrokerAccountResponse(
+                    broker=config.broker,
+                    mode=mode,
+                    connected=True,
+                    using_runtime_credentials=status.using_runtime_credentials,
+                    currency="USD",
+                    cash=float(_safe_float(latest.cash, 0.0)),
+                    equity=float(_safe_float(latest.equity, 0.0)),
+                    buying_power=float(_safe_float(latest.buying_power, 0.0)),
+                    message="Market closed: showing last persisted portfolio snapshot",
+                )
+                _broker_account_cache_set(cache_key, response.model_dump())
+                return response
+
         info = broker.get_account_info()
         cash = float(info.get("cash", 0.0))
         equity = float(info.get("equity", info.get("portfolio_value", 0.0)))
         buying_power = float(info.get("buying_power", 0.0))
         currency = str(info.get("currency", "USD"))
-        return BrokerAccountResponse(
+        response = BrokerAccountResponse(
             broker=config.broker,
             mode=mode,
             connected=True,
@@ -1384,8 +1617,10 @@ async def get_broker_account():
             buying_power=buying_power,
             message="Account fetched successfully",
         )
+        _broker_account_cache_set(cache_key, response.model_dump())
+        return response
     except (RuntimeError, ValueError, TypeError, KeyError) as exc:
-        return BrokerAccountResponse(
+        response = BrokerAccountResponse(
             broker=config.broker,
             mode=mode,
             connected=False,
@@ -1396,6 +1631,8 @@ async def get_broker_account():
             buying_power=0.0,
             message=f"Broker account unavailable: {exc}",
         )
+        _broker_account_cache_set(cache_key, response.model_dump())
+        return response
     finally:
         _set_last_broker_sync(datetime.now(timezone.utc).isoformat())
 
@@ -1574,6 +1811,14 @@ async def create_order(
         HTTPException: If validation fails or broker execution fails
     """
     try:
+        # Refresh config snapshot from request-scoped storage to avoid stale
+        # process-level config bleed across long-lived sessions/tests.
+        try:
+            runtime_config = _load_runtime_config(execution_service.storage)
+            _set_config_snapshot(runtime_config)
+        except Exception:
+            pass
+
         block_reason = _execution_block_reason(request.symbol, execution_service.broker)
         if block_reason:
             raise HTTPException(status_code=409, detail=block_reason)
@@ -2324,7 +2569,14 @@ async def safety_preflight(symbol: str, db: Session = Depends(get_db)):
     _set_config_snapshot(config)
     set_global_trading_enabled(bool(config.trading_enabled))
     if not config.trading_enabled:
-        return {"allowed": False, "reason": "Trading is disabled in Settings"}
+        mode = "paper" if bool(config.paper_trading) else "live"
+        return {
+            "allowed": False,
+            "reason": (
+                "Trading is disabled in Settings. "
+                f"{mode.title()} mode only selects the account mode; it does not enable execution."
+            ),
+        }
     broker = get_broker()
     reason = _execution_block_reason(symbol.strip().upper(), broker)
     return {"allowed": reason is None, "reason": reason or ""}
@@ -2444,6 +2696,7 @@ async def ws_system_health(websocket: WebSocket):
 
 @router.post("/runner/start", response_model=RunnerActionResponse)
 async def start_runner(
+    request: Optional[RunnerStartRequest] = None,
     db: Session = Depends(get_db),
     x_idempotency_key: Optional[str] = Header(default=None),
 ):
@@ -2463,9 +2716,14 @@ async def start_runner(
     if not config.trading_enabled:
         active_strategy_count = len(storage.get_active_strategies())
         if active_strategy_count > 0:
+            mode = "paper" if bool(config.paper_trading) else "live"
             payload = {
                 "success": False,
-                "message": "Trading is disabled in Settings. Enable Trading Enabled before starting runner.",
+                "message": (
+                    "Trading is disabled in Settings. "
+                    f"{mode.title()} mode only selects the account mode; "
+                    "turn on Trading Enabled and save Settings before starting runner."
+                ),
                 "status": "stopped",
             }
             _idempotency_cache_set("/runner/start", x_idempotency_key, payload)
@@ -2490,6 +2748,56 @@ async def start_runner(
                 "Load/save Alpaca keys in Settings before starting runner."
             ),
         )
+    workspace_symbols_override: Optional[List[str]] = None
+    if request is not None and bool(request.use_workspace_universe):
+        prefs = _load_trading_preferences(storage)
+        account_snapshot = _load_account_snapshot(broker)
+        equity = _safe_float(account_snapshot.get("equity", 0.0), 0.0)
+        buying_power = _safe_float(account_snapshot.get("buying_power", 0.0), 0.0)
+        synthetic_initial_capital = max(
+            100.0,
+            buying_power if buying_power > 0 else (
+                equity if equity > 0 else (_safe_float(prefs.weekly_budget, 200.0) * 4.0)
+            ),
+        )
+        today = datetime.now(timezone.utc).date().isoformat()
+        workspace_request = BacktestRequest(
+            start_date=today,
+            end_date=today,
+            initial_capital=synthetic_initial_capital,
+            use_workspace_universe=True,
+            asset_type=request.asset_type,
+            screener_mode=request.screener_mode,
+            stock_preset=request.stock_preset,
+            etf_preset=request.etf_preset,
+            screener_limit=request.screener_limit,
+            seed_only=request.seed_only,
+            preset_universe_mode=request.preset_universe_mode,
+            min_dollar_volume=request.min_dollar_volume,
+            max_spread_bps=request.max_spread_bps,
+            max_sector_weight_pct=request.max_sector_weight_pct,
+            auto_regime_adjust=request.auto_regime_adjust,
+        )
+        screener = MarketScreener(
+            alpaca_client=alpaca_creds,
+            require_real_data=require_real_data,
+        )
+        try:
+            workspace_symbols_override, _ = _resolve_workspace_universe_for_backtest(
+                storage=storage,
+                screener=screener,
+                prefs=prefs,
+                request=workspace_request,
+                broker=broker,
+                initial_capital=synthetic_initial_capital,
+            )
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc))
+        if not workspace_symbols_override:
+            raise HTTPException(
+                status_code=400,
+                detail="Workspace universe resolution produced zero symbols. Adjust Screener settings or switch Runner Universe Source.",
+            )
     result = runner_manager.start_runner(
         db=db,
         broker=broker,
@@ -2499,6 +2807,7 @@ async def start_runner(
         streaming_enabled=config.streaming_enabled,
         alpaca_client=alpaca_creds,
         require_real_data=require_real_data,
+        symbol_universe_override=workspace_symbols_override,
     )
     _idempotency_cache_set("/runner/start", x_idempotency_key, result)
     return RunnerActionResponse(**result)
@@ -2970,6 +3279,394 @@ def _resolve_workspace_universe_for_backtest(
     return symbols, context
 
 
+def _resolve_strategy_backtest_parameters(
+    db_strategy: Any,
+    request_parameters: Optional[Dict[str, float]],
+) -> Dict[str, float]:
+    """Resolve backtest parameters from strategy config with request overrides."""
+    default_params = get_default_parameters()
+    param_defs = {param.name: param for param in default_params}
+    resolved_parameters: Dict[str, float] = {}
+    if db_strategy.config and isinstance(db_strategy.config.get("parameters"), dict):
+        for name, value in db_strategy.config.get("parameters", {}).items():
+            if name not in param_defs:
+                continue
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(numeric):
+                continue
+            pdef = param_defs[name]
+            resolved_parameters[name] = max(pdef.min_value, min(pdef.max_value, numeric))
+    if request_parameters:
+        for name, value in request_parameters.items():
+            if name not in param_defs:
+                raise HTTPException(status_code=400, detail=f"Unknown backtest parameter: {name}")
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail=f"Backtest parameter {name} must be numeric")
+            if not math.isfinite(numeric):
+                raise HTTPException(status_code=400, detail=f"Backtest parameter {name} must be finite")
+            pdef = param_defs[name]
+            if not (pdef.min_value <= numeric <= pdef.max_value):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Backtest parameter {name} must be within [{pdef.min_value}, {pdef.max_value}]",
+                )
+            resolved_parameters[name] = numeric
+    return resolved_parameters
+
+
+def _prepare_backtest_execution_context(
+    *,
+    storage: StorageService,
+    db_strategy: Any,
+    request: BacktestRequest,
+) -> Dict[str, Any]:
+    """Prepare validated backtest execution context shared by backtest/optimizer flows."""
+    prefs = _load_trading_preferences(storage)
+    emulate_live_trading = bool(request.emulate_live_trading)
+
+    selected_symbols = list(request.symbols or [])
+    if not selected_symbols and db_strategy.config:
+        selected_symbols = list(db_strategy.config.get("symbols", ["AAPL", "MSFT"]))
+    selected_symbols = _normalize_symbols(selected_symbols)
+    if not selected_symbols:
+        raise HTTPException(status_code=400, detail="At least one valid symbol is required for backtest")
+
+    _bt_config = _get_config_snapshot()
+    _bt_mode = "paper" if _bt_config.paper_trading else "live"
+    broker_name = str(_bt_config.broker or "").strip().lower()
+    if emulate_live_trading and broker_name != "alpaca":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Live-equivalent backtesting requires Alpaca broker mode. "
+                "Set broker=alpaca in Settings, then retry."
+            ),
+        )
+    _bt_require_real_data = bool(
+        emulate_live_trading
+        or (_bt_config.strict_alpaca_data and broker_name == "alpaca")
+    )
+    _bt_creds = _resolve_alpaca_credentials_for_mode(_bt_mode)
+    if _bt_require_real_data and not _bt_creds:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Strict Alpaca data mode is enabled for {_bt_mode} but credentials are unavailable. "
+                "Load/save Alpaca keys in Settings before running backtests."
+            ),
+        )
+
+    broker_for_constraints: Optional[BrokerInterface] = None
+    if broker_name == "alpaca":
+        try:
+            broker_for_constraints = get_broker()
+        except RuntimeError as exc:
+            if emulate_live_trading:
+                raise HTTPException(status_code=400, detail=str(exc))
+
+    universe_context: Dict[str, Any] = {
+        "symbols_source": "strategy_symbols",
+        "symbols_requested": len(selected_symbols),
+    }
+    live_parity_context: Dict[str, Any] = {
+        "broker": broker_name or "unknown",
+        "broker_mode": _bt_mode,
+        "strict_real_data_required": _bt_require_real_data,
+        "credentials_available": bool(_bt_creds),
+        "workspace_universe_requested": bool(request.use_workspace_universe),
+    }
+    if request.use_workspace_universe:
+        try:
+            screener = MarketScreener(
+                alpaca_client=_bt_creds,
+                require_real_data=_bt_require_real_data,
+            )
+            selected_symbols, universe_context = _resolve_workspace_universe_for_backtest(
+                storage=storage,
+                screener=screener,
+                prefs=prefs,
+                request=request,
+                broker=broker_for_constraints,
+                initial_capital=float(request.initial_capital),
+            )
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc))
+        if not selected_symbols:
+            raise HTTPException(
+                status_code=400,
+                detail="Workspace universe resolution produced zero symbols. Adjust guardrails/preset/universe mode.",
+            )
+    if not selected_symbols:
+        raise HTTPException(status_code=400, detail="At least one valid symbol is required for backtest")
+
+    require_fractionable = False
+    symbol_capabilities: Dict[str, Dict[str, bool]] = {}
+    filtered_out: List[Dict[str, str]] = []
+    if emulate_live_trading:
+        asset_type_for_rules = _resolve_backtest_asset_type(request.asset_type, prefs)
+        if request.use_workspace_universe and universe_context.get("asset_type") in {"stock", "etf"}:
+            asset_type_for_rules = AssetType(str(universe_context["asset_type"]))
+        synthetic_account = {
+            "equity": float(request.initial_capital),
+            "buying_power": float(request.initial_capital),
+        }
+        require_fractionable = _should_require_fractionable_symbols(asset_type_for_rules, prefs, synthetic_account)
+        if broker_for_constraints is not None:
+            symbol_capabilities = _collect_symbol_capabilities(
+                broker_for_constraints,
+                [{"symbol": symbol} for symbol in selected_symbols],
+            )
+        enforced_symbols: List[str] = []
+        for symbol in selected_symbols:
+            capabilities = symbol_capabilities.get(symbol, {"tradable": True, "fractionable": True})
+            tradable = bool(capabilities.get("tradable", True))
+            fractionable = bool(capabilities.get("fractionable", True))
+            if not tradable:
+                filtered_out.append({"symbol": symbol, "reason": "not broker tradable"})
+                continue
+            if require_fractionable and not fractionable:
+                filtered_out.append({"symbol": symbol, "reason": "not fractionable"})
+                continue
+            enforced_symbols.append(symbol)
+        selected_symbols = enforced_symbols
+        if not selected_symbols:
+            raise HTTPException(
+                status_code=400,
+                detail="All candidate symbols were filtered by live execution rules (tradable/fractionable).",
+            )
+    universe_context["symbols_selected"] = len(selected_symbols)
+    if filtered_out:
+        universe_context["symbols_filtered_out"] = filtered_out[:50]
+
+    max_position_size = float(_bt_config.max_position_size)
+    risk_limit_daily = float(_bt_config.risk_limit_daily)
+    if broker_for_constraints is not None:
+        max_position_size, risk_limit_daily = _balance_adjusted_limits(
+            broker=broker_for_constraints,
+            requested_max_position_size=max_position_size,
+            requested_risk_limit_daily=risk_limit_daily,
+        )
+    live_parity_context["require_fractionable"] = require_fractionable
+    live_parity_context["symbol_capabilities_checked"] = bool(symbol_capabilities)
+    live_parity_context["symbols_selected"] = len(selected_symbols)
+    live_parity_context["symbols_filtered_out_count"] = len(filtered_out)
+    live_parity_context["max_position_size"] = max_position_size
+    live_parity_context["risk_limit_daily"] = risk_limit_daily
+    universe_context["live_parity_context"] = live_parity_context
+
+    analytics = StrategyAnalyticsService(
+        storage.db,
+        alpaca_creds=_bt_creds,
+        require_real_data=_bt_require_real_data,
+    )
+    return {
+        "prefs": prefs,
+        "selected_symbols": selected_symbols,
+        "universe_context": universe_context,
+        "analytics": analytics,
+        "emulate_live_trading": emulate_live_trading,
+        "require_fractionable": require_fractionable,
+        "symbol_capabilities": symbol_capabilities,
+        "max_position_size": max_position_size,
+        "risk_limit_daily": risk_limit_daily,
+        "fee_bps": 0.0,
+    }
+
+
+def _to_backtest_response(result: Any) -> BacktestResponse:
+    """Convert engine backtest result to API response model."""
+    return BacktestResponse(
+        strategy_id=result.strategy_id,
+        start_date=result.start_date,
+        end_date=result.end_date,
+        initial_capital=result.initial_capital,
+        final_capital=result.final_capital,
+        total_return=result.total_return,
+        total_trades=result.total_trades,
+        winning_trades=result.winning_trades,
+        losing_trades=result.losing_trades,
+        win_rate=result.win_rate,
+        max_drawdown=result.max_drawdown,
+        sharpe_ratio=result.sharpe_ratio,
+        volatility=result.volatility,
+        trades=result.trades,
+        equity_curve=result.equity_curve,
+        diagnostics=result.diagnostics,
+    )
+
+
+def _compute_strategy_optimization_response(
+    *,
+    strategy_id: str,
+    request: StrategyOptimizationRequest,
+    db: Session,
+    progress_callback: Optional[callable] = None,
+    should_cancel: Optional[callable] = None,
+) -> StrategyOptimizationResponse:
+    """Run optimization and return typed response model."""
+    try:
+        strategy_id_int = int(strategy_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid strategy ID")
+
+    storage = StorageService(db)
+    db_strategy = storage.strategies.get_by_id(strategy_id_int)
+    if not db_strategy:
+        raise HTTPException(status_code=404, detail="Strategy not found")
+
+    try:
+        start_dt = datetime.fromisoformat(request.start_date)
+        end_dt = datetime.fromisoformat(request.end_date)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="start_date and end_date must be ISO date/time strings")
+    if start_dt > end_dt:
+        raise HTTPException(status_code=400, detail="start_date must be before or equal to end_date")
+    if not math.isfinite(request.initial_capital):
+        raise HTTPException(status_code=400, detail="initial_capital must be a finite number")
+    if request.initial_capital < 100 or request.initial_capital > 100_000_000:
+        raise HTTPException(status_code=400, detail="initial_capital must be within [100, 100000000]")
+    if not math.isfinite(request.contribution_amount):
+        raise HTTPException(status_code=400, detail="contribution_amount must be a finite number")
+
+    backtest_request = BacktestRequest(
+        start_date=request.start_date,
+        end_date=request.end_date,
+        initial_capital=request.initial_capital,
+        contribution_amount=request.contribution_amount,
+        contribution_frequency=request.contribution_frequency,
+        symbols=request.symbols,
+        parameters=request.parameters,
+        emulate_live_trading=request.emulate_live_trading,
+        use_workspace_universe=request.use_workspace_universe,
+        asset_type=request.asset_type,
+        screener_mode=request.screener_mode,
+        stock_preset=request.stock_preset,
+        etf_preset=request.etf_preset,
+        screener_limit=request.screener_limit,
+        seed_only=request.seed_only,
+        preset_universe_mode=request.preset_universe_mode,
+        min_dollar_volume=request.min_dollar_volume,
+        max_spread_bps=request.max_spread_bps,
+        max_sector_weight_pct=request.max_sector_weight_pct,
+        auto_regime_adjust=request.auto_regime_adjust,
+    )
+    resolved_parameters = _resolve_strategy_backtest_parameters(
+        db_strategy=db_strategy,
+        request_parameters=backtest_request.parameters,
+    )
+    exec_context = _prepare_backtest_execution_context(
+        storage=storage,
+        db_strategy=db_strategy,
+        request=backtest_request,
+    )
+    base_symbols = list(exec_context["selected_symbols"])
+    symbol_capabilities = exec_context["symbol_capabilities"] or {}
+    if symbol_capabilities:
+        symbol_capabilities = {
+            symbol: dict(symbol_capabilities.get(symbol, {"tradable": True, "fractionable": True}))
+            for symbol in base_symbols
+        }
+
+    optimizer = StrategyOptimizerService(exec_context["analytics"])
+    optimization_context = OptimizationContext(
+        strategy_id=strategy_id,
+        start_date=backtest_request.start_date,
+        end_date=backtest_request.end_date,
+        initial_capital=float(backtest_request.initial_capital),
+        contribution_amount=float(backtest_request.contribution_amount),
+        contribution_frequency=str(backtest_request.contribution_frequency),
+        emulate_live_trading=bool(exec_context["emulate_live_trading"]),
+        require_fractionable=bool(exec_context["require_fractionable"]),
+        max_position_size=float(exec_context["max_position_size"]),
+        risk_limit_daily=float(exec_context["risk_limit_daily"]),
+        fee_bps=float(exec_context["fee_bps"]),
+        universe_context=dict(exec_context["universe_context"]),
+        symbol_capabilities=symbol_capabilities,
+    )
+    try:
+        optimize_payload = optimizer.optimize(
+            context=optimization_context,
+            base_symbols=base_symbols,
+            base_parameters=resolved_parameters,
+            iterations=int(request.iterations),
+            min_trades=int(request.min_trades),
+            objective=str(request.objective),
+            strict_min_trades=bool(request.strict_min_trades),
+            walk_forward_enabled=bool(request.walk_forward_enabled),
+            walk_forward_folds=int(request.walk_forward_folds),
+            random_seed=request.random_seed,
+            progress_callback=progress_callback,
+            should_cancel=should_cancel,
+        )
+    except OptimizationCancelledError:
+        raise
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    best_result = optimize_payload["best_result"]
+    best_response = _to_backtest_response(best_result)
+    top_candidates = [
+        StrategyOptimizationCandidate(**row)
+        for row in (optimize_payload.get("top_candidates") or [])
+    ]
+
+    response = StrategyOptimizationResponse(
+        strategy_id=strategy_id,
+        requested_iterations=int(optimize_payload["requested_iterations"]),
+        evaluated_iterations=int(optimize_payload["evaluated_iterations"]),
+        objective=str(optimize_payload["objective"]),
+        score=float(optimize_payload["score"]),
+        min_trades_target=int(optimize_payload.get("min_trades_target", int(request.min_trades))),
+        strict_min_trades=bool(optimize_payload.get("strict_min_trades", bool(request.strict_min_trades))),
+        best_candidate_meets_min_trades=bool(optimize_payload.get("best_candidate_meets_min_trades", True)),
+        recommended_parameters={
+            key: float(value)
+            for key, value in (optimize_payload.get("recommended_parameters") or {}).items()
+        },
+        recommended_symbols=[
+            str(symbol).upper()
+            for symbol in (optimize_payload.get("recommended_symbols") or [])
+            if str(symbol).strip()
+        ],
+        top_candidates=top_candidates,
+        best_result=best_response,
+        walk_forward=(
+            StrategyOptimizationWalkForwardReport(**optimize_payload["walk_forward"])
+            if isinstance(optimize_payload.get("walk_forward"), dict)
+            else None
+        ),
+        notes=[str(note) for note in (optimize_payload.get("notes") or [])],
+    )
+
+    storage.create_audit_log(
+        event_type="config_updated",
+        description=f"Strategy optimization completed: {db_strategy.name}",
+        details={
+            "strategy_id": db_strategy.id,
+            "start_date": request.start_date,
+            "end_date": request.end_date,
+            "contribution_amount": request.contribution_amount,
+            "contribution_frequency": request.contribution_frequency,
+            "requested_iterations": response.requested_iterations,
+            "evaluated_iterations": response.evaluated_iterations,
+            "objective": response.objective,
+            "min_trades_target": response.min_trades_target,
+            "strict_min_trades": response.strict_min_trades,
+            "recommended_symbol_count": len(response.recommended_symbols),
+            "best_sharpe_ratio": response.best_result.sharpe_ratio,
+            "best_total_return": response.best_result.total_return,
+        },
+    )
+    return response
+
+
 @router.get("/strategies/{strategy_id}/config", response_model=StrategyConfigResponse)
 async def get_strategy_config(strategy_id: str, db: Session = Depends(get_db)):
     """
@@ -3173,180 +3870,14 @@ async def run_strategy_backtest(
     if request.initial_capital < 100 or request.initial_capital > 100_000_000:
         raise HTTPException(status_code=400, detail="initial_capital must be within [100, 100000000]")
     
-    prefs = _load_trading_preferences(storage)
-    emulate_live_trading = bool(request.emulate_live_trading)
-
-    # Use strategy symbols if not provided in request.
-    if not request.symbols and db_strategy.config:
-        request.symbols = db_strategy.config.get('symbols', ['AAPL', 'MSFT'])
-    if request.symbols:
-        request.symbols = _normalize_symbols(request.symbols)
-        if not request.symbols:
-            raise HTTPException(status_code=400, detail="At least one valid symbol is required for backtest")
-
-    # Resolve parameter set: strategy-saved parameters with request overrides.
-    default_params = get_default_parameters()
-    param_defs = {param.name: param for param in default_params}
-    resolved_parameters: Dict[str, float] = {}
-    if db_strategy.config and isinstance(db_strategy.config.get("parameters"), dict):
-        for name, value in db_strategy.config.get("parameters", {}).items():
-            if name not in param_defs:
-                continue
-            try:
-                numeric = float(value)
-            except (TypeError, ValueError):
-                continue
-            if not math.isfinite(numeric):
-                continue
-            pdef = param_defs[name]
-            resolved_parameters[name] = max(pdef.min_value, min(pdef.max_value, numeric))
-    if request.parameters:
-        for name, value in request.parameters.items():
-            if name not in param_defs:
-                raise HTTPException(status_code=400, detail=f"Unknown backtest parameter: {name}")
-            try:
-                numeric = float(value)
-            except (TypeError, ValueError):
-                raise HTTPException(status_code=400, detail=f"Backtest parameter {name} must be numeric")
-            if not math.isfinite(numeric):
-                raise HTTPException(status_code=400, detail=f"Backtest parameter {name} must be finite")
-            pdef = param_defs[name]
-            if not (pdef.min_value <= numeric <= pdef.max_value):
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Backtest parameter {name} must be within [{pdef.min_value}, {pdef.max_value}]",
-                )
-            resolved_parameters[name] = numeric
-    
-    # Run backtest with strict Alpaca-data enforcement when configured.
-    _bt_config = _get_config_snapshot()
-    _bt_mode = "paper" if _bt_config.paper_trading else "live"
-    broker_name = str(_bt_config.broker or "").strip().lower()
-    if emulate_live_trading and broker_name != "alpaca":
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Live-equivalent backtesting requires Alpaca broker mode. "
-                "Set broker=alpaca in Settings, then retry."
-            ),
-        )
-    _bt_require_real_data = bool(
-        emulate_live_trading
-        or (_bt_config.strict_alpaca_data and broker_name == "alpaca")
+    resolved_parameters = _resolve_strategy_backtest_parameters(
+        db_strategy=db_strategy,
+        request_parameters=request.parameters,
     )
-    _bt_creds = _resolve_alpaca_credentials_for_mode(_bt_mode)
-    if _bt_require_real_data and not _bt_creds:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Strict Alpaca data mode is enabled for {_bt_mode} but credentials are unavailable. "
-                "Load/save Alpaca keys in Settings before running backtests."
-            ),
-        )
-
-    broker_for_constraints: Optional[BrokerInterface] = None
-    if broker_name == "alpaca":
-        try:
-            broker_for_constraints = get_broker()
-        except RuntimeError as exc:
-            if emulate_live_trading:
-                raise HTTPException(status_code=400, detail=str(exc))
-
-    selected_symbols = list(request.symbols or [])
-    universe_context: Dict[str, Any] = {
-        "symbols_source": "strategy_symbols",
-        "symbols_requested": len(selected_symbols),
-    }
-    live_parity_context: Dict[str, Any] = {
-        "broker": broker_name or "unknown",
-        "broker_mode": _bt_mode,
-        "strict_real_data_required": _bt_require_real_data,
-        "credentials_available": bool(_bt_creds),
-        "workspace_universe_requested": bool(request.use_workspace_universe),
-    }
-    if request.use_workspace_universe:
-        try:
-            screener = MarketScreener(
-                alpaca_client=_bt_creds,
-                require_real_data=_bt_require_real_data,
-            )
-            selected_symbols, universe_context = _resolve_workspace_universe_for_backtest(
-                storage=storage,
-                screener=screener,
-                prefs=prefs,
-                request=request,
-                broker=broker_for_constraints,
-                initial_capital=float(request.initial_capital),
-            )
-        except RuntimeError as exc:
-            raise HTTPException(status_code=503, detail=str(exc))
-        if not selected_symbols:
-            raise HTTPException(
-                status_code=400,
-                detail="Workspace universe resolution produced zero symbols. Adjust guardrails/preset/universe mode.",
-            )
-    if not selected_symbols:
-        raise HTTPException(status_code=400, detail="At least one valid symbol is required for backtest")
-
-    require_fractionable = False
-    symbol_capabilities: Dict[str, Dict[str, bool]] = {}
-    filtered_out: List[Dict[str, str]] = []
-    if emulate_live_trading:
-        asset_type_for_rules = _resolve_backtest_asset_type(request.asset_type, prefs)
-        if request.use_workspace_universe and universe_context.get("asset_type") in {"stock", "etf"}:
-            asset_type_for_rules = AssetType(str(universe_context["asset_type"]))
-        synthetic_account = {
-            "equity": float(request.initial_capital),
-            "buying_power": float(request.initial_capital),
-        }
-        require_fractionable = _should_require_fractionable_symbols(asset_type_for_rules, prefs, synthetic_account)
-        if broker_for_constraints is not None:
-            symbol_capabilities = _collect_symbol_capabilities(
-                broker_for_constraints,
-                [{"symbol": symbol} for symbol in selected_symbols],
-            )
-        enforced_symbols: List[str] = []
-        for symbol in selected_symbols:
-            capabilities = symbol_capabilities.get(symbol, {"tradable": True, "fractionable": True})
-            tradable = bool(capabilities.get("tradable", True))
-            fractionable = bool(capabilities.get("fractionable", True))
-            if not tradable:
-                filtered_out.append({"symbol": symbol, "reason": "not broker tradable"})
-                continue
-            if require_fractionable and not fractionable:
-                filtered_out.append({"symbol": symbol, "reason": "not fractionable"})
-                continue
-            enforced_symbols.append(symbol)
-        selected_symbols = enforced_symbols
-        if not selected_symbols:
-            raise HTTPException(
-                status_code=400,
-                detail="All candidate symbols were filtered by live execution rules (tradable/fractionable).",
-            )
-    universe_context["symbols_selected"] = len(selected_symbols)
-    if filtered_out:
-        universe_context["symbols_filtered_out"] = filtered_out[:50]
-
-    max_position_size = float(_bt_config.max_position_size)
-    risk_limit_daily = float(_bt_config.risk_limit_daily)
-    if broker_for_constraints is not None:
-        max_position_size, risk_limit_daily = _balance_adjusted_limits(
-            broker=broker_for_constraints,
-            requested_max_position_size=max_position_size,
-            requested_risk_limit_daily=risk_limit_daily,
-        )
-    live_parity_context["require_fractionable"] = require_fractionable
-    live_parity_context["symbol_capabilities_checked"] = bool(symbol_capabilities)
-    live_parity_context["symbols_selected"] = len(selected_symbols)
-    live_parity_context["symbols_filtered_out_count"] = len(filtered_out)
-    live_parity_context["max_position_size"] = max_position_size
-    live_parity_context["risk_limit_daily"] = risk_limit_daily
-    universe_context["live_parity_context"] = live_parity_context
-
-    analytics = StrategyAnalyticsService(
-        db,
-        alpaca_creds=_bt_creds,
-        require_real_data=_bt_require_real_data,
+    exec_context = _prepare_backtest_execution_context(
+        storage=storage,
+        db_strategy=db_strategy,
+        request=request,
     )
     from config.strategy_config import BacktestRequest as BacktestReq
     
@@ -3355,19 +3886,21 @@ async def run_strategy_backtest(
         start_date=request.start_date,
         end_date=request.end_date,
         initial_capital=request.initial_capital,
-        symbols=selected_symbols,
+        contribution_amount=request.contribution_amount,
+        contribution_frequency=request.contribution_frequency,
+        symbols=exec_context["selected_symbols"],
         parameters=resolved_parameters or None,
-        emulate_live_trading=emulate_live_trading,
-        symbol_capabilities=symbol_capabilities or None,
-        require_fractionable=require_fractionable,
-        max_position_size=max_position_size,
-        risk_limit_daily=risk_limit_daily,
-        fee_bps=0.0,
-        universe_context=universe_context,
+        emulate_live_trading=exec_context["emulate_live_trading"],
+        symbol_capabilities=exec_context["symbol_capabilities"] or None,
+        require_fractionable=exec_context["require_fractionable"],
+        max_position_size=exec_context["max_position_size"],
+        risk_limit_daily=exec_context["risk_limit_daily"],
+        fee_bps=exec_context["fee_bps"],
+        universe_context=exec_context["universe_context"],
     )
     
     try:
-        result = analytics.run_backtest(backtest_req)
+        result = exec_context["analytics"].run_backtest(backtest_req)
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
     
@@ -3378,31 +3911,244 @@ async def run_strategy_backtest(
             "strategy_id": db_strategy.id,
             "start_date": request.start_date,
             "end_date": request.end_date,
+            "contribution_amount": request.contribution_amount,
+            "contribution_frequency": request.contribution_frequency,
             "total_trades": result.total_trades,
             "win_rate": result.win_rate,
-            "emulate_live_trading": emulate_live_trading,
-            "symbols_source": universe_context.get("symbols_source"),
-            "symbols_selected": universe_context.get("symbols_selected"),
+            "emulate_live_trading": exec_context["emulate_live_trading"],
+            "symbols_source": exec_context["universe_context"].get("symbols_source"),
+            "symbols_selected": exec_context["universe_context"].get("symbols_selected"),
         },
     )
-    
-    return BacktestResponse(
-        strategy_id=result.strategy_id,
-        start_date=result.start_date,
-        end_date=result.end_date,
-        initial_capital=result.initial_capital,
-        final_capital=result.final_capital,
-        total_return=result.total_return,
-        total_trades=result.total_trades,
-        winning_trades=result.winning_trades,
-        losing_trades=result.losing_trades,
-        win_rate=result.win_rate,
-        max_drawdown=result.max_drawdown,
-        sharpe_ratio=result.sharpe_ratio,
-        volatility=result.volatility,
-        trades=result.trades,
-        equity_curve=result.equity_curve,
-        diagnostics=result.diagnostics,
+    return _to_backtest_response(result)
+
+
+@router.post("/strategies/{strategy_id}/optimize", response_model=StrategyOptimizationResponse)
+async def optimize_strategy_configuration(
+    strategy_id: str,
+    request: StrategyOptimizationRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Run parameter + symbol optimization for a strategy using historical backtests.
+
+    Uses the same backtest engine and live-equivalence controls as /backtest,
+    then recommends an objective-optimized parameter/symbol set.
+    """
+    return _compute_strategy_optimization_response(
+        strategy_id=strategy_id,
+        request=request,
+        db=db,
+    )
+
+
+def _run_optimizer_job(job_id: str) -> None:
+    """Background worker for async optimizer jobs."""
+    started_at = datetime.now(timezone.utc).isoformat()
+    _optimizer_update_job(
+        job_id,
+        {
+            "status": "running",
+            "started_at": started_at,
+            "message": "Running parameter search",
+        },
+    )
+
+    def _should_cancel() -> bool:
+        row = _optimizer_get_job(job_id)
+        return bool(row and row.get("cancel_requested"))
+
+    def _progress_update(completed: int, total: int, stage: str) -> None:
+        row = _optimizer_get_job(job_id)
+        if not row:
+            return
+        if row.get("started_at"):
+            elapsed = max(
+                0.0,
+                (datetime.now(timezone.utc) - datetime.fromisoformat(str(row["started_at"]))).total_seconds(),
+            )
+        else:
+            elapsed = 0.0
+        total_safe = max(1, int(total))
+        completed_safe = max(0, min(int(completed), total_safe))
+        progress_pct = (completed_safe / total_safe) * 100.0
+        avg = (elapsed / completed_safe) if completed_safe > 0 else None
+        eta = (avg * (total_safe - completed_safe)) if avg is not None else None
+        stage_label = {
+            "initializing": "Initializing optimizer",
+            "parameter_search": "Evaluating parameter candidates",
+            "symbol_trim": "Testing symbol universe trims",
+            "walk_forward": "Running walk-forward validation",
+            "finalizing": "Finalizing best candidate",
+        }.get(stage, "Running optimizer")
+        _optimizer_update_job(
+            job_id,
+            {
+                "status": "running",
+                "progress_pct": round(progress_pct, 2),
+                "completed_iterations": completed_safe,
+                "total_iterations": total_safe,
+                "elapsed_seconds": round(elapsed, 3),
+                "eta_seconds": round(eta, 3) if eta is not None else None,
+                "avg_seconds_per_iteration": round(avg, 3) if avg is not None else None,
+                "message": stage_label,
+            },
+        )
+
+    row = _optimizer_get_job(job_id)
+    if not row:
+        return
+    strategy_id = str(row.get("strategy_id"))
+    request_payload = row.get("request") or {}
+    try:
+        request = StrategyOptimizationRequest(**request_payload)
+    except Exception as exc:
+        _optimizer_update_job(
+            job_id,
+            {
+                "status": "failed",
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "message": "Invalid request payload",
+                "error": str(exc),
+            },
+        )
+        return
+
+    db = SessionLocal()
+    try:
+        response = _compute_strategy_optimization_response(
+            strategy_id=strategy_id,
+            request=request,
+            db=db,
+            progress_callback=_progress_update,
+            should_cancel=_should_cancel,
+        )
+        _optimizer_update_job(
+            job_id,
+            {
+                "status": "completed",
+                "progress_pct": 100.0,
+                "completed_iterations": max(
+                    int(_optimizer_get_job(job_id).get("completed_iterations") if _optimizer_get_job(job_id) else 0),
+                    int(response.evaluated_iterations),
+                ),
+                "total_iterations": max(
+                    int(_optimizer_get_job(job_id).get("total_iterations") if _optimizer_get_job(job_id) else 0),
+                    int(response.evaluated_iterations),
+                ),
+                "eta_seconds": 0.0,
+                "message": "Completed",
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "result": response.model_dump(),
+            },
+        )
+    except OptimizationCancelledError:
+        _optimizer_update_job(
+            job_id,
+            {
+                "status": "canceled",
+                "message": "Canceled by user",
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "error": None,
+            },
+        )
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, str) else json.dumps(exc.detail)
+        status = "canceled" if _should_cancel() else "failed"
+        _optimizer_update_job(
+            job_id,
+            {
+                "status": status,
+                "message": "Canceled by user" if status == "canceled" else "Failed",
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "error": detail,
+            },
+        )
+    except Exception as exc:
+        status = "canceled" if _should_cancel() else "failed"
+        _optimizer_update_job(
+            job_id,
+            {
+                "status": status,
+                "message": "Canceled by user" if status == "canceled" else "Failed",
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "error": str(exc),
+            },
+        )
+    finally:
+        db.close()
+
+
+@router.post("/strategies/{strategy_id}/optimize/start", response_model=StrategyOptimizationJobStartResponse)
+async def start_strategy_optimization_job(
+    strategy_id: str,
+    request: StrategyOptimizationRequest,
+    db: Session = Depends(get_db),
+):
+    """Start async optimizer job and return job id for status polling."""
+    try:
+        strategy_id_int = int(strategy_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid strategy ID")
+    storage = StorageService(db)
+    db_strategy = storage.strategies.get_by_id(strategy_id_int)
+    if not db_strategy:
+        raise HTTPException(status_code=404, detail="Strategy not found")
+
+    payload = request.model_dump(exclude_none=True)
+    job = _optimizer_create_job(strategy_id=strategy_id, request_payload=payload)
+    thread = threading.Thread(
+        target=_run_optimizer_job,
+        args=(str(job["job_id"]),),
+        daemon=True,
+        name=f"optimizer-{job['job_id']}",
+    )
+    thread.start()
+    return StrategyOptimizationJobStartResponse(
+        job_id=str(job["job_id"]),
+        strategy_id=str(strategy_id),
+        status="queued",
+        created_at=str(job["created_at"]),
+    )
+
+
+@router.get("/strategies/{strategy_id}/optimize/{job_id}", response_model=StrategyOptimizationJobStatusResponse)
+async def get_strategy_optimization_job_status(strategy_id: str, job_id: str):
+    """Fetch current async optimizer job status."""
+    row = _optimizer_get_job(job_id)
+    if not row or str(row.get("strategy_id")) != str(strategy_id):
+        raise HTTPException(status_code=404, detail="Optimization job not found")
+    return _optimizer_progress_snapshot(row)
+
+
+@router.post("/strategies/{strategy_id}/optimize/{job_id}/cancel", response_model=StrategyOptimizationJobCancelResponse)
+async def cancel_strategy_optimization_job(strategy_id: str, job_id: str):
+    """Request cancellation for an async optimizer job."""
+    row = _optimizer_get_job(job_id)
+    if not row or str(row.get("strategy_id")) != str(strategy_id):
+        raise HTTPException(status_code=404, detail="Optimization job not found")
+    status = str(row.get("status") or "failed")
+    if status in {"completed", "failed", "canceled"}:
+        return StrategyOptimizationJobCancelResponse(
+            success=False,
+            job_id=job_id,
+            strategy_id=strategy_id,
+            status=status,  # type: ignore[arg-type]
+            message=f"Job already {status}",
+        )
+    updated = _optimizer_update_job(
+        job_id,
+        {
+            "cancel_requested": True,
+            "message": "Cancel requested",
+        },
+    ) or row
+    return StrategyOptimizationJobCancelResponse(
+        success=True,
+        job_id=job_id,
+        strategy_id=strategy_id,
+        status=str(updated.get("status") or "running"),  # type: ignore[arg-type]
+        message="Cancellation requested",
     )
 
 
@@ -3548,9 +4294,25 @@ def _create_market_screener() -> MarketScreener:
                 "Open Settings and load/save Alpaca keys for this mode."
             ),
         )
+    api_key = str((creds or {}).get("api_key") or "").strip()
+    api_key_sig = api_key[-8:] if api_key else ""
+    cache_key = f"{str(config.broker).lower()}:{mode}:{int(require_real_data)}:{api_key_sig}"
+    with _market_screener_instances_lock:
+        cached = _market_screener_instances.get(cache_key)
+        if cached is not None:
+            return cached
     if creds:
-        return MarketScreener(alpaca_client=creds, require_real_data=require_real_data)
-    return MarketScreener(require_real_data=False)
+        screener = MarketScreener(alpaca_client=creds, require_real_data=require_real_data)
+    else:
+        screener = MarketScreener(require_real_data=False)
+    with _market_screener_instances_lock:
+        _market_screener_instances[cache_key] = screener
+        # Bound in-memory screener instances to a tiny set.
+        if len(_market_screener_instances) > 4:
+            stale_keys = list(_market_screener_instances.keys())[:-4]
+            for stale_key in stale_keys:
+                _market_screener_instances.pop(stale_key, None)
+    return screener
 
 
 def _paginate_assets(assets_raw: List[dict], page: int, page_size: int) -> tuple[List[ScreenerAsset], int, int]:
@@ -4084,6 +4846,44 @@ async def get_preference_recommendation(
     normalized_asset_type = asset_type or prefs.asset_type
     if normalized_asset_type == AssetType.BOTH:
         normalized_asset_type = AssetType.STOCK
+    stock_presets = {"weekly_optimized", "three_to_five_weekly", "monthly_optimized", "small_budget_weekly", "micro_budget"}
+    etf_presets = {"conservative", "balanced", "aggressive"}
+    requested_preset = preset.value if preset is not None else None
+    config_snapshot = _get_config_snapshot()
+    mode = "paper" if config_snapshot.paper_trading else "live"
+    runtime_creds = _get_runtime_credentials(mode)
+    runtime_credentials_loaded = bool(
+        str(runtime_creds.get("api_key") or "").strip()
+        and str(runtime_creds.get("secret_key") or "").strip()
+    )
+    recommendation_cache_key = json.dumps(
+        {
+            "asset_type": normalized_asset_type.value,
+            "requested_preset": requested_preset or "",
+            "equity_override": _safe_float(equity, -1.0) if equity is not None else None,
+            "weekly_budget_override": _safe_float(weekly_budget, -1.0) if weekly_budget is not None else None,
+            "target_trades_per_week": int(target_trades_per_week),
+            "prefs": {
+                "asset_type": prefs.asset_type.value,
+                "stock_preset": prefs.stock_preset.value,
+                "etf_preset": prefs.etf_preset.value,
+                "weekly_budget": _safe_float(prefs.weekly_budget, 0.0),
+                "screener_limit": int(prefs.screener_limit),
+            },
+            "config": {
+                "broker": str(config_snapshot.broker).lower(),
+                "paper_trading": bool(config_snapshot.paper_trading),
+                "strict_alpaca_data": bool(config_snapshot.strict_alpaca_data),
+            },
+            "runtime_credentials_loaded": runtime_credentials_loaded,
+            "last_broker_sync_at": _last_broker_sync_at or "",
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    cached = _preference_recommendation_cache_get(recommendation_cache_key)
+    if cached is not None:
+        return cached
 
     broker: Optional[BrokerInterface] = None
     try:
@@ -4111,10 +4911,6 @@ async def get_preference_recommendation(
     )
     if effective_weekly_budget <= 0:
         effective_weekly_budget = 200.0
-
-    stock_presets = {"weekly_optimized", "three_to_five_weekly", "monthly_optimized", "small_budget_weekly", "micro_budget"}
-    etf_presets = {"conservative", "balanced", "aggressive"}
-    requested_preset = preset.value if preset is not None else None
 
     if normalized_asset_type == AssetType.ETF:
         effective_preset = requested_preset if requested_preset in etf_presets else prefs.etf_preset.value
@@ -4216,7 +5012,7 @@ async def get_preference_recommendation(
         "risk_limit_daily": float(round(recommended_risk_limit_daily, 2)),
         "screener_limit": int(recommended_screener_limit),
     }
-    return {
+    response_payload = {
         "asset_type": normalized_asset_type.value,
         "stock_preset": effective_preset if normalized_asset_type == AssetType.STOCK else prefs.stock_preset.value,
         "etf_preset": effective_preset if normalized_asset_type == AssetType.ETF else prefs.etf_preset.value,
@@ -4235,6 +5031,8 @@ async def get_preference_recommendation(
             "equity, and current holdings concentration."
         ),
     }
+    _preference_recommendation_cache_set(recommendation_cache_key, response_payload)
+    return response_payload
 
 
 @router.get("/screener/chart/{symbol}", response_model=SymbolChartResponse)

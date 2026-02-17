@@ -277,6 +277,26 @@ class TestStrategyBacktesting:
         
         data = response.json()
         assert data["initial_capital"] == 50000.0
+
+    def test_backtest_with_recurring_contributions(self, test_strategy):
+        """Backtest should accept recurring contribution settings and report diagnostics."""
+        response = client.post(
+            f"/strategies/{test_strategy.id}/backtest",
+            json={
+                "start_date": "2024-01-01",
+                "end_date": "2024-06-30",
+                "initial_capital": 1000.0,
+                "contribution_amount": 30.0,
+                "contribution_frequency": "weekly",
+            },
+        )
+        assert response.status_code == 200
+        payload = response.json()
+        diagnostics = payload.get("diagnostics", {})
+        assert diagnostics.get("contribution_frequency") == "weekly"
+        assert float(diagnostics.get("contribution_amount", 0.0)) == 30.0
+        assert int(diagnostics.get("contribution_events", 0)) >= 0
+        assert float(diagnostics.get("capital_contributions_total", 0.0)) >= 0.0
     
     def test_run_backtest_not_found(self):
         """Test backtest for non-existent strategy."""

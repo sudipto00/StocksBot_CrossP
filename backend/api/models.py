@@ -382,6 +382,7 @@ class RunnerStatusResponse(BaseModel):
     strategies: List[Dict[str, Any]] = Field(default_factory=list, description="Loaded strategies")
     tick_interval: float = Field(..., description="Tick interval in seconds")
     broker_connected: bool = Field(..., description="Whether broker is connected")
+    runner_thread_alive: bool = Field(default=False, description="Whether runner scheduler thread is alive")
     poll_success_count: int = Field(default=0, description="Successful poll cycles")
     poll_error_count: int = Field(default=0, description="Poll cycles with errors")
     last_poll_error: str = Field(default="", description="Most recent poll error summary")
@@ -396,6 +397,7 @@ class RunnerStatusResponse(BaseModel):
     last_catchup_at: Optional[str] = Field(default=None, description="Last catch-up cycle timestamp ISO string")
     resume_count: int = Field(default=0, description="Number of sleep->resume transitions")
     market_session_open: Optional[bool] = Field(default=None, description="Latest broker market-session flag")
+    last_state_persisted_at: Optional[str] = Field(default=None, description="Last persisted runner-state checkpoint timestamp ISO string")
 
 
 class RunnerActionResponse(BaseModel):
@@ -403,6 +405,40 @@ class RunnerActionResponse(BaseModel):
     success: bool = Field(..., description="Whether action was successful")
     message: str = Field(..., description="Action result message")
     status: str = Field(..., description="Current runner status")
+
+
+class RunnerStartRequest(BaseModel):
+    """Optional runner start request with workspace-universe override controls."""
+    use_workspace_universe: bool = Field(
+        default=False,
+        description="When true, resolve start-time symbol universe from Screener workspace controls.",
+    )
+    asset_type: Optional[Literal["stock", "etf"]] = Field(
+        default=None,
+        description="Optional workspace asset type override for runner universe resolution.",
+    )
+    screener_mode: Optional[Literal["most_active", "preset"]] = Field(
+        default=None,
+        description="Optional workspace screener mode override for runner universe resolution.",
+    )
+    stock_preset: Optional[Literal["weekly_optimized", "three_to_five_weekly", "monthly_optimized", "small_budget_weekly", "micro_budget"]] = Field(
+        default=None,
+        description="Optional stock preset override for workspace runner universe.",
+    )
+    etf_preset: Optional[Literal["conservative", "balanced", "aggressive"]] = Field(
+        default=None,
+        description="Optional ETF preset override for workspace runner universe.",
+    )
+    screener_limit: Optional[int] = Field(default=None, ge=10, le=200, description="Universe size cap for workspace-backed runner starts.")
+    seed_only: Optional[bool] = Field(default=None, description="Compatibility flag for preset universe mode.")
+    preset_universe_mode: Optional[Literal["seed_only", "seed_guardrail_blend", "guardrail_only"]] = Field(
+        default=None,
+        description="Preset universe mode when screener_mode=preset.",
+    )
+    min_dollar_volume: Optional[float] = Field(default=None, ge=0, description="Guardrail override: minimum dollar volume.")
+    max_spread_bps: Optional[float] = Field(default=None, ge=1, description="Guardrail override: max spread in bps.")
+    max_sector_weight_pct: Optional[float] = Field(default=None, ge=5, le=100, description="Guardrail override: sector concentration cap.")
+    auto_regime_adjust: Optional[bool] = Field(default=None, description="Guardrail override: enable regime-based adjustment.")
 
 
 class WebSocketAuthTicketResponse(BaseModel):
@@ -462,6 +498,11 @@ class BacktestRequest(BaseModel):
     start_date: str = Field(..., description="Start date (ISO format)")
     end_date: str = Field(..., description="End date (ISO format)")
     initial_capital: float = Field(default=100000.0, description="Initial capital")
+    contribution_amount: float = Field(default=0.0, ge=0.0, description="Optional recurring contribution amount.")
+    contribution_frequency: Literal["none", "weekly", "monthly"] = Field(
+        default="none",
+        description="Recurring contribution frequency applied during backtest.",
+    )
     symbols: Optional[List[str]] = Field(None, description="Symbols to backtest")
     parameters: Optional[Dict[str, float]] = Field(None, description="Strategy parameters")
     # Live-equivalence controls (optional for backward compatibility).
@@ -535,6 +576,180 @@ class ParameterTuneResponse(BaseModel):
     new_value: float = Field(..., description="New value")
     success: bool = Field(..., description="Whether update was successful")
     message: str = Field(..., description="Result message")
+
+
+class StrategyOptimizationRequest(BaseModel):
+    """Strategy optimization request model."""
+    start_date: str = Field(..., description="Start date (ISO format)")
+    end_date: str = Field(..., description="End date (ISO format)")
+    initial_capital: float = Field(default=100000.0, description="Initial capital")
+    contribution_amount: float = Field(default=0.0, ge=0.0, description="Optional recurring contribution amount.")
+    contribution_frequency: Literal["none", "weekly", "monthly"] = Field(
+        default="none",
+        description="Recurring contribution frequency applied during optimization backtests.",
+    )
+    symbols: Optional[List[str]] = Field(None, description="Optional explicit symbol universe")
+    parameters: Optional[Dict[str, float]] = Field(None, description="Optional base parameter overrides")
+    emulate_live_trading: bool = Field(
+        default=True,
+        description="Use live-equivalent broker/data constraints during optimization backtests",
+    )
+    use_workspace_universe: bool = Field(
+        default=True,
+        description="Resolve candidate symbols from current screener workspace controls",
+    )
+    asset_type: Optional[Literal["stock", "etf"]] = Field(
+        default=None,
+        description="Optional workspace asset type override for candidate universe",
+    )
+    screener_mode: Optional[Literal["most_active", "preset"]] = Field(
+        default=None,
+        description="Optional workspace screener mode override",
+    )
+    stock_preset: Optional[Literal["weekly_optimized", "three_to_five_weekly", "monthly_optimized", "small_budget_weekly", "micro_budget"]] = Field(
+        default=None,
+        description="Optional stock preset override for workspace-backed optimization",
+    )
+    etf_preset: Optional[Literal["conservative", "balanced", "aggressive"]] = Field(
+        default=None,
+        description="Optional ETF preset override for workspace-backed optimization",
+    )
+    screener_limit: Optional[int] = Field(default=None, ge=10, le=200, description="Universe size cap.")
+    seed_only: Optional[bool] = Field(default=None, description="Compatibility flag for preset universe mode.")
+    preset_universe_mode: Optional[Literal["seed_only", "seed_guardrail_blend", "guardrail_only"]] = Field(
+        default=None,
+        description="Preset universe mode when screener_mode=preset.",
+    )
+    min_dollar_volume: Optional[float] = Field(default=None, ge=0, description="Guardrail override: minimum dollar volume.")
+    max_spread_bps: Optional[float] = Field(default=None, ge=1, description="Guardrail override: max spread in bps.")
+    max_sector_weight_pct: Optional[float] = Field(default=None, ge=5, le=100, description="Guardrail override: sector concentration cap.")
+    auto_regime_adjust: Optional[bool] = Field(default=None, description="Guardrail override: enable regime-based adjustment.")
+    iterations: int = Field(default=36, ge=8, le=240, description="Number of optimization candidates to evaluate")
+    min_trades: int = Field(default=12, ge=0, le=1000, description="Minimum desired trade count for scoring penalty")
+    objective: Literal["balanced", "sharpe", "return"] = Field(
+        default="balanced",
+        description="Optimization objective: balanced risk-adjusted, Sharpe-priority, or return-priority",
+    )
+    strict_min_trades: bool = Field(
+        default=False,
+        description="When true, strongly penalize candidates that do not reach min_trades",
+    )
+    walk_forward_enabled: bool = Field(
+        default=True,
+        description="Run out-of-sample walk-forward validation on final recommendation",
+    )
+    walk_forward_folds: int = Field(
+        default=3,
+        ge=2,
+        le=8,
+        description="Number of sequential walk-forward folds for validation when enabled",
+    )
+    random_seed: Optional[int] = Field(default=None, ge=0, le=2_147_483_647, description="Optional deterministic random seed")
+
+
+class StrategyOptimizationCandidate(BaseModel):
+    """Compact summary of an optimization candidate."""
+    rank: int = Field(..., description="Rank among evaluated candidates")
+    score: float = Field(..., description="Optimization objective score")
+    meets_min_trades: bool = Field(default=True, description="Whether candidate met min_trades target")
+    symbol_count: int = Field(..., description="Number of symbols used")
+    sharpe_ratio: float = Field(..., description="Sharpe ratio")
+    total_return: float = Field(..., description="Total return percentage")
+    max_drawdown: float = Field(..., description="Maximum drawdown percentage")
+    win_rate: float = Field(..., description="Win rate percentage")
+    total_trades: int = Field(..., description="Total executed trades")
+    parameters: Dict[str, float] = Field(default_factory=dict, description="Candidate parameter values")
+
+
+class StrategyOptimizationWalkForwardFold(BaseModel):
+    """Single out-of-sample validation fold."""
+    fold_index: int = Field(..., description="1-based fold index")
+    train_start: str = Field(..., description="Training window start date")
+    train_end: str = Field(..., description="Training window end date")
+    test_start: str = Field(..., description="Validation window start date")
+    test_end: str = Field(..., description="Validation window end date")
+    score: float = Field(..., description="Objective score on this fold")
+    total_return: float = Field(..., description="Fold total return percentage")
+    sharpe_ratio: float = Field(..., description="Fold Sharpe ratio")
+    max_drawdown: float = Field(..., description="Fold max drawdown percentage")
+    win_rate: float = Field(..., description="Fold win rate percentage")
+    total_trades: int = Field(..., description="Fold executed trades")
+    meets_min_trades: bool = Field(default=True, description="Whether fold met min_trades target")
+
+
+class StrategyOptimizationWalkForwardReport(BaseModel):
+    """Walk-forward summary over sequential validation folds."""
+    enabled: bool = Field(default=False, description="Whether walk-forward validation ran")
+    objective: str = Field(default="balanced", description="Objective used for fold scoring")
+    strict_min_trades: bool = Field(default=False, description="Whether strict min-trades gating was used")
+    min_trades_target: int = Field(default=0, description="Trade-count target used for folds")
+    folds_requested: int = Field(default=0, description="Requested number of folds")
+    folds_completed: int = Field(default=0, description="Completed fold count")
+    pass_rate_pct: float = Field(default=0.0, description="Percent of folds passing min-trades gate")
+    average_score: float = Field(default=0.0, description="Average objective score across folds")
+    average_return: float = Field(default=0.0, description="Average return across folds")
+    average_sharpe: float = Field(default=0.0, description="Average Sharpe across folds")
+    worst_fold_return: float = Field(default=0.0, description="Worst return among completed folds")
+    folds: List[StrategyOptimizationWalkForwardFold] = Field(default_factory=list, description="Fold-level details")
+    notes: List[str] = Field(default_factory=list, description="Walk-forward caveats and guidance")
+
+
+class StrategyOptimizationResponse(BaseModel):
+    """Strategy optimization response model."""
+    strategy_id: str = Field(..., description="Strategy ID")
+    requested_iterations: int = Field(..., description="Requested number of candidate evaluations")
+    evaluated_iterations: int = Field(..., description="Actual number of evaluated candidates")
+    objective: str = Field(..., description="Optimization objective description")
+    score: float = Field(..., description="Best objective score")
+    min_trades_target: int = Field(default=0, description="Trade-count target used by optimizer")
+    strict_min_trades: bool = Field(default=False, description="Whether strict min-trades gating was enabled")
+    best_candidate_meets_min_trades: bool = Field(default=True, description="Whether selected candidate meets min_trades target")
+    recommended_parameters: Dict[str, float] = Field(default_factory=dict, description="Recommended parameter set")
+    recommended_symbols: List[str] = Field(default_factory=list, description="Recommended symbol universe")
+    top_candidates: List[StrategyOptimizationCandidate] = Field(default_factory=list, description="Top candidate summaries")
+    best_result: BacktestResponse = Field(..., description="Backtest result for recommended configuration")
+    walk_forward: Optional[StrategyOptimizationWalkForwardReport] = Field(
+        default=None,
+        description="Optional walk-forward validation report",
+    )
+    notes: List[str] = Field(default_factory=list, description="Usage notes and caveats")
+
+
+class StrategyOptimizationJobStartResponse(BaseModel):
+    """Asynchronous strategy optimization job creation response."""
+    job_id: str = Field(..., description="Optimization job ID")
+    strategy_id: str = Field(..., description="Strategy ID")
+    status: Literal["queued", "running", "completed", "failed", "canceled"] = Field(..., description="Job status")
+    created_at: str = Field(..., description="Job creation timestamp (ISO)")
+
+
+class StrategyOptimizationJobStatusResponse(BaseModel):
+    """Asynchronous strategy optimization job status response."""
+    job_id: str = Field(..., description="Optimization job ID")
+    strategy_id: str = Field(..., description="Strategy ID")
+    status: Literal["queued", "running", "completed", "failed", "canceled"] = Field(..., description="Job status")
+    progress_pct: float = Field(default=0.0, description="Progress percentage")
+    completed_iterations: int = Field(default=0, description="Completed optimizer steps")
+    total_iterations: int = Field(default=0, description="Total optimizer steps")
+    elapsed_seconds: float = Field(default=0.0, description="Elapsed runtime seconds")
+    eta_seconds: Optional[float] = Field(default=None, description="Estimated remaining seconds")
+    avg_seconds_per_iteration: Optional[float] = Field(default=None, description="Average seconds per completed step")
+    message: str = Field(default="", description="Human-readable status detail")
+    cancel_requested: bool = Field(default=False, description="Whether cancel was requested")
+    error: Optional[str] = Field(default=None, description="Failure reason when status=failed")
+    created_at: str = Field(..., description="Job creation timestamp (ISO)")
+    started_at: Optional[str] = Field(default=None, description="Job start timestamp (ISO)")
+    completed_at: Optional[str] = Field(default=None, description="Job completion timestamp (ISO)")
+    result: Optional[StrategyOptimizationResponse] = Field(default=None, description="Final optimization output when completed")
+
+
+class StrategyOptimizationJobCancelResponse(BaseModel):
+    """Asynchronous strategy optimization cancellation response."""
+    success: bool = Field(..., description="Whether cancellation request was accepted")
+    job_id: str = Field(..., description="Optimization job ID")
+    strategy_id: str = Field(..., description="Strategy ID")
+    status: Literal["queued", "running", "completed", "failed", "canceled"] = Field(..., description="Job status after cancellation request")
+    message: str = Field(..., description="Cancellation status message")
 
 
 # ============================================================================

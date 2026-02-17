@@ -15,6 +15,8 @@ from api import routes as api_routes
 from storage.database import Base, get_db
 from storage.service import StorageService
 from storage.models import OrderSideEnum, TradeTypeEnum
+from config.strategy_config import BacktestResult
+from api.models import BacktestResponse, StrategyOptimizationResponse
 
 # Create test database
 SQLALCHEMY_DATABASE_URL = "sqlite:///./test.db"
@@ -200,6 +202,323 @@ def test_delete_strategy():
     # Verify it's deleted
     get_response = client.get(f"/strategies/{strategy_id}")
     assert get_response.status_code == 404
+
+
+def test_optimize_strategy_returns_recommendation(monkeypatch):
+    """Optimizer endpoint should return recommended parameters/symbols payload."""
+    created = client.post(
+        "/strategies",
+        json={
+            "name": "Optimize Test",
+            "symbols": ["AAPL", "MSFT", "INTC"],
+        },
+    )
+    assert created.status_code == 200
+    strategy_id = created.json()["id"]
+
+    def _fake_optimize(self, **kwargs):
+        assert kwargs["objective"] == "return"
+        assert kwargs["strict_min_trades"] is True
+        assert kwargs["walk_forward_enabled"] is True
+        assert kwargs["walk_forward_folds"] == 4
+        best = BacktestResult(
+            strategy_id=strategy_id,
+            start_date="2024-01-01",
+            end_date="2024-03-31",
+            initial_capital=100000.0,
+            final_capital=104200.0,
+            total_return=4.2,
+            total_trades=12,
+            winning_trades=7,
+            losing_trades=5,
+            win_rate=58.3,
+            max_drawdown=2.1,
+            sharpe_ratio=1.35,
+            volatility=12.8,
+            trades=[],
+            equity_curve=[],
+            diagnostics={"blocked_reasons": {}, "top_blockers": []},
+        )
+        return {
+            "requested_iterations": 8,
+            "evaluated_iterations": 8,
+            "objective": "return_priority",
+            "score": 142.12,
+            "min_trades_target": 20,
+            "strict_min_trades": True,
+            "best_candidate_meets_min_trades": False,
+            "recommended_parameters": {
+                "position_size": 450.0,
+                "stop_loss_pct": 1.75,
+            },
+            "recommended_symbols": ["AAPL", "MSFT"],
+            "top_candidates": [
+                {
+                    "rank": 1,
+                    "score": 142.12,
+                    "meets_min_trades": False,
+                    "symbol_count": 2,
+                    "sharpe_ratio": 1.35,
+                    "total_return": 4.2,
+                    "max_drawdown": 2.1,
+                    "win_rate": 58.3,
+                    "total_trades": 12,
+                    "parameters": {"position_size": 450.0, "stop_loss_pct": 1.75},
+                }
+            ],
+            "best_result": best,
+            "walk_forward": {
+                "enabled": True,
+                "objective": "return_priority",
+                "strict_min_trades": True,
+                "min_trades_target": 20,
+                "folds_requested": 4,
+                "folds_completed": 2,
+                "pass_rate_pct": 50.0,
+                "average_score": 12.0,
+                "average_return": 1.2,
+                "average_sharpe": 0.4,
+                "worst_fold_return": -0.8,
+                "folds": [
+                    {
+                        "fold_index": 1,
+                        "train_start": "2024-01-01",
+                        "train_end": "2024-02-28",
+                        "test_start": "2024-02-29",
+                        "test_end": "2024-03-31",
+                        "score": 10.0,
+                        "total_return": 2.0,
+                        "sharpe_ratio": 0.8,
+                        "max_drawdown": 1.0,
+                        "win_rate": 60.0,
+                        "total_trades": 25,
+                        "meets_min_trades": True,
+                    }
+                ],
+                "notes": ["wf"],
+            },
+            "notes": ["ok"],
+        }
+
+    monkeypatch.setattr("services.strategy_optimizer.StrategyOptimizerService.optimize", _fake_optimize)
+
+    response = client.post(
+        f"/strategies/{strategy_id}/optimize",
+        json={
+            "start_date": "2024-01-01",
+            "end_date": "2024-03-31",
+            "initial_capital": 100000,
+            "emulate_live_trading": False,
+            "use_workspace_universe": False,
+            "iterations": 8,
+            "objective": "return",
+            "strict_min_trades": True,
+            "walk_forward_enabled": True,
+            "walk_forward_folds": 4,
+            "min_trades": 20,
+        },
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["strategy_id"] == strategy_id
+    assert payload["requested_iterations"] == 8
+    assert payload["evaluated_iterations"] == 8
+    assert payload["recommended_symbols"] == ["AAPL", "MSFT"]
+    assert payload["recommended_parameters"]["position_size"] == 450.0
+    assert payload["best_result"]["sharpe_ratio"] == 1.35
+    assert payload["objective"] == "return_priority"
+    assert payload["strict_min_trades"] is True
+    assert payload["min_trades_target"] == 20
+    assert payload["best_candidate_meets_min_trades"] is False
+    assert payload["walk_forward"]["folds_requested"] == 4
+
+
+def test_optimize_strategy_rejects_invalid_iterations():
+    """Optimizer should enforce minimum iteration count via request validation."""
+    created = client.post(
+        "/strategies",
+        json={
+            "name": "Optimize Validation Test",
+            "symbols": ["AAPL", "MSFT"],
+        },
+    )
+    assert created.status_code == 200
+    strategy_id = created.json()["id"]
+
+    response = client.post(
+        f"/strategies/{strategy_id}/optimize",
+        json={
+            "start_date": "2024-01-01",
+            "end_date": "2024-03-31",
+            "initial_capital": 100000,
+            "emulate_live_trading": False,
+            "use_workspace_universe": False,
+            "iterations": 2,
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_optimize_strategy_async_job_lifecycle(monkeypatch):
+    """Async optimizer endpoints should expose job start/status/completion."""
+    created = client.post(
+        "/strategies",
+        json={
+            "name": "Optimize Async Test",
+            "symbols": ["AAPL", "MSFT"],
+        },
+    )
+    assert created.status_code == 200
+    strategy_id = created.json()["id"]
+
+    def _fake_compute(*, strategy_id: str, request, db, progress_callback=None, should_cancel=None):
+        if progress_callback:
+            progress_callback(1, 3, "parameter_search")
+            progress_callback(2, 3, "parameter_search")
+            progress_callback(3, 3, "finalizing")
+        return StrategyOptimizationResponse(
+            strategy_id=strategy_id,
+            requested_iterations=12,
+            evaluated_iterations=12,
+            objective="sharpe_ratio_with_trade_count_penalty",
+            score=101.0,
+            recommended_parameters={"position_size": 250.0},
+            recommended_symbols=["AAPL"],
+            top_candidates=[],
+            best_result=BacktestResponse(
+                strategy_id=strategy_id,
+                start_date="2024-01-01",
+                end_date="2024-03-31",
+                initial_capital=100000.0,
+                final_capital=103000.0,
+                total_return=3.0,
+                total_trades=8,
+                winning_trades=5,
+                losing_trades=3,
+                win_rate=62.5,
+                max_drawdown=1.8,
+                sharpe_ratio=1.2,
+                volatility=10.0,
+                trades=[],
+                equity_curve=[],
+                diagnostics={},
+            ),
+            notes=["ok"],
+        )
+
+    monkeypatch.setattr(api_routes, "_compute_strategy_optimization_response", _fake_compute)
+
+    start = client.post(
+        f"/strategies/{strategy_id}/optimize/start",
+        json={
+            "start_date": "2024-01-01",
+            "end_date": "2024-03-31",
+            "initial_capital": 100000,
+            "emulate_live_trading": False,
+            "use_workspace_universe": False,
+            "iterations": 12,
+        },
+    )
+    assert start.status_code == 200
+    job_id = start.json()["job_id"]
+
+    status_payload = None
+    for _ in range(40):
+        status = client.get(f"/strategies/{strategy_id}/optimize/{job_id}")
+        assert status.status_code == 200
+        status_payload = status.json()
+        if status_payload["status"] in {"completed", "failed", "canceled"}:
+            break
+        time.sleep(0.05)
+
+    assert status_payload is not None
+    assert status_payload["status"] == "completed"
+    assert status_payload["result"]["strategy_id"] == strategy_id
+    assert status_payload["result"]["recommended_symbols"] == ["AAPL"]
+
+
+def test_optimize_strategy_async_job_cancel(monkeypatch):
+    """Async optimizer cancel endpoint should mark running jobs for cancellation."""
+    created = client.post(
+        "/strategies",
+        json={
+            "name": "Optimize Async Cancel Test",
+            "symbols": ["AAPL", "MSFT"],
+        },
+    )
+    assert created.status_code == 200
+    strategy_id = created.json()["id"]
+
+    def _slow_compute(*, strategy_id: str, request, db, progress_callback=None, should_cancel=None):
+        total = 20
+        for idx in range(total):
+            if should_cancel and should_cancel():
+                raise api_routes.OptimizationCancelledError("canceled")
+            if progress_callback:
+                progress_callback(idx + 1, total, "parameter_search")
+            time.sleep(0.02)
+        return StrategyOptimizationResponse(
+            strategy_id=strategy_id,
+            requested_iterations=20,
+            evaluated_iterations=20,
+            objective="sharpe_ratio_with_trade_count_penalty",
+            score=88.0,
+            recommended_parameters={"position_size": 200.0},
+            recommended_symbols=["AAPL"],
+            top_candidates=[],
+            best_result=BacktestResponse(
+                strategy_id=strategy_id,
+                start_date="2024-01-01",
+                end_date="2024-03-31",
+                initial_capital=100000.0,
+                final_capital=101000.0,
+                total_return=1.0,
+                total_trades=5,
+                winning_trades=3,
+                losing_trades=2,
+                win_rate=60.0,
+                max_drawdown=2.0,
+                sharpe_ratio=0.6,
+                volatility=11.0,
+                trades=[],
+                equity_curve=[],
+                diagnostics={},
+            ),
+            notes=["ok"],
+        )
+
+    monkeypatch.setattr(api_routes, "_compute_strategy_optimization_response", _slow_compute)
+
+    start = client.post(
+        f"/strategies/{strategy_id}/optimize/start",
+        json={
+            "start_date": "2024-01-01",
+            "end_date": "2024-03-31",
+            "initial_capital": 100000,
+            "emulate_live_trading": False,
+            "use_workspace_universe": False,
+            "iterations": 20,
+        },
+    )
+    assert start.status_code == 200
+    job_id = start.json()["job_id"]
+
+    time.sleep(0.1)
+    cancel = client.post(f"/strategies/{strategy_id}/optimize/{job_id}/cancel")
+    assert cancel.status_code == 200
+    assert cancel.json()["success"] is True
+
+    final_payload = None
+    for _ in range(50):
+        status = client.get(f"/strategies/{strategy_id}/optimize/{job_id}")
+        assert status.status_code == 200
+        final_payload = status.json()
+        if final_payload["status"] in {"canceled", "failed", "completed"}:
+            break
+        time.sleep(0.05)
+
+    assert final_payload is not None
+    assert final_payload["status"] == "canceled"
 
 
 # ============================================================================
@@ -567,6 +886,42 @@ def test_start_runner_no_strategies():
     data = response.json()
     assert data["success"] == False
     assert "no active strategies" in data["message"].lower()
+
+
+def test_start_runner_workspace_universe_override(monkeypatch):
+    """Runner start should pass workspace universe symbols as non-destructive overrides."""
+    captured: dict[str, object] = {}
+
+    class _DummyBroker:
+        def get_account_info(self):
+            return {"equity": 10000.0, "buying_power": 10000.0}
+
+    def _fake_resolve_workspace(**_kwargs):
+        return (["AAPL", "MSFT", "INTC"], {"symbols_source": "workspace_universe"})
+
+    def _fake_start_runner(**kwargs):
+        captured["symbol_universe_override"] = kwargs.get("symbol_universe_override")
+        return {"success": True, "message": "Runner started", "status": "running"}
+
+    monkeypatch.setattr(api_routes, "get_broker", lambda: _DummyBroker())
+    monkeypatch.setattr(api_routes, "_resolve_workspace_universe_for_backtest", _fake_resolve_workspace)
+    monkeypatch.setattr(api_routes.runner_manager, "start_runner", _fake_start_runner)
+
+    response = client.post(
+        "/runner/start",
+        json={
+            "use_workspace_universe": True,
+            "asset_type": "stock",
+            "screener_mode": "preset",
+            "stock_preset": "micro_budget",
+            "preset_universe_mode": "seed_only",
+            "screener_limit": 25,
+        },
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["success"] is True
+    assert captured.get("symbol_universe_override") == ["AAPL", "MSFT", "INTC"]
 
 
 def test_start_stop_runner():

@@ -10,9 +10,10 @@ TODO: Implement concrete broker implementations
 
 from abc import ABC, abstractmethod
 from typing import Dict, List, Optional, Any, Callable
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 import math
+from zoneinfo import ZoneInfo
 
 
 class OrderSide(Enum):
@@ -238,19 +239,35 @@ class PaperBroker(BrokerInterface):
     
     """
     
-    def __init__(self, starting_balance: float = 100000.0):
+    def __init__(self, starting_balance: float = 100000.0, simulate_market_hours: bool = False):
         """
         Initialize paper broker.
         
         Args:
             starting_balance: Starting cash balance
+            simulate_market_hours: When true, only move simulated prices during
+                US regular market hours (Mon-Fri 9:30-16:00 ET).
         """
         self.connected = False
         self.balance = starting_balance
+        self.simulate_market_hours = bool(simulate_market_hours)
         self.positions: Dict[str, Dict[str, Any]] = {}
         self.orders: Dict[str, Dict[str, Any]] = {}
         self.order_counter = 0
         self._market_data_cache: Dict[str, Dict[str, Any]] = {}
+        self._market_tz = ZoneInfo("America/New_York")
+
+    def is_market_open(self) -> bool:
+        """Return regular US market-hours state when enabled."""
+        if not self.simulate_market_hours:
+            return True
+        return self._is_market_open_at(datetime.now(timezone.utc))
+
+    def get_next_market_open(self) -> Optional[datetime]:
+        """Return next US regular session open when market-hours simulation is enabled."""
+        if not self.simulate_market_hours:
+            return None
+        return self._next_market_open_from(datetime.now(timezone.utc))
     
     def connect(self) -> bool:
         """Connect to paper broker (always succeeds)."""
@@ -423,8 +440,8 @@ class PaperBroker(BrokerInterface):
 
     def _simulated_price(self, symbol: str) -> float:
         """Generate stable but non-flat simulated prices per symbol."""
-        now = datetime.now()
-        bucket = int(now.timestamp() // 30)
+        now_utc = datetime.now(timezone.utc)
+        bucket = int(now_utc.timestamp() // 30)
         static_prices = {
             # Keep AAPL stable at 100 for backward-compatible tests.
             "AAPL": 100.0,
@@ -438,11 +455,44 @@ class PaperBroker(BrokerInterface):
             base = self._baseline_price(symbol)
             state = {"base": base}
             self._market_data_cache[symbol] = state
+
+        # Keep prices frozen while market is closed when market-hours simulation is active.
+        if self.simulate_market_hours and not self._is_market_open_at(now_utc):
+            last_price = state.get("last_price")
+            if last_price is None:
+                last_price = float(state.get("base", 100.0))
+                state["last_price"] = last_price
+            return max(1.0, round(float(last_price), 2))
+
         base = float(state.get("base", 100.0))
         drift_seed = (sum(ord(ch) for ch in symbol) + bucket) % 17 - 8
         drift_pct = drift_seed / 1000.0  # +/-0.8%
         price = max(1.0, round(base * (1.0 + drift_pct), 2))
+        state["last_price"] = price
         return price
+
+    def _is_market_open_at(self, now_utc: datetime) -> bool:
+        """Regular US session check (Mon-Fri, 09:30-16:00 ET)."""
+        local_now = now_utc.astimezone(self._market_tz)
+        if local_now.weekday() >= 5:
+            return False
+        market_open = local_now.replace(hour=9, minute=30, second=0, microsecond=0)
+        market_close = local_now.replace(hour=16, minute=0, second=0, microsecond=0)
+        return market_open <= local_now < market_close
+
+    def _next_market_open_from(self, now_utc: datetime) -> datetime:
+        """Compute next regular US session open in UTC."""
+        local_now = now_utc.astimezone(self._market_tz)
+        market_open = local_now.replace(hour=9, minute=30, second=0, microsecond=0)
+
+        if local_now.weekday() < 5 and local_now < market_open:
+            return market_open.astimezone(timezone.utc)
+
+        next_day = local_now + timedelta(days=1)
+        while next_day.weekday() >= 5:
+            next_day += timedelta(days=1)
+        next_open_local = next_day.replace(hour=9, minute=30, second=0, microsecond=0)
+        return next_open_local.astimezone(timezone.utc)
 
     @staticmethod
     def _baseline_price(symbol: str) -> float:

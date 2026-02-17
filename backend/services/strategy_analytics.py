@@ -150,6 +150,16 @@ class StrategyAnalyticsService:
 
         params = self._resolve_backtest_parameters(request.parameters or {})
         initial_capital = float(request.initial_capital)
+        contribution_amount = max(0.0, float(getattr(request, "contribution_amount", 0.0) or 0.0))
+        contribution_frequency = str(getattr(request, "contribution_frequency", "none") or "none").strip().lower()
+        if contribution_frequency not in {"none", "weekly", "monthly"}:
+            contribution_frequency = "none"
+        if contribution_amount <= 0:
+            contribution_frequency = "none"
+        contribution_anchor_weekday = start_dt.date().weekday()
+        contribution_anchor_day = start_dt.date().day
+        total_contributions = 0.0
+        contribution_events = 0
         cash = initial_capital
         trade_id = 1
         emulate_live_trading = bool(request.emulate_live_trading)
@@ -203,6 +213,10 @@ class StrategyAnalyticsService:
             "max_position_size_applied": max_position_size,
             "risk_limit_daily_applied": daily_risk_limit,
             "fee_bps_applied": fee_bps,
+            "contribution_amount": contribution_amount,
+            "contribution_frequency": contribution_frequency,
+            "contribution_events": 0,
+            "capital_contributions_total": 0.0,
         }
         if isinstance(request.universe_context, dict) and request.universe_context:
             diagnostics["universe_context"] = dict(request.universe_context)
@@ -290,6 +304,16 @@ class StrategyAnalyticsService:
             diagnostics["trading_days_evaluated"] += 1
             day_ts = datetime.combine(day, datetime.min.time(), tzinfo=timezone.utc)
             day_realized_pnl = 0.0
+            if self._should_apply_contribution(
+                day=day,
+                start_day=start_dt.date(),
+                frequency=contribution_frequency,
+                anchor_weekday=contribution_anchor_weekday,
+                anchor_day_of_month=contribution_anchor_day,
+            ):
+                cash += contribution_amount
+                total_contributions += contribution_amount
+                contribution_events += 1
 
             for symbol in sorted(series_by_symbol.keys()):
                 point = date_index_by_symbol[symbol].get(day)
@@ -610,12 +634,13 @@ class StrategyAnalyticsService:
             equity_curve.append({"timestamp": final_ts.isoformat(), "equity": round(cash, 2)})
 
         final_capital = round(cash, 2)
-        total_pnl = final_capital - initial_capital
+        capital_base_for_return = max(1.0, initial_capital + total_contributions)
+        total_pnl = final_capital - capital_base_for_return
         total_trades = len(trades)
         winning_trades = len([t for t in trades if t["pnl"] > 0])
         losing_trades = len([t for t in trades if t["pnl"] < 0])
         win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0.0
-        total_return = (total_pnl / initial_capital * 100) if initial_capital > 0 else 0.0
+        total_return = (total_pnl / capital_base_for_return * 100) if capital_base_for_return > 0 else 0.0
 
         max_drawdown = self._calculate_max_drawdown_from_equity(equity_curve)
         equity_returns = self._equity_returns(equity_curve)
@@ -640,6 +665,9 @@ class StrategyAnalyticsService:
         diagnostics["top_blockers"] = blocked_nonzero[:5]
         diagnostics["symbols_without_data"] = sorted(set(diagnostics["symbols_without_data"]))
         diagnostics["risk_metrics_end_state"] = risk_manager.get_risk_metrics()
+        diagnostics["contribution_events"] = int(contribution_events)
+        diagnostics["capital_contributions_total"] = round(float(total_contributions), 2)
+        diagnostics["capital_base_for_return"] = round(float(capital_base_for_return), 2)
         diagnostics["symbol_capabilities_enforced"] = bool(symbol_capabilities)
         if symbol_capabilities:
             diagnostics["symbol_capabilities"] = {
@@ -693,6 +721,27 @@ class StrategyAnalyticsService:
             equity_curve=equity_curve,
             diagnostics=diagnostics,
         )
+
+    @staticmethod
+    def _should_apply_contribution(
+        *,
+        day: date_type,
+        start_day: date_type,
+        frequency: str,
+        anchor_weekday: int,
+        anchor_day_of_month: int,
+    ) -> bool:
+        """Determine whether recurring contribution should be applied on this day."""
+        if frequency not in {"weekly", "monthly"}:
+            return False
+        if day <= start_day:
+            # Initial capital already represents day-0 funding.
+            return False
+        if frequency == "weekly":
+            return day.weekday() == anchor_weekday
+        last_dom = (day.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
+        effective_dom = min(anchor_day_of_month, int(last_dom.day))
+        return day.day == effective_dom
 
     def _build_live_parity_report(
         self,

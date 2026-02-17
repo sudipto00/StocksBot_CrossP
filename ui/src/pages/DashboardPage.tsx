@@ -64,6 +64,7 @@ function DashboardPage() {
         strategies: runnerData.strategies,
         tick_interval: runnerData.tick_interval,
         broker_connected: runnerData.broker_connected,
+        runner_thread_alive: runnerData.runner_thread_alive,
         poll_success_count: runnerData.poll_success_count,
         poll_error_count: runnerData.poll_error_count,
         last_poll_error: runnerData.last_poll_error,
@@ -76,6 +77,7 @@ function DashboardPage() {
         last_catchup_at: runnerData.last_catchup_at,
         resume_count: runnerData.resume_count,
         market_session_open: runnerData.market_session_open,
+        last_state_persisted_at: runnerData.last_state_persisted_at,
       });
     } catch (err) {
       console.error('Failed to load runner status:', err);
@@ -146,6 +148,7 @@ function DashboardPage() {
         strategies: runnerData.strategies,
         tick_interval: runnerData.tick_interval,
         broker_connected: runnerData.broker_connected,
+        runner_thread_alive: runnerData.runner_thread_alive,
         poll_success_count: runnerData.poll_success_count,
         poll_error_count: runnerData.poll_error_count,
         last_poll_error: runnerData.last_poll_error,
@@ -158,6 +161,7 @@ function DashboardPage() {
         last_catchup_at: runnerData.last_catchup_at,
         resume_count: runnerData.resume_count,
         market_session_open: runnerData.market_session_open,
+        last_state_persisted_at: runnerData.last_state_persisted_at,
       });
       setAnalytics(analyticsData);
       setSummary(summaryData);
@@ -267,6 +271,17 @@ function DashboardPage() {
   const performancePnl = summary?.total_pnl ?? analytics?.total_pnl ?? 0;
   const performancePnlClass = performancePnl >= 0 ? 'text-green-400' : 'text-red-400';
   const runnerStatusLabel = (runnerState?.status || 'unknown').toUpperCase();
+  const runnerActive = runnerState?.status === RunnerStatus.RUNNING || runnerState?.status === RunnerStatus.SLEEPING;
+  const brokerHealthLabel = !brokerAccount?.connected
+    ? 'Unavailable'
+    : (runnerActive && !runnerState?.broker_connected)
+      ? 'Degraded'
+      : 'Connected';
+  const brokerHealthClass = brokerHealthLabel === 'Connected'
+    ? 'text-green-400'
+    : brokerHealthLabel === 'Degraded'
+      ? 'text-amber-400'
+      : 'text-gray-300';
   const startBlockedReason =
     runnerLoading
       ? 'Runner action is in progress.'
@@ -520,8 +535,8 @@ function DashboardPage() {
                 </div>
                 <div className="rounded border border-gray-700 bg-gray-900/50 p-2">
                   <p className="text-gray-400">Broker</p>
-                  <p className={`font-semibold ${(runnerState?.broker_connected && brokerAccount?.connected) ? 'text-green-400' : 'text-amber-400'}`}>
-                    {(runnerState?.broker_connected && brokerAccount?.connected) ? 'Connected' : 'Degraded'}
+                  <p className={`font-semibold ${brokerHealthClass}`}>
+                    {brokerHealthLabel}
                   </p>
                 </div>
                 <div className="rounded border border-gray-700 bg-gray-900/50 p-2">

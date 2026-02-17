@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { showSuccessNotification, showErrorNotification } from '../utils/notifications';
 import {
   getStrategies,
@@ -13,6 +13,9 @@ import {
   updateStrategyConfig,
   getStrategyMetrics,
   runBacktest,
+  startStrategyOptimization,
+  getStrategyOptimizationStatus,
+  cancelStrategyOptimization,
   tuneParameter,
   getTradingPreferences,
   getScreenerAssets,
@@ -32,6 +35,8 @@ import {
   BacktestResult,
   BacktestDiagnostics,
   BacktestLiveParityReport,
+  StrategyOptimizationResult,
+  StrategyOptimizationJobStatus,
   StrategyParameter,
   AssetTypePreference,
   TradingPreferences,
@@ -50,10 +55,18 @@ const STRATEGY_LIMITS = {
   backtestCapitalMin: 100,
   backtestCapitalMax: 100_000_000,
 };
+const OPTIMIZER_PROFILE_DEFAULTS: Record<'fast' | 'balanced' | 'robust', { iterations: number; minTrades: number }> = {
+  fast: { iterations: 24, minTrades: 8 },
+  balanced: { iterations: 60, minTrades: 15 },
+  robust: { iterations: 140, minTrades: 25 },
+};
 const WORKSPACE_LAST_APPLIED_AT_KEY = 'stocksbot.workspace.lastAppliedAt';
 const WORKSPACE_SNAPSHOT_KEY = 'stocksbot.workspace.snapshot';
 const SCREENER_PRESET_UNIVERSE_MODE_KEY = 'stocksbot.screener.preset.universeMode';
 const SCREENER_PRESET_SEED_ONLY_KEY = 'stocksbot.screener.preset.seedOnly';
+const STRATEGY_ANALYSIS_UNIVERSE_MODE_KEY = 'stocksbot.strategy.analysis.universeMode';
+const STRATEGY_SELECTED_ID_KEY = 'stocksbot.strategy.selectedId';
+const STRATEGY_OPTIMIZER_JOBS_KEY = 'stocksbot.strategy.optimizer.jobs';
 const USD_FORMATTER = new Intl.NumberFormat('en-US', {
   style: 'currency',
   currency: 'USD',
@@ -89,6 +102,10 @@ interface WorkspaceSnapshot {
   auto_regime_adjust?: boolean;
 }
 
+function snapshotAssetMatchesPrefs(snapshot: WorkspaceSnapshot, prefs: TradingPreferences): boolean {
+  return (snapshot.asset_type || prefs.asset_type) === prefs.asset_type;
+}
+
 function formatCurrency(value: number): string {
   return USD_FORMATTER.format(value);
 }
@@ -110,9 +127,35 @@ function formatLocalDateTime(value: string | null | undefined): string {
   return parsed.toLocaleString();
 }
 
+function formatDurationSeconds(seconds: number | null | undefined): string {
+  if (seconds == null || !Number.isFinite(seconds) || seconds < 0) return 'n/a';
+  const total = Math.round(seconds);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  if (h > 0) return `${h}h ${m}m ${s}s`;
+  if (m > 0) return `${m}m ${s}s`;
+  return `${s}s`;
+}
+
 function safeNumber(value: unknown, fallback = 0): number {
   const parsed = typeof value === 'number' ? value : Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, fallback: T): Promise<T> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(fallback), timeoutMs);
+    promise
+      .then((value) => {
+        clearTimeout(timer);
+        resolve(value);
+      })
+      .catch(() => {
+        clearTimeout(timer);
+        resolve(fallback);
+      });
+  });
 }
 
 function computeEstimatedDynamicPositionSize(input: {
@@ -174,6 +217,88 @@ function readPresetUniverseModeSetting(): 'seed_only' | 'seed_guardrail_blend' |
   } catch {
     return 'seed_guardrail_blend';
   }
+}
+
+function readAnalysisUniverseModeSetting(): 'workspace_universe' | 'strategy_symbols' {
+  if (typeof window === 'undefined') return 'workspace_universe';
+  try {
+    const stored = window.localStorage.getItem(STRATEGY_ANALYSIS_UNIVERSE_MODE_KEY);
+    if (stored === 'strategy_symbols' || stored === 'workspace_universe') {
+      return stored;
+    }
+    return 'workspace_universe';
+  } catch {
+    return 'workspace_universe';
+  }
+}
+
+function readPersistedSelectedStrategyId(): string | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const value = window.localStorage.getItem(STRATEGY_SELECTED_ID_KEY);
+    return value && value.trim().length > 0 ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function persistSelectedStrategyId(strategyId: string | null): void {
+  if (typeof window === 'undefined') return;
+  try {
+    if (!strategyId) {
+      window.localStorage.removeItem(STRATEGY_SELECTED_ID_KEY);
+      return;
+    }
+    window.localStorage.setItem(STRATEGY_SELECTED_ID_KEY, strategyId);
+  } catch {
+    // ignore localStorage write failures
+  }
+}
+
+function readOptimizerJobStore(): Record<string, string> {
+  if (typeof window === 'undefined') return {};
+  try {
+    const raw = window.localStorage.getItem(STRATEGY_OPTIMIZER_JOBS_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    if (!parsed || typeof parsed !== 'object') return {};
+    const normalized: Record<string, string> = {};
+    Object.entries(parsed).forEach(([strategyId, jobId]) => {
+      if (typeof strategyId === 'string' && typeof jobId === 'string' && strategyId && jobId) {
+        normalized[strategyId] = jobId;
+      }
+    });
+    return normalized;
+  } catch {
+    return {};
+  }
+}
+
+function writeOptimizerJobStore(store: Record<string, string>): void {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.setItem(STRATEGY_OPTIMIZER_JOBS_KEY, JSON.stringify(store));
+  } catch {
+    // ignore localStorage write failures
+  }
+}
+
+function readPersistedOptimizerJobId(strategyId: string): string | null {
+  const store = readOptimizerJobStore();
+  return store[strategyId] || null;
+}
+
+function persistOptimizerJobId(strategyId: string, jobId: string): void {
+  const store = readOptimizerJobStore();
+  store[strategyId] = jobId;
+  writeOptimizerJobStore(store);
+}
+
+function clearPersistedOptimizerJobId(strategyId: string): void {
+  const store = readOptimizerJobStore();
+  if (!(strategyId in store)) return;
+  delete store[strategyId];
+  writeOptimizerJobStore(store);
 }
 
 function normalizeSymbols(raw: string): string[] {
@@ -327,10 +452,32 @@ function StrategyPage() {
   const [backtestStartDate, setBacktestStartDate] = useState('2024-01-01');
   const [backtestEndDate, setBacktestEndDate] = useState('2024-12-31');
   const [backtestCapital, setBacktestCapital] = useState('100000');
+  const [backtestContributionAmount, setBacktestContributionAmount] = useState('0');
+  const [backtestContributionFrequency, setBacktestContributionFrequency] = useState<'none' | 'weekly' | 'monthly'>('none');
+  const [optimizerLoading, setOptimizerLoading] = useState(false);
+  const [optimizerError, setOptimizerError] = useState<string | null>(null);
+  const [optimizerResult, setOptimizerResult] = useState<StrategyOptimizationResult | null>(null);
+  const [optimizerJobStatus, setOptimizerJobStatus] = useState<StrategyOptimizationJobStatus | null>(null);
+  const [optimizerJobId, setOptimizerJobId] = useState<string | null>(null);
+  const [optimizerProfile, setOptimizerProfile] = useState<'fast' | 'balanced' | 'robust'>('balanced');
+  const [optimizerLookbackYears, setOptimizerLookbackYears] = useState<'custom' | '1' | '2' | '3' | '5'>('custom');
+  const [optimizerIterations, setOptimizerIterations] = useState('36');
+  const [optimizerMinTrades, setOptimizerMinTrades] = useState('12');
+  const [optimizerObjective, setOptimizerObjective] = useState<'balanced' | 'sharpe' | 'return'>('balanced');
+  const [optimizerStrictMinTrades, setOptimizerStrictMinTrades] = useState(false);
+  const [optimizerWalkForwardEnabled, setOptimizerWalkForwardEnabled] = useState(true);
+  const [optimizerWalkForwardFolds, setOptimizerWalkForwardFolds] = useState('3');
+  const [optimizerRandomSeed, setOptimizerRandomSeed] = useState('');
+  const [optimizerApplyLoading, setOptimizerApplyLoading] = useState(false);
+  const [optimizerApplyMessage, setOptimizerApplyMessage] = useState<{ type: 'success' | 'error' | 'info'; text: string } | null>(null);
+  const [analysisUniverseMode, setAnalysisUniverseMode] = useState<'workspace_universe' | 'strategy_symbols'>(() => readAnalysisUniverseModeSetting());
+  const analysisUsesWorkspaceUniverse = analysisUniverseMode === 'workspace_universe';
   const [detailTab, setDetailTab] = useState<'metrics' | 'config' | 'backtest'>('metrics');
   const activeStrategyCount = strategies.filter((s) => s.status === StrategyStatus.ACTIVE).length;
   const runnerIsActive = runnerStatus === 'running' || runnerStatus === 'sleeping';
   const backtestDiagnostics: BacktestDiagnostics | null = backtestResult?.diagnostics || null;
+  const backtestContributionTotal = Math.max(0, Number(backtestDiagnostics?.capital_contributions_total ?? 0));
+  const backtestContributionEvents = Math.max(0, Math.round(Number(backtestDiagnostics?.contribution_events ?? 0)));
   const backtestLiveParity: BacktestLiveParityReport | null = backtestDiagnostics?.live_parity || null;
   const topBacktestBlockers = (backtestDiagnostics?.top_blockers || []).filter((item) => item.count > 0);
   const [settingsSummary, setSettingsSummary] = useState<string>('Loading trading preferences...');
@@ -339,8 +486,12 @@ function StrategyPage() {
   const [runnerInputSummaryLoading, setRunnerInputSummaryLoading] = useState(false);
   const [workspaceLastAppliedAt, setWorkspaceLastAppliedAt] = useState<string | null>(null);
   const [workspaceSnapshot, setWorkspaceSnapshot] = useState<WorkspaceSnapshot | null>(null);
+  const [workspaceUniverseSymbols, setWorkspaceUniverseSymbols] = useState<string[]>([]);
+  const [workspaceUniverseLoading, setWorkspaceUniverseLoading] = useState(false);
   const [prefillMessage, setPrefillMessage] = useState<string>('');
   const [prefillLoading, setPrefillLoading] = useState(false);
+  const workspaceUniverseCacheRef = useRef<{ key: string; symbols: string[] } | null>(null);
+  const runnerSummaryRequestIdRef = useRef(0);
 
   const refreshRunnerPreflight = useCallback(async () => {
     try {
@@ -376,6 +527,37 @@ function StrategyPage() {
   }, [refreshRunnerPreflight]);
 
   useEffect(() => {
+    const defaults = OPTIMIZER_PROFILE_DEFAULTS[optimizerProfile];
+    setOptimizerIterations(String(defaults.iterations));
+    setOptimizerMinTrades(String(defaults.minTrades));
+  }, [optimizerProfile]);
+
+  useEffect(() => {
+    if (optimizerLookbackYears === 'custom') return;
+    if (!isIsoDate(backtestEndDate)) return;
+    const years = Number.parseInt(optimizerLookbackYears, 10);
+    if (!Number.isFinite(years) || years <= 0) return;
+    const end = new Date(`${backtestEndDate}T00:00:00`);
+    if (Number.isNaN(end.getTime())) return;
+    const start = new Date(end);
+    start.setFullYear(start.getFullYear() - years);
+    start.setDate(start.getDate() + 1);
+    const yyyy = start.getFullYear();
+    const mm = String(start.getMonth() + 1).padStart(2, '0');
+    const dd = String(start.getDate()).padStart(2, '0');
+    setBacktestStartDate(`${yyyy}-${mm}-${dd}`);
+  }, [optimizerLookbackYears, backtestEndDate]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    try {
+      window.localStorage.setItem(STRATEGY_ANALYSIS_UNIVERSE_MODE_KEY, analysisUniverseMode);
+    } catch {
+      // ignore localStorage write failures
+    }
+  }, [analysisUniverseMode]);
+
+  useEffect(() => {
     const readLastApplied = () => {
       if (typeof window === 'undefined') return;
       try {
@@ -409,6 +591,21 @@ function StrategyPage() {
       const response = await getStrategies();
       setStrategies(response.strategies);
       void loadRunnerInputSummary(response.strategies);
+      const stillSelected = selectedStrategy
+        ? response.strategies.some((strategy) => strategy.id === selectedStrategy.id)
+        : false;
+      if (!stillSelected) {
+        const persistedSelectedId = readPersistedSelectedStrategyId();
+        const nextStrategy = persistedSelectedId
+          ? response.strategies.find((strategy) => strategy.id === persistedSelectedId) || null
+          : null;
+        if (nextStrategy) {
+          void handleSelectStrategy(nextStrategy);
+        } else {
+          setSelectedStrategy(null);
+          persistSelectedStrategyId(null);
+        }
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load strategies');
     } finally {
@@ -443,9 +640,105 @@ function StrategyPage() {
     }
   };
 
+  const resolveWorkspaceUniverseInputs = useCallback((prefs: TradingPreferences) => {
+    const snapshot = workspaceSnapshot && snapshotAssetMatchesPrefs(workspaceSnapshot, prefs)
+      ? workspaceSnapshot
+      : null;
+    const screenerMode =
+      prefs.asset_type === 'stock'
+        ? (snapshot?.screener_mode || prefs.screener_mode)
+        : 'preset';
+    const presetUniverseMode = (
+      snapshot?.preset_universe_mode
+      || (typeof snapshot?.seed_only_preset === 'boolean'
+        ? (snapshot.seed_only_preset ? 'seed_only' : 'seed_guardrail_blend')
+        : readPresetUniverseModeSetting())
+    );
+    const cacheKey = JSON.stringify({
+      asset_type: prefs.asset_type,
+      screener_mode: screenerMode,
+      stock_preset: prefs.stock_preset,
+      etf_preset: prefs.etf_preset,
+      screener_limit: prefs.screener_limit,
+      preset_universe_mode: presetUniverseMode,
+      min_dollar_volume: snapshot?.min_dollar_volume,
+      max_spread_bps: snapshot?.max_spread_bps,
+      max_sector_weight_pct: snapshot?.max_sector_weight_pct,
+      auto_regime_adjust: snapshot?.auto_regime_adjust,
+    });
+    return {
+      cacheKey,
+      screenerMode,
+      presetUniverseMode,
+      request: {
+        use_workspace_universe: true,
+        asset_type: prefs.asset_type,
+        screener_mode: screenerMode,
+        stock_preset: prefs.stock_preset,
+        etf_preset: prefs.etf_preset,
+        screener_limit: prefs.screener_limit,
+        preset_universe_mode: presetUniverseMode,
+        seed_only: presetUniverseMode === 'seed_only',
+        min_dollar_volume: snapshot?.min_dollar_volume,
+        max_spread_bps: snapshot?.max_spread_bps,
+        max_sector_weight_pct: snapshot?.max_sector_weight_pct,
+        auto_regime_adjust: snapshot?.auto_regime_adjust,
+      } as const,
+      screenerOptions: {
+        screenerMode,
+        stockPreset: prefs.stock_preset,
+        etfPreset: prefs.etf_preset,
+        presetUniverseMode: screenerMode === 'preset' ? presetUniverseMode : undefined,
+        seedOnly: screenerMode === 'preset' ? presetUniverseMode === 'seed_only' : undefined,
+        minDollarVolume: snapshot?.min_dollar_volume,
+        maxSpreadBps: snapshot?.max_spread_bps,
+        maxSectorWeightPct: snapshot?.max_sector_weight_pct,
+        autoRegimeAdjust: snapshot?.auto_regime_adjust,
+      },
+    };
+  }, [workspaceSnapshot]);
+
+  const refreshWorkspaceUniverseSymbols = useCallback(async (prefsOverride?: TradingPreferences | null) => {
+    if (!analysisUsesWorkspaceUniverse) {
+      setWorkspaceUniverseSymbols([]);
+      setWorkspaceUniverseLoading(false);
+      return;
+    }
+    const prefs = prefsOverride ?? await withTimeout(getTradingPreferences(), 2500, null);
+    if (!prefs) {
+      setWorkspaceUniverseSymbols([]);
+      setWorkspaceUniverseLoading(false);
+      return;
+    }
+    const resolved = resolveWorkspaceUniverseInputs(prefs);
+    const cached = workspaceUniverseCacheRef.current;
+    if (cached && cached.key === resolved.cacheKey) {
+      setWorkspaceUniverseSymbols(cached.symbols);
+      setWorkspaceUniverseLoading(false);
+      return;
+    }
+    setWorkspaceUniverseLoading(true);
+    const response = await withTimeout(
+      getScreenerAssets(prefs.asset_type as AssetTypePreference, prefs.screener_limit, resolved.screenerOptions),
+      6000,
+      null,
+    );
+    if (response && Array.isArray(response.assets)) {
+      const symbols = normalizeSymbols((response.assets || []).map((asset) => asset.symbol).join(', '))
+        .slice(0, STRATEGY_LIMITS.maxSymbols);
+      workspaceUniverseCacheRef.current = { key: resolved.cacheKey, symbols };
+      setWorkspaceUniverseSymbols(symbols);
+    } else {
+      setWorkspaceUniverseSymbols([]);
+    }
+    setWorkspaceUniverseLoading(false);
+  }, [analysisUsesWorkspaceUniverse, resolveWorkspaceUniverseInputs]);
+
   const loadRunnerInputSummary = useCallback(async (strategySnapshot?: Strategy[]) => {
     try {
       setRunnerInputSummaryLoading(true);
+      const requestId = runnerSummaryRequestIdRef.current + 1;
+      runnerSummaryRequestIdRef.current = requestId;
       const sourceStrategies = strategySnapshot ?? strategies;
       const activeStrategies = sourceStrategies.filter((strategy) => strategy.status === StrategyStatus.ACTIVE);
       const inactiveStrategies = sourceStrategies.filter((strategy) => strategy.status !== StrategyStatus.ACTIVE);
@@ -464,28 +757,20 @@ function StrategyPage() {
         });
       });
 
-      const [prefs, config, brokerAccount, budgetStatus, portfolioSummary] = await Promise.all([
-        getTradingPreferences().catch(() => null),
-        getConfig().catch(() => null),
-        getBrokerAccount().catch(() => null),
-        getBudgetStatus().catch(() => null),
-        getPortfolioSummary().catch(() => null),
+      const [prefs, config, brokerAccount, budgetStatus] = await Promise.all([
+        withTimeout(getTradingPreferences(), 2500, null),
+        withTimeout(getConfig(), 2500, null),
+        withTimeout(getBrokerAccount(), 3000, null),
+        withTimeout(getBudgetStatus(), 2500, null),
       ]);
-      let recommendation: PreferenceRecommendationResponse | null = null;
-      if (prefs) {
-        const preset = prefs.asset_type === 'etf' ? prefs.etf_preset : prefs.stock_preset;
-        recommendation = await getPreferenceRecommendation({
-          asset_type: prefs.asset_type,
-          preset,
-          weekly_budget: prefs.weekly_budget,
-        }).catch(() => null);
-      }
 
-      setRunnerInputSummary({
+      if (runnerSummaryRequestIdRef.current !== requestId) return;
+
+      setRunnerInputSummary((prev) => ({
         preferences: prefs,
         config,
         brokerAccount,
-        recommendation,
+        recommendation: prev?.recommendation ?? null,
         budgetStatus,
         activeStrategyCount: activeStrategies.length,
         activeSymbolCount: symbolSet.size,
@@ -493,13 +778,53 @@ function StrategyPage() {
         inactiveStrategyCount: inactiveStrategies.length,
         inactiveSymbolCount: inactiveSymbolSet.size,
         inactiveSymbolsPreview: Array.from(inactiveSymbolSet).slice(0, 12),
-        openPositionCount: Math.max(0, Math.round(Number(portfolioSummary?.total_positions || 0))),
+        openPositionCount: Math.max(0, Math.round(Number(prev?.openPositionCount || 0))),
         generatedAt: new Date().toISOString(),
+      }));
+
+      if (!analysisUsesWorkspaceUniverse) {
+        setWorkspaceUniverseSymbols([]);
+        setWorkspaceUniverseLoading(false);
+      }
+
+      // Non-blocking enrichments; UI loads immediately with core snapshot.
+      void withTimeout(getPortfolioSummary(), 3000, null).then((portfolioSummary) => {
+        if (runnerSummaryRequestIdRef.current !== requestId || !portfolioSummary) return;
+        setRunnerInputSummary((prev) => prev ? {
+          ...prev,
+          openPositionCount: Math.max(0, Math.round(Number(portfolioSummary.total_positions || 0))),
+        } : prev);
       });
+      if (prefs) {
+        const preset = prefs.asset_type === 'etf' ? prefs.etf_preset : prefs.stock_preset;
+        void withTimeout(getPreferenceRecommendation({
+          asset_type: prefs.asset_type,
+          preset,
+          weekly_budget: prefs.weekly_budget,
+        }), 3500, null).then((recommendation) => {
+          if (runnerSummaryRequestIdRef.current !== requestId || !recommendation) return;
+          setRunnerInputSummary((prev) => prev ? { ...prev, recommendation } : prev);
+        });
+      }
     } finally {
       setRunnerInputSummaryLoading(false);
     }
-  }, [strategies]);
+  }, [analysisUsesWorkspaceUniverse, strategies]);
+
+  useEffect(() => {
+    if (analysisUsesWorkspaceUniverse) {
+      void refreshWorkspaceUniverseSymbols(runnerInputSummary?.preferences ?? null);
+      return;
+    }
+    setWorkspaceUniverseSymbols([]);
+    setWorkspaceUniverseLoading(false);
+  }, [
+    analysisUsesWorkspaceUniverse,
+    refreshWorkspaceUniverseSymbols,
+    runnerInputSummary?.preferences,
+    workspaceLastAppliedAt,
+    workspaceSnapshot,
+  ]);
 
   const loadStrategyConfig = useCallback(async (strategyId: string) => {
     try {
@@ -524,6 +849,49 @@ function StrategyPage() {
     void loadStrategyConfig(selectedStrategy.id);
   }, [selectedStrategy, workspaceLastAppliedAt, loadStrategyConfig]);
 
+  useEffect(() => {
+    if (!selectedStrategy || !optimizerJobId) return;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
+    const poll = async () => {
+      try {
+        const status = await getStrategyOptimizationStatus(selectedStrategy.id, optimizerJobId);
+        if (cancelled) return;
+        setOptimizerJobStatus(status);
+        const isTerminal = status.status === 'completed' || status.status === 'failed' || status.status === 'canceled';
+        if (!isTerminal) {
+          persistOptimizerJobId(selectedStrategy.id, optimizerJobId);
+        } else {
+          clearPersistedOptimizerJobId(selectedStrategy.id);
+        }
+        setOptimizerLoading(!isTerminal);
+        if (status.status === 'completed' && status.result) {
+          setOptimizerResult(status.result);
+          setBacktestResult(status.result.best_result);
+          setBacktestCompletedAt(status.completed_at || new Date().toISOString());
+        }
+        if (status.status === 'failed') {
+          setOptimizerError(status.error || status.message || 'Optimization failed');
+        }
+        if (!isTerminal) {
+          timer = setTimeout(() => {
+            void poll();
+          }, 1000);
+        }
+      } catch (err) {
+        if (cancelled) return;
+        setOptimizerLoading(false);
+        setOptimizerError(err instanceof Error ? err.message : 'Failed to fetch optimizer status');
+      }
+    };
+    void poll();
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [selectedStrategy, optimizerJobId]);
+
   const loadStrategyMetrics = useCallback(async (strategyId: string) => {
     try {
       setMetricsLoading(true);
@@ -533,6 +901,42 @@ function StrategyPage() {
       console.error('Failed to load strategy metrics:', err);
     } finally {
       setMetricsLoading(false);
+    }
+  }, []);
+
+  const restoreOptimizerStateForStrategy = useCallback(async (strategyId: string) => {
+    const persistedJobId = readPersistedOptimizerJobId(strategyId);
+    if (!persistedJobId) {
+      setOptimizerLoading(false);
+      setOptimizerJobId(null);
+      setOptimizerJobStatus(null);
+      return;
+    }
+
+    setOptimizerJobId(persistedJobId);
+    setOptimizerLoading(true);
+    setOptimizerError(null);
+    try {
+      const status = await getStrategyOptimizationStatus(strategyId, persistedJobId);
+      setOptimizerJobStatus(status);
+      const isTerminal = status.status === 'completed' || status.status === 'failed' || status.status === 'canceled';
+      setOptimizerLoading(!isTerminal);
+      if (status.status === 'completed' && status.result) {
+        setOptimizerResult(status.result);
+        setBacktestResult(status.result.best_result);
+        setBacktestCompletedAt(status.completed_at || new Date().toISOString());
+      }
+      if (status.status === 'failed') {
+        setOptimizerError(status.error || status.message || 'Optimization failed');
+      }
+      if (isTerminal) {
+        clearPersistedOptimizerJobId(strategyId);
+      }
+    } catch {
+      clearPersistedOptimizerJobId(strategyId);
+      setOptimizerLoading(false);
+      setOptimizerJobId(null);
+      setOptimizerJobStatus(null);
     }
   }, []);
 
@@ -548,21 +952,53 @@ function StrategyPage() {
   }, [selectedStrategy, loadStrategyMetrics]);
 
   const handleSelectStrategy = async (strategy: Strategy) => {
+    persistSelectedStrategyId(strategy.id);
     setSelectedStrategy(strategy);
     setDetailTab('metrics');
     setStrategyConfig(null);
     setStrategyMetrics(null);
     setBacktestResult(null);
+    setBacktestCompletedAt(null);
+    setOptimizerResult(null);
+    setOptimizerError(null);
+    setOptimizerJobStatus(null);
+    setOptimizerJobId(null);
 
-    await loadStrategyConfig(strategy.id);
-    await loadStrategyMetrics(strategy.id);
+    await Promise.all([
+      loadStrategyConfig(strategy.id),
+      loadStrategyMetrics(strategy.id),
+    ]);
+    await restoreOptimizerStateForStrategy(strategy.id);
   };
 
   const handleStartRunner = async () => {
     try {
       setRunnerLoading(true);
+      let startPayload:
+        | {
+          use_workspace_universe: boolean;
+          asset_type: 'stock' | 'etf';
+          screener_mode: 'most_active' | 'preset';
+          stock_preset: 'weekly_optimized' | 'three_to_five_weekly' | 'monthly_optimized' | 'small_budget_weekly' | 'micro_budget';
+          etf_preset: 'conservative' | 'balanced' | 'aggressive';
+          screener_limit: number;
+          preset_universe_mode: 'seed_only' | 'seed_guardrail_blend' | 'guardrail_only';
+          seed_only: boolean;
+          min_dollar_volume?: number;
+          max_spread_bps?: number;
+          max_sector_weight_pct?: number;
+          auto_regime_adjust?: boolean;
+        }
+        | undefined;
+      if (analysisUsesWorkspaceUniverse) {
+        const prefs = await getTradingPreferences();
+        const resolved = resolveWorkspaceUniverseInputs(prefs);
+        startPayload = {
+          ...resolved.request,
+        };
+      }
       await loadRunnerInputSummary();
-      const result = await startRunner();
+      const result = await startRunner(startPayload);
 
       if (result.success) {
         await showSuccessNotification('Runner Started', result.message);
@@ -573,7 +1009,7 @@ function StrategyPage() {
         await showErrorNotification('Start Failed', result.message);
       }
     } catch (err) {
-      await showErrorNotification('Start Error', 'Failed to start runner');
+      await showErrorNotification('Start Error', err instanceof Error ? err.message : 'Failed to start runner');
     } finally {
       setRunnerLoading(false);
     }
@@ -642,7 +1078,9 @@ function StrategyPage() {
       await Promise.all(removable.map((strategy) => deleteStrategy(strategy.id)));
       await showSuccessNotification('Cleanup Complete', `Removed ${removable.length} defunct/inactive strategies`);
       if (selectedStrategy && removable.some((strategy) => strategy.id === selectedStrategy.id)) {
+        clearPersistedOptimizerJobId(selectedStrategy.id);
         setSelectedStrategy(null);
+        persistSelectedStrategyId(null);
         setStrategyConfig(null);
         setStrategyMetrics(null);
       }
@@ -739,8 +1177,10 @@ function StrategyPage() {
       }
       await deleteStrategy(strategy.id);
       await showSuccessNotification('Strategy Deleted', `Strategy "${strategy.name}" deleted`);
+      clearPersistedOptimizerJobId(strategy.id);
       if (selectedStrategy?.id === strategy.id) {
         setSelectedStrategy(null);
+        persistSelectedStrategyId(null);
         setStrategyConfig(null);
         setStrategyMetrics(null);
       }
@@ -821,6 +1261,17 @@ function StrategyPage() {
     }
   };
 
+  const buildResolvedParameterPayload = (): Record<string, number> => {
+    if (!strategyConfig) return {};
+    return strategyConfig.parameters.reduce((acc, param) => {
+      const draft = parameterDrafts[param.name];
+      const parsed = Number.isFinite(draft) ? Number(draft) : param.value;
+      const bounded = Math.min(param.max_value, Math.max(param.min_value, parsed));
+      acc[param.name] = bounded;
+      return acc;
+    }, {} as Record<string, number>);
+  };
+
   const handleRunBacktest = async () => {
     if (!selectedStrategy || !strategyConfig) return;
 
@@ -841,18 +1292,14 @@ function StrategyPage() {
         setBacktestError(`Initial capital must be between ${STRATEGY_LIMITS.backtestCapitalMin} and ${STRATEGY_LIMITS.backtestCapitalMax}`);
         return;
       }
+      const parsedContributionAmount = Math.max(0, Number.parseFloat(backtestContributionAmount) || 0);
+      const contributionFrequency = parsedContributionAmount > 0 ? backtestContributionFrequency : 'none';
       const symbols = normalizeSymbols(configSymbols);
       if (symbols.length === 0) {
         setBacktestError('At least one valid symbol is required');
         return;
       }
-      const parameters = strategyConfig.parameters.reduce((acc, param) => {
-        const draft = parameterDrafts[param.name];
-        const parsed = Number.isFinite(draft) ? Number(draft) : param.value;
-        const bounded = Math.min(param.max_value, Math.max(param.min_value, parsed));
-        acc[param.name] = bounded;
-        return acc;
-      }, {} as Record<string, number>);
+      const parameters = buildResolvedParameterPayload();
       const workspacePresetUniverseMode = (
         workspaceSnapshot?.preset_universe_mode
         || (typeof workspaceSnapshot?.seed_only_preset === 'boolean'
@@ -863,10 +1310,12 @@ function StrategyPage() {
         start_date: backtestStartDate,
         end_date: backtestEndDate,
         initial_capital: initialCapital,
+        contribution_amount: parsedContributionAmount,
+        contribution_frequency: contributionFrequency,
         symbols,
         parameters,
         emulate_live_trading: true,
-        use_workspace_universe: true,
+        use_workspace_universe: analysisUsesWorkspaceUniverse,
         asset_type: currentPrefs?.asset_type,
         screener_mode: currentPrefs?.asset_type === 'etf' ? 'preset' : currentPrefs?.screener_mode,
         stock_preset: currentPrefs?.stock_preset,
@@ -888,6 +1337,173 @@ function StrategyPage() {
       await showErrorNotification('Backtest Error', message);
     } finally {
       setBacktestLoading(false);
+    }
+  };
+
+  const handleRunOptimizer = async () => {
+    if (!selectedStrategy || !strategyConfig) return;
+    let startedJob = false;
+    try {
+      setOptimizerLoading(true);
+      setOptimizerError(null);
+      setOptimizerResult(null);
+      setOptimizerJobStatus(null);
+      setOptimizerJobId(null);
+      if (!isIsoDate(backtestStartDate) || !isIsoDate(backtestEndDate)) {
+        setOptimizerError('Start and end dates must be valid ISO dates');
+        return;
+      }
+      if (new Date(backtestStartDate) > new Date(backtestEndDate)) {
+        setOptimizerError('Start date must be on or before end date');
+        return;
+      }
+      const initialCapital = Number.parseFloat(backtestCapital);
+      if (!Number.isFinite(initialCapital) || initialCapital < STRATEGY_LIMITS.backtestCapitalMin || initialCapital > STRATEGY_LIMITS.backtestCapitalMax) {
+        setOptimizerError(`Initial capital must be between ${STRATEGY_LIMITS.backtestCapitalMin} and ${STRATEGY_LIMITS.backtestCapitalMax}`);
+        return;
+      }
+      const parsedContributionAmount = Math.max(0, Number.parseFloat(backtestContributionAmount) || 0);
+      const contributionFrequency = parsedContributionAmount > 0 ? backtestContributionFrequency : 'none';
+      const parsedIterations = Math.max(8, Math.min(240, Math.round(Number.parseFloat(optimizerIterations) || 36)));
+      const parsedMinTrades = Math.max(0, Math.min(1000, Math.round(Number.parseFloat(optimizerMinTrades) || 12)));
+      const parsedWalkForwardFolds = Math.max(2, Math.min(8, Math.round(Number.parseFloat(optimizerWalkForwardFolds) || 3)));
+      const parsedSeed = optimizerRandomSeed.trim()
+        ? Math.max(0, Math.round(Number.parseFloat(optimizerRandomSeed)))
+        : undefined;
+
+      const symbols = normalizeSymbols(configSymbols);
+      if (symbols.length === 0) {
+        setOptimizerError('At least one valid symbol is required');
+        return;
+      }
+      const parameters = buildResolvedParameterPayload();
+      const workspacePresetUniverseMode = (
+        workspaceSnapshot?.preset_universe_mode
+        || (typeof workspaceSnapshot?.seed_only_preset === 'boolean'
+          ? (workspaceSnapshot.seed_only_preset ? 'seed_only' : 'seed_guardrail_blend')
+          : readPresetUniverseModeSetting())
+      );
+
+      const start = await startStrategyOptimization(selectedStrategy.id, {
+        start_date: backtestStartDate,
+        end_date: backtestEndDate,
+        initial_capital: initialCapital,
+        contribution_amount: parsedContributionAmount,
+        contribution_frequency: contributionFrequency,
+        symbols,
+        parameters,
+        emulate_live_trading: true,
+        use_workspace_universe: analysisUsesWorkspaceUniverse,
+        asset_type: currentPrefs?.asset_type,
+        screener_mode: currentPrefs?.asset_type === 'etf' ? 'preset' : currentPrefs?.screener_mode,
+        stock_preset: currentPrefs?.stock_preset,
+        etf_preset: currentPrefs?.etf_preset,
+        screener_limit: currentPrefs?.screener_limit,
+        preset_universe_mode: workspacePresetUniverseMode,
+        seed_only: workspacePresetUniverseMode === 'seed_only',
+        min_dollar_volume: effectiveMinDollarVolume,
+        max_spread_bps: effectiveMaxSpreadBps,
+        max_sector_weight_pct: effectiveMaxSectorWeightPct,
+        auto_regime_adjust: effectiveAutoRegimeAdjust,
+        iterations: parsedIterations,
+        min_trades: parsedMinTrades,
+        objective: optimizerObjective,
+        strict_min_trades: optimizerStrictMinTrades,
+        walk_forward_enabled: optimizerWalkForwardEnabled,
+        walk_forward_folds: parsedWalkForwardFolds,
+        random_seed: Number.isFinite(parsedSeed) ? parsedSeed : undefined,
+      });
+      setOptimizerJobId(start.job_id);
+      persistOptimizerJobId(selectedStrategy.id, start.job_id);
+      setOptimizerJobStatus({
+        job_id: start.job_id,
+        strategy_id: selectedStrategy.id,
+        status: start.status,
+        progress_pct: 0,
+        completed_iterations: 0,
+        total_iterations: 0,
+        elapsed_seconds: 0,
+        eta_seconds: null,
+        avg_seconds_per_iteration: null,
+        message: 'Queued',
+        cancel_requested: false,
+        error: null,
+        created_at: start.created_at,
+        started_at: null,
+        completed_at: null,
+        result: null,
+      });
+      startedJob = true;
+      await showSuccessNotification('Optimizer Started', 'Optimization started in background. Progress will update live.');
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to optimize strategy';
+      setOptimizerError(message);
+      await showErrorNotification('Optimization Error', message);
+    } finally {
+      if (!startedJob) {
+        setOptimizerLoading(false);
+      }
+    }
+  };
+
+  const handleCancelOptimizer = async () => {
+    if (!selectedStrategy || !optimizerJobId) return;
+    try {
+      await cancelStrategyOptimization(selectedStrategy.id, optimizerJobId);
+      await showSuccessNotification('Cancel Requested', 'Optimizer cancellation requested.');
+    } catch (err) {
+      await showErrorNotification('Cancel Error', err instanceof Error ? err.message : 'Failed to cancel optimizer');
+    }
+  };
+
+  const handleApplyOptimization = async (applySymbols: boolean) => {
+    if (!selectedStrategy) {
+      setOptimizerApplyMessage({ type: 'error', text: 'No strategy selected. Select a strategy first.' });
+      return;
+    }
+    if (!optimizerResult) {
+      setOptimizerApplyMessage({ type: 'error', text: 'No optimizer result available yet. Run optimizer first.' });
+      return;
+    }
+    try {
+      setOptimizerApplyLoading(true);
+      setOptimizerApplyMessage({
+        type: 'info',
+        text: applySymbols ? 'Applying parameters and symbols...' : 'Applying parameters...',
+      });
+      const payload: {
+        parameters: Record<string, number>;
+        symbols?: string[];
+      } = {
+        parameters: optimizerResult.recommended_parameters,
+      };
+      if (applySymbols) {
+        payload.symbols = optimizerResult.recommended_symbols;
+      }
+      await updateStrategyConfig(selectedStrategy.id, payload);
+      await loadStrategyConfig(selectedStrategy.id);
+      if (applySymbols) {
+        setConfigSymbols(optimizerResult.recommended_symbols.join(', '));
+        setAnalysisUniverseMode('strategy_symbols');
+      }
+      setOptimizerApplyMessage({
+        type: 'success',
+        text: applySymbols
+          ? 'Applied optimizer parameters and symbol universe to strategy config.'
+          : 'Applied optimizer parameters to strategy config.',
+      });
+      await showSuccessNotification(
+        'Optimization Applied',
+        applySymbols
+          ? 'Applied optimized parameters and trimmed symbol universe. Backtests now use strategy symbols unless you switch back to workspace universe.'
+          : 'Applied optimized parameters.',
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to apply optimization output';
+      setOptimizerApplyMessage({ type: 'error', text: message });
+      await showErrorNotification('Apply Error', message);
+    } finally {
+      setOptimizerApplyLoading(false);
     }
   };
 
@@ -956,6 +1572,8 @@ function StrategyPage() {
 
   const selectedSymbolList = strategyConfig ? strategyConfig.symbols : normalizeSymbols(configSymbols);
   const selectedSymbolSet = new Set(selectedSymbolList.map((symbol) => symbol.trim().toUpperCase()).filter(Boolean));
+  const workspaceSymbolSet = new Set(workspaceUniverseSymbols.map((symbol) => symbol.trim().toUpperCase()).filter(Boolean));
+  const effectiveSymbolSet = analysisUsesWorkspaceUniverse ? workspaceSymbolSet : selectedSymbolSet;
   const savedParameterMap = strategyConfig
     ? strategyConfig.parameters.reduce((acc, param) => {
       acc[param.name] = param.value;
@@ -988,10 +1606,22 @@ function StrategyPage() {
   const effectiveAutoRegimeAdjust = typeof workspaceSnapshot?.auto_regime_adjust === 'boolean'
     ? workspaceSnapshot.auto_regime_adjust
     : true;
+  const optimizerProgressPct = Math.max(
+    0,
+    Math.min(100, Number(optimizerJobStatus?.progress_pct ?? (optimizerLoading ? 2 : 0))),
+  );
+  const optimizerTerminal = optimizerJobStatus?.status === 'completed'
+    || optimizerJobStatus?.status === 'failed'
+    || optimizerJobStatus?.status === 'canceled';
+  const optimizerStatusText = optimizerJobStatus
+    ? `${optimizerJobStatus.status.toUpperCase()}: ${optimizerJobStatus.message || ''}`.trim()
+    : optimizerLoading
+      ? 'RUNNING'
+      : 'IDLE';
   const estimatedPositionSize = strategyConfig
     ? computeEstimatedDynamicPositionSize({
       requestedPositionSize: savedParameterMap.position_size ?? 1000,
-      symbolCount: Math.max(1, selectedSymbolSet.size || 1),
+      symbolCount: Math.max(1, effectiveSymbolSet.size || 1),
       existingPositionCount: runnerInputSummary?.openPositionCount ?? 0,
       remainingWeeklyBudget: budgetStatus?.remaining_budget ?? currentPrefs?.weekly_budget ?? 0,
       buyingPower: runnerInputSummary?.brokerAccount?.buying_power ?? 0,
@@ -1126,8 +1756,36 @@ function StrategyPage() {
             </button>
           </div>
           <p className="mt-1 text-xs text-blue-200">
-            Start Runner executes active strategy symbols and applies the controls shown here.
+            Start Runner executes active strategy symbols and applies risk/execution controls shown here.
           </p>
+          <p className="mt-1 text-xs text-blue-200">
+            Workspace Universe mode resolves symbols from Screener at runner start without overwriting hardened strategy symbol lists.
+          </p>
+          <div className="mt-3 grid grid-cols-1 gap-2 md:grid-cols-3">
+            <label className="text-xs text-blue-100">
+              Runner Universe Source
+              <select
+                value={analysisUniverseMode}
+                onChange={(e) => setAnalysisUniverseMode(e.target.value as 'workspace_universe' | 'strategy_symbols')}
+                className="mt-1 w-full rounded border border-blue-800 bg-blue-950/50 px-3 py-2 text-blue-100"
+              >
+                <option value="strategy_symbols">Strategy Symbols (Hardened)</option>
+                <option value="workspace_universe">Workspace Universe (Override on Start)</option>
+              </select>
+            </label>
+            <div className="rounded bg-blue-950/40 px-3 py-2 text-xs text-blue-100">
+              <div className="text-blue-300">Current mode</div>
+              <div className="font-semibold">
+                {analysisUsesWorkspaceUniverse ? 'Workspace Universe override on runner start' : 'Strategy Symbols hardened universe'}
+              </div>
+            </div>
+            <div className="rounded bg-blue-950/40 px-3 py-2 text-xs text-blue-100">
+              <div className="text-blue-300">Backtest/Optimizer source</div>
+              <div className="font-semibold">
+                {analysisUsesWorkspaceUniverse ? 'Workspace Universe' : 'Strategy Symbols'}
+              </div>
+            </div>
+          </div>
           <div className="mt-3 grid grid-cols-1 gap-2 text-xs text-blue-100 md:grid-cols-3">
             <div className="rounded bg-blue-950/40 px-3 py-2">
               Active strategies used: <span className="font-semibold">{runnerInputSummary?.activeStrategyCount ?? activeStrategyCount}</span>
@@ -1137,6 +1795,16 @@ function StrategyPage() {
             </div>
             <div className="rounded bg-blue-950/40 px-3 py-2">
               Unique symbols in scope: <span className="font-semibold">{runnerInputSummary?.activeSymbolCount ?? 0}</span>
+            </div>
+            <div className="rounded bg-blue-950/40 px-3 py-2">
+              Runner universe source: <span className="font-semibold">{analysisUsesWorkspaceUniverse ? 'Workspace Universe' : 'Strategy Symbols (Hardened)'}</span>
+            </div>
+            <div className="rounded bg-blue-950/40 px-3 py-2">
+              Workspace resolved symbols: <span className="font-semibold">
+                {analysisUsesWorkspaceUniverse
+                  ? (workspaceUniverseLoading ? 'Loading...' : workspaceUniverseSymbols.length)
+                  : '-'}
+              </span>
             </div>
             <div className="rounded bg-blue-950/40 px-3 py-2">
               Workspace universe: <span className="font-semibold">{formatUniverseLabel(runnerInputSummary?.preferences ?? null)}</span>
@@ -1163,11 +1831,17 @@ function StrategyPage() {
           <p className="mt-2 text-xs text-blue-200">
             Symbol sample:{' '}
             <span className="font-mono text-blue-100">
-              {(runnerInputSummary?.activeSymbolsPreview || []).length > 0
-                ? (runnerInputSummary?.activeSymbolsPreview || []).join(', ')
-                : (runnerInputSummary?.inactiveSymbolsPreview || []).length > 0
-                  ? `No active strategy symbols. Stopped-strategy sample: ${(runnerInputSummary?.inactiveSymbolsPreview || []).join(', ')}`
-                  : 'No strategy symbols found'}
+              {analysisUsesWorkspaceUniverse
+                ? (workspaceUniverseLoading
+                  ? 'Resolving workspace symbols...'
+                  : (workspaceUniverseSymbols.length > 0
+                    ? workspaceUniverseSymbols.slice(0, 12).join(', ')
+                    : 'No workspace symbols found'))
+                : ((runnerInputSummary?.activeSymbolsPreview || []).length > 0
+                  ? (runnerInputSummary?.activeSymbolsPreview || []).join(', ')
+                  : (runnerInputSummary?.inactiveSymbolsPreview || []).length > 0
+                    ? `No active strategy symbols. Stopped-strategy sample: ${(runnerInputSummary?.inactiveSymbolsPreview || []).join(', ')}`
+                    : 'No strategy symbols found')}
             </span>
           </p>
           <p className="mt-1 text-xs text-blue-200">
@@ -1362,8 +2036,12 @@ function StrategyPage() {
                   </div>
 
                   <div className="mt-3 rounded bg-cyan-950/40 px-3 py-2 text-xs text-cyan-100">
-                    Symbols ({selectedSymbolSet.size}):{' '}
-                    <span className="font-mono">{Array.from(selectedSymbolSet).join(', ') || 'None'}</span>
+                    Symbols ({effectiveSymbolSet.size}) [{analysisUsesWorkspaceUniverse ? 'Workspace Universe' : 'Strategy Symbols'}]:{' '}
+                    <span className="font-mono">
+                      {analysisUsesWorkspaceUniverse && workspaceUniverseLoading
+                        ? 'Resolving workspace symbols...'
+                        : Array.from(effectiveSymbolSet).join(', ') || 'None'}
+                    </span>
                   </div>
 
                   {strategyConfig?.parameters && strategyConfig.parameters.length > 0 && (
@@ -1620,6 +2298,399 @@ function StrategyPage() {
                 {detailTab === 'backtest' && (
                 <div className="bg-gray-800 rounded-lg border border-gray-700 p-6">
                   <h3 className="text-lg font-semibold text-white mb-4">Backtesting</h3>
+                  <div className="mb-4 rounded border border-indigo-800 bg-indigo-900/20 p-4">
+                    <div className="flex items-center justify-between gap-3 mb-3">
+                      <div>
+                        <h4 className="text-sm font-semibold text-indigo-100">Optimizer</h4>
+                        <p className="text-xs text-indigo-200/80">
+                          Uses the same date range, initial capital, recurring contribution schedule, and live-parity rules as this Backtesting tab.
+                        </p>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <button
+                          onClick={handleRunOptimizer}
+                          disabled={optimizerLoading || !strategyConfig}
+                          className={`px-3 py-2 rounded text-sm font-medium ${
+                            optimizerLoading || !strategyConfig
+                              ? 'bg-gray-600 text-gray-400 cursor-not-allowed'
+                              : 'bg-indigo-600 hover:bg-indigo-700 text-white'
+                          }`}
+                        >
+                          {optimizerLoading ? 'Optimizing...' : 'Run Optimizer'}
+                        </button>
+                        <button
+                          onClick={handleCancelOptimizer}
+                          disabled={!optimizerLoading || !optimizerJobId || Boolean(optimizerJobStatus?.cancel_requested)}
+                          className={`px-3 py-2 rounded text-sm font-medium ${
+                            !optimizerLoading || !optimizerJobId || Boolean(optimizerJobStatus?.cancel_requested)
+                              ? 'bg-gray-600 text-gray-400 cursor-not-allowed'
+                              : 'bg-amber-600 hover:bg-amber-700 text-white'
+                          }`}
+                        >
+                          {optimizerJobStatus?.cancel_requested ? 'Cancel Requested' : 'Cancel'}
+                        </button>
+                      </div>
+                    </div>
+                    <div className="grid grid-cols-1 md:grid-cols-5 gap-3 mb-3">
+                      <label className="text-xs text-gray-300">
+                        Start Date
+                        <input
+                          type="date"
+                          value={backtestStartDate}
+                          onChange={(e) => setBacktestStartDate(e.target.value)}
+                          className="mt-1 bg-gray-700 text-white px-3 py-2 rounded border border-gray-600 w-full"
+                        />
+                      </label>
+                      <label className="text-xs text-gray-300">
+                        End Date
+                        <input
+                          type="date"
+                          value={backtestEndDate}
+                          onChange={(e) => setBacktestEndDate(e.target.value)}
+                          className="mt-1 bg-gray-700 text-white px-3 py-2 rounded border border-gray-600 w-full"
+                        />
+                      </label>
+                      <label className="text-xs text-gray-300">
+                        Initial Capital
+                        <input
+                          type="number"
+                          value={backtestCapital}
+                          onChange={(e) => setBacktestCapital(e.target.value)}
+                          className="mt-1 bg-gray-700 text-white px-3 py-2 rounded border border-gray-600 w-full"
+                        />
+                      </label>
+                      <label className="text-xs text-gray-300">
+                        Contribution Frequency
+                        <select
+                          value={backtestContributionFrequency}
+                          onChange={(e) => setBacktestContributionFrequency(e.target.value as 'none' | 'weekly' | 'monthly')}
+                          className="mt-1 bg-gray-700 text-white px-3 py-2 rounded border border-gray-600 w-full"
+                        >
+                          <option value="none">None</option>
+                          <option value="weekly">Weekly</option>
+                          <option value="monthly">Monthly</option>
+                        </select>
+                      </label>
+                      <label className="text-xs text-gray-300">
+                        Contribution Amount
+                        <input
+                          type="number"
+                          min={0}
+                          value={backtestContributionAmount}
+                          onChange={(e) => setBacktestContributionAmount(e.target.value)}
+                          className="mt-1 bg-gray-700 text-white px-3 py-2 rounded border border-gray-600 w-full"
+                        />
+                      </label>
+                    </div>
+                    <div className="grid grid-cols-1 md:grid-cols-4 gap-3 mb-3">
+                      <label className="text-xs text-gray-300">
+                        Optimization Profile
+                        <select
+                          value={optimizerProfile}
+                          onChange={(e) => setOptimizerProfile(e.target.value as 'fast' | 'balanced' | 'robust')}
+                          className="mt-1 bg-gray-700 text-white px-3 py-2 rounded border border-gray-600 w-full"
+                        >
+                          <option value="fast">Fast</option>
+                          <option value="balanced">Balanced</option>
+                          <option value="robust">Robust</option>
+                        </select>
+                      </label>
+                      <label className="text-xs text-gray-300">
+                        Objective
+                        <select
+                          value={optimizerObjective}
+                          onChange={(e) => setOptimizerObjective(e.target.value as 'balanced' | 'sharpe' | 'return')}
+                          className="mt-1 bg-gray-700 text-white px-3 py-2 rounded border border-gray-600 w-full"
+                        >
+                          <option value="balanced">Balanced (Risk-Adjusted)</option>
+                          <option value="sharpe">Sharpe Priority</option>
+                          <option value="return">Return Priority</option>
+                        </select>
+                      </label>
+                      <label className="text-xs text-gray-300">
+                        Lookback (Years)
+                        <select
+                          value={optimizerLookbackYears}
+                          onChange={(e) => setOptimizerLookbackYears(e.target.value as 'custom' | '1' | '2' | '3' | '5')}
+                          className="mt-1 bg-gray-700 text-white px-3 py-2 rounded border border-gray-600 w-full"
+                        >
+                          <option value="custom">Custom Dates</option>
+                          <option value="1">1 Year</option>
+                          <option value="2">2 Years</option>
+                          <option value="3">3 Years</option>
+                          <option value="5">5 Years</option>
+                        </select>
+                      </label>
+                      <div className="text-xs text-gray-300 rounded bg-gray-800 px-3 py-2 border border-gray-700">
+                        <div className="text-gray-400">Status</div>
+                        <div className="text-white font-semibold mt-1">{optimizerStatusText}</div>
+                      </div>
+                    </div>
+                    <p className="text-[11px] text-gray-400 mb-2">
+                      Backtest/optimizer symbol source is controlled from Runner Input Summary (Runner Universe Source).
+                    </p>
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mb-3">
+                      <label className="text-xs text-gray-300">
+                        Iterations
+                        <input
+                          type="number"
+                          min={8}
+                          max={240}
+                          value={optimizerIterations}
+                          onChange={(e) => setOptimizerIterations(e.target.value)}
+                          className="mt-1 bg-gray-700 text-white px-3 py-2 rounded border border-gray-600 w-full"
+                        />
+                      </label>
+                      <label className="text-xs text-gray-300">
+                        Minimum Trades Target
+                        <input
+                          type="number"
+                          min={0}
+                          max={1000}
+                          value={optimizerMinTrades}
+                          onChange={(e) => setOptimizerMinTrades(e.target.value)}
+                          className="mt-1 bg-gray-700 text-white px-3 py-2 rounded border border-gray-600 w-full"
+                        />
+                      </label>
+                      <label className="text-xs text-gray-300">
+                        Random Seed (Optional)
+                        <input
+                          type="number"
+                          min={0}
+                          value={optimizerRandomSeed}
+                          onChange={(e) => setOptimizerRandomSeed(e.target.value)}
+                          className="mt-1 bg-gray-700 text-white px-3 py-2 rounded border border-gray-600 w-full"
+                        />
+                      </label>
+                    </div>
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mb-3">
+                      <label className="text-xs text-gray-300">
+                        Walk-Forward Folds
+                        <input
+                          type="number"
+                          min={2}
+                          max={8}
+                          disabled={!optimizerWalkForwardEnabled}
+                          value={optimizerWalkForwardFolds}
+                          onChange={(e) => setOptimizerWalkForwardFolds(e.target.value)}
+                          className={`mt-1 px-3 py-2 rounded border w-full ${
+                            optimizerWalkForwardEnabled
+                              ? 'bg-gray-700 text-white border-gray-600'
+                              : 'bg-gray-800 text-gray-500 border-gray-700'
+                          }`}
+                        />
+                      </label>
+                      <label className="text-xs text-gray-300">
+                        <span className="block mb-1">Strict Min Trades</span>
+                        <div className="rounded border border-gray-700 bg-gray-800 px-3 py-2 flex items-center justify-between">
+                          <span className="text-gray-300">Reject low-trade candidates</span>
+                          <input
+                            type="checkbox"
+                            checked={optimizerStrictMinTrades}
+                            onChange={(e) => setOptimizerStrictMinTrades(e.target.checked)}
+                            className="h-4 w-4"
+                          />
+                        </div>
+                      </label>
+                      <label className="text-xs text-gray-300">
+                        <span className="block mb-1">Walk-Forward Validation</span>
+                        <div className="rounded border border-gray-700 bg-gray-800 px-3 py-2 flex items-center justify-between">
+                          <span className="text-gray-300">Run out-of-sample folds</span>
+                          <input
+                            type="checkbox"
+                            checked={optimizerWalkForwardEnabled}
+                            onChange={(e) => setOptimizerWalkForwardEnabled(e.target.checked)}
+                            className="h-4 w-4"
+                          />
+                        </div>
+                      </label>
+                    </div>
+                    <div className="mb-3">
+                      <div className="flex justify-between text-[11px] text-gray-300 mb-1">
+                        <span>Progress</span>
+                        <span>{optimizerProgressPct.toFixed(1)}%</span>
+                      </div>
+                      <div className="w-full h-2 rounded bg-gray-700 overflow-hidden">
+                        <div
+                          className={`h-2 ${optimizerTerminal ? 'bg-emerald-500' : 'bg-indigo-500'} transition-all duration-500`}
+                          style={{ width: `${optimizerProgressPct}%` }}
+                        />
+                      </div>
+                      <div className="mt-1 flex justify-between text-[11px] text-gray-400">
+                        <span>
+                          Elapsed: {formatDurationSeconds(optimizerJobStatus?.elapsed_seconds ?? (optimizerLoading ? 0 : null))}
+                        </span>
+                        <span>
+                          ETA: {formatDurationSeconds(optimizerJobStatus?.eta_seconds ?? null)}
+                        </span>
+                      </div>
+                    </div>
+                    <p className="text-[11px] text-gray-400 mb-2">
+                      Guidance: `fast` for quick screening, `balanced` for regular tuning, `robust` for deeper search on stable universes.
+                      Increase `iterations` when results are unstable across reruns; raise `min trades` to avoid overfitting tiny sample sizes.
+                    </p>
+                    {optimizerError && (
+                      <p className="text-red-300 text-xs mb-3">{optimizerError}</p>
+                    )}
+                    {optimizerResult && (
+                      <div className="space-y-3">
+                        <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-xs">
+                          <div className="rounded bg-gray-800 px-3 py-2">
+                            <div className="text-gray-400">Best Sharpe</div>
+                            <div className="font-semibold text-white">{optimizerResult.best_result.sharpe_ratio.toFixed(2)}</div>
+                          </div>
+                          <div className="rounded bg-gray-800 px-3 py-2">
+                            <div className="text-gray-400">Best Return</div>
+                            <div className={`font-semibold ${optimizerResult.best_result.total_return >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                              {optimizerResult.best_result.total_return.toFixed(2)}%
+                            </div>
+                          </div>
+                          <div className="rounded bg-gray-800 px-3 py-2">
+                            <div className="text-gray-400">Best Trades</div>
+                            <div className="font-semibold text-white">{optimizerResult.best_result.total_trades}</div>
+                          </div>
+                          <div className="rounded bg-gray-800 px-3 py-2">
+                            <div className="text-gray-400">Universe</div>
+                            <div className="font-semibold text-white">{optimizerResult.recommended_symbols.length} symbols</div>
+                          </div>
+                        </div>
+                        <p className="text-xs text-indigo-100">
+                          Evaluated {optimizerResult.evaluated_iterations}/{optimizerResult.requested_iterations} candidates.
+                          {' '}
+                          Objective: {optimizerResult.objective.replace(/_/g, ' ')}.
+                          {' '}
+                          Min trades target: {optimizerResult.min_trades_target}
+                          {' '}
+                          ({optimizerResult.strict_min_trades ? 'strict' : 'soft'} gate).
+                        </p>
+                        <p className={`text-xs ${optimizerResult.best_candidate_meets_min_trades ? 'text-emerald-300' : 'text-amber-300'}`}>
+                          {optimizerResult.best_candidate_meets_min_trades
+                            ? 'Selected candidate meets the minimum trades target.'
+                            : 'Selected candidate is below minimum trades target. Increase date range or loosen entry filters.'}
+                        </p>
+                        <div className="max-h-40 overflow-auto rounded border border-gray-700">
+                          <table className="w-full text-xs text-gray-300">
+                            <thead className="bg-gray-900 text-gray-400">
+                              <tr>
+                                <th className="text-left px-2 py-1">Parameter</th>
+                                <th className="text-right px-2 py-1">Recommended</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {Object.entries(optimizerResult.recommended_parameters).map(([name, value]) => (
+                                <tr key={name} className="border-t border-gray-800">
+                                  <td className="px-2 py-1">{name}</td>
+                                  <td className="px-2 py-1 text-right font-mono">{Number(value).toFixed(4)}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                        <p className="text-xs text-gray-400">
+                          Symbols: {optimizerResult.recommended_symbols.join(', ')}
+                        </p>
+                        {optimizerResult.walk_forward && (
+                          <div className="rounded border border-gray-700 bg-gray-900 p-3 space-y-2">
+                            <div className="text-xs font-semibold text-indigo-100">Walk-Forward Validation</div>
+                            <div className="grid grid-cols-2 md:grid-cols-5 gap-2 text-xs">
+                              <div className="rounded bg-gray-800 px-2 py-1">
+                                <div className="text-gray-400">Folds</div>
+                                <div className="text-white font-semibold">
+                                  {optimizerResult.walk_forward.folds_completed}/{optimizerResult.walk_forward.folds_requested}
+                                </div>
+                              </div>
+                              <div className="rounded bg-gray-800 px-2 py-1">
+                                <div className="text-gray-400">Pass Rate</div>
+                                <div className="text-white font-semibold">{optimizerResult.walk_forward.pass_rate_pct.toFixed(1)}%</div>
+                              </div>
+                              <div className="rounded bg-gray-800 px-2 py-1">
+                                <div className="text-gray-400">Avg Return</div>
+                                <div className={`font-semibold ${optimizerResult.walk_forward.average_return >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                                  {optimizerResult.walk_forward.average_return.toFixed(2)}%
+                                </div>
+                              </div>
+                              <div className="rounded bg-gray-800 px-2 py-1">
+                                <div className="text-gray-400">Avg Sharpe</div>
+                                <div className="text-white font-semibold">{optimizerResult.walk_forward.average_sharpe.toFixed(2)}</div>
+                              </div>
+                              <div className="rounded bg-gray-800 px-2 py-1">
+                                <div className="text-gray-400">Worst Fold</div>
+                                <div className={`font-semibold ${optimizerResult.walk_forward.worst_fold_return >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                                  {optimizerResult.walk_forward.worst_fold_return.toFixed(2)}%
+                                </div>
+                              </div>
+                            </div>
+                            {optimizerResult.walk_forward.folds.length > 0 && (
+                              <div className="max-h-40 overflow-auto rounded border border-gray-700">
+                                <table className="w-full text-xs text-gray-300">
+                                  <thead className="bg-gray-900 text-gray-400">
+                                    <tr>
+                                      <th className="px-2 py-1 text-left">Fold</th>
+                                      <th className="px-2 py-1 text-left">Test Window</th>
+                                      <th className="px-2 py-1 text-right">Return</th>
+                                      <th className="px-2 py-1 text-right">Sharpe</th>
+                                      <th className="px-2 py-1 text-right">Trades</th>
+                                      <th className="px-2 py-1 text-right">Pass</th>
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    {optimizerResult.walk_forward.folds.map((fold) => (
+                                      <tr key={`${fold.fold_index}-${fold.test_start}`} className="border-t border-gray-800">
+                                        <td className="px-2 py-1">{fold.fold_index}</td>
+                                        <td className="px-2 py-1 font-mono">{fold.test_start} to {fold.test_end}</td>
+                                        <td className={`px-2 py-1 text-right ${fold.total_return >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                                          {fold.total_return.toFixed(2)}%
+                                        </td>
+                                        <td className="px-2 py-1 text-right">{fold.sharpe_ratio.toFixed(2)}</td>
+                                        <td className="px-2 py-1 text-right">{fold.total_trades}</td>
+                                        <td className={`px-2 py-1 text-right ${fold.meets_min_trades ? 'text-emerald-300' : 'text-amber-300'}`}>
+                                          {fold.meets_min_trades ? 'Yes' : 'No'}
+                                        </td>
+                                      </tr>
+                                    ))}
+                                  </tbody>
+                                </table>
+                              </div>
+                            )}
+                            {optimizerResult.walk_forward.notes.length > 0 && (
+                              <p className="text-[11px] text-gray-400">
+                                {optimizerResult.walk_forward.notes.join(' ')}
+                              </p>
+                            )}
+                          </div>
+                        )}
+                        <div className="flex flex-wrap gap-2">
+                          <button
+                            onClick={() => handleApplyOptimization(false)}
+                            disabled={optimizerApplyLoading}
+                            className="px-3 py-2 rounded text-xs font-medium bg-blue-600 hover:bg-blue-700 text-white"
+                          >
+                            {optimizerApplyLoading ? 'Applying...' : 'Apply Parameters'}
+                          </button>
+                          <button
+                            onClick={() => handleApplyOptimization(true)}
+                            disabled={optimizerApplyLoading}
+                            className="px-3 py-2 rounded text-xs font-medium bg-green-600 hover:bg-green-700 text-white"
+                          >
+                            {optimizerApplyLoading ? 'Applying...' : 'Apply Parameters + Symbols'}
+                          </button>
+                        </div>
+                        {optimizerApplyMessage && (
+                          <p
+                            className={`text-xs ${
+                              optimizerApplyMessage.type === 'success'
+                                ? 'text-emerald-300'
+                                : optimizerApplyMessage.type === 'error'
+                                  ? 'text-red-300'
+                                  : 'text-blue-200'
+                            }`}
+                          >
+                            {optimizerApplyMessage.text}
+                          </p>
+                        )}
+                      </div>
+                    )}
+                  </div>
 
                   {!backtestResult ? (
                     <div className="space-y-4">
@@ -1653,6 +2724,31 @@ function StrategyPage() {
                           className="bg-gray-700 text-white px-4 py-2 rounded border border-gray-600 w-full"
                           placeholder="100000"
                         />
+                      </div>
+                      <div className="grid grid-cols-2 gap-4">
+                        <div>
+                          <label className="text-white font-medium block mb-2">Contribution Frequency</label>
+                          <select
+                            value={backtestContributionFrequency}
+                            onChange={(e) => setBacktestContributionFrequency(e.target.value as 'none' | 'weekly' | 'monthly')}
+                            className="bg-gray-700 text-white px-4 py-2 rounded border border-gray-600 w-full"
+                          >
+                            <option value="none">None</option>
+                            <option value="weekly">Weekly</option>
+                            <option value="monthly">Monthly</option>
+                          </select>
+                        </div>
+                        <div>
+                          <label className="text-white font-medium block mb-2">Contribution Amount</label>
+                          <input
+                            type="number"
+                            min={0}
+                            value={backtestContributionAmount}
+                            onChange={(e) => setBacktestContributionAmount(e.target.value)}
+                            className="bg-gray-700 text-white px-4 py-2 rounded border border-gray-600 w-full"
+                            placeholder="0"
+                          />
+                        </div>
                       </div>
                       {backtestError && <p className="text-red-400 text-sm">{backtestError}</p>}
                       {!backtestError && backtestLoading && (
@@ -1700,6 +2796,13 @@ function StrategyPage() {
                           <div className="text-gray-400 text-sm mb-1">Sharpe Ratio</div>
                           <div className="text-2xl font-bold text-white">{backtestResult.sharpe_ratio.toFixed(2)}</div>
                         </div>
+                        {backtestContributionTotal > 0 && (
+                          <div className="bg-gray-900 rounded p-4">
+                            <div className="text-gray-400 text-sm mb-1">Capital Contributions</div>
+                            <div className="text-2xl font-bold text-white">{formatCurrency(backtestContributionTotal)}</div>
+                            <div className="text-xs text-gray-500 mt-1">{backtestContributionEvents} event(s)</div>
+                          </div>
+                        )}
                       </div>
 
                       {backtestDiagnostics && (
@@ -1958,7 +3061,7 @@ function StrategyPage() {
           <div className="bg-gray-800 rounded-lg p-6 border border-gray-700 w-full max-w-md">
             <h3 className="text-xl font-bold text-white mb-4">Create New Strategy</h3>
             <div className="mb-4 rounded border border-blue-800 bg-blue-900/20 p-3 text-xs text-blue-100">
-              Runner uses active strategy symbols plus workspace controls.
+              Runner uses active strategy symbols and configured risk/execution controls.
               {' '}
               Current workspace: <span className="font-semibold">{formatUniverseLabel(runnerInputSummary?.preferences ?? null)}</span>
               {' | '}

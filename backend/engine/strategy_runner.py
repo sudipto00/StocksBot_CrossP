@@ -86,9 +86,12 @@ class StrategyRunner:
         self.last_catchup_at: Optional[datetime] = None
         self.resume_count: int = 0
         self.market_session_open: Optional[bool] = None
+        self.last_state_persisted_at: Optional[datetime] = None
         self.off_hours_poll_interval = max(15.0, float(self.tick_interval))
         self._sleep_state_key = "runner_sleep_state"
+        self._runtime_state_key = "runner_runtime_state"
         self._restore_sleep_state()
+        self._restore_runtime_state()
         
         # Callbacks
         self.on_signal_callback: Optional[Callable] = None
@@ -158,6 +161,7 @@ class StrategyRunner:
         self._stop_event.clear()
         self._runner_thread = threading.Thread(target=self._run_loop, daemon=True)
         self._runner_thread.start()
+        self._persist_runtime_state()
 
         print(f"[StrategyRunner] Runner started with {len(self.strategies)} strategies")
         return True
@@ -204,6 +208,7 @@ class StrategyRunner:
         self.next_market_open_at = None
         self.status = StrategyStatus.STOPPED
         self._persist_sleep_state()
+        self._persist_runtime_state()
         print("[StrategyRunner] Runner stopped")
         return True
     
@@ -228,6 +233,7 @@ class StrategyRunner:
                     self._enter_sleep_mode()
                     self.poll_success_count += 1
                     self.last_successful_poll_at = datetime.now(timezone.utc)
+                    self._persist_runtime_state()
                     self._sleep_wait(self.off_hours_poll_interval)
                     continue
 
@@ -279,6 +285,8 @@ class StrategyRunner:
                 self._record_portfolio_snapshot()
             except Exception as e:
                 print(f"[StrategyRunner] Error recording portfolio snapshot: {e}")
+
+            self._persist_runtime_state()
             
             # Wait for next tick, but wake early on broker trade updates.
             self._sleep_wait(self.tick_interval)
@@ -385,6 +393,41 @@ class StrategyRunner:
         except Exception:
             logger.exception("Failed to persist runner sleep-state checkpoint")
 
+    def _persist_runtime_state(self) -> None:
+        """Persist runner runtime health counters/state for status continuity across restarts."""
+        if not self.storage:
+            return
+        try:
+            payload = {
+                "status": self.status.value,
+                "poll_success_count": int(self.poll_success_count),
+                "poll_error_count": int(self.poll_error_count),
+                "last_poll_error": self.last_poll_error,
+                "last_poll_at": self.last_poll_at.isoformat() if self.last_poll_at else None,
+                "last_successful_poll_at": self.last_successful_poll_at.isoformat() if self.last_successful_poll_at else None,
+                "last_reconciliation_at": self.last_reconciliation_at.isoformat() if self.last_reconciliation_at else None,
+                "last_reconciliation_discrepancies": int(self.last_reconciliation_discrepancies),
+                "sleeping": bool(self.sleeping),
+                "sleep_since": self.sleep_since.isoformat() if self.sleep_since else None,
+                "next_market_open_at": self.next_market_open_at.isoformat() if self.next_market_open_at else None,
+                "last_resume_at": self.last_resume_at.isoformat() if self.last_resume_at else None,
+                "last_catchup_at": self.last_catchup_at.isoformat() if self.last_catchup_at else None,
+                "resume_count": int(self.resume_count),
+                "market_session_open": self.market_session_open,
+                "broker_connected": bool(self.broker.is_connected()),
+                "runner_thread_alive": bool(self._runner_thread and self._runner_thread.is_alive()),
+                "persisted_at": datetime.now(timezone.utc).isoformat(),
+            }
+            self.storage.config.upsert(
+                key=self._runtime_state_key,
+                value=json.dumps(payload),
+                value_type="json",
+                description="Runner runtime health/status checkpoint",
+            )
+            self.last_state_persisted_at = datetime.now(timezone.utc)
+        except Exception:
+            logger.exception("Failed to persist runner runtime-state checkpoint")
+
     def _restore_sleep_state(self) -> None:
         """Load prior sleep/resume checkpoint from DB config, if present."""
         if not self.storage:
@@ -404,6 +447,36 @@ class StrategyRunner:
                 self.status = StrategyStatus.SLEEPING
         except Exception:
             logger.exception("Failed to restore runner sleep-state checkpoint")
+
+    def _restore_runtime_state(self) -> None:
+        """Load last runtime health counters/state from DB config, if present."""
+        if not self.storage:
+            return
+        try:
+            entry = self.storage.config.get_by_key(self._runtime_state_key)
+            if not entry or not entry.value:
+                return
+            payload = json.loads(entry.value)
+            self.poll_success_count = int(payload.get("poll_success_count", self.poll_success_count))
+            self.poll_error_count = int(payload.get("poll_error_count", self.poll_error_count))
+            self.last_poll_error = str(payload.get("last_poll_error") or self.last_poll_error)
+            self.last_poll_at = self._parse_iso(payload.get("last_poll_at")) or self.last_poll_at
+            self.last_successful_poll_at = (
+                self._parse_iso(payload.get("last_successful_poll_at")) or self.last_successful_poll_at
+            )
+            self.last_reconciliation_at = self._parse_iso(payload.get("last_reconciliation_at")) or self.last_reconciliation_at
+            self.last_reconciliation_discrepancies = int(
+                payload.get("last_reconciliation_discrepancies", self.last_reconciliation_discrepancies)
+            )
+            if payload.get("market_session_open") is not None:
+                self.market_session_open = bool(payload.get("market_session_open"))
+            self.last_state_persisted_at = self._parse_iso(payload.get("persisted_at"))
+        except Exception:
+            logger.exception("Failed to restore runner runtime-state checkpoint")
+
+    def is_thread_alive(self) -> bool:
+        """Return whether runner loop thread is alive."""
+        return bool(self._runner_thread and self._runner_thread.is_alive())
 
     def _parse_iso(self, value: Any) -> Optional[datetime]:
         """Parse optional ISO datetime safely."""
@@ -680,6 +753,7 @@ class StrategyRunner:
             "strategies": [s.get_state() for s in self.strategies.values()],
             "tick_interval": self.tick_interval,
             "broker_connected": self.broker.is_connected(),
+            "runner_thread_alive": self.is_thread_alive(),
             "poll_success_count": self.poll_success_count,
             "poll_error_count": self.poll_error_count,
             "last_poll_error": self.last_poll_error,
@@ -694,6 +768,7 @@ class StrategyRunner:
             "last_catchup_at": self.last_catchup_at.isoformat() if self.last_catchup_at else None,
             "resume_count": self.resume_count,
             "market_session_open": self.market_session_open,
+            "last_state_persisted_at": self.last_state_persisted_at.isoformat() if self.last_state_persisted_at else None,
         }
     
     def get_strategies(self) -> List[StrategyInterface]:

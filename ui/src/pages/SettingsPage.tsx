@@ -522,7 +522,7 @@ function SettingsPage() {
           {/* Paper Trading */}
           <div className="flex items-center justify-between">
             <div>
-              <label className="text-white font-medium flex items-center gap-1">Paper Trading Mode <HelpTooltip text="Use simulated Alpaca environment instead of live account." /></label>
+              <label className="text-white font-medium flex items-center gap-1">Paper Trading Mode <HelpTooltip text="Selects paper account mode only. Trading Enabled must still be ON to run execution." /></label>
               <p className="text-gray-400 text-sm">Simulate trading without real money</p>
             </div>
             <button

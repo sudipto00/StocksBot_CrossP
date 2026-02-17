@@ -29,6 +29,7 @@ import {
   // Runner types
   RunnerStatusResponse,
   RunnerActionResponse,
+  RunnerStartRequest,
   WebSocketAuthTicketResponse,
   SystemHealthSnapshot,
   SafetyStatusResponse,
@@ -47,6 +48,11 @@ import {
   StrategyMetrics,
   BacktestRequest,
   BacktestResult,
+  StrategyOptimizationRequest,
+  StrategyOptimizationResult,
+  StrategyOptimizationJobStartResponse,
+  StrategyOptimizationJobStatus,
+  StrategyOptimizationJobCancelResponse,
   ParameterTuneRequest,
   ParameterTuneResponse,
   TradingPreferences,
@@ -440,9 +446,11 @@ export async function getRunnerStatus(): Promise<RunnerStatusResponse> {
 /**
  * Start the strategy runner.
  */
-export async function startRunner(): Promise<RunnerActionResponse> {
+export async function startRunner(request?: RunnerStartRequest): Promise<RunnerActionResponse> {
   const response = await authFetch(`${BACKEND_URL}/runner/start`, {
     method: 'POST',
+    headers: request ? { 'Content-Type': 'application/json' } : undefined,
+    body: request ? JSON.stringify(request) : undefined,
   });
   
   if (!response.ok) {
@@ -716,7 +724,8 @@ export async function updateStrategyConfig(
   });
   
   if (!response.ok) {
-    throw new Error(`Backend returned ${response.status}`);
+    const body = await response.json().catch(() => null);
+    throw new Error(body?.detail || body?.message || `Backend returned ${response.status}`);
   }
   
   return response.json();
@@ -755,6 +764,84 @@ export async function runBacktest(
     throw new Error(body?.detail || `Backend returned ${response.status}`);
   }
   
+  return response.json();
+}
+
+/**
+ * Run strategy optimization using repeated backtests.
+ */
+export async function optimizeStrategy(
+  strategyId: string,
+  request: StrategyOptimizationRequest
+): Promise<StrategyOptimizationResult> {
+  const response = await authFetch(`${BACKEND_URL}/strategies/${strategyId}/optimize`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(request),
+  });
+
+  if (!response.ok) {
+    const body = await response.json().catch(() => null);
+    throw new Error(body?.detail || `Backend returned ${response.status}`);
+  }
+
+  return response.json();
+}
+
+/**
+ * Start async strategy optimization job.
+ */
+export async function startStrategyOptimization(
+  strategyId: string,
+  request: StrategyOptimizationRequest
+): Promise<StrategyOptimizationJobStartResponse> {
+  const response = await authFetch(`${BACKEND_URL}/strategies/${strategyId}/optimize/start`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(request),
+  });
+
+  if (!response.ok) {
+    const body = await response.json().catch(() => null);
+    throw new Error(body?.detail || `Backend returned ${response.status}`);
+  }
+
+  return response.json();
+}
+
+/**
+ * Get async strategy optimization job status.
+ */
+export async function getStrategyOptimizationStatus(
+  strategyId: string,
+  jobId: string
+): Promise<StrategyOptimizationJobStatus> {
+  const response = await authFetch(`${BACKEND_URL}/strategies/${strategyId}/optimize/${jobId}`);
+  if (!response.ok) {
+    const body = await response.json().catch(() => null);
+    throw new Error(body?.detail || `Backend returned ${response.status}`);
+  }
+  return response.json();
+}
+
+/**
+ * Cancel async strategy optimization job.
+ */
+export async function cancelStrategyOptimization(
+  strategyId: string,
+  jobId: string
+): Promise<StrategyOptimizationJobCancelResponse> {
+  const response = await authFetch(`${BACKEND_URL}/strategies/${strategyId}/optimize/${jobId}/cancel`, {
+    method: 'POST',
+  });
+  if (!response.ok) {
+    const body = await response.json().catch(() => null);
+    throw new Error(body?.detail || `Backend returned ${response.status}`);
+  }
   return response.json();
 }
 
