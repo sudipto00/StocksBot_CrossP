@@ -59,16 +59,45 @@ def _reset_runtime_singletons() -> None:
             api_routes._idempotency_cache.clear()
     except Exception:
         pass
+    # Cancel and clear optimizer background state to avoid cross-test leakage.
+    try:
+        with api_routes._optimizer_jobs_lock:
+            active_job_ids = list(api_routes._optimizer_jobs.keys())
+            active_threads = list(api_routes._optimizer_job_threads.values())
+        for job_id in active_job_ids:
+            try:
+                api_routes._optimizer_request_cancel(job_id, message="Test reset")
+            except Exception:
+                pass
+        for thread in active_threads:
+            try:
+                thread.join(timeout=0.25)
+            except Exception:
+                pass
+        with api_routes._optimizer_jobs_lock:
+            job_ids = set(api_routes._optimizer_jobs.keys()) | set(api_routes._optimizer_job_threads.keys())
+            api_routes._optimizer_jobs.clear()
+            api_routes._optimizer_job_threads.clear()
+        for job_id in job_ids:
+            try:
+                api_routes._optimizer_clear_cancel_token(str(job_id))
+            except Exception:
+                pass
+    except Exception:
+        pass
 
 
 @pytest.fixture(autouse=True)
 def setup_database():
     """Create and drop test database for each test."""
     app.dependency_overrides[get_db] = override_get_db
+    original_session_local = api_routes.SessionLocal
+    api_routes.SessionLocal = TestingSessionLocal
     _reset_runtime_singletons()
     Base.metadata.create_all(bind=engine)
     yield
     _reset_runtime_singletons()
+    api_routes.SessionLocal = original_session_local
     Base.metadata.drop_all(bind=engine)
     app.dependency_overrides.pop(get_db, None)
 
@@ -533,6 +562,184 @@ def test_optimize_strategy_async_job_cancel(monkeypatch):
     assert final_payload["status"] == "canceled"
 
 
+def test_optimize_start_rejects_second_active_job_for_same_strategy(monkeypatch):
+    """Only one active optimizer job should run per strategy."""
+    created = client.post(
+        "/strategies",
+        json={
+            "name": "Optimize Concurrency Guard Test",
+            "symbols": ["AAPL", "MSFT"],
+        },
+    )
+    assert created.status_code == 200
+    strategy_id = created.json()["id"]
+
+    def _slow_compute(*, strategy_id: str, request, db, progress_callback=None, should_cancel=None):
+        for idx in range(50):
+            if should_cancel and should_cancel():
+                raise api_routes.OptimizationCancelledError("canceled")
+            if progress_callback:
+                progress_callback(idx + 1, 50, "parameter_search")
+            time.sleep(0.02)
+        return StrategyOptimizationResponse(
+            strategy_id=strategy_id,
+            requested_iterations=50,
+            evaluated_iterations=50,
+            objective="balanced",
+            score=20.0,
+            recommended_parameters={"position_size": 200.0},
+            recommended_symbols=["AAPL"],
+            top_candidates=[],
+            best_result=BacktestResponse(
+                strategy_id=strategy_id,
+                start_date="2024-01-01",
+                end_date="2024-03-31",
+                initial_capital=100000.0,
+                final_capital=101000.0,
+                total_return=1.0,
+                total_trades=6,
+                winning_trades=4,
+                losing_trades=2,
+                win_rate=66.7,
+                max_drawdown=2.0,
+                sharpe_ratio=0.6,
+                volatility=11.0,
+                trades=[],
+                equity_curve=[],
+                diagnostics={},
+            ),
+            notes=["ok"],
+        )
+
+    monkeypatch.setattr(api_routes, "_compute_strategy_optimization_response", _slow_compute)
+
+    payload_one = {
+        "start_date": "2024-01-01",
+        "end_date": "2024-03-31",
+        "initial_capital": 100000,
+        "emulate_live_trading": False,
+        "use_workspace_universe": False,
+        "iterations": 30,
+    }
+    payload_two = {
+        "start_date": "2024-01-01",
+        "end_date": "2024-03-31",
+        "initial_capital": 100000,
+        "emulate_live_trading": False,
+        "use_workspace_universe": False,
+        "iterations": 40,
+    }
+    first = client.post(f"/strategies/{strategy_id}/optimize/start", json=payload_one)
+    assert first.status_code == 200
+
+    second = client.post(f"/strategies/{strategy_id}/optimize/start", json=payload_two)
+    assert second.status_code == 409
+    assert "already has an active optimizer job" in str(second.json().get("detail", ""))
+
+
+def test_optimize_start_reuses_existing_job_for_identical_payload(monkeypatch):
+    """Identical start requests should return existing job id instead of creating duplicates."""
+    created = client.post(
+        "/strategies",
+        json={
+            "name": "Optimize Idempotent Payload Test",
+            "symbols": ["AAPL", "MSFT"],
+        },
+    )
+    assert created.status_code == 200
+    strategy_id = created.json()["id"]
+
+    def _slow_compute(*, strategy_id: str, request, db, progress_callback=None, should_cancel=None):
+        for idx in range(30):
+            if should_cancel and should_cancel():
+                raise api_routes.OptimizationCancelledError("canceled")
+            if progress_callback:
+                progress_callback(idx + 1, 30, "parameter_search")
+            time.sleep(0.02)
+        return StrategyOptimizationResponse(
+            strategy_id=strategy_id,
+            requested_iterations=30,
+            evaluated_iterations=30,
+            objective="balanced",
+            score=15.0,
+            recommended_parameters={"position_size": 180.0},
+            recommended_symbols=["AAPL"],
+            top_candidates=[],
+            best_result=BacktestResponse(
+                strategy_id=strategy_id,
+                start_date="2024-01-01",
+                end_date="2024-03-31",
+                initial_capital=100000.0,
+                final_capital=100800.0,
+                total_return=0.8,
+                total_trades=5,
+                winning_trades=3,
+                losing_trades=2,
+                win_rate=60.0,
+                max_drawdown=2.2,
+                sharpe_ratio=0.4,
+                volatility=12.0,
+                trades=[],
+                equity_curve=[],
+                diagnostics={},
+            ),
+            notes=["ok"],
+        )
+
+    monkeypatch.setattr(api_routes, "_compute_strategy_optimization_response", _slow_compute)
+
+    payload = {
+        "start_date": "2024-01-01",
+        "end_date": "2024-03-31",
+        "initial_capital": 100000,
+        "emulate_live_trading": False,
+        "use_workspace_universe": False,
+        "iterations": 30,
+    }
+    first = client.post(f"/strategies/{strategy_id}/optimize/start", json=payload)
+    second = client.post(f"/strategies/{strategy_id}/optimize/start", json=payload)
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["job_id"] == second.json()["job_id"]
+
+
+def test_optimizer_health_endpoint_reports_snapshot():
+    """Optimizer health endpoint should return counts and active job metadata."""
+    created = client.post(
+        "/strategies",
+        json={
+            "name": "Optimizer Health Test",
+            "symbols": ["AAPL"],
+        },
+    )
+    assert created.status_code == 200
+    strategy_id = str(created.json()["id"])
+    job = api_routes._optimizer_create_job(
+        strategy_id=strategy_id,
+        request_payload={
+            "start_date": "2024-01-01",
+            "end_date": "2024-03-31",
+            "initial_capital": 100000,
+            "iterations": 12,
+        },
+    )
+    api_routes._optimizer_update_job(
+        str(job["job_id"]),
+        {
+            "status": "running",
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "message": "Running parameter search",
+        },
+    )
+
+    response = client.get("/optimizer/health")
+    assert response.status_code == 200
+    payload = response.json()
+    assert "status_counts" in payload
+    assert "active_jobs" in payload
+    assert payload["active_job_count"] >= 1
+
+
 def test_optimize_strategy_async_job_force_cancel_query(monkeypatch):
     """Force cancel query flag should be accepted and request cancellation."""
     created = client.post(
@@ -985,6 +1192,132 @@ def test_optimizer_history_supports_multi_strategy_compare_query(monkeypatch):
     assert strategy_ids == sorted([strategy_one, strategy_two])
 
 
+def test_optimizer_status_falls_back_to_persisted_job_row_after_memory_loss():
+    """Status endpoint should remain available from persisted async rows."""
+    created = client.post(
+        "/strategies",
+        json={
+            "name": "Persisted Status Fallback Test",
+            "symbols": ["AAPL"],
+        },
+    )
+    assert created.status_code == 200
+    strategy_id = str(created.json()["id"])
+
+    job = api_routes._optimizer_create_job(
+        strategy_id=strategy_id,
+        request_payload={
+            "start_date": "2024-01-01",
+            "end_date": "2024-03-31",
+            "initial_capital": 100000,
+            "iterations": 12,
+        },
+    )
+    job_id = str(job["job_id"])
+    api_routes._optimizer_update_job(
+        job_id,
+        {
+            "status": "running",
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "message": "Running parameter search",
+        },
+    )
+
+    with api_routes._optimizer_jobs_lock:
+        api_routes._optimizer_jobs.pop(job_id, None)
+        api_routes._optimizer_job_threads.pop(job_id, None)
+
+    status = client.get(f"/strategies/{strategy_id}/optimize/{job_id}")
+    assert status.status_code == 200
+    payload = status.json()
+    assert payload["job_id"] == job_id
+    assert payload["status"] in {"failed", "canceled", "completed", "running"}
+
+
+def test_optimizer_jobs_endpoint_includes_persisted_async_rows():
+    """Jobs listing should include persisted async rows even without in-memory state."""
+    created = client.post(
+        "/strategies",
+        json={
+            "name": "Persisted Job Listing Test",
+            "symbols": ["AAPL"],
+        },
+    )
+    assert created.status_code == 200
+    strategy_id = str(created.json()["id"])
+
+    job = api_routes._optimizer_create_job(
+        strategy_id=strategy_id,
+        request_payload={
+            "start_date": "2024-01-01",
+            "end_date": "2024-03-31",
+            "initial_capital": 100000,
+            "iterations": 12,
+        },
+    )
+    job_id = str(job["job_id"])
+    api_routes._optimizer_update_job(
+        job_id,
+        {
+            "status": "completed",
+            "progress_pct": 100.0,
+            "message": "Completed",
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    with api_routes._optimizer_jobs_lock:
+        api_routes._optimizer_jobs.pop(job_id, None)
+        api_routes._optimizer_job_threads.pop(job_id, None)
+
+    listing = client.get("/optimizer/jobs")
+    assert listing.status_code == 200
+    rows = listing.json().get("jobs", [])
+    matched = next((row for row in rows if str(row.get("job_id")) == job_id), None)
+    assert matched is not None
+    assert matched["status"] in {"completed", "failed", "canceled"}
+
+
+def test_purge_optimizer_jobs_endpoint_removes_canceled_async_rows():
+    """DELETE /optimizer/jobs should remove canceled async rows."""
+    created = client.post(
+        "/strategies",
+        json={
+            "name": "Purge Jobs Test",
+            "symbols": ["AAPL"],
+        },
+    )
+    assert created.status_code == 200
+    strategy_id = str(created.json()["id"])
+
+    job = api_routes._optimizer_create_job(
+        strategy_id=strategy_id,
+        request_payload={
+            "start_date": "2024-01-01",
+            "end_date": "2024-03-31",
+            "initial_capital": 100000,
+            "iterations": 12,
+        },
+    )
+    job_id = str(job["job_id"])
+    api_routes._optimizer_update_job(
+        job_id,
+        {
+            "status": "canceled",
+            "message": "Canceled by user",
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+
+    purge = client.delete("/optimizer/jobs?statuses=canceled")
+    assert purge.status_code == 200
+    assert int(purge.json().get("deleted_count", 0)) >= 1
+
+    history = client.get(f"/optimizer/history?strategy_ids={strategy_id}&statuses=canceled")
+    assert history.status_code == 200
+    rows = history.json().get("runs", [])
+    assert all(str(row.get("run_id")) != job_id for row in rows)
+
+
 # ============================================================================
 # Audit Log Tests
 # ============================================================================
@@ -1376,6 +1709,8 @@ def test_start_runner_workspace_universe_override(monkeypatch):
     strategy_id = str(create_response.json()["id"])
     activate_response = client.put(f"/strategies/{strategy_id}", json={"status": "active"})
     assert activate_response.status_code == 200
+    config_response = client.post("/config", json={"trading_enabled": True})
+    assert config_response.status_code == 200
 
     response = client.post(
         "/runner/start",
@@ -1497,6 +1832,7 @@ def test_maintenance_storage_and_cleanup(tmp_path):
     assert cleanup_data["success"] is True
     assert cleanup_data["log_files_deleted"] >= 0
     assert cleanup_data["audit_files_deleted"] >= 0
+    assert cleanup_data["optimization_rows_deleted"] >= 0
     assert not old_log.exists()
     assert not old_audit.exists()
 

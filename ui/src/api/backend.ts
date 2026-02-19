@@ -53,7 +53,11 @@ import {
   StrategyOptimizationJobStartResponse,
   StrategyOptimizationJobStatus,
   StrategyOptimizationJobCancelResponse,
+  OptimizerJobsListResponse,
+  OptimizerCancelAllResponse,
+  OptimizerPurgeJobsResponse,
   StrategyOptimizationHistoryResponse,
+  OptimizerHealthResponse,
   ParameterTuneRequest,
   ParameterTuneResponse,
   TradingPreferences,
@@ -900,6 +904,64 @@ export async function cancelStrategyOptimization(
 }
 
 /**
+ * List optimizer jobs from in-memory + persisted backend state.
+ */
+export async function listOptimizerJobs(): Promise<OptimizerJobsListResponse> {
+  const response = await authFetch(`${BACKEND_URL}/optimizer/jobs`);
+  if (!response.ok) {
+    const body = await response.json().catch(() => null);
+    throw new Error(body?.detail || `Backend returned ${response.status}`);
+  }
+  return response.json();
+}
+
+/**
+ * Request cancellation for all running/queued async optimizer jobs.
+ */
+export async function cancelAllOptimizerJobs(force = true): Promise<OptimizerCancelAllResponse> {
+  const params = new URLSearchParams();
+  if (force) params.set('force', 'true');
+  const response = await authFetch(
+    `${BACKEND_URL}/optimizer/cancel-all${params.toString() ? `?${params.toString()}` : ''}`,
+    { method: 'POST' },
+  );
+  if (!response.ok) {
+    const body = await response.json().catch(() => null);
+    throw new Error(body?.detail || `Backend returned ${response.status}`);
+  }
+  return response.json();
+}
+
+/**
+ * Purge terminal optimizer rows from persistent history.
+ */
+export async function purgeOptimizerJobs(options?: {
+  statuses?: string[];
+  strategyId?: string;
+  olderThanHours?: number;
+  includeSync?: boolean;
+}): Promise<OptimizerPurgeJobsResponse> {
+  const params = new URLSearchParams();
+  const statuses = options?.statuses && options.statuses.length > 0
+    ? options.statuses
+    : ['canceled', 'failed', 'completed'];
+  params.set('statuses', statuses.join(','));
+  if (options?.strategyId) params.set('strategy_id', options.strategyId);
+  if (typeof options?.olderThanHours === 'number' && Number.isFinite(options.olderThanHours)) {
+    params.set('older_than_hours', String(options.olderThanHours));
+  }
+  if (options?.includeSync) params.set('include_sync', 'true');
+  const response = await authFetch(`${BACKEND_URL}/optimizer/jobs?${params.toString()}`, {
+    method: 'DELETE',
+  });
+  if (!response.ok) {
+    const body = await response.json().catch(() => null);
+    throw new Error(body?.detail || `Backend returned ${response.status}`);
+  }
+  return response.json();
+}
+
+/**
  * List optimization history for a specific strategy.
  */
 export async function getStrategyOptimizationHistory(
@@ -933,6 +995,18 @@ export async function getOptimizerHistory(
   params.set('limit_per_strategy', String(limitPerStrategy));
   params.set('limit_total', String(limitTotal));
   const response = await authFetch(`${BACKEND_URL}/optimizer/history?${params.toString()}`);
+  if (!response.ok) {
+    const body = await response.json().catch(() => null);
+    throw new Error(body?.detail || `Backend returned ${response.status}`);
+  }
+  return response.json();
+}
+
+/**
+ * Get optimizer subsystem operational health snapshot.
+ */
+export async function getOptimizerHealth(): Promise<OptimizerHealthResponse> {
+  const response = await authFetch(`${BACKEND_URL}/optimizer/health`);
   if (!response.ok) {
     const body = await response.json().catch(() => null);
     throw new Error(body?.detail || `Backend returned ${response.status}`);

@@ -405,7 +405,7 @@ function SettingsPage() {
       const result = await runMaintenanceCleanup();
       await showSuccessNotification(
         'Cleanup Complete',
-        `Deleted ${result.log_files_deleted} log files, ${result.audit_files_deleted} audit files, and ${result.audit_rows_deleted} audit rows`
+        `Deleted ${result.log_files_deleted} log files, ${result.audit_files_deleted} audit files, ${result.audit_rows_deleted} audit rows, and ${result.optimization_rows_deleted ?? 0} optimizer rows`
       );
       setStorageInfo(await getMaintenanceStorage());
     } catch (err) {

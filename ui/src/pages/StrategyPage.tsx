@@ -17,6 +17,9 @@ import {
   getStrategyOptimizationStatus,
   cancelStrategyOptimization,
   getOptimizerHistory,
+  getOptimizerHealth,
+  cancelAllOptimizerJobs,
+  purgeOptimizerJobs,
   tuneParameter,
   getTradingPreferences,
   getScreenerAssets,
@@ -39,6 +42,7 @@ import {
   StrategyOptimizationResult,
   StrategyOptimizationJobStatus,
   StrategyOptimizationHistoryItem,
+  OptimizerHealthResponse,
   StrategyParameter,
   AssetTypePreference,
   TradingPreferences,
@@ -72,6 +76,7 @@ const STRATEGY_SELECTED_ID_KEY = 'stocksbot.strategy.selectedId';
 const STRATEGY_OPTIMIZER_JOBS_KEY = 'stocksbot.strategy.optimizer.jobs';
 const OPTIMIZER_STATUS_POLL_INTERVAL_MS = 1000;
 const OPTIMIZER_STATUS_RETRY_INTERVAL_MS = 3000;
+const OPTIMIZER_HEALTH_POLL_INTERVAL_MS = 5000;
 const USD_FORMATTER = new Intl.NumberFormat('en-US', {
   style: 'currency',
   currency: 'USD',
@@ -565,6 +570,11 @@ function StrategyPage() {
   const [optimizerRandomSeed, setOptimizerRandomSeed] = useState('');
   const [optimizerApplyLoading, setOptimizerApplyLoading] = useState(false);
   const [optimizerApplyMessage, setOptimizerApplyMessage] = useState<{ type: 'success' | 'error' | 'info'; text: string } | null>(null);
+  const [optimizerHealth, setOptimizerHealth] = useState<OptimizerHealthResponse | null>(null);
+  const [optimizerHealthError, setOptimizerHealthError] = useState<string | null>(null);
+  const [optimizerHealthLoading, setOptimizerHealthLoading] = useState(false);
+  const [optimizerGlobalCancelLoading, setOptimizerGlobalCancelLoading] = useState(false);
+  const [optimizerPurgeLoading, setOptimizerPurgeLoading] = useState(false);
   const [optimizerHistoryLoading, setOptimizerHistoryLoading] = useState(false);
   const [optimizerHistoryError, setOptimizerHistoryError] = useState<string | null>(null);
   const [optimizerHistoryRuns, setOptimizerHistoryRuns] = useState<StrategyOptimizationHistoryItem[]>([]);
@@ -1116,12 +1126,31 @@ function StrategyPage() {
     }
   }, [compareStrategyIds, selectedStrategy?.id]);
 
+  const refreshOptimizerHealth = useCallback(async (silent = false) => {
+    if (!silent) {
+      setOptimizerHealthLoading(true);
+    }
+    try {
+      const snapshot = await getOptimizerHealth();
+      setOptimizerHealth(snapshot);
+      setOptimizerHealthError(null);
+    } catch (err) {
+      setOptimizerHealthError(err instanceof Error ? err.message : 'Failed to load optimizer health');
+    } finally {
+      if (!silent) {
+        setOptimizerHealthLoading(false);
+      }
+    }
+  }, []);
+
   useEffect(() => {
     if (!selectedStrategy) {
       setCompareStrategyIds([]);
       setSelectedHistoryRunByStrategy({});
       setOptimizerHistoryRuns([]);
       setOptimizerHistoryError(null);
+      setOptimizerHealth(null);
+      setOptimizerHealthError(null);
       return;
     }
     const validIds = new Set(strategies.map((strategy) => strategy.id));
@@ -1139,29 +1168,48 @@ function StrategyPage() {
   ]);
 
   useEffect(() => {
+    if (!selectedStrategy || detailTab !== 'backtest') return;
+    let cancelled = false;
+    const load = async (silent = false) => {
+      if (cancelled) return;
+      await refreshOptimizerHealth(silent);
+    };
+    void load(false);
+    const timer = setInterval(() => {
+      void load(true);
+    }, OPTIMIZER_HEALTH_POLL_INTERVAL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [detailTab, selectedStrategy, refreshOptimizerHealth]);
+
+  useEffect(() => {
     if (!selectedStrategy || !optimizerJobStatus) return;
     const terminal = optimizerJobStatus.status === 'completed'
       || optimizerJobStatus.status === 'failed'
       || optimizerJobStatus.status === 'canceled';
     if (!terminal) return;
     void loadOptimizationHistory(selectedStrategy.id);
+    void refreshOptimizerHealth(true);
   }, [
     selectedStrategy,
     optimizerJobStatus?.status,
     optimizerJobStatus?.completed_at,
     loadOptimizationHistory,
+    refreshOptimizerHealth,
   ]);
 
   // Auto-refresh metrics every 10 seconds when a strategy is selected
   useEffect(() => {
-    if (selectedStrategy) {
-      const interval = setInterval(() => {
-        loadStrategyMetrics(selectedStrategy.id);
-      }, 10000);
-
-      return () => clearInterval(interval);
-    }
-  }, [selectedStrategy, loadStrategyMetrics]);
+    if (!selectedStrategy) return;
+    // Poll aggressively only on Metrics tab; reduce background load on other tabs.
+    const pollIntervalMs = detailTab === 'metrics' ? 10000 : 20000;
+    const interval = setInterval(() => {
+      loadStrategyMetrics(selectedStrategy.id);
+    }, pollIntervalMs);
+    return () => clearInterval(interval);
+  }, [selectedStrategy, detailTab, loadStrategyMetrics]);
 
   const handleSelectStrategy = async (strategy: Strategy) => {
     persistSelectedStrategyId(strategy.id);
@@ -1180,6 +1228,8 @@ function StrategyPage() {
     setOptimizerHistoryRuns([]);
     setOptimizerHistoryError(null);
     setSelectedHistoryRunByStrategy({});
+    setOptimizerHealth(null);
+    setOptimizerHealthError(null);
 
     await Promise.all([
       loadStrategyConfig(strategy.id),
@@ -1663,6 +1713,7 @@ function StrategyPage() {
       });
       startedJob = true;
       await showSuccessNotification('Optimizer Started', 'Optimization started in background. Progress will update live.');
+      void refreshOptimizerHealth(true);
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Failed to optimize strategy';
       setOptimizerError(message);
@@ -1679,8 +1730,58 @@ function StrategyPage() {
     try {
       await cancelStrategyOptimization(selectedStrategy.id, optimizerJobId, true);
       await showSuccessNotification('Cancel Requested', 'Force cancellation requested. Current optimizer step will stop shortly.');
+      void refreshOptimizerHealth(true);
     } catch (err) {
       await showErrorNotification('Cancel Error', err instanceof Error ? err.message : 'Failed to cancel optimizer');
+    }
+  };
+
+  const handleCancelAllOptimizerJobs = async () => {
+    try {
+      setOptimizerGlobalCancelLoading(true);
+      const response = await cancelAllOptimizerJobs(true);
+      await showSuccessNotification(
+        'Cancel Requested',
+        response.requested_count > 0
+          ? `Force-cancel requested for ${response.requested_count} optimizer job(s).`
+          : 'No active optimizer jobs were found.',
+      );
+      if (selectedStrategy) {
+        void loadOptimizationHistory(selectedStrategy.id);
+      }
+      void refreshOptimizerHealth(false);
+    } catch (err) {
+      await showErrorNotification(
+        'Cancel All Error',
+        err instanceof Error ? err.message : 'Failed to cancel backend optimizer jobs',
+      );
+    } finally {
+      setOptimizerGlobalCancelLoading(false);
+    }
+  };
+
+  const handlePurgeTerminalOptimizerJobs = async () => {
+    if (!confirm('Purge terminal optimizer rows (completed/failed/canceled) from backend history?')) return;
+    try {
+      setOptimizerPurgeLoading(true);
+      const response = await purgeOptimizerJobs({
+        statuses: ['canceled', 'failed', 'completed'],
+      });
+      await showSuccessNotification(
+        'Optimizer History Purged',
+        `Deleted ${response.deleted_count} terminal optimizer row(s).`,
+      );
+      if (selectedStrategy) {
+        void loadOptimizationHistory(selectedStrategy.id);
+      }
+      void refreshOptimizerHealth(false);
+    } catch (err) {
+      await showErrorNotification(
+        'Purge Error',
+        err instanceof Error ? err.message : 'Failed to purge optimizer history',
+      );
+    } finally {
+      setOptimizerPurgeLoading(false);
     }
   };
 
@@ -1865,6 +1966,10 @@ function StrategyPage() {
       stopLossPct: savedParameterMap.stop_loss_pct ?? 2,
     })
     : null;
+  const optimizerActiveJobs = optimizerHealth?.active_jobs || [];
+  const selectedStrategyActiveOptimizerJobs = selectedStrategy
+    ? optimizerActiveJobs.filter((job) => job.strategy_id === selectedStrategy.id)
+    : [];
   const compareCandidateStrategies = selectedStrategy
     ? strategies.filter((strategy) => strategy.id !== selectedStrategy.id)
     : [];
@@ -2856,6 +2961,86 @@ function StrategyPage() {
                           ETA: {formatDurationSeconds(optimizerJobStatus?.eta_seconds ?? null)}
                         </span>
                       </div>
+                    </div>
+                    <div className="mb-3 rounded border border-indigo-800/60 bg-indigo-950/20 p-3">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div>
+                          <p className="text-xs font-semibold text-indigo-100">Optimizer Operations</p>
+                          <p className="text-[11px] text-indigo-200/80">
+                            Backend health + bulk controls for stuck Monte Carlo or orphaned jobs.
+                          </p>
+                        </div>
+                        <div className="flex flex-wrap gap-2">
+                          <button
+                            onClick={() => refreshOptimizerHealth(false)}
+                            disabled={optimizerHealthLoading}
+                            className={`px-2 py-1 rounded text-xs font-medium ${
+                              optimizerHealthLoading
+                                ? 'bg-gray-700 text-gray-500 cursor-not-allowed'
+                                : 'bg-gray-700 hover:bg-gray-600 text-gray-100'
+                            }`}
+                          >
+                            {optimizerHealthLoading ? 'Refreshing...' : 'Refresh Health'}
+                          </button>
+                          <button
+                            onClick={handleCancelAllOptimizerJobs}
+                            disabled={optimizerGlobalCancelLoading}
+                            className={`px-2 py-1 rounded text-xs font-medium ${
+                              optimizerGlobalCancelLoading
+                                ? 'bg-gray-700 text-gray-500 cursor-not-allowed'
+                                : 'bg-amber-700 hover:bg-amber-600 text-white'
+                            }`}
+                          >
+                            {optimizerGlobalCancelLoading ? 'Cancelling...' : 'Force Cancel All Jobs'}
+                          </button>
+                          <button
+                            onClick={handlePurgeTerminalOptimizerJobs}
+                            disabled={optimizerPurgeLoading}
+                            className={`px-2 py-1 rounded text-xs font-medium ${
+                              optimizerPurgeLoading
+                                ? 'bg-gray-700 text-gray-500 cursor-not-allowed'
+                                : 'bg-red-700 hover:bg-red-600 text-white'
+                            }`}
+                          >
+                            {optimizerPurgeLoading ? 'Purging...' : 'Purge Terminal Jobs'}
+                          </button>
+                        </div>
+                      </div>
+                      {optimizerHealthError && (
+                        <p className="mt-2 text-[11px] text-amber-200">{optimizerHealthError}</p>
+                      )}
+                      <div className="mt-2 grid grid-cols-2 gap-2 text-[11px] md:grid-cols-5">
+                        <div className="rounded bg-indigo-950/30 px-2 py-1 text-indigo-100">
+                          Active Jobs: <span className="font-semibold">{optimizerHealth?.active_job_count ?? 0}</span>
+                        </div>
+                        <div className="rounded bg-indigo-950/30 px-2 py-1 text-indigo-100">
+                          In-Memory Jobs: <span className="font-semibold">{optimizerHealth?.in_memory_job_count ?? 0}</span>
+                        </div>
+                        <div className="rounded bg-indigo-950/30 px-2 py-1 text-indigo-100">
+                          Worker Threads: <span className="font-semibold">{optimizerHealth?.worker_threads_alive ?? 0}</span>
+                        </div>
+                        <div className="rounded bg-indigo-950/30 px-2 py-1 text-indigo-100">
+                          Persisted Async: <span className="font-semibold">{optimizerHealth?.total_persisted_async_jobs ?? 0}</span>
+                        </div>
+                        <div className="rounded bg-indigo-950/30 px-2 py-1 text-indigo-100">
+                          Oldest Active Age: <span className="font-semibold">{formatDurationSeconds(optimizerHealth?.max_active_job_age_seconds ?? null)}</span>
+                        </div>
+                      </div>
+                      {selectedStrategyActiveOptimizerJobs.length > 0 && (
+                        <div className="mt-2 rounded border border-indigo-900/60 bg-indigo-950/30 p-2">
+                          <p className="text-[11px] text-indigo-100 mb-1">
+                            Selected strategy has {selectedStrategyActiveOptimizerJobs.length} active optimizer job(s):
+                          </p>
+                          <div className="space-y-1">
+                            {selectedStrategyActiveOptimizerJobs.slice(0, 3).map((job) => (
+                              <div key={`optimizer-active-${job.job_id}`} className="flex items-center justify-between text-[11px] text-indigo-100">
+                                <span className="font-mono">{job.job_id.slice(0, 12)}...</span>
+                                <span>{job.status.toUpperCase()} ({Number(job.progress_pct || 0).toFixed(1)}%)</span>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
                     </div>
                     <p className="text-[11px] text-gray-400 mb-2">
                       Guidance: `fast` for quick screening, `balanced` for regular tuning, `robust` for deeper search on stable universes.

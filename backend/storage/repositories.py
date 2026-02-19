@@ -556,12 +556,14 @@ class OptimizationRunRepository:
         *,
         strategy_ids: Optional[List[int]] = None,
         statuses: Optional[List[str]] = None,
+        sources: Optional[List[str]] = None,
         limit_per_strategy: int = 10,
         limit_total: int = 200,
     ) -> List[OptimizationRun]:
         per_strategy = max(1, min(int(limit_per_strategy or 10), 100))
         total = max(1, min(int(limit_total or 200), 500))
         status_set = {str(status).strip().lower() for status in (statuses or []) if str(status).strip()}
+        source_set = {str(source).strip().lower() for source in (sources or []) if str(source).strip()}
         rows: List[OptimizationRun] = []
         if strategy_ids:
             seen: set[int] = set()
@@ -576,6 +578,8 @@ class OptimizationRunRepository:
                 query = self.db.query(OptimizationRun).filter(OptimizationRun.strategy_id == strategy_id_int)
                 if status_set:
                     query = query.filter(OptimizationRun.status.in_(list(status_set)))
+                if source_set:
+                    query = query.filter(OptimizationRun.source.in_(list(source_set)))
                 strategy_rows = (
                     query
                     .order_by(OptimizationRun.created_at.desc())
@@ -592,6 +596,8 @@ class OptimizationRunRepository:
         query = self.db.query(OptimizationRun)
         if status_set:
             query = query.filter(OptimizationRun.status.in_(list(status_set)))
+        if source_set:
+            query = query.filter(OptimizationRun.source.in_(list(source_set)))
         return (
             query.order_by(OptimizationRun.created_at.desc())
             .limit(total)
@@ -613,5 +619,30 @@ class OptimizationRunRepository:
         for row in rows:
             self.db.delete(row)
             deleted += 1
+        self.db.commit()
+        return deleted
+
+    def delete_runs(
+        self,
+        *,
+        statuses: Optional[List[str]] = None,
+        source: Optional[str] = None,
+        strategy_id: Optional[int] = None,
+        older_than: Optional[datetime] = None,
+    ) -> int:
+        """Delete optimization runs matching optional filters."""
+        query = self.db.query(OptimizationRun)
+        if statuses:
+            normalized_statuses = [str(status).strip().lower() for status in statuses if str(status).strip()]
+            if normalized_statuses:
+                query = query.filter(OptimizationRun.status.in_(normalized_statuses))
+        if source:
+            query = query.filter(OptimizationRun.source == str(source).strip().lower())
+        if strategy_id is not None:
+            query = query.filter(OptimizationRun.strategy_id == int(strategy_id))
+        if older_than is not None:
+            cutoff = _to_db_datetime(older_than)
+            query = query.filter(OptimizationRun.created_at < cutoff)
+        deleted = int(query.delete(synchronize_session=False) or 0)
         self.db.commit()
         return deleted

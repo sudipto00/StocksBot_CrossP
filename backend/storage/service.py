@@ -353,6 +353,7 @@ class StorageService:
         *,
         strategy_ids: Optional[List[int]] = None,
         statuses: Optional[List[str]] = None,
+        sources: Optional[List[str]] = None,
         limit_per_strategy: int = 10,
         limit_total: int = 200,
     ) -> List[OptimizationRun]:
@@ -360,6 +361,7 @@ class StorageService:
         return self.optimization_runs.list_recent(
             strategy_ids=strategy_ids,
             statuses=statuses,
+            sources=sources,
             limit_per_strategy=limit_per_strategy,
             limit_total=limit_total,
         )
@@ -371,3 +373,19 @@ class StorageService:
     def prune_strategy_optimization_history(self, strategy_id: int, keep: int) -> int:
         """Prune older optimization runs for a strategy."""
         return self.optimization_runs.prune_strategy_history(strategy_id=strategy_id, keep=keep)
+
+    def delete_optimization_runs(
+        self,
+        *,
+        statuses: Optional[List[str]] = None,
+        source: Optional[str] = None,
+        strategy_id: Optional[int] = None,
+        older_than: Optional[datetime] = None,
+    ) -> int:
+        """Delete optimization runs matching filters."""
+        return self.optimization_runs.delete_runs(
+            statuses=statuses,
+            source=source,
+            strategy_id=strategy_id,
+            older_than=older_than,
+        )

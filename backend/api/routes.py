@@ -8,6 +8,7 @@ import math
 import logging
 import os
 import re
+import hashlib
 import secrets
 import threading
 import time
@@ -330,8 +331,10 @@ _PREFERENCE_RECOMMENDATION_CACHE_TTL_SECONDS = 10
 _optimizer_jobs: Dict[str, Dict[str, Any]] = {}
 _optimizer_jobs_lock = threading.Lock()
 _optimizer_job_threads: Dict[str, threading.Thread] = {}
+_optimizer_start_lock = threading.Lock()
 _OPTIMIZER_MAX_JOB_HISTORY = 40
 _OPTIMIZATION_HISTORY_LIMIT_PER_STRATEGY = 40
+_OPTIMIZER_DB_PROGRESS_FLUSH_SECONDS = 2.0
 
 _SUMMARY_NOTIFICATION_PREFERENCES_KEY = "summary_notification_preferences"
 _SUMMARY_NOTIFICATION_SCHEDULE_STATE_KEY = "summary_notification_schedule_state"
@@ -540,13 +543,26 @@ def _optimizer_clear_cancel_token(job_id: str) -> None:
 
 def _optimizer_request_cancel(job_id: str, *, message: str = "Cancel requested") -> Optional[Dict[str, Any]]:
     _optimizer_write_cancel_token(job_id)
-    return _optimizer_update_job(
+    updated = _optimizer_update_job(
         job_id,
         {
             "cancel_requested": True,
             "message": message,
         },
     )
+    if updated is not None:
+        return updated
+    persisted = _optimizer_get_persisted_job(job_id)
+    if persisted is None:
+        return None
+    persisted.update(
+        {
+            "cancel_requested": True,
+            "message": message,
+        }
+    )
+    _optimizer_persist_snapshot(persisted, prune_history=False)
+    return persisted
 
 
 def _optimizer_create_job(strategy_id: str, request_payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -573,11 +589,14 @@ def _optimizer_create_job(strategy_id: str, request_payload: Dict[str, Any]) -> 
         "request": dict(request_payload),
         "result": None,
         "cancel_token_path": _optimizer_cancel_token_path(job_id),
+        "_last_db_flush_monotonic": 0.0,
     }
     with _optimizer_jobs_lock:
         _optimizer_jobs[job_id] = row
         _optimizer_prune_jobs_locked()
-    return dict(row)
+    snapshot = dict(row)
+    _optimizer_persist_snapshot(snapshot, prune_history=False)
+    return snapshot
 
 
 def _optimizer_reconcile_job_liveness_locked(job_id: str) -> Optional[Dict[str, Any]]:
@@ -601,24 +620,52 @@ def _optimizer_reconcile_job_liveness_locked(job_id: str) -> Optional[Dict[str, 
     )
     _optimizer_job_threads.pop(job_id, None)
     _optimizer_clear_cancel_token(job_id)
-    return dict(row)
+    snapshot = dict(row)
+    _optimizer_persist_snapshot(snapshot, prune_history=True)
+    return snapshot
 
 
 def _optimizer_get_job(job_id: str) -> Optional[Dict[str, Any]]:
     """Get optimizer job snapshot by ID."""
     with _optimizer_jobs_lock:
-        return _optimizer_reconcile_job_liveness_locked(job_id)
+        row = _optimizer_reconcile_job_liveness_locked(job_id)
+    if row is not None:
+        return row
+    return _optimizer_get_persisted_job(job_id)
 
 
 def _optimizer_update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Atomically update optimizer job fields and return snapshot."""
+    row_missing = False
+    should_persist_terminal = False
+    should_persist_periodic = False
     with _optimizer_jobs_lock:
         row = _optimizer_jobs.get(job_id)
         if row is None:
+            row_missing = True
+        else:
+            row.update(updates)
+            now_mono = time.monotonic()
+            last_flush = float(row.get("_last_db_flush_monotonic") or 0.0)
+            status_value = str(row.get("status") or "")
+            should_persist_terminal = status_value in {"completed", "failed", "canceled"}
+            should_persist_periodic = should_persist_terminal or ((now_mono - last_flush) >= _OPTIMIZER_DB_PROGRESS_FLUSH_SECONDS)
+            if should_persist_periodic:
+                row["_last_db_flush_monotonic"] = now_mono
+            snapshot = dict(row)
+    if row_missing:
+        persisted = _optimizer_get_persisted_job(job_id)
+        if persisted is None:
             return None
-        row.update(updates)
-        snapshot = dict(row)
+        persisted.update(updates)
+        _optimizer_persist_snapshot(
+            persisted,
+            prune_history=str(persisted.get("status") or "") in {"completed", "failed", "canceled"},
+        )
+        return persisted
     status_value = str(snapshot.get("status") or "")
+    if should_persist_periodic:
+        _optimizer_persist_snapshot(snapshot, prune_history=should_persist_terminal)
     if status_value in {"completed", "failed", "canceled"}:
         with _optimizer_jobs_lock:
             _optimizer_job_threads.pop(job_id, None)
@@ -663,6 +710,103 @@ def _optimizer_progress_snapshot(row: Dict[str, Any]) -> StrategyOptimizationJob
         completed_at=str(row["completed_at"]) if row.get("completed_at") else None,
         result=result_model,
     )
+
+
+def _optimizer_persist_snapshot(snapshot: Dict[str, Any], *, prune_history: bool = False) -> None:
+    """Persist async optimizer snapshot into durable storage."""
+    job_id = str(snapshot.get("job_id") or "").strip()
+    strategy_id = str(snapshot.get("strategy_id") or "").strip()
+    if not job_id or not strategy_id:
+        return
+    db = SessionLocal()
+    try:
+        _persist_optimization_history_run(
+            db=db,
+            run_id=job_id,
+            strategy_id=strategy_id,
+            source="async",
+            status=str(snapshot.get("status") or "failed"),
+            request_payload=dict(snapshot.get("request")) if isinstance(snapshot.get("request"), dict) else {},
+            result_payload=dict(snapshot.get("result")) if isinstance(snapshot.get("result"), dict) else None,
+            error=str(snapshot.get("error")) if snapshot.get("error") else None,
+            job_id=job_id,
+            created_at=snapshot.get("created_at"),
+            started_at=snapshot.get("started_at"),
+            completed_at=snapshot.get("completed_at"),
+            prune_history=prune_history,
+        )
+    finally:
+        db.close()
+
+
+def _optimizer_row_from_db(run: DBOptimizationRun) -> Dict[str, Any]:
+    """Convert persisted async run row to optimizer job payload shape."""
+    row: Dict[str, Any] = {
+        "job_id": str(run.run_id),
+        "strategy_id": str(run.strategy_id),
+        "status": str(run.status or "failed"),
+        "progress_pct": 100.0 if str(run.status or "") in {"completed", "failed", "canceled"} else 0.0,
+        "completed_iterations": int(run.evaluated_iterations or 0),
+        "total_iterations": int(run.requested_iterations or run.evaluated_iterations or 0),
+        "elapsed_seconds": 0.0,
+        "eta_seconds": 0.0 if str(run.status or "") in {"completed", "failed", "canceled"} else None,
+        "avg_seconds_per_iteration": None,
+        "message": str(run.error or ("Completed" if str(run.status or "") == "completed" else "Running optimizer")),
+        "cancel_requested": bool(_optimizer_cancel_token_exists(str(run.run_id))),
+        "error": str(run.error) if run.error else None,
+        "created_at": _iso_or_none(_ensure_utc_datetime(run.created_at)),
+        "started_at": _iso_or_none(_ensure_utc_datetime(run.started_at)),
+        "completed_at": _iso_or_none(_ensure_utc_datetime(run.completed_at)),
+        "request": dict(run.request_payload) if isinstance(run.request_payload, dict) else {},
+        "result": dict(run.result_payload) if isinstance(run.result_payload, dict) else None,
+    }
+    started_at = _parse_iso_datetime(row.get("started_at"))
+    completed_at = _parse_iso_datetime(row.get("completed_at"))
+    if started_at is not None:
+        terminal = str(row.get("status") or "") in {"completed", "failed", "canceled"}
+        if terminal and completed_at is not None:
+            elapsed = max(0.0, (completed_at - started_at).total_seconds())
+        else:
+            elapsed = max(0.0, (datetime.now(timezone.utc) - started_at).total_seconds())
+        row["elapsed_seconds"] = round(elapsed, 3)
+    return row
+
+
+def _optimizer_get_persisted_job(job_id: str) -> Optional[Dict[str, Any]]:
+    """Fetch async optimizer job state from persistent storage."""
+    db = SessionLocal()
+    try:
+        storage = StorageService(db)
+        run = storage.get_optimization_run_by_run_id(str(job_id))
+        if run is None or str(run.source or "").lower() != "async":
+            return None
+        row = _optimizer_row_from_db(run)
+    finally:
+        db.close()
+
+    status = str(row.get("status") or "failed")
+    if status in {"completed", "failed", "canceled"}:
+        return row
+
+    # Running/queued rows with no local worker are stale after process restart.
+    with _optimizer_jobs_lock:
+        worker = _optimizer_job_threads.get(str(job_id))
+    if worker is not None and worker.is_alive():
+        return row
+
+    canceled = bool(row.get("cancel_requested")) or _optimizer_cancel_token_exists(str(job_id))
+    row.update(
+        {
+            "status": "canceled" if canceled else "failed",
+            "message": "Canceled by user" if canceled else "Optimizer worker not running",
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+            "error": None if canceled else str(row.get("error") or "Worker exited unexpectedly"),
+            "eta_seconds": 0.0,
+        }
+    )
+    _optimizer_persist_snapshot(row, prune_history=True)
+    _optimizer_clear_cancel_token(str(job_id))
+    return row
 
 
 def _parse_iso_datetime(value: Any) -> Optional[datetime]:
@@ -725,6 +869,116 @@ def _parse_optimizer_statuses(raw_value: Optional[str]) -> List[str]:
         seen.add(normalized)
         statuses.append(normalized)
     return statuses
+
+
+def _optimizer_request_payload_signature(payload: Dict[str, Any]) -> str:
+    """Build stable hash for optimizer request payload dedupe/idempotency checks."""
+    def _normalize(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                str(key): _normalize(inner)
+                for key, inner in sorted(value.items(), key=lambda item: str(item[0]))
+                if not str(key).startswith("_")
+            }
+        if isinstance(value, list):
+            return [_normalize(item) for item in value]
+        return value
+    normalized = _normalize(dict(payload or {}))
+    encoded = json.dumps(normalized, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _optimizer_collect_jobs_for_strategy(
+    strategy_id: str,
+    *,
+    statuses: Optional[set[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Collect optimizer jobs for a strategy from memory + persisted rows."""
+    allowed = {str(status).lower() for status in (statuses or set())}
+    candidate_ids: set[str] = set()
+    rows: List[Dict[str, Any]] = []
+
+    with _optimizer_jobs_lock:
+        for job_id, row in _optimizer_jobs.items():
+            if str(row.get("strategy_id") or "") == str(strategy_id):
+                candidate_ids.add(str(job_id))
+
+    for job_id in list(candidate_ids):
+        row = _optimizer_get_job(job_id)
+        if row is None:
+            continue
+        status = str(row.get("status") or "").lower()
+        if allowed and status not in allowed:
+            continue
+        rows.append(row)
+
+    db = SessionLocal()
+    try:
+        storage = StorageService(db)
+        persisted = storage.list_recent_optimization_runs(
+            strategy_ids=[int(strategy_id)],
+            statuses=list(allowed) if allowed else None,
+            sources=["async"],
+            limit_total=500,
+        )
+    except Exception:
+        persisted = []
+    finally:
+        db.close()
+
+    for run in persisted:
+        job_id = str(run.run_id or "")
+        if not job_id or job_id in candidate_ids:
+            continue
+        row = _optimizer_get_job(job_id)
+        if row is None:
+            continue
+        status = str(row.get("status") or "").lower()
+        if allowed and status not in allowed:
+            continue
+        rows.append(row)
+        candidate_ids.add(job_id)
+
+    rows.sort(key=lambda row: str(row.get("created_at") or ""), reverse=True)
+    return rows
+
+
+def _optimizer_find_reusable_job(
+    strategy_id: str,
+    request_payload: Dict[str, Any],
+    *,
+    idempotency_key: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """Find existing optimizer job that can be reused for this start request."""
+    all_rows = _optimizer_collect_jobs_for_strategy(strategy_id)
+    if idempotency_key:
+        for row in all_rows:
+            request_row = row.get("request")
+            if not isinstance(request_row, dict):
+                continue
+            if str(request_row.get("_idempotency_key") or "") == str(idempotency_key):
+                return row
+
+    active_rows = _optimizer_collect_jobs_for_strategy(
+        strategy_id,
+        statuses={"queued", "running"},
+    )
+    target_sig = _optimizer_request_payload_signature(request_payload)
+    for row in active_rows:
+        request_row = row.get("request")
+        if not isinstance(request_row, dict):
+            continue
+        if _optimizer_request_payload_signature(request_row) == target_sig:
+            return row
+    return None
+
+
+def _optimizer_find_active_job_for_strategy(strategy_id: str) -> Optional[Dict[str, Any]]:
+    rows = _optimizer_collect_jobs_for_strategy(
+        strategy_id,
+        statuses={"queued", "running"},
+    )
+    return rows[0] if rows else None
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
@@ -803,6 +1057,7 @@ def _persist_optimization_history_run(
     created_at: Optional[Any],
     started_at: Optional[Any],
     completed_at: Optional[Any],
+    prune_history: bool = True,
 ) -> None:
     try:
         strategy_id_int = int(str(strategy_id))
@@ -888,10 +1143,11 @@ def _persist_optimization_history_run(
             started_at=parsed_started_at,
             completed_at=parsed_completed_at,
         )
-        storage.prune_strategy_optimization_history(
-            strategy_id=strategy_id_int,
-            keep=_OPTIMIZATION_HISTORY_LIMIT_PER_STRATEGY,
-        )
+        if prune_history:
+            storage.prune_strategy_optimization_history(
+                strategy_id=strategy_id_int,
+                keep=_OPTIMIZATION_HISTORY_LIMIT_PER_STRATEGY,
+            )
     except Exception:
         logger.exception("Failed to persist optimization history run %s", run_id)
 
@@ -1485,14 +1741,25 @@ def _run_housekeeping(storage: StorageService, force: bool = False) -> Dict[str,
     global _last_housekeeping_run
     now = datetime.now(timezone.utc)
     if not force and _last_housekeeping_run and (now - _last_housekeeping_run).total_seconds() < 3600:
-        return {"audit_rows_deleted": 0, "log_files_deleted": 0, "audit_files_deleted": 0}
+        return {
+            "audit_rows_deleted": 0,
+            "optimization_rows_deleted": 0,
+            "log_files_deleted": 0,
+            "audit_files_deleted": 0,
+        }
     _last_housekeeping_run = now
     config = _get_config_snapshot()
     audit_rows_deleted = storage.audit_logs.delete_old_logs(days=config.audit_retention_days)
+    optimization_rows_deleted = storage.delete_optimization_runs(
+        statuses=["completed", "failed", "canceled"],
+        source="async",
+        older_than=now - timedelta(days=int(config.audit_retention_days)),
+    )
     log_files_deleted = cleanup_old_files(config.log_directory, config.log_retention_days)
     audit_files_deleted = cleanup_old_files(config.audit_export_directory, config.audit_retention_days)
     return {
         "audit_rows_deleted": int(audit_rows_deleted),
+        "optimization_rows_deleted": int(optimization_rows_deleted),
         "log_files_deleted": int(log_files_deleted),
         "audit_files_deleted": int(audit_files_deleted),
     }
@@ -4104,6 +4371,14 @@ def _compute_strategy_optimization_response(
     should_cancel: Optional[callable] = None,
 ) -> StrategyOptimizationResponse:
     """Run optimization and return typed response model."""
+    def _emit_setup(stage: str) -> None:
+        if progress_callback is None:
+            return
+        try:
+            progress_callback(0, 1, stage)
+        except Exception:
+            return
+
     try:
         strategy_id_int = int(strategy_id)
     except ValueError:
@@ -4154,6 +4429,7 @@ def _compute_strategy_optimization_response(
         db_strategy=db_strategy,
         request_parameters=backtest_request.parameters,
     )
+    _emit_setup("context_prep")
     exec_context = _prepare_backtest_execution_context(
         storage=storage,
         db_strategy=db_strategy,
@@ -4195,6 +4471,7 @@ def _compute_strategy_optimization_response(
         require_real_data=bool(getattr(exec_context["analytics"], "_require_real_data", False)),
         cancel_token_path=cancel_token_path,
     )
+    _emit_setup("bootstrap_workers")
     try:
         optimize_payload = optimizer.optimize(
             context=optimization_context,
@@ -4582,7 +4859,7 @@ def _run_optimizer_job(job_id: str) -> None:
         {
             "status": "running",
             "started_at": started_at,
-            "message": "Running parameter search",
+            "message": "Preparing optimization context",
         },
     )
     cancel_token_path = _optimizer_cancel_token_path(job_id)
@@ -4607,12 +4884,21 @@ def _run_optimizer_job(job_id: str) -> None:
         total_safe = max(1, int(total))
         completed_safe = max(0, min(int(completed), total_safe))
         progress_pct = (completed_safe / total_safe) * 100.0
-        if progress_pct <= 0.0 and stage in {"parameter_search", "ensemble_search", "symbol_trim", "walk_forward"}:
+        if progress_pct <= 0.0 and stage in {
+            "context_prep",
+            "bootstrap_workers",
+            "parameter_search",
+            "ensemble_search",
+            "symbol_trim",
+            "walk_forward",
+        }:
             progress_pct = 0.5
         avg = (elapsed / completed_safe) if completed_safe > 0 else None
         eta = (avg * (total_safe - completed_safe)) if avg is not None else None
         stage_label = {
             "initializing": "Initializing optimizer",
+            "context_prep": "Preparing symbols, universe, and live constraints",
+            "bootstrap_workers": "Bootstrapping optimizer workers",
             "parameter_search": "Evaluating parameter candidates",
             "ensemble_search": "Running Monte Carlo ensemble scenarios",
             "symbol_trim": "Testing symbol universe trims",
@@ -4756,6 +5042,7 @@ def _run_optimizer_job(job_id: str) -> None:
 async def start_strategy_optimization_job(
     strategy_id: str,
     request: StrategyOptimizationRequest,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
     db: Session = Depends(get_db),
 ):
     """Start async optimizer job and return job id for status polling."""
@@ -4769,7 +5056,40 @@ async def start_strategy_optimization_job(
         raise HTTPException(status_code=404, detail="Strategy not found")
 
     payload = request.model_dump(exclude_none=True)
-    job = _optimizer_create_job(strategy_id=strategy_id, request_payload=payload)
+    normalized_idempotency_key = str(idempotency_key or "").strip()
+    if normalized_idempotency_key:
+        payload["_idempotency_key"] = normalized_idempotency_key[:128]
+
+    with _optimizer_start_lock:
+        reusable = _optimizer_find_reusable_job(
+            str(strategy_id),
+            payload,
+            idempotency_key=normalized_idempotency_key or None,
+        )
+        if reusable is not None:
+            status_value = str(reusable.get("status") or "queued").lower()
+            if status_value not in {"queued", "running", "completed", "failed", "canceled"}:
+                status_value = "queued"
+            return StrategyOptimizationJobStartResponse(
+                job_id=str(reusable.get("job_id") or ""),
+                strategy_id=str(strategy_id),
+                status=status_value,  # type: ignore[arg-type]
+                created_at=str(reusable.get("created_at") or datetime.now(timezone.utc).isoformat()),
+            )
+
+        active = _optimizer_find_active_job_for_strategy(str(strategy_id))
+        if active is not None:
+            active_job_id = str(active.get("job_id") or "")
+            active_status = str(active.get("status") or "running")
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Strategy {strategy_id} already has an active optimizer job "
+                    f"({active_job_id}, status={active_status}). Cancel or wait before starting another."
+                ),
+            )
+
+        job = _optimizer_create_job(strategy_id=strategy_id, request_payload=payload)
     thread = threading.Thread(
         target=_run_optimizer_job,
         args=(str(job["job_id"]),),
@@ -4830,14 +5150,41 @@ async def cancel_strategy_optimization_job(
 
 @router.get("/optimizer/jobs")
 async def list_optimizer_jobs():
-    """List in-memory optimizer jobs for operational troubleshooting."""
+    """List async optimizer jobs (in-memory active + durable history fallback)."""
+    rows_by_id: Dict[str, Dict[str, Any]] = {}
     with _optimizer_jobs_lock:
-        rows: List[Dict[str, Any]] = []
         for job_id in list(_optimizer_jobs.keys()):
             row = _optimizer_reconcile_job_liveness_locked(job_id)
             if row is not None:
-                rows.append(row)
-    rows.sort(key=lambda row: str(row.get("created_at") or ""), reverse=True)
+                rows_by_id[str(row.get("job_id") or job_id)] = row
+
+    db = SessionLocal()
+    try:
+        storage = StorageService(db)
+        persisted_rows = storage.list_recent_optimization_runs(
+            statuses=None,
+            sources=["async"],
+            limit_total=500,
+        )
+    finally:
+        db.close()
+
+    for persisted in persisted_rows:
+        persisted_job_id = str(persisted.run_id or "")
+        if not persisted_job_id:
+            continue
+        if persisted_job_id in rows_by_id:
+            continue
+        row = _optimizer_get_job(persisted_job_id)
+        if row is None:
+            continue
+        rows_by_id[persisted_job_id] = row
+
+    rows = sorted(
+        rows_by_id.values(),
+        key=lambda row: str(row.get("created_at") or ""),
+        reverse=True,
+    )
     jobs: List[Dict[str, Any]] = []
     for row in rows:
         jobs.append(
@@ -4856,15 +5203,108 @@ async def list_optimizer_jobs():
     return {"jobs": jobs, "total_count": len(jobs)}
 
 
+@router.get("/optimizer/health")
+async def optimizer_health_snapshot(db: Session = Depends(get_db)):
+    """
+    Operational snapshot for optimizer subsystem health and queue pressure.
+    """
+    now_utc = datetime.now(timezone.utc)
+    storage = StorageService(db)
+    persisted_rows = storage.list_recent_optimization_runs(
+        statuses=None,
+        sources=["async"],
+        limit_total=500,
+    )
+    status_counts: Dict[str, int] = {
+        "queued": 0,
+        "running": 0,
+        "completed": 0,
+        "failed": 0,
+        "canceled": 0,
+    }
+    active_jobs: List[Dict[str, Any]] = []
+    for run in persisted_rows:
+        status_value = str(run.status or "").lower()
+        if status_value in status_counts:
+            status_counts[status_value] += 1
+        if status_value not in {"queued", "running"}:
+            continue
+        row = _optimizer_get_job(str(run.run_id)) or _optimizer_row_from_db(run)
+        active_jobs.append(
+            {
+                "job_id": str(row.get("job_id") or ""),
+                "strategy_id": str(row.get("strategy_id") or ""),
+                "status": str(row.get("status") or status_value),
+                "message": str(row.get("message") or ""),
+                "progress_pct": float(row.get("progress_pct") or 0.0),
+                "elapsed_seconds": float(row.get("elapsed_seconds") or 0.0),
+                "created_at": row.get("created_at"),
+                "started_at": row.get("started_at"),
+            }
+        )
+    active_jobs.sort(key=lambda row: str(row.get("created_at") or ""), reverse=True)
+    max_active_job_age_seconds = 0.0
+    for row in active_jobs:
+        created_at = _parse_iso_datetime(row.get("created_at"))
+        if created_at is None:
+            continue
+        age = max(0.0, (now_utc - created_at).total_seconds())
+        max_active_job_age_seconds = max(max_active_job_age_seconds, age)
+
+    with _optimizer_jobs_lock:
+        in_memory_jobs = len(_optimizer_jobs)
+        worker_threads_alive = sum(1 for thread in _optimizer_job_threads.values() if thread.is_alive())
+
+    last_created_at = None
+    if persisted_rows:
+        last_created = _ensure_utc_datetime(persisted_rows[0].created_at)
+        last_created_at = last_created.isoformat() if last_created is not None else None
+
+    return {
+        "generated_at": now_utc.isoformat(),
+        "status_counts": status_counts,
+        "total_persisted_async_jobs": len(persisted_rows),
+        "active_job_count": len(active_jobs),
+        "active_jobs": active_jobs[:50],
+        "max_active_job_age_seconds": round(max_active_job_age_seconds, 3),
+        "in_memory_job_count": int(in_memory_jobs),
+        "worker_threads_alive": int(worker_threads_alive),
+        "last_created_at": last_created_at,
+    }
+
+
 @router.post("/optimizer/cancel-all")
 async def cancel_all_optimizer_jobs(force: bool = Query(default=False)):
-    """Request cancellation for all queued/running optimizer jobs."""
+    """Request cancellation for all queued/running async optimizer jobs."""
+    candidates_by_id: Dict[str, Dict[str, Any]] = {}
     with _optimizer_jobs_lock:
-        candidates: List[Dict[str, Any]] = []
         for job_id in list(_optimizer_jobs.keys()):
             row = _optimizer_reconcile_job_liveness_locked(job_id)
             if row and str(row.get("status") or "") in {"queued", "running"}:
-                candidates.append(row)
+                candidates_by_id[str(row.get("job_id") or job_id)] = row
+
+    db = SessionLocal()
+    try:
+        storage = StorageService(db)
+        persisted_rows = storage.list_recent_optimization_runs(
+            statuses=["queued", "running"],
+            sources=["async"],
+            limit_total=500,
+        )
+    finally:
+        db.close()
+
+    for persisted in persisted_rows:
+        persisted_job_id = str(persisted.run_id or "")
+        if not persisted_job_id or persisted_job_id in candidates_by_id:
+            continue
+        row = _optimizer_get_job(persisted_job_id)
+        if row is None:
+            continue
+        if str(row.get("status") or "") in {"queued", "running"}:
+            candidates_by_id[persisted_job_id] = row
+
+    candidates = list(candidates_by_id.values())
     cancelled: List[Dict[str, str]] = []
     for row in candidates:
         job_id = str(row.get("job_id") or "")
@@ -4881,6 +5321,69 @@ async def cancel_all_optimizer_jobs(force: bool = Query(default=False)):
         "force": bool(force),
         "requested_count": len(cancelled),
         "jobs": cancelled,
+    }
+
+
+@router.delete("/optimizer/jobs")
+async def purge_optimizer_jobs(
+    statuses: Optional[str] = Query(default="canceled,failed,completed", description="Comma-separated statuses to delete"),
+    strategy_id: Optional[int] = Query(default=None, ge=1),
+    older_than_hours: Optional[int] = Query(default=None, ge=1, le=24 * 365),
+    include_sync: bool = Query(default=False, description="Include synchronous optimization history rows"),
+    db: Session = Depends(get_db),
+):
+    """
+    Purge persisted optimizer job rows by status.
+    By default only async terminal rows are removed.
+    """
+    parsed_statuses = _parse_optimizer_statuses(statuses)
+    if not parsed_statuses:
+        raise HTTPException(status_code=400, detail="No valid statuses provided")
+    forbidden = {"queued", "running"} & set(parsed_statuses)
+    if forbidden:
+        raise HTTPException(
+            status_code=400,
+            detail="Refusing to purge non-terminal statuses queued/running",
+        )
+    older_than_dt = (
+        datetime.now(timezone.utc) - timedelta(hours=int(older_than_hours))
+        if older_than_hours is not None
+        else None
+    )
+    storage = StorageService(db)
+    deleted = storage.delete_optimization_runs(
+        statuses=parsed_statuses,
+        source=None if include_sync else "async",
+        strategy_id=int(strategy_id) if strategy_id is not None else None,
+        older_than=older_than_dt,
+    )
+
+    # Best-effort in-memory cleanup for terminal rows removed from DB.
+    with _optimizer_jobs_lock:
+        removable_job_ids: List[str] = []
+        for job_id, row in _optimizer_jobs.items():
+            row_status = str(row.get("status") or "").lower()
+            if row_status not in parsed_statuses:
+                continue
+            if strategy_id is not None and str(row.get("strategy_id") or "") != str(strategy_id):
+                continue
+            if older_than_dt is not None:
+                created_at = _parse_iso_datetime(row.get("created_at"))
+                if created_at is None or created_at >= older_than_dt:
+                    continue
+            removable_job_ids.append(job_id)
+        for job_id in removable_job_ids:
+            _optimizer_jobs.pop(job_id, None)
+            _optimizer_job_threads.pop(job_id, None)
+            _optimizer_clear_cancel_token(job_id)
+
+    return {
+        "success": True,
+        "deleted_count": int(deleted),
+        "statuses": parsed_statuses,
+        "strategy_id": int(strategy_id) if strategy_id is not None else None,
+        "older_than_hours": int(older_than_hours) if older_than_hours is not None else None,
+        "include_sync": bool(include_sync),
     }
 
 

@@ -409,6 +409,7 @@ export interface MaintenanceStorageResponse {
 export interface MaintenanceCleanupResponse {
   success: boolean;
   audit_rows_deleted: number;
+  optimization_rows_deleted?: number;
   log_files_deleted: number;
   audit_files_deleted: number;
 }
@@ -784,6 +785,42 @@ export interface StrategyOptimizationJobCancelResponse {
   message: string;
 }
 
+export interface OptimizerJobListItem {
+  job_id: string;
+  strategy_id: string;
+  status: StrategyOptimizationJobState;
+  cancel_requested: boolean;
+  message: string;
+  progress_pct: number;
+  created_at?: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
+}
+
+export interface OptimizerJobsListResponse {
+  jobs: OptimizerJobListItem[];
+  total_count: number;
+}
+
+export interface OptimizerCancelAllResponse {
+  success: boolean;
+  force: boolean;
+  requested_count: number;
+  jobs: Array<{
+    job_id: string;
+    strategy_id: string;
+  }>;
+}
+
+export interface OptimizerPurgeJobsResponse {
+  success: boolean;
+  deleted_count: number;
+  statuses: string[];
+  strategy_id?: number | null;
+  older_than_hours?: number | null;
+  include_sync: boolean;
+}
+
 export interface StrategyOptimizationHistoryItem {
   run_id: string;
   strategy_id: string;
@@ -807,6 +844,29 @@ export interface StrategyOptimizationHistoryItem {
 export interface StrategyOptimizationHistoryResponse {
   runs: StrategyOptimizationHistoryItem[];
   total_count: number;
+}
+
+export interface OptimizerHealthActiveJob {
+  job_id: string;
+  strategy_id: string;
+  status: StrategyOptimizationJobState;
+  message: string;
+  progress_pct: number;
+  elapsed_seconds: number;
+  created_at?: string | null;
+  started_at?: string | null;
+}
+
+export interface OptimizerHealthResponse {
+  generated_at: string;
+  status_counts: Record<string, number>;
+  total_persisted_async_jobs: number;
+  active_job_count: number;
+  active_jobs: OptimizerHealthActiveJob[];
+  max_active_job_age_seconds: number;
+  in_memory_job_count: number;
+  worker_threads_alive: number;
+  last_created_at?: string | null;
 }
 
 export interface ParameterTuneRequest {

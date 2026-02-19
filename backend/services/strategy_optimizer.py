@@ -430,7 +430,15 @@ class StrategyOptimizerService:
                 next_candidate_idx = 0
                 last_heartbeat_at = time.monotonic()
                 with ProcessPoolExecutor(max_workers=resolved_max_workers) as executor:
+                    _emit("ensemble_search")
                     while next_candidate_idx < len(candidates) and len(future_to_payload) < resolved_max_workers:
+                        if should_cancel and should_cancel():
+                            executor.shutdown(wait=False, cancel_futures=True)
+                            raise OptimizationCancelledError("Optimization canceled")
+                        now = time.monotonic()
+                        if (now - last_heartbeat_at) >= 1.0:
+                            _emit("ensemble_search")
+                            last_heartbeat_at = now
                         params = candidates[next_candidate_idx]
                         candidate_seed = base_seed + (next_candidate_idx * 1009) + 17
                         payload = {
@@ -446,8 +454,6 @@ class StrategyOptimizerService:
                         future = executor.submit(_evaluate_ensemble_candidate_worker, payload)
                         future_to_payload[future] = (next_candidate_idx, params)
                         next_candidate_idx += 1
-                    if future_to_payload:
-                        # Surface that Monte Carlo work started even before first candidate finishes.
                         _emit("ensemble_search")
                     while future_to_payload:
                         if should_cancel and should_cancel():

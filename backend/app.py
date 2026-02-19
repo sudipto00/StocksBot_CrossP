@@ -17,7 +17,7 @@ from api.routes import (
     stop_summary_scheduler,
 )
 from config.settings import get_settings
-from storage.database import init_db
+from storage.database import init_db, ensure_optimization_runs_schema
 
 logger = logging.getLogger(__name__)
 SENSITIVE_KEYS = {"api_key", "secret_key", "password", "token", "authorization"}
@@ -35,6 +35,7 @@ async def _lifespan(_app: FastAPI):
     """Manage background service lifecycle."""
     try:
         init_db()
+        ensure_optimization_runs_schema()
     except (RuntimeError, ValueError, TypeError):
         logger.exception("Failed to initialize database schema")
         raise
