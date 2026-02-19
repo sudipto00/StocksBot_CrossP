@@ -438,3 +438,102 @@ def test_paper_execution_storage_integration(storage_service, paper_broker):
     
     assert trade.order_id == order.id
     assert trade.price == 150.0
+
+
+def test_runner_reconciliation_self_heals_local_positions(storage_service, monkeypatch):
+    """Runner reconciliation should align local positions to broker truth."""
+    class StaticBroker(PaperBroker):
+        def __init__(self):
+            super().__init__(starting_balance=100000.0)
+            self.connected = True
+
+        def get_positions(self):
+            return [
+                {
+                    "symbol": "SPY",
+                    "quantity": 1.25,
+                    "side": "long",
+                    "avg_entry_price": 500.0,
+                    "current_price": 505.0,
+                    "market_value": 631.25,
+                }
+            ]
+
+    broker = StaticBroker()
+    runner = StrategyRunner(
+        broker=broker,
+        storage_service=storage_service,
+        tick_interval=0.1,
+    )
+
+    storage_service.create_position(symbol="AAPL", side="long", quantity=2.0, avg_entry_price=100.0)
+
+    class _Bind:
+        url = "sqlite:///./reconcile_test.db"
+
+    original_get_bind = storage_service.db.get_bind
+
+    def _patched_get_bind(*args, **kwargs):
+        # Runner guard calls get_bind() with no args; keep that non-memory URL.
+        if not args and not kwargs:
+            return _Bind()
+        # SQLAlchemy internals call get_bind(mapper=..., clause=...).
+        return original_get_bind(*args, **kwargs)
+
+    monkeypatch.setattr(storage_service.db, "get_bind", _patched_get_bind)
+    runner._last_reconciliation_ts = 0.0
+    runner._maybe_reconcile_positions_with_broker()
+
+    open_positions = storage_service.get_open_positions()
+    assert len(open_positions) == 1
+    assert open_positions[0].symbol == "SPY"
+    assert float(open_positions[0].quantity) == pytest.approx(1.25)
+    assert runner.last_reconciliation_discrepancies == 0
+
+
+def test_runner_snapshot_off_hours_ignores_transient_position_flicker(storage_service):
+    """Runner should not persist off-hours snapshot churn from temporary empty positions."""
+    class FlickerBroker(PaperBroker):
+        def __init__(self):
+            super().__init__(starting_balance=100000.0)
+            self.connected = True
+            self.empty = False
+
+        def is_market_open(self) -> bool:
+            return False
+
+        def get_account_info(self):
+            return {
+                "equity": 1000.0,
+                "cash": 500.0,
+                "buying_power": 2000.0,
+            }
+
+        def get_positions(self):
+            if self.empty:
+                return []
+            return [
+                {
+                    "symbol": "SPY",
+                    "quantity": 1.0,
+                    "side": "long",
+                    "avg_entry_price": 500.0,
+                    "current_price": 500.0,
+                    "market_value": 500.0,
+                }
+            ]
+
+    broker = FlickerBroker()
+    runner = StrategyRunner(
+        broker=broker,
+        storage_service=storage_service,
+        tick_interval=0.1,
+    )
+
+    runner._record_portfolio_snapshot()
+    assert len(storage_service.get_recent_portfolio_snapshots(limit=100)) == 1
+
+    broker.empty = True
+    runner._record_portfolio_snapshot()
+    snapshots = storage_service.get_recent_portfolio_snapshots(limit=100)
+    assert len(snapshots) == 1

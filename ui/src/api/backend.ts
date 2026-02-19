@@ -53,6 +53,7 @@ import {
   StrategyOptimizationJobStartResponse,
   StrategyOptimizationJobStatus,
   StrategyOptimizationJobCancelResponse,
+  StrategyOptimizationHistoryResponse,
   ParameterTuneRequest,
   ParameterTuneResponse,
   TradingPreferences,
@@ -501,9 +502,24 @@ export async function getSystemHealthSnapshot(): Promise<SystemHealthSnapshot> {
     getSafetyStatus().catch(() => ({ kill_switch_active: false, last_broker_sync_at: null })),
   ]);
 
+  const runnerActive = String(runner.status || '').toLowerCase() === 'running'
+    || String(runner.status || '').toLowerCase() === 'sleeping';
+  const runnerLastSuccess = runner.last_successful_poll_at ? new Date(runner.last_successful_poll_at) : null;
+  const runnerRecentSuccess = runnerLastSuccess && !Number.isNaN(runnerLastSuccess.getTime())
+    ? (Date.now() - runnerLastSuccess.getTime()) <= Math.max(10_000, (runner.tick_interval || 60) * 1000 * 3)
+    : false;
+  const brokerConnected = Boolean(
+    broker.connected
+    && (
+      !runnerActive
+      || runner.broker_connected
+      || runnerRecentSuccess
+    )
+  );
+
   return {
     runner_status: runner.status,
-    broker_connected: Boolean(runner.broker_connected && broker.connected),
+    broker_connected: brokerConnected,
     poll_error_count: runner.poll_error_count || 0,
     last_poll_error: runner.last_poll_error || '',
     critical_event_count: criticalLogs.total_count || 0,
@@ -640,10 +656,28 @@ export async function getPortfolioAnalytics(days?: number): Promise<PortfolioAna
   }
   
   const data: PortfolioAnalyticsResponse = await response.json();
+  const normalizedSeries = data.time_series
+    .map((point, index) => ({
+      point,
+      index,
+      ts: new Date(point.timestamp).getTime(),
+    }))
+    .filter((entry) => Number.isFinite(entry.ts))
+    .sort((a, b) => (a.ts - b.ts) || (a.index - b.index))
+    .reduce<PortfolioAnalyticsResponse['time_series']>((acc, entry) => {
+      const last = acc[acc.length - 1];
+      if (last && last.timestamp === entry.point.timestamp) {
+        acc[acc.length - 1] = entry.point;
+        return acc;
+      }
+      acc.push(entry.point);
+      return acc;
+    }, []);
+  const effectiveSeries = normalizedSeries.length > 0 ? normalizedSeries : data.time_series;
   
   // Map backend response to UI expected format
   return {
-    equity_curve: data.time_series.map(point => ({
+    equity_curve: effectiveSeries.map(point => ({
       timestamp: point.timestamp,
       equity: point.equity,
       trade_pnl: point.pnl,
@@ -820,7 +854,21 @@ export async function getStrategyOptimizationStatus(
   strategyId: string,
   jobId: string
 ): Promise<StrategyOptimizationJobStatus> {
-  const response = await authFetch(`${BACKEND_URL}/strategies/${strategyId}/optimize/${jobId}`);
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), 25000);
+  let response: Response;
+  try {
+    response = await authFetch(`${BACKEND_URL}/strategies/${strategyId}/optimize/${jobId}`, {
+      signal: controller.signal,
+    });
+  } catch (err) {
+    if (err instanceof DOMException && err.name === 'AbortError') {
+      throw new Error('Optimizer status request timed out');
+    }
+    throw err;
+  } finally {
+    window.clearTimeout(timer);
+  }
   if (!response.ok) {
     const body = await response.json().catch(() => null);
     throw new Error(body?.detail || `Backend returned ${response.status}`);
@@ -833,11 +881,58 @@ export async function getStrategyOptimizationStatus(
  */
 export async function cancelStrategyOptimization(
   strategyId: string,
-  jobId: string
+  jobId: string,
+  force = false,
 ): Promise<StrategyOptimizationJobCancelResponse> {
-  const response = await authFetch(`${BACKEND_URL}/strategies/${strategyId}/optimize/${jobId}/cancel`, {
+  const params = new URLSearchParams();
+  if (force) params.set('force', 'true');
+  const response = await authFetch(
+    `${BACKEND_URL}/strategies/${strategyId}/optimize/${jobId}/cancel${params.toString() ? `?${params.toString()}` : ''}`,
+    {
     method: 'POST',
-  });
+    },
+  );
+  if (!response.ok) {
+    const body = await response.json().catch(() => null);
+    throw new Error(body?.detail || `Backend returned ${response.status}`);
+  }
+  return response.json();
+}
+
+/**
+ * List optimization history for a specific strategy.
+ */
+export async function getStrategyOptimizationHistory(
+  strategyId: string,
+  limit = 20,
+  includePayload = false,
+): Promise<StrategyOptimizationHistoryResponse> {
+  const params = new URLSearchParams();
+  params.set('limit', String(limit));
+  if (includePayload) params.set('include_payload', 'true');
+  const response = await authFetch(`${BACKEND_URL}/strategies/${strategyId}/optimization-history?${params.toString()}`);
+  if (!response.ok) {
+    const body = await response.json().catch(() => null);
+    throw new Error(body?.detail || `Backend returned ${response.status}`);
+  }
+  return response.json();
+}
+
+/**
+ * List optimization history across one or more strategies.
+ */
+export async function getOptimizerHistory(
+  strategyIds?: string[],
+  limitPerStrategy = 10,
+  limitTotal = 200,
+): Promise<StrategyOptimizationHistoryResponse> {
+  const params = new URLSearchParams();
+  if (strategyIds && strategyIds.length > 0) {
+    params.set('strategy_ids', strategyIds.join(','));
+  }
+  params.set('limit_per_strategy', String(limitPerStrategy));
+  params.set('limit_total', String(limitTotal));
+  const response = await authFetch(`${BACKEND_URL}/optimizer/history?${params.toString()}`);
   if (!response.ok) {
     const body = await response.json().catch(() => null);
     throw new Error(body?.detail || `Backend returned ${response.status}`);

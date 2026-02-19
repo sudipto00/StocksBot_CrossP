@@ -7,14 +7,18 @@ objective with optional out-of-sample walk-forward validation.
 """
 from __future__ import annotations
 
+from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 import math
+import os
 import random
+import statistics
+import time
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from config.strategy_config import BacktestRequest, BacktestResult, get_default_parameters
-from services.strategy_analytics import StrategyAnalyticsService
+from services.strategy_analytics import StrategyAnalyticsService, BacktestCancelledError
 
 
 @dataclass
@@ -34,6 +38,9 @@ class OptimizationContext:
     fee_bps: float
     universe_context: Dict[str, Any]
     symbol_capabilities: Dict[str, Dict[str, bool]]
+    alpaca_creds: Optional[Dict[str, str]]
+    require_real_data: bool
+    cancel_token_path: Optional[str] = None
 
 
 @dataclass
@@ -45,10 +52,287 @@ class OptimizationOutcome:
     parameters: Dict[str, float]
     symbols: List[str]
     result: BacktestResult
+    robustness: Optional[Dict[str, float]] = None
 
 
 class OptimizationCancelledError(RuntimeError):
     """Raised when optimization is canceled by the caller."""
+
+
+def _objective_score_for_result(
+    *,
+    result: BacktestResult,
+    min_trades: int,
+    objective: str,
+    strict_min_trades: bool,
+) -> Tuple[float, bool]:
+    sharpe = float(result.sharpe_ratio or 0.0)
+    total_return = float(result.total_return or 0.0)
+    drawdown = abs(float(result.max_drawdown or 0.0))
+    win_rate = float(result.win_rate or 0.0)
+    trades = int(result.total_trades or 0)
+    meets_min_trades = trades >= max(0, int(min_trades))
+    trade_penalty = float(max(0, min_trades - trades)) * 0.35
+    blocker_penalty = 0.0
+    diagnostics = result.diagnostics if isinstance(result.diagnostics, dict) else {}
+    blocked = diagnostics.get("blocked_reasons", {}) if isinstance(diagnostics, dict) else {}
+    if isinstance(blocked, dict):
+        blocker_penalty += float(blocked.get("risk_circuit_breaker", 0) or 0) * 0.001
+        blocker_penalty += float(blocked.get("daily_risk_limit", 0) or 0) * 0.0005
+    if objective == "sharpe":
+        base_score = (
+            (sharpe * 110.0)
+            + (total_return * 1.1)
+            + (win_rate * 0.12)
+            - (drawdown * 1.0)
+        )
+    elif objective == "return":
+        base_score = (
+            (total_return * 3.1)
+            + (sharpe * 30.0)
+            + (win_rate * 0.08)
+            - (drawdown * 0.7)
+        )
+    else:
+        base_score = (
+            (sharpe * 80.0)
+            + (total_return * 1.8)
+            + (win_rate * 0.14)
+            - (drawdown * 0.9)
+        )
+    if strict_min_trades and not meets_min_trades:
+        shortfall = float(max(1, min_trades - trades))
+        gated_score = -1_000_000.0 - (shortfall * 1000.0) - drawdown
+        return (gated_score, False)
+    return (base_score - trade_penalty - blocker_penalty, meets_min_trades)
+
+
+def _safe_percentile(values: Sequence[float], pct: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(float(v) for v in values)
+    if len(ordered) == 1:
+        return float(ordered[0])
+    rank = max(0.0, min(1.0, float(pct) / 100.0)) * (len(ordered) - 1)
+    lower = int(math.floor(rank))
+    upper = int(math.ceil(rank))
+    if lower == upper:
+        return float(ordered[lower])
+    weight = rank - lower
+    return float(ordered[lower] + (ordered[upper] - ordered[lower]) * weight)
+
+
+def _perturb_symbol_subset(symbols: Sequence[str], rng: random.Random) -> List[str]:
+    base = [str(s).strip().upper() for s in symbols if str(s).strip()]
+    if len(base) <= 8:
+        return base
+    keep_ratio = rng.uniform(0.7, 1.0)
+    keep_count = max(8, min(len(base), int(round(len(base) * keep_ratio))))
+    if keep_count >= len(base):
+        return list(base)
+    sampled = set(rng.sample(base, keep_count))
+    return [symbol for symbol in base if symbol in sampled]
+
+
+def _jitter_window(start_iso: str, end_iso: str, rng: random.Random) -> Tuple[str, str]:
+    start = datetime.fromisoformat(start_iso.split("T", 1)[0]).date()
+    end = datetime.fromisoformat(end_iso.split("T", 1)[0]).date()
+    if end <= start:
+        return (start.isoformat(), end.isoformat())
+    span_days = max(1, (end - start).days)
+    jitter = max(0, min(3, span_days // 120))
+    if jitter <= 0:
+        return (start.isoformat(), end.isoformat())
+    shifted_start = start + timedelta(days=rng.randint(-jitter, jitter))
+    shifted_end = end + timedelta(days=rng.randint(-jitter, jitter))
+    if shifted_end <= shifted_start:
+        shifted_end = shifted_start + timedelta(days=max(30, span_days // 2))
+    return (shifted_start.isoformat(), shifted_end.isoformat())
+
+
+def _robust_score_from_scenarios(
+    *,
+    scenario_metrics: Sequence[Dict[str, float]],
+    min_trades: int,
+    objective: str,
+    strict_min_trades: bool,
+) -> Dict[str, float]:
+    if not scenario_metrics:
+        return {
+            "score": -1_000_000.0,
+            "median_sharpe": 0.0,
+            "median_return": 0.0,
+            "p95_drawdown": 100.0,
+            "loss_probability": 1.0,
+            "median_trades": 0.0,
+            "min_trade_pass_rate": 0.0,
+            "meets_min_trades": 0.0,
+        }
+    sharpe_values = [float(item.get("sharpe_ratio", 0.0) or 0.0) for item in scenario_metrics]
+    return_values = [float(item.get("total_return", 0.0) or 0.0) for item in scenario_metrics]
+    drawdown_values = [abs(float(item.get("max_drawdown", 0.0) or 0.0)) for item in scenario_metrics]
+    trade_values = [max(0.0, float(item.get("total_trades", 0.0) or 0.0)) for item in scenario_metrics]
+    median_sharpe = float(statistics.median(sharpe_values))
+    median_return = float(statistics.median(return_values))
+    p95_drawdown = float(_safe_percentile(drawdown_values, 95.0))
+    median_trades = float(statistics.median(trade_values))
+    min_trade_hits = sum(1 for trades in trade_values if trades >= max(0, int(min_trades)))
+    pass_rate = float(min_trade_hits / max(1, len(trade_values)))
+    loss_probability = float(
+        sum(1 for ret in return_values if ret < 0.0) / max(1, len(return_values))
+    )
+    trade_shortfall = max(0.0, float(min_trades) - median_trades)
+    if objective == "sharpe":
+        score = (
+            (median_sharpe * 120.0)
+            + (median_return * 0.8)
+            - (p95_drawdown * 1.4)
+            - (loss_probability * 40.0)
+        )
+    elif objective == "return":
+        score = (
+            (median_return * 3.0)
+            + (median_sharpe * 35.0)
+            - (p95_drawdown * 1.1)
+            - (loss_probability * 35.0)
+        )
+    else:
+        score = (
+            (median_sharpe * 90.0)
+            + (median_return * 1.7)
+            - (p95_drawdown * 1.2)
+            - (loss_probability * 38.0)
+        )
+    if strict_min_trades and median_trades < float(min_trades):
+        score = -1_000_000.0 - (trade_shortfall * 1000.0) - p95_drawdown
+    else:
+        score -= trade_shortfall * 0.9
+    meets_min = 1.0 if median_trades >= float(min_trades) else 0.0
+    return {
+        "score": float(score),
+        "median_sharpe": median_sharpe,
+        "median_return": median_return,
+        "p95_drawdown": p95_drawdown,
+        "loss_probability": loss_probability,
+        "median_trades": median_trades,
+        "min_trade_pass_rate": pass_rate,
+        "meets_min_trades": meets_min,
+    }
+
+
+def _evaluate_ensemble_candidate_worker(payload: Dict[str, Any]) -> Dict[str, Any]:
+    context = payload.get("context") or {}
+    parameters = {
+        str(key): float(value)
+        for key, value in (payload.get("parameters") or {}).items()
+    }
+    base_symbols = [
+        str(symbol).strip().upper()
+        for symbol in (payload.get("base_symbols") or [])
+        if str(symbol).strip()
+    ]
+    ensemble_runs = max(1, int(payload.get("ensemble_runs") or 1))
+    min_trades = int(payload.get("min_trades") or 0)
+    objective = str(payload.get("objective") or "balanced")
+    strict_min_trades = bool(payload.get("strict_min_trades"))
+    random_seed = int(payload.get("seed") or 0)
+    rng = random.Random(random_seed)
+    analytics = StrategyAnalyticsService(
+        db=None,  # type: ignore[arg-type]
+        alpaca_creds=(
+            dict(context.get("alpaca_creds"))
+            if isinstance(context.get("alpaca_creds"), dict)
+            else None
+        ),
+        require_real_data=bool(context.get("require_real_data", False)),
+    )
+    symbol_capabilities = context.get("symbol_capabilities")
+    capability_map = symbol_capabilities if isinstance(symbol_capabilities, dict) else {}
+    base_universe_context = (
+        dict(context.get("universe_context"))
+        if isinstance(context.get("universe_context"), dict)
+        else {}
+    )
+    base_fee_bps = max(0.0, float(context.get("fee_bps", 0.0) or 0.0))
+    cancel_token_path = str(context.get("cancel_token_path") or "").strip() or None
+
+    def _worker_should_cancel() -> bool:
+        return bool(cancel_token_path and os.path.exists(cancel_token_path))
+
+    scenario_metrics: List[Dict[str, float]] = []
+    for run_index in range(ensemble_runs):
+        if _worker_should_cancel():
+            raise RuntimeError("Optimization canceled")
+        scenario_symbols = _perturb_symbol_subset(base_symbols, rng)
+        start_date, end_date = _jitter_window(
+            str(context.get("start_date", "")),
+            str(context.get("end_date", "")),
+            rng,
+        )
+        scenario_fee_bps = max(0.0, base_fee_bps + rng.uniform(-1.5, 4.0))
+        scenario_slippage_bps = max(1.0, min(75.0, 5.0 + rng.uniform(-2.0, 12.0)))
+        scenario_universe_context = dict(base_universe_context)
+        optimizer_ctx = (
+            dict(scenario_universe_context.get("optimizer"))
+            if isinstance(scenario_universe_context.get("optimizer"), dict)
+            else {}
+        )
+        optimizer_ctx.update(
+            {
+                "enabled": True,
+                "ensemble_mode": True,
+                "ensemble_run_index": run_index + 1,
+                "ensemble_runs": ensemble_runs,
+                "slippage_bps_override": round(float(scenario_slippage_bps), 6),
+                "timing_jitter_enabled": True,
+            }
+        )
+        scenario_universe_context["optimizer"] = optimizer_ctx
+        capabilities = {
+            symbol: dict(capability_map.get(symbol, {"tradable": True, "fractionable": True}))
+            for symbol in scenario_symbols
+        }
+        request = BacktestRequest(
+            strategy_id=str(context.get("strategy_id") or ""),
+            start_date=start_date,
+            end_date=end_date,
+            initial_capital=float(context.get("initial_capital") or 100000.0),
+            contribution_amount=float(context.get("contribution_amount") or 0.0),
+            contribution_frequency=str(context.get("contribution_frequency") or "none"),
+            symbols=scenario_symbols,
+            parameters=parameters,
+            emulate_live_trading=bool(context.get("emulate_live_trading")),
+            symbol_capabilities=capabilities or None,
+            require_fractionable=bool(context.get("require_fractionable")),
+            max_position_size=float(context.get("max_position_size") or 0.0) or None,
+            risk_limit_daily=float(context.get("risk_limit_daily") or 0.0) or None,
+            fee_bps=float(scenario_fee_bps),
+            universe_context=scenario_universe_context,
+        )
+        try:
+            result = analytics.run_backtest(request, should_cancel=_worker_should_cancel)
+        except BacktestCancelledError as exc:
+            raise RuntimeError("Optimization canceled") from exc
+        scenario_metrics.append(
+            {
+                "sharpe_ratio": float(result.sharpe_ratio or 0.0),
+                "total_return": float(result.total_return or 0.0),
+                "max_drawdown": abs(float(result.max_drawdown or 0.0)),
+                "total_trades": float(result.total_trades or 0),
+                "win_rate": float(result.win_rate or 0.0),
+            }
+        )
+    robust = _robust_score_from_scenarios(
+        scenario_metrics=scenario_metrics,
+        min_trades=min_trades,
+        objective=objective,
+        strict_min_trades=strict_min_trades,
+    )
+    return {
+        "score": float(robust["score"]),
+        "meets_min_trades": bool(robust["meets_min_trades"] >= 1.0),
+        "robustness": robust,
+    }
 
 
 class StrategyOptimizerService:
@@ -98,6 +382,9 @@ class StrategyOptimizerService:
         walk_forward_enabled: bool = True,
         walk_forward_folds: int = 3,
         random_seed: Optional[int] = None,
+        ensemble_mode: bool = False,
+        ensemble_runs: int = 8,
+        max_workers: Optional[int] = None,
         progress_callback: Optional[Callable[[int, int, str], None]] = None,
         should_cancel: Optional[Callable[[], bool]] = None,
     ) -> Dict[str, Any]:
@@ -110,6 +397,9 @@ class StrategyOptimizerService:
         base_params = self._normalize_parameters(base_parameters)
         objective_key = self._normalize_objective(objective)
         rng = random.Random(random_seed)
+        ensemble_enabled = bool(ensemble_mode)
+        safe_ensemble_runs = max(1, int(ensemble_runs))
+        resolved_max_workers = self._resolve_max_workers(max_workers)
         candidates = self._build_parameter_candidates(
             base=base_params,
             iterations=iterations,
@@ -117,7 +407,12 @@ class StrategyOptimizerService:
         )
         trim_steps = max(0, len(self._candidate_symbol_counts(total=len(symbols))) - 1)
         walk_forward_steps = int(walk_forward_folds) if walk_forward_enabled else 0
-        total_steps = max(1, len(candidates) + trim_steps + max(0, walk_forward_steps))
+        candidate_steps = (
+            len(candidates) * safe_ensemble_runs
+            if ensemble_enabled
+            else len(candidates)
+        )
+        total_steps = max(1, candidate_steps + trim_steps + max(0, walk_forward_steps))
         completed_steps = 0
 
         def _emit(stage: str) -> None:
@@ -127,37 +422,191 @@ class StrategyOptimizerService:
 
         _emit("initializing")
         outcomes: List[OptimizationOutcome] = []
-        for params in candidates:
-            if should_cancel and should_cancel():
-                raise OptimizationCancelledError("Optimization canceled")
-            result = self._run_backtest(
-                context=context,
-                symbols=symbols,
-                parameters=params,
-            )
-            score, meets_min_trades = self._objective_score(
-                result=result,
-                min_trades=min_trades,
-                objective=objective_key,
-                strict_min_trades=strict_min_trades,
-            )
-            outcomes.append(
-                OptimizationOutcome(
-                    score=score,
-                    meets_min_trades=meets_min_trades,
+        if ensemble_enabled:
+            base_seed = random_seed if isinstance(random_seed, int) else 0
+            worker_context = self._build_ensemble_worker_context(context=context)
+            try:
+                future_to_payload: Dict[Future, Tuple[int, Dict[str, float]]] = {}
+                next_candidate_idx = 0
+                last_heartbeat_at = time.monotonic()
+                with ProcessPoolExecutor(max_workers=resolved_max_workers) as executor:
+                    while next_candidate_idx < len(candidates) and len(future_to_payload) < resolved_max_workers:
+                        params = candidates[next_candidate_idx]
+                        candidate_seed = base_seed + (next_candidate_idx * 1009) + 17
+                        payload = {
+                            "context": worker_context,
+                            "parameters": params,
+                            "base_symbols": list(symbols),
+                            "ensemble_runs": safe_ensemble_runs,
+                            "min_trades": int(min_trades),
+                            "objective": objective_key,
+                            "strict_min_trades": bool(strict_min_trades),
+                            "seed": int(candidate_seed),
+                        }
+                        future = executor.submit(_evaluate_ensemble_candidate_worker, payload)
+                        future_to_payload[future] = (next_candidate_idx, params)
+                        next_candidate_idx += 1
+                    if future_to_payload:
+                        # Surface that Monte Carlo work started even before first candidate finishes.
+                        _emit("ensemble_search")
+                    while future_to_payload:
+                        if should_cancel and should_cancel():
+                            executor.shutdown(wait=False, cancel_futures=True)
+                            raise OptimizationCancelledError("Optimization canceled")
+                        done, _ = wait(
+                            list(future_to_payload.keys()),
+                            timeout=0.2,
+                            return_when=FIRST_COMPLETED,
+                        )
+                        if not done:
+                            now = time.monotonic()
+                            if (now - last_heartbeat_at) >= 1.0:
+                                _emit("ensemble_search")
+                                last_heartbeat_at = now
+                            continue
+                        for future in done:
+                            _, params = future_to_payload.pop(future)
+                            try:
+                                payload = future.result()
+                            except Exception as exc:
+                                if should_cancel and should_cancel():
+                                    executor.shutdown(wait=False, cancel_futures=True)
+                                    raise OptimizationCancelledError("Optimization canceled") from exc
+                                if "canceled" in str(exc).lower() or "cancelled" in str(exc).lower():
+                                    executor.shutdown(wait=False, cancel_futures=True)
+                                    raise OptimizationCancelledError("Optimization canceled") from exc
+                                raise
+                            robustness = (
+                                dict(payload.get("robustness"))
+                                if isinstance(payload.get("robustness"), dict)
+                                else None
+                            )
+                            representative = self._build_summary_backtest_result(
+                                context=context,
+                                parameters=params,
+                                robustness=robustness,
+                            )
+                            outcomes.append(
+                                OptimizationOutcome(
+                                    score=float(payload.get("score", -1_000_000.0)),
+                                    meets_min_trades=bool(payload.get("meets_min_trades", False)),
+                                    parameters=dict(params),
+                                    symbols=list(symbols),
+                                    result=representative,
+                                    robustness=robustness,
+                                )
+                            )
+                            completed_steps += safe_ensemble_runs
+                            _emit("ensemble_search")
+                            last_heartbeat_at = time.monotonic()
+                            if should_cancel and should_cancel():
+                                executor.shutdown(wait=False, cancel_futures=True)
+                                raise OptimizationCancelledError("Optimization canceled")
+                            if next_candidate_idx < len(candidates):
+                                next_params = candidates[next_candidate_idx]
+                                candidate_seed = base_seed + (next_candidate_idx * 1009) + 17
+                                next_payload = {
+                                    "context": worker_context,
+                                    "parameters": next_params,
+                                    "base_symbols": list(symbols),
+                                    "ensemble_runs": safe_ensemble_runs,
+                                    "min_trades": int(min_trades),
+                                    "objective": objective_key,
+                                    "strict_min_trades": bool(strict_min_trades),
+                                    "seed": int(candidate_seed),
+                                }
+                                next_future = executor.submit(
+                                    _evaluate_ensemble_candidate_worker,
+                                    next_payload,
+                                )
+                                future_to_payload[next_future] = (next_candidate_idx, next_params)
+                                next_candidate_idx += 1
+            except OptimizationCancelledError:
+                raise
+            except Exception:
+                if should_cancel and should_cancel():
+                    raise OptimizationCancelledError("Optimization canceled")
+                # Fallback to baseline path if multiprocessing is unavailable in runtime.
+                outcomes = []
+                completed_steps = 0
+                total_steps = max(1, len(candidates) + trim_steps + max(0, walk_forward_steps))
+                for params in candidates:
+                    if should_cancel and should_cancel():
+                        raise OptimizationCancelledError("Optimization canceled")
+                    result = self._run_backtest(
+                        context=context,
+                        symbols=symbols,
+                        parameters=params,
+                        should_cancel=should_cancel,
+                    )
+                    score, meets_min_trades = self._objective_score(
+                        result=result,
+                        min_trades=min_trades,
+                        objective=objective_key,
+                        strict_min_trades=strict_min_trades,
+                    )
+                    outcomes.append(
+                        OptimizationOutcome(
+                            score=score,
+                            meets_min_trades=meets_min_trades,
+                            parameters=params,
+                            symbols=list(symbols),
+                            result=result,
+                        )
+                    )
+                    completed_steps += 1
+                    _emit("parameter_search")
+                ensemble_enabled = False
+                safe_ensemble_runs = 1
+                resolved_max_workers = 1
+        else:
+            for params in candidates:
+                if should_cancel and should_cancel():
+                    raise OptimizationCancelledError("Optimization canceled")
+                result = self._run_backtest(
+                    context=context,
+                    symbols=symbols,
                     parameters=params,
-                    symbols=list(symbols),
-                    result=result,
+                    should_cancel=should_cancel,
                 )
-            )
-            completed_steps += 1
-            _emit("parameter_search")
+                score, meets_min_trades = self._objective_score(
+                    result=result,
+                    min_trades=min_trades,
+                    objective=objective_key,
+                    strict_min_trades=strict_min_trades,
+                )
+                outcomes.append(
+                    OptimizationOutcome(
+                        score=score,
+                        meets_min_trades=meets_min_trades,
+                        parameters=params,
+                        symbols=list(symbols),
+                        result=result,
+                    )
+                )
+                completed_steps += 1
+                _emit("parameter_search")
 
         if not outcomes:
             raise RuntimeError("Optimizer did not produce any candidate outcome")
 
         outcomes.sort(key=lambda item: item.score, reverse=True)
         best = outcomes[0]
+        if ensemble_enabled:
+            detailed_best = self._run_backtest(
+                context=context,
+                symbols=symbols,
+                parameters=best.parameters,
+                should_cancel=should_cancel,
+            )
+            best = OptimizationOutcome(
+                score=best.score,
+                meets_min_trades=best.meets_min_trades,
+                parameters=dict(best.parameters),
+                symbols=list(symbols),
+                result=detailed_best,
+                robustness=dict(best.robustness) if isinstance(best.robustness, dict) else None,
+            )
 
         ranked_symbols = self._rank_symbols_by_best_result(symbols=symbols, result=best.result)
         symbol_counts = self._candidate_symbol_counts(total=len(ranked_symbols))
@@ -171,6 +620,7 @@ class StrategyOptimizerService:
                 context=context,
                 symbols=subset,
                 parameters=best.parameters,
+                should_cancel=should_cancel,
             )
             subset_score, subset_meets = self._objective_score(
                 result=subset_result,
@@ -233,6 +683,9 @@ class StrategyOptimizerService:
             "top_candidates": payload_candidates,
             "best_result": best.result,
             "score": round(best.score, 6),
+            "ensemble_mode": bool(ensemble_enabled),
+            "ensemble_runs": int(safe_ensemble_runs if ensemble_enabled else 1),
+            "max_workers_used": int(resolved_max_workers if ensemble_enabled else 1),
             "min_trades_target": int(min_trades),
             "strict_min_trades": bool(strict_min_trades),
             "best_candidate_meets_min_trades": bool(best.meets_min_trades),
@@ -245,6 +698,10 @@ class StrategyOptimizerService:
                 (
                     f"Minimum trades target: {int(min_trades)} "
                     f"({'strict gate' if strict_min_trades else 'soft penalty'})."
+                ),
+                (
+                    f"Evaluation mode: {'monte_carlo_ensemble' if ensemble_enabled else 'baseline_single_path'}; "
+                    f"ensemble_runs={safe_ensemble_runs if ensemble_enabled else 1}; workers={resolved_max_workers if ensemble_enabled else 1}."
                 ),
                 "Final symbol set may be trimmed from the candidate universe when trim variants improve objective score.",
                 (
@@ -266,12 +723,21 @@ class StrategyOptimizerService:
         context: OptimizationContext,
         symbols: List[str],
         parameters: Dict[str, float],
+        should_cancel: Optional[Callable[[], bool]] = None,
     ) -> BacktestResult:
         ctx = dict(context.universe_context or {})
-        ctx["optimizer"] = {
-            "enabled": True,
-            "symbols_candidate_count": len(symbols),
-        }
+        optimizer_ctx = (
+            dict(ctx.get("optimizer"))
+            if isinstance(ctx.get("optimizer"), dict)
+            else {}
+        )
+        optimizer_ctx.update(
+            {
+                "enabled": True,
+                "symbols_candidate_count": len(symbols),
+            }
+        )
+        ctx["optimizer"] = optimizer_ctx
         capabilities = {
             symbol: dict(context.symbol_capabilities.get(symbol, {"tradable": True, "fractionable": True}))
             for symbol in symbols
@@ -293,7 +759,91 @@ class StrategyOptimizerService:
             fee_bps=context.fee_bps,
             universe_context=ctx,
         )
-        return self.analytics.run_backtest(request)
+        try:
+            return self.analytics.run_backtest(request, should_cancel=should_cancel)
+        except BacktestCancelledError as exc:
+            raise OptimizationCancelledError("Optimization canceled") from exc
+
+    def _build_ensemble_worker_context(self, *, context: OptimizationContext) -> Dict[str, Any]:
+        return {
+            "strategy_id": str(context.strategy_id),
+            "start_date": str(context.start_date),
+            "end_date": str(context.end_date),
+            "initial_capital": float(context.initial_capital),
+            "contribution_amount": float(context.contribution_amount),
+            "contribution_frequency": str(context.contribution_frequency),
+            "emulate_live_trading": bool(context.emulate_live_trading),
+            "require_fractionable": bool(context.require_fractionable),
+            "max_position_size": float(context.max_position_size),
+            "risk_limit_daily": float(context.risk_limit_daily),
+            "fee_bps": float(context.fee_bps),
+            "universe_context": dict(context.universe_context or {}),
+            "symbol_capabilities": {
+                str(symbol): {
+                    "tradable": bool((caps or {}).get("tradable", True)),
+                    "fractionable": bool((caps or {}).get("fractionable", True)),
+                }
+                for symbol, caps in (context.symbol_capabilities or {}).items()
+            },
+            "alpaca_creds": dict(context.alpaca_creds) if isinstance(context.alpaca_creds, dict) else None,
+            "require_real_data": bool(context.require_real_data),
+            "cancel_token_path": (
+                str(context.cancel_token_path).strip()
+                if context.cancel_token_path
+                else None
+            ),
+        }
+
+    def _build_summary_backtest_result(
+        self,
+        *,
+        context: OptimizationContext,
+        parameters: Dict[str, float],
+        robustness: Optional[Dict[str, float]],
+    ) -> BacktestResult:
+        robust = robustness if isinstance(robustness, dict) else {}
+        total_return = float(robust.get("median_return", 0.0) or 0.0)
+        sharpe = float(robust.get("median_sharpe", 0.0) or 0.0)
+        drawdown = float(robust.get("p95_drawdown", 0.0) or 0.0)
+        trades = int(max(0.0, float(robust.get("median_trades", 0.0) or 0.0)))
+        final_capital = max(0.0, float(context.initial_capital) * (1.0 + total_return / 100.0))
+        return BacktestResult(
+            strategy_id=context.strategy_id,
+            start_date=context.start_date,
+            end_date=context.end_date,
+            initial_capital=float(context.initial_capital),
+            final_capital=round(final_capital, 2),
+            total_return=round(total_return, 6),
+            total_trades=trades,
+            winning_trades=0,
+            losing_trades=0,
+            win_rate=0.0,
+            max_drawdown=round(drawdown, 6),
+            sharpe_ratio=round(sharpe, 6),
+            volatility=0.0,
+            trades=[],
+            equity_curve=[],
+            diagnostics={
+                "optimizer": {
+                    "ensemble_mode": True,
+                    "summary_only": True,
+                    "robustness": robust,
+                    "parameters": {key: float(value) for key, value in parameters.items()},
+                }
+            },
+        )
+
+    @staticmethod
+    def _resolve_max_workers(requested: Optional[int]) -> int:
+        cpu_total = max(1, int(os.cpu_count() or 1))
+        default_workers = min(4, max(1, cpu_total - 1))
+        if requested is None:
+            return max(1, min(6, default_workers))
+        try:
+            parsed = int(requested)
+        except (TypeError, ValueError):
+            return max(1, min(6, default_workers))
+        return max(1, min(6, parsed, cpu_total))
 
     def _candidate_symbol_counts(self, total: int) -> List[int]:
         if total <= 8:
@@ -416,45 +966,12 @@ class StrategyOptimizerService:
         objective: str,
         strict_min_trades: bool,
     ) -> Tuple[float, bool]:
-        sharpe = float(result.sharpe_ratio or 0.0)
-        total_return = float(result.total_return or 0.0)
-        drawdown = abs(float(result.max_drawdown or 0.0))
-        win_rate = float(result.win_rate or 0.0)
-        trades = int(result.total_trades or 0)
-        meets_min_trades = trades >= max(0, int(min_trades))
-        trade_penalty = float(max(0, min_trades - trades)) * 0.35
-        blocker_penalty = 0.0
-        diagnostics = result.diagnostics if isinstance(result.diagnostics, dict) else {}
-        blocked = diagnostics.get("blocked_reasons", {}) if isinstance(diagnostics, dict) else {}
-        if isinstance(blocked, dict):
-            blocker_penalty += float(blocked.get("risk_circuit_breaker", 0) or 0) * 0.001
-            blocker_penalty += float(blocked.get("daily_risk_limit", 0) or 0) * 0.0005
-        if objective == "sharpe":
-            base_score = (
-                (sharpe * 110.0)
-                + (total_return * 1.1)
-                + (win_rate * 0.12)
-                - (drawdown * 1.0)
-            )
-        elif objective == "return":
-            base_score = (
-                (total_return * 3.1)
-                + (sharpe * 30.0)
-                + (win_rate * 0.08)
-                - (drawdown * 0.7)
-            )
-        else:
-            base_score = (
-                (sharpe * 80.0)
-                + (total_return * 1.8)
-                + (win_rate * 0.14)
-                - (drawdown * 0.9)
-            )
-        if strict_min_trades and not meets_min_trades:
-            shortfall = float(max(1, min_trades - trades))
-            gated_score = -1_000_000.0 - (shortfall * 1000.0) - drawdown
-            return (gated_score, False)
-        return (base_score - trade_penalty - blocker_penalty, meets_min_trades)
+        return _objective_score_for_result(
+            result=result,
+            min_trades=min_trades,
+            objective=objective,
+            strict_min_trades=strict_min_trades,
+        )
 
     def _compute_walk_forward_report(
         self,
@@ -524,11 +1041,15 @@ class StrategyOptimizerService:
                 fee_bps=context.fee_bps,
                 universe_context=dict(context.universe_context or {}),
                 symbol_capabilities=dict(context.symbol_capabilities or {}),
+                alpaca_creds=dict(context.alpaca_creds) if isinstance(context.alpaca_creds, dict) else None,
+                require_real_data=bool(context.require_real_data),
+                cancel_token_path=context.cancel_token_path,
             )
             fold_result = self._run_backtest(
                 context=fold_context,
                 symbols=symbols,
                 parameters=parameters,
+                should_cancel=should_cancel,
             )
             fold_score, fold_meets = self._objective_score(
                 result=fold_result,

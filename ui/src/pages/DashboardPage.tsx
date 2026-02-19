@@ -272,9 +272,18 @@ function DashboardPage() {
   const performancePnlClass = performancePnl >= 0 ? 'text-green-400' : 'text-red-400';
   const runnerStatusLabel = (runnerState?.status || 'unknown').toUpperCase();
   const runnerActive = runnerState?.status === RunnerStatus.RUNNING || runnerState?.status === RunnerStatus.SLEEPING;
+  const runnerRecentSuccess = (() => {
+    if (!runnerState?.last_successful_poll_at) return false;
+    const parsed = new Date(runnerState.last_successful_poll_at);
+    if (Number.isNaN(parsed.getTime())) return false;
+    const ageMs = Date.now() - parsed.getTime();
+    const tickMs = Math.max(10_000, (runnerState?.tick_interval || 60) * 1000 * 3);
+    return ageMs >= 0 && ageMs <= tickMs;
+  })();
+  const runnerBrokerLikelyHealthy = Boolean(runnerState?.broker_connected || runnerRecentSuccess);
   const brokerHealthLabel = !brokerAccount?.connected
     ? 'Unavailable'
-    : (runnerActive && !runnerState?.broker_connected)
+    : (runnerActive && !runnerBrokerLikelyHealthy)
       ? 'Degraded'
       : 'Connected';
   const brokerHealthClass = brokerHealthLabel === 'Connected'

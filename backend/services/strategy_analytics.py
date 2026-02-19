@@ -3,7 +3,7 @@ Strategy Analytics Service.
 Provides functionality for calculating strategy metrics, backtesting,
 and performance analysis.
 """
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Callable
 from datetime import datetime, timedelta, timezone, date as date_type
 import math
 from sqlalchemy.orm import Session
@@ -19,6 +19,10 @@ from services.market_screener import MarketScreener
 
 # Default slippage applied to each fill (basis points).
 _DEFAULT_SLIPPAGE_BPS = 5.0
+
+
+class BacktestCancelledError(RuntimeError):
+    """Raised when a caller requests backtest cancellation."""
 
 
 def compute_risk_based_position_size(
@@ -61,6 +65,9 @@ class StrategyAnalyticsService:
         self.storage = StorageService(db)
         self._alpaca_creds = alpaca_creds
         self._require_real_data = bool(require_real_data)
+        # In-process cache to avoid repeated historical bar pulls during
+        # optimization/backtest loops for the same symbol window.
+        self._historical_bars_cache: Dict[str, List[Dict[str, Any]]] = {}
 
     def get_strategy_metrics(self, strategy_id: int) -> StrategyMetrics:
         """
@@ -129,7 +136,11 @@ class StrategyAnalyticsService:
             sharpe_ratio=sharpe_ratio,
         )
 
-    def run_backtest(self, request: BacktestRequest) -> BacktestResult:
+    def run_backtest(
+        self,
+        request: BacktestRequest,
+        should_cancel: Optional[Callable[[], bool]] = None,
+    ) -> BacktestResult:
         """
         Run a deterministic historical backtest for a strategy.
 
@@ -226,6 +237,18 @@ class StrategyAnalyticsService:
             alpaca_client=self._alpaca_creds,
             require_real_data=self._require_real_data,
         )
+        cancel_check_counter = 0
+
+        def _check_cancel() -> None:
+            nonlocal cancel_check_counter
+            if should_cancel is None:
+                return
+            cancel_check_counter += 1
+            # Avoid callback overhead on every micro-step while still staying responsive.
+            if cancel_check_counter % 8 != 0:
+                return
+            if should_cancel():
+                raise BacktestCancelledError("Backtest canceled")
 
         series_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
         # Build date-keyed index per symbol for O(1) lookups.
@@ -233,7 +256,13 @@ class StrategyAnalyticsService:
         latest_price_by_symbol: Dict[str, float] = {}
         all_dates: set[date_type] = set()
         for symbol in symbols:
-            points = screener.get_symbol_chart(symbol, days=lookback_days)
+            _check_cancel()
+            cache_key = f"{symbol.upper()}:{lookback_days}"
+            points = self._historical_bars_cache.get(cache_key)
+            if points is None:
+                fetched = screener.get_symbol_chart(symbol, days=lookback_days)
+                points = [dict(point) for point in fetched if isinstance(point, dict)]
+                self._historical_bars_cache[cache_key] = points
             parsed = self._prepare_series(points, start_dt=start_dt, end_dt=end_dt)
             if not parsed:
                 diagnostics["symbols_without_data"].append(symbol)
@@ -295,10 +324,24 @@ class StrategyAnalyticsService:
         trades: List[Dict[str, Any]] = []
         equity_curve: List[Dict[str, Any]] = []
         slippage_bps = _DEFAULT_SLIPPAGE_BPS
+        optimizer_ctx = (
+            request.universe_context.get("optimizer")
+            if isinstance(request.universe_context, dict)
+            else None
+        )
+        if isinstance(optimizer_ctx, dict):
+            override = optimizer_ctx.get("slippage_bps_override")
+            try:
+                override_value = float(override)
+            except (TypeError, ValueError):
+                override_value = None
+            if override_value is not None and math.isfinite(override_value):
+                slippage_bps = max(0.0, min(250.0, override_value))
         max_hold_days = int(params.get("max_hold_days", 10))
         dca_tranches = max(1, min(3, int(params.get("dca_tranches", 1))))
 
         for day in sorted(all_dates):
+            _check_cancel()
             if day < start_dt.date() or day > end_dt.date():
                 continue
             diagnostics["trading_days_evaluated"] += 1
@@ -316,6 +359,7 @@ class StrategyAnalyticsService:
                 contribution_events += 1
 
             for symbol in sorted(series_by_symbol.keys()):
+                _check_cancel()
                 point = date_index_by_symbol[symbol].get(day)
                 if point is None:
                     continue
@@ -592,6 +636,7 @@ class StrategyAnalyticsService:
             })
 
         # Force-close remaining positions at end of window.
+        _check_cancel()
         if open_positions:
             final_ts = datetime.combine(end_dt.date(), datetime.min.time(), tzinfo=timezone.utc)
             for symbol in sorted(list(open_positions.keys())):

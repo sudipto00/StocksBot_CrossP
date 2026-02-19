@@ -12,6 +12,7 @@ import secrets
 import threading
 import time
 import asyncio
+import tempfile
 from pathlib import Path
 from fastapi import APIRouter, HTTPException, Depends, Query, Header, WebSocket, WebSocketDisconnect
 from typing import List, Optional, Dict, Any
@@ -20,7 +21,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from storage.database import SessionLocal, get_db
 from storage.service import StorageService
-from storage.models import AuditLog as DBAuditLog, Trade as DBTrade
+from storage.models import AuditLog as DBAuditLog, Trade as DBTrade, OptimizationRun as DBOptimizationRun
 from services.broker import BrokerInterface, PaperBroker
 from services.order_execution import (
     OrderExecutionService,
@@ -91,6 +92,8 @@ from .models import (
     StrategyOptimizationJobStartResponse,
     StrategyOptimizationJobStatusResponse,
     StrategyOptimizationJobCancelResponse,
+    StrategyOptimizationHistoryItem,
+    StrategyOptimizationHistoryResponse,
     StrategyParameter,
     ScreenerPreset,
     AssetType,
@@ -326,7 +329,9 @@ _preference_recommendation_cache_lock = threading.Lock()
 _PREFERENCE_RECOMMENDATION_CACHE_TTL_SECONDS = 10
 _optimizer_jobs: Dict[str, Dict[str, Any]] = {}
 _optimizer_jobs_lock = threading.Lock()
+_optimizer_job_threads: Dict[str, threading.Thread] = {}
 _OPTIMIZER_MAX_JOB_HISTORY = 40
+_OPTIMIZATION_HISTORY_LIMIT_PER_STRATEGY = 40
 
 _SUMMARY_NOTIFICATION_PREFERENCES_KEY = "summary_notification_preferences"
 _SUMMARY_NOTIFICATION_SCHEDULE_STATE_KEY = "summary_notification_schedule_state"
@@ -497,12 +502,58 @@ def _optimizer_prune_jobs_locked() -> None:
     while len(_optimizer_jobs) > _OPTIMIZER_MAX_JOB_HISTORY and completed:
         job_id, _ = completed.pop(0)
         _optimizer_jobs.pop(job_id, None)
+        _optimizer_job_threads.pop(job_id, None)
+        _optimizer_clear_cancel_token(job_id)
+
+
+def _optimizer_cancel_token_path(job_id: str) -> str:
+    safe_job_id = re.sub(r"[^a-zA-Z0-9_-]", "", str(job_id or ""))[:64] or "unknown"
+    return os.path.join(tempfile.gettempdir(), f"stocksbot_optimizer_cancel_{safe_job_id}.flag")
+
+
+def _optimizer_cancel_token_exists(job_id: str) -> bool:
+    try:
+        return os.path.exists(_optimizer_cancel_token_path(job_id))
+    except Exception:
+        return False
+
+
+def _optimizer_write_cancel_token(job_id: str) -> None:
+    token_path = _optimizer_cancel_token_path(job_id)
+    try:
+        with open(token_path, "w", encoding="utf-8") as handle:
+            handle.write(datetime.now(timezone.utc).isoformat())
+    except Exception:
+        # Best effort only; in-memory cancel flag still applies.
+        return
+
+
+def _optimizer_clear_cancel_token(job_id: str) -> None:
+    token_path = _optimizer_cancel_token_path(job_id)
+    try:
+        if os.path.exists(token_path):
+            os.remove(token_path)
+    except Exception:
+        # Best effort cleanup.
+        return
+
+
+def _optimizer_request_cancel(job_id: str, *, message: str = "Cancel requested") -> Optional[Dict[str, Any]]:
+    _optimizer_write_cancel_token(job_id)
+    return _optimizer_update_job(
+        job_id,
+        {
+            "cancel_requested": True,
+            "message": message,
+        },
+    )
 
 
 def _optimizer_create_job(strategy_id: str, request_payload: Dict[str, Any]) -> Dict[str, Any]:
     """Create and register a queued optimizer job."""
     created_at = datetime.now(timezone.utc).isoformat()
     job_id = secrets.token_hex(12)
+    _optimizer_clear_cancel_token(job_id)
     row = {
         "job_id": job_id,
         "strategy_id": strategy_id,
@@ -521,6 +572,7 @@ def _optimizer_create_job(strategy_id: str, request_payload: Dict[str, Any]) -> 
         "completed_at": None,
         "request": dict(request_payload),
         "result": None,
+        "cancel_token_path": _optimizer_cancel_token_path(job_id),
     }
     with _optimizer_jobs_lock:
         _optimizer_jobs[job_id] = row
@@ -528,11 +580,34 @@ def _optimizer_create_job(strategy_id: str, request_payload: Dict[str, Any]) -> 
     return dict(row)
 
 
+def _optimizer_reconcile_job_liveness_locked(job_id: str) -> Optional[Dict[str, Any]]:
+    row = _optimizer_jobs.get(job_id)
+    if row is None:
+        return None
+    status = str(row.get("status") or "failed")
+    if status in {"completed", "failed", "canceled"}:
+        return dict(row)
+    worker = _optimizer_job_threads.get(job_id)
+    if worker is not None and worker.is_alive():
+        return dict(row)
+    canceled = bool(row.get("cancel_requested")) or _optimizer_cancel_token_exists(job_id)
+    row.update(
+        {
+            "status": "canceled" if canceled else "failed",
+            "message": "Canceled by user" if canceled else "Optimizer worker not running",
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+            "error": None if canceled else str(row.get("error") or "Worker exited unexpectedly"),
+        }
+    )
+    _optimizer_job_threads.pop(job_id, None)
+    _optimizer_clear_cancel_token(job_id)
+    return dict(row)
+
+
 def _optimizer_get_job(job_id: str) -> Optional[Dict[str, Any]]:
     """Get optimizer job snapshot by ID."""
     with _optimizer_jobs_lock:
-        row = _optimizer_jobs.get(job_id)
-        return dict(row) if row else None
+        return _optimizer_reconcile_job_liveness_locked(job_id)
 
 
 def _optimizer_update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -542,7 +617,13 @@ def _optimizer_update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict
         if row is None:
             return None
         row.update(updates)
-        return dict(row)
+        snapshot = dict(row)
+    status_value = str(snapshot.get("status") or "")
+    if status_value in {"completed", "failed", "canceled"}:
+        with _optimizer_jobs_lock:
+            _optimizer_job_threads.pop(job_id, None)
+        _optimizer_clear_cancel_token(job_id)
+    return snapshot
 
 
 def _optimizer_progress_snapshot(row: Dict[str, Any]) -> StrategyOptimizationJobStatusResponse:
@@ -581,6 +662,288 @@ def _optimizer_progress_snapshot(row: Dict[str, Any]) -> StrategyOptimizationJob
         started_at=str(row["started_at"]) if row.get("started_at") else None,
         completed_at=str(row["completed_at"]) if row.get("completed_at") else None,
         result=result_model,
+    )
+
+
+def _parse_iso_datetime(value: Any) -> Optional[datetime]:
+    """Best-effort ISO datetime parsing with UTC fallback for naive values."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    raw = str(value).strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _iso_or_none(value: Optional[datetime]) -> Optional[str]:
+    normalized = _ensure_utc_datetime(value)
+    return normalized.isoformat() if normalized is not None else None
+
+
+def _duration_seconds(started_at: Optional[datetime], completed_at: Optional[datetime]) -> Optional[float]:
+    if started_at is None or completed_at is None:
+        return None
+    duration = (completed_at - started_at).total_seconds()
+    if not math.isfinite(duration):
+        return None
+    return max(0.0, round(duration, 3))
+
+
+def _parse_strategy_ids_csv(raw_value: Optional[str]) -> List[int]:
+    if not raw_value:
+        return []
+    values: List[int] = []
+    seen: set[int] = set()
+    for token in str(raw_value).split(","):
+        try:
+            strategy_id = int(str(token).strip())
+        except (TypeError, ValueError):
+            continue
+        if strategy_id in seen:
+            continue
+        seen.add(strategy_id)
+        values.append(strategy_id)
+    return values
+
+
+def _parse_optimizer_statuses(raw_value: Optional[str]) -> List[str]:
+    allowed = {"queued", "running", "completed", "failed", "canceled"}
+    if not raw_value:
+        return []
+    statuses: List[str] = []
+    seen: set[str] = set()
+    for token in str(raw_value).split(","):
+        normalized = str(token).strip().lower()
+        if not normalized or normalized not in allowed or normalized in seen:
+            continue
+        seen.add(normalized)
+        statuses.append(normalized)
+    return statuses
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _build_optimization_request_summary(payload: Dict[str, Any]) -> Dict[str, Any]:
+    symbols_value = payload.get("symbols")
+    symbol_count = len(symbols_value) if isinstance(symbols_value, list) else 0
+    params_value = payload.get("parameters")
+    parameter_count = len(params_value) if isinstance(params_value, dict) else 0
+    return {
+        "start_date": str(payload.get("start_date") or ""),
+        "end_date": str(payload.get("end_date") or ""),
+        "initial_capital": _safe_float(payload.get("initial_capital"), 0.0),
+        "contribution_amount": _safe_float(payload.get("contribution_amount"), 0.0),
+        "contribution_frequency": str(payload.get("contribution_frequency") or "none"),
+        "iterations": _safe_int(payload.get("iterations"), 0),
+        "objective": str(payload.get("objective") or "balanced"),
+        "min_trades": _safe_int(payload.get("min_trades"), 0),
+        "strict_min_trades": bool(payload.get("strict_min_trades")),
+        "walk_forward_enabled": bool(payload.get("walk_forward_enabled", True)),
+        "walk_forward_folds": _safe_int(payload.get("walk_forward_folds"), 0),
+        "ensemble_mode": bool(payload.get("ensemble_mode")),
+        "ensemble_runs": _safe_int(payload.get("ensemble_runs"), 0),
+        "max_workers": _safe_int(payload.get("max_workers"), 0),
+        "use_workspace_universe": bool(payload.get("use_workspace_universe", True)),
+        "emulate_live_trading": bool(payload.get("emulate_live_trading", True)),
+        "symbol_count": symbol_count,
+        "parameter_count": parameter_count,
+    }
+
+
+def _build_optimization_metrics_summary(result_model: Optional[StrategyOptimizationResponse], row: DBOptimizationRun) -> Dict[str, Any]:
+    if result_model is not None:
+        return {
+            "score": float(result_model.score),
+            "objective": str(result_model.objective),
+            "requested_iterations": int(result_model.requested_iterations),
+            "evaluated_iterations": int(result_model.evaluated_iterations),
+            "total_return": float(result_model.best_result.total_return),
+            "sharpe_ratio": float(result_model.best_result.sharpe_ratio),
+            "max_drawdown": float(result_model.best_result.max_drawdown),
+            "win_rate": float(result_model.best_result.win_rate),
+            "total_trades": int(result_model.best_result.total_trades),
+            "recommended_symbol_count": len(result_model.recommended_symbols),
+        }
+    return {
+        "score": _safe_float(row.score, 0.0),
+        "objective": str(row.objective or ""),
+        "requested_iterations": _safe_int(row.requested_iterations, 0),
+        "evaluated_iterations": _safe_int(row.evaluated_iterations, 0),
+        "total_return": _safe_float(row.total_return, 0.0),
+        "sharpe_ratio": _safe_float(row.sharpe_ratio, 0.0),
+        "max_drawdown": _safe_float(row.max_drawdown, 0.0),
+        "win_rate": _safe_float(row.win_rate, 0.0),
+        "total_trades": _safe_int(row.total_trades, 0),
+        "recommended_symbol_count": _safe_int(row.recommended_symbol_count, 0),
+    }
+
+
+def _persist_optimization_history_run(
+    *,
+    db: Session,
+    run_id: str,
+    strategy_id: str,
+    source: str,
+    status: str,
+    request_payload: Optional[Dict[str, Any]],
+    result_payload: Optional[Dict[str, Any]],
+    error: Optional[str],
+    job_id: Optional[str],
+    created_at: Optional[Any],
+    started_at: Optional[Any],
+    completed_at: Optional[Any],
+) -> None:
+    try:
+        strategy_id_int = int(str(strategy_id))
+    except (TypeError, ValueError):
+        return
+    if not run_id:
+        return
+    try:
+        storage = StorageService(db)
+        db_strategy = storage.strategies.get_by_id(strategy_id_int)
+        strategy_name = db_strategy.name if db_strategy else f"Strategy {strategy_id_int}"
+        parsed_created_at = _parse_iso_datetime(created_at) or datetime.now(timezone.utc)
+        parsed_started_at = _parse_iso_datetime(started_at)
+        parsed_completed_at = _parse_iso_datetime(completed_at)
+        result_model: Optional[StrategyOptimizationResponse] = None
+        if isinstance(result_payload, dict):
+            try:
+                result_model = StrategyOptimizationResponse(**result_payload)
+            except Exception:
+                result_model = None
+
+        storage.upsert_optimization_run(
+            run_id=str(run_id),
+            strategy_id=strategy_id_int,
+            strategy_name=strategy_name,
+            source="async" if str(source).strip().lower() == "async" else "sync",
+            status=str(status or "failed").strip().lower(),
+            job_id=str(job_id) if job_id else None,
+            request_payload=dict(request_payload or {}),
+            result_payload=result_model.model_dump() if result_model is not None else (dict(result_payload) if isinstance(result_payload, dict) else None),
+            error=str(error) if error else None,
+            objective=(
+                str(result_model.objective)
+                if result_model is not None
+                else None
+            ),
+            score=(
+                float(result_model.score)
+                if result_model is not None
+                else None
+            ),
+            total_return=(
+                float(result_model.best_result.total_return)
+                if result_model is not None
+                else None
+            ),
+            sharpe_ratio=(
+                float(result_model.best_result.sharpe_ratio)
+                if result_model is not None
+                else None
+            ),
+            max_drawdown=(
+                float(result_model.best_result.max_drawdown)
+                if result_model is not None
+                else None
+            ),
+            total_trades=(
+                int(result_model.best_result.total_trades)
+                if result_model is not None
+                else None
+            ),
+            win_rate=(
+                float(result_model.best_result.win_rate)
+                if result_model is not None
+                else None
+            ),
+            recommended_symbol_count=(
+                len(result_model.recommended_symbols)
+                if result_model is not None
+                else 0
+            ),
+            requested_iterations=(
+                int(result_model.requested_iterations)
+                if result_model is not None
+                else None
+            ),
+            evaluated_iterations=(
+                int(result_model.evaluated_iterations)
+                if result_model is not None
+                else None
+            ),
+            created_at=parsed_created_at,
+            started_at=parsed_started_at,
+            completed_at=parsed_completed_at,
+        )
+        storage.prune_strategy_optimization_history(
+            strategy_id=strategy_id_int,
+            keep=_OPTIMIZATION_HISTORY_LIMIT_PER_STRATEGY,
+        )
+    except Exception:
+        logger.exception("Failed to persist optimization history run %s", run_id)
+
+
+def _to_optimization_history_item(
+    row: DBOptimizationRun,
+    *,
+    include_payload: bool = False,
+) -> StrategyOptimizationHistoryItem:
+    request_payload = dict(row.request_payload) if isinstance(row.request_payload, dict) else {}
+    result_payload_raw = dict(row.result_payload) if isinstance(row.result_payload, dict) else None
+    result_model: Optional[StrategyOptimizationResponse] = None
+    if result_payload_raw:
+        try:
+            result_model = StrategyOptimizationResponse(**result_payload_raw)
+        except Exception:
+            result_model = None
+    started_at = _ensure_utc_datetime(row.started_at)
+    completed_at = _ensure_utc_datetime(row.completed_at)
+    created_at = _ensure_utc_datetime(row.created_at) or datetime.now(timezone.utc)
+    recommended_parameters: Dict[str, float] = {}
+    recommended_symbols: List[str] = []
+    if result_model is not None:
+        recommended_parameters = {
+            key: float(value)
+            for key, value in result_model.recommended_parameters.items()
+        }
+        recommended_symbols = [str(symbol).upper() for symbol in result_model.recommended_symbols if str(symbol).strip()]
+    source_value = str(row.source or "").strip().lower()
+    if source_value not in {"sync", "async"}:
+        source_value = "sync"
+    status_value = str(row.status or "").strip().lower()
+    if status_value not in {"queued", "running", "completed", "failed", "canceled"}:
+        status_value = "failed"
+    return StrategyOptimizationHistoryItem(
+        run_id=str(row.run_id),
+        strategy_id=str(row.strategy_id),
+        strategy_name=str(row.strategy_name or ""),
+        source=source_value,  # type: ignore[arg-type]
+        status=status_value,  # type: ignore[arg-type]
+        job_id=str(row.job_id) if row.job_id else None,
+        created_at=created_at.isoformat(),
+        started_at=_iso_or_none(started_at),
+        completed_at=_iso_or_none(completed_at),
+        duration_seconds=_duration_seconds(started_at, completed_at),
+        error=str(row.error) if row.error else None,
+        request_summary=_build_optimization_request_summary(request_payload),
+        metrics_summary=_build_optimization_metrics_summary(result_model, row),
+        recommended_parameters=recommended_parameters,
+        recommended_symbols=recommended_symbols,
+        request_payload=request_payload if include_payload else None,
+        result_payload=result_model if include_payload else None,
     )
 
 
@@ -730,9 +1093,11 @@ def _load_holdings_snapshot(storage: StorageService, broker: Optional[BrokerInte
     Load current holdings with market values, preferring broker truth and falling back to local positions.
     """
     holdings: List[Dict[str, Any]] = []
+    broker_snapshot_loaded = False
     if broker is not None:
         try:
             broker_positions = broker.get_positions()
+            broker_snapshot_loaded = True
             for raw in broker_positions:
                 symbol = str(raw.get("symbol", "")).strip().upper()
                 if not symbol:
@@ -751,10 +1116,12 @@ def _load_holdings_snapshot(storage: StorageService, broker: Optional[BrokerInte
                     "market_value": max(0.0, market_value),
                     "asset_type": str(raw.get("asset_type", "")).lower(),
                 })
-            if holdings:
-                return holdings
         except (RuntimeError, ValueError, TypeError, KeyError):
+            broker_snapshot_loaded = False
             holdings = []
+    if broker_snapshot_loaded:
+        # Broker is source-of-truth even when there are zero positions.
+        return holdings
 
     # Fallback to local stored positions.
     local_positions = storage.get_open_positions()
@@ -867,12 +1234,32 @@ def _capture_portfolio_snapshot(storage: StorageService, broker: Optional[Broker
     except (RuntimeError, ValueError, TypeError, KeyError):
         market_open = True
 
-    # Keep equity curve stable off-hours by reusing the last persisted snapshot.
-    if not market_open and latest is not None:
-        return _snapshot_to_payload(latest)
+    account_snapshot: Optional[Dict[str, float]] = None
+    holdings_snapshot: Optional[List[Dict[str, Any]]] = None
+    realized_pnl_total: Optional[float] = None
 
-    account_snapshot = _load_account_snapshot(broker)
-    holdings_snapshot = _load_holdings_snapshot(storage, broker)
+    # Keep equity curve stable off-hours, while still allowing true fills/state changes.
+    if not market_open and latest is not None:
+        account_snapshot = _load_account_snapshot(broker)
+        holdings_snapshot = _load_holdings_snapshot(storage, broker)
+        trades = storage.get_all_trades(limit=5000)
+        realized_pnl_total = sum(_safe_float(trade.realized_pnl, 0.0) for trade in trades)
+        cash_eps = 0.05
+        realized_eps = 0.01
+        off_hours_trade_change = (
+            abs(_safe_float(account_snapshot.get("cash", 0.0), 0.0) - _safe_float(latest.cash, 0.0)) >= cash_eps
+            or abs(realized_pnl_total - _safe_float(latest.realized_pnl_total, 0.0)) >= realized_eps
+        )
+        if not off_hours_trade_change:
+            return _snapshot_to_payload(latest)
+
+    if account_snapshot is None:
+        account_snapshot = _load_account_snapshot(broker)
+    if holdings_snapshot is None:
+        holdings_snapshot = _load_holdings_snapshot(storage, broker)
+    equity = _safe_float(account_snapshot.get("equity", 0.0), 0.0)
+    cash = _safe_float(account_snapshot.get("cash", 0.0), 0.0)
+    buying_power = _safe_float(account_snapshot.get("buying_power", 0.0), 0.0)
     market_value = sum(_safe_float(h.get("market_value", 0.0), 0.0) for h in holdings_snapshot)
     unrealized_pnl = 0.0
     for h in holdings_snapshot:
@@ -882,24 +1269,60 @@ def _capture_portfolio_snapshot(storage: StorageService, broker: Optional[Broker
         row_market_value = _safe_float(h.get("market_value", qty * current_price), 0.0)
         unrealized_pnl += row_market_value - (qty * avg_entry_price)
 
-    trades = storage.get_all_trades(limit=5000)
-    realized_pnl_total = sum(_safe_float(trade.realized_pnl, 0.0) for trade in trades)
+    if realized_pnl_total is None:
+        trades = storage.get_all_trades(limit=5000)
+        realized_pnl_total = sum(_safe_float(trade.realized_pnl, 0.0) for trade in trades)
+    if equity <= 0.0 and (cash > 0.0 or market_value > 0.0):
+        equity = max(0.0, cash + market_value)
 
-    # Avoid duplicate writes when repeated UI polling samples within a few seconds.
-    if latest is not None and latest.timestamp is not None:
-        latest_ts = _ensure_utc_datetime(latest.timestamp)
-        if latest_ts is not None and (now_utc - latest_ts).total_seconds() < 5:
-            if (
-                abs(_safe_float(latest.equity, 0.0) - _safe_float(account_snapshot.get("equity", 0.0), 0.0)) < 1e-9
-                and abs(_safe_float(latest.market_value, 0.0) - market_value) < 1e-9
-                and abs(_safe_float(latest.realized_pnl_total, 0.0) - realized_pnl_total) < 1e-9
-            ):
+    if latest is not None:
+        latest_ts = _ensure_utc_datetime(getattr(latest, "timestamp", None))
+        elapsed_seconds = (
+            (now_utc - latest_ts).total_seconds()
+            if latest_ts is not None
+            else (15.0 * 60.0)
+        )
+        latest_equity = _safe_float(getattr(latest, "equity", 0.0), 0.0)
+        latest_cash = _safe_float(getattr(latest, "cash", 0.0), 0.0)
+        latest_bp = _safe_float(getattr(latest, "buying_power", 0.0), 0.0)
+        latest_mv = _safe_float(getattr(latest, "market_value", 0.0), 0.0)
+        latest_unreal = _safe_float(getattr(latest, "unrealized_pnl", 0.0), 0.0)
+        latest_realized = _safe_float(getattr(latest, "realized_pnl_total", 0.0), 0.0)
+        latest_open_positions = int(getattr(latest, "open_positions", 0) or 0)
+
+        min_interval_seconds = 20.0
+        max_interval_seconds = 15.0 * 60.0
+        equity_eps = max(0.10, abs(latest_equity) * 0.0002)
+        market_value_eps = max(0.10, abs(latest_mv) * 0.0003)
+        cash_eps = 0.05
+        realized_eps = 0.01
+
+        if not market_open:
+            off_hours_trade_change = (
+                abs(cash - latest_cash) >= cash_eps
+                or abs(realized_pnl_total - latest_realized) >= realized_eps
+            )
+            if not off_hours_trade_change:
                 return _snapshot_to_payload(latest)
 
+        meaningful_change = (
+            abs(equity - latest_equity) >= equity_eps
+            or abs(cash - latest_cash) >= cash_eps
+            or abs(buying_power - latest_bp) >= cash_eps
+            or abs(market_value - latest_mv) >= market_value_eps
+            or abs(unrealized_pnl - latest_unreal) >= market_value_eps
+            or abs(realized_pnl_total - latest_realized) >= realized_eps
+            or len(holdings_snapshot) != latest_open_positions
+        )
+        if elapsed_seconds < min_interval_seconds and not meaningful_change:
+            return _snapshot_to_payload(latest)
+        if elapsed_seconds < max_interval_seconds and not meaningful_change:
+            return _snapshot_to_payload(latest)
+
     snapshot = storage.record_portfolio_snapshot(
-        equity=_safe_float(account_snapshot.get("equity", 0.0), 0.0),
-        cash=_safe_float(account_snapshot.get("cash", 0.0), 0.0),
-        buying_power=_safe_float(account_snapshot.get("buying_power", 0.0), 0.0),
+        equity=equity,
+        cash=cash,
+        buying_power=buying_power,
         market_value=market_value,
         unrealized_pnl=unrealized_pnl,
         realized_pnl_total=realized_pnl_total,
@@ -1093,6 +1516,16 @@ def _delete_all_files(directory: str) -> int:
 
 def _run_reconciliation(storage: StorageService, broker: BrokerInterface) -> Dict[str, Any]:
     """Compare local open positions with broker positions and log discrepancies."""
+    def _signed_quantity(raw_qty: Any, raw_side: Any = None) -> float:
+        qty = _safe_float(raw_qty, 0.0)
+        side_value = getattr(raw_side, "value", raw_side)
+        side = str(side_value or "").strip().lower()
+        if side == "short":
+            return -abs(qty)
+        if side == "long":
+            return abs(qty)
+        return qty
+
     broker_positions = broker.get_positions()
     local_positions = storage.get_open_positions()
     broker_qty: Dict[str, float] = {}
@@ -1101,10 +1534,10 @@ def _run_reconciliation(storage: StorageService, broker: BrokerInterface) -> Dic
         sym = str(row.get("symbol", "")).upper()
         if not sym:
             continue
-        broker_qty[sym] = broker_qty.get(sym, 0.0) + float(row.get("quantity", 0.0))
+        broker_qty[sym] = broker_qty.get(sym, 0.0) + _signed_quantity(row.get("quantity", 0.0), row.get("side"))
     for row in local_positions:
         sym = str(row.symbol).upper()
-        local_qty[sym] = local_qty.get(sym, 0.0) + float(row.quantity or 0.0)
+        local_qty[sym] = local_qty.get(sym, 0.0) + _signed_quantity(row.quantity or 0.0, getattr(row, "side", None))
 
     symbols = sorted(set(broker_qty.keys()) | set(local_qty.keys()))
     discrepancies: List[Dict[str, Any]] = []
@@ -1219,6 +1652,140 @@ def _parse_utc_iso_timestamp(raw: Any) -> Optional[datetime]:
     except ValueError:
         return None
     return _ensure_utc_datetime(parsed)
+
+
+def _portfolio_bucket_seconds_for_span(span_seconds: float) -> int:
+    """Choose adaptive downsampling bucket size for equity-series rendering."""
+    if span_seconds <= 6 * 3600:
+        return 60
+    if span_seconds <= 2 * 86400:
+        return 5 * 60
+    if span_seconds <= 14 * 86400:
+        return 15 * 60
+    if span_seconds <= 60 * 86400:
+        return 60 * 60
+    return 4 * 60 * 60
+
+
+def _normalize_portfolio_time_series(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Normalize equity curve for chart stability:
+    1) sort + sanitize,
+    2) adaptive time-bucket downsample,
+    3) suppress short-lived A->B->A spikes without trade/PnL change.
+    """
+    if not rows:
+        return []
+
+    entries: List[Dict[str, Any]] = []
+    for row in rows:
+        ts = _parse_utc_iso_timestamp(row.get("timestamp"))
+        if ts is None:
+            continue
+        entries.append(
+            {
+                "ts": ts,
+                "equity": _safe_float(row.get("equity", 0.0), 0.0),
+                "pnl": _safe_float(row.get("pnl", 0.0), 0.0),
+                "cumulative_pnl": _safe_float(row.get("cumulative_pnl", 0.0), 0.0),
+                "symbol": str(row.get("symbol", "PORTFOLIO") or "PORTFOLIO"),
+            }
+        )
+
+    if not entries:
+        return []
+    entries.sort(key=lambda item: item["ts"])
+
+    span_seconds = (
+        (entries[-1]["ts"] - entries[0]["ts"]).total_seconds()
+        if len(entries) > 1
+        else 0.0
+    )
+    bucket_seconds = _portfolio_bucket_seconds_for_span(span_seconds)
+
+    bucketed: List[Dict[str, Any]] = []
+    for entry in entries:
+        ts = entry["ts"]
+        bucket_key = int(ts.timestamp()) // max(1, bucket_seconds)
+        if bucketed and bucketed[-1]["bucket_key"] == bucket_key:
+            # Keep close-equity for the bucket; accumulate realized delta.
+            bucketed[-1]["timestamp"] = ts.isoformat()
+            bucketed[-1]["equity"] = entry["equity"]
+            bucketed[-1]["cumulative_pnl"] = entry["cumulative_pnl"]
+            bucketed[-1]["pnl"] = _safe_float(bucketed[-1]["pnl"], 0.0) + entry["pnl"]
+            bucketed[-1]["symbol"] = entry["symbol"]
+            continue
+        bucketed.append(
+            {
+                "bucket_key": bucket_key,
+                "timestamp": ts.isoformat(),
+                "equity": entry["equity"],
+                "pnl": entry["pnl"],
+                "cumulative_pnl": entry["cumulative_pnl"],
+                "symbol": entry["symbol"],
+            }
+        )
+
+    reduced = [
+        {
+            "timestamp": row["timestamp"],
+            "equity": row["equity"],
+            "pnl": row["pnl"],
+            "cumulative_pnl": row["cumulative_pnl"],
+            "symbol": row["symbol"],
+        }
+        for row in bucketed
+    ]
+
+    if len(reduced) < 3:
+        return reduced
+
+    filtered: List[Dict[str, Any]] = [reduced[0]]
+    for index in range(1, len(reduced) - 1):
+        previous = filtered[-1]
+        current = reduced[index]
+        nxt = reduced[index + 1]
+        prev_ts = _parse_utc_iso_timestamp(previous.get("timestamp"))
+        curr_ts = _parse_utc_iso_timestamp(current.get("timestamp"))
+        next_ts = _parse_utc_iso_timestamp(nxt.get("timestamp"))
+        if prev_ts is None or curr_ts is None or next_ts is None:
+            filtered.append(current)
+            continue
+
+        gap_prev = (curr_ts - prev_ts).total_seconds()
+        gap_next = (next_ts - curr_ts).total_seconds()
+        if gap_prev <= 0 or gap_next <= 0:
+            filtered.append(current)
+            continue
+
+        prev_equity = _safe_float(previous.get("equity", 0.0), 0.0)
+        curr_equity = _safe_float(current.get("equity", 0.0), 0.0)
+        next_equity = _safe_float(nxt.get("equity", 0.0), 0.0)
+        prev_cum = _safe_float(previous.get("cumulative_pnl", 0.0), 0.0)
+        curr_cum = _safe_float(current.get("cumulative_pnl", 0.0), 0.0)
+        next_cum = _safe_float(nxt.get("cumulative_pnl", 0.0), 0.0)
+        curr_pnl = _safe_float(current.get("pnl", 0.0), 0.0)
+
+        equity_eps = max(0.20, abs(prev_equity) * 0.00025)
+        pnl_eps = 0.01
+        trade_activity = (
+            abs(curr_pnl) >= pnl_eps
+            or abs(curr_cum - prev_cum) >= pnl_eps
+            or abs(next_cum - curr_cum) >= pnl_eps
+        )
+        transient_window = gap_prev <= 20 * 60 and gap_next <= 20 * 60
+        reverts_to_prev = abs(prev_equity - next_equity) <= equity_eps
+        spike_amplitude = (
+            abs(curr_equity - prev_equity) >= (equity_eps * 3.0)
+            and abs(curr_equity - next_equity) >= (equity_eps * 3.0)
+        )
+        if transient_window and reverts_to_prev and spike_amplitude and not trade_activity:
+            continue
+
+        filtered.append(current)
+
+    filtered.append(reduced[-1])
+    return filtered
 
 
 def _send_summary_with_stats(
@@ -2672,9 +3239,15 @@ async def ws_system_health(websocket: WebSocket):
     try:
         while True:
             status = runner_manager.get_status()
+            broker_connected = bool(status.get("broker_connected", False))
+            if not broker_connected:
+                try:
+                    broker_connected = bool(get_broker().is_connected())
+                except (RuntimeError, ValueError, TypeError, KeyError):
+                    broker_connected = False
             payload = {
                 "runner_status": status.get("status", "unknown"),
-                "broker_connected": bool(status.get("broker_connected", False)),
+                "broker_connected": broker_connected,
                 "poll_success_count": int(status.get("poll_success_count", 0)),
                 "poll_error_count": int(status.get("poll_error_count", 0)),
                 "last_poll_error": str(status.get("last_poll_error", "")),
@@ -2748,8 +3321,26 @@ async def start_runner(
                 "Load/save Alpaca keys in Settings before starting runner."
             ),
         )
-    workspace_symbols_override: Optional[List[str]] = None
+    symbol_universe_overrides: Dict[str, List[str]] = {}
     if request is not None and bool(request.use_workspace_universe):
+        target_strategy_id = str(request.target_strategy_id or "").strip()
+        if not target_strategy_id:
+            raise HTTPException(
+                status_code=400,
+                detail="target_strategy_id is required when use_workspace_universe=true.",
+            )
+        try:
+            target_strategy_id_int = int(target_strategy_id)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid target_strategy_id")
+        target_strategy = storage.strategies.get_by_id(target_strategy_id_int)
+        if target_strategy is None:
+            raise HTTPException(status_code=404, detail="Target strategy not found")
+        if not bool(getattr(target_strategy, "is_active", False)):
+            raise HTTPException(
+                status_code=400,
+                detail="Target strategy must be active before starting runner with workspace universe override.",
+            )
         prefs = _load_trading_preferences(storage)
         account_snapshot = _load_account_snapshot(broker)
         equity = _safe_float(account_snapshot.get("equity", 0.0), 0.0)
@@ -2798,6 +3389,7 @@ async def start_runner(
                 status_code=400,
                 detail="Workspace universe resolution produced zero symbols. Adjust Screener settings or switch Runner Universe Source.",
             )
+        symbol_universe_overrides[target_strategy_id] = workspace_symbols_override
     result = runner_manager.start_runner(
         db=db,
         broker=broker,
@@ -2807,7 +3399,7 @@ async def start_runner(
         streaming_enabled=config.streaming_enabled,
         alpaca_client=alpaca_creds,
         require_real_data=require_real_data,
-        symbol_universe_override=workspace_symbols_override,
+        symbol_universe_overrides=symbol_universe_overrides or None,
     )
     _idempotency_cache_set("/runner/start", x_idempotency_key, result)
     return RunnerActionResponse(**result)
@@ -2928,7 +3520,7 @@ async def get_portfolio_analytics(
             snapshot_rows = [latest_snapshot]
 
     if snapshot_rows:
-        time_series: List[Dict[str, Any]] = []
+        raw_time_series: List[Dict[str, Any]] = []
         first_equity = _safe_float(snapshot_rows[0].equity, 0.0)
         first_realized_total = _safe_float(snapshot_rows[0].realized_pnl_total, 0.0)
         previous_realized_total = first_realized_total
@@ -2939,7 +3531,7 @@ async def get_portfolio_analytics(
             realized_total = _safe_float(snapshot.realized_pnl_total, previous_realized_total)
             realized_pnl_delta = 0.0 if index == 0 else (realized_total - previous_realized_total)
             cumulative_pnl = realized_total - first_realized_total
-            time_series.append({
+            raw_time_series.append({
                 "timestamp": ts.isoformat(),
                 "equity": equity,
                 "pnl": realized_pnl_delta,
@@ -2947,6 +3539,9 @@ async def get_portfolio_analytics(
                 "symbol": "PORTFOLIO",
             })
             previous_realized_total = realized_total
+
+        # Normalize curve for chart readability without hiding real trade/PnL changes.
+        time_series = _normalize_portfolio_time_series(raw_time_series)
 
         current_equity = _safe_float(snapshot_rows[-1].equity, 0.0)
         if current_equity <= 0.0:
@@ -3573,6 +4168,11 @@ def _compute_strategy_optimization_response(
         }
 
     optimizer = StrategyOptimizerService(exec_context["analytics"])
+    cancel_token_path = (
+        str(getattr(should_cancel, "cancel_token_path", "")).strip()
+        if should_cancel is not None
+        else ""
+    ) or None
     optimization_context = OptimizationContext(
         strategy_id=strategy_id,
         start_date=backtest_request.start_date,
@@ -3587,6 +4187,13 @@ def _compute_strategy_optimization_response(
         fee_bps=float(exec_context["fee_bps"]),
         universe_context=dict(exec_context["universe_context"]),
         symbol_capabilities=symbol_capabilities,
+        alpaca_creds=(
+            dict(getattr(exec_context["analytics"], "_alpaca_creds"))
+            if isinstance(getattr(exec_context["analytics"], "_alpaca_creds", None), dict)
+            else None
+        ),
+        require_real_data=bool(getattr(exec_context["analytics"], "_require_real_data", False)),
+        cancel_token_path=cancel_token_path,
     )
     try:
         optimize_payload = optimizer.optimize(
@@ -3599,6 +4206,9 @@ def _compute_strategy_optimization_response(
             strict_min_trades=bool(request.strict_min_trades),
             walk_forward_enabled=bool(request.walk_forward_enabled),
             walk_forward_folds=int(request.walk_forward_folds),
+            ensemble_mode=bool(request.ensemble_mode),
+            ensemble_runs=int(request.ensemble_runs),
+            max_workers=request.max_workers,
             random_seed=request.random_seed,
             progress_callback=progress_callback,
             should_cancel=should_cancel,
@@ -3623,6 +4233,9 @@ def _compute_strategy_optimization_response(
         evaluated_iterations=int(optimize_payload["evaluated_iterations"]),
         objective=str(optimize_payload["objective"]),
         score=float(optimize_payload["score"]),
+        ensemble_mode=bool(optimize_payload.get("ensemble_mode", bool(request.ensemble_mode))),
+        ensemble_runs=int(optimize_payload.get("ensemble_runs", int(request.ensemble_runs))),
+        max_workers_used=int(optimize_payload.get("max_workers_used", int(request.max_workers or 1))),
         min_trades_target=int(optimize_payload.get("min_trades_target", int(request.min_trades))),
         strict_min_trades=bool(optimize_payload.get("strict_min_trades", bool(request.strict_min_trades))),
         best_candidate_meets_min_trades=bool(optimize_payload.get("best_candidate_meets_min_trades", True)),
@@ -3657,6 +4270,9 @@ def _compute_strategy_optimization_response(
             "requested_iterations": response.requested_iterations,
             "evaluated_iterations": response.evaluated_iterations,
             "objective": response.objective,
+            "ensemble_mode": response.ensemble_mode,
+            "ensemble_runs": response.ensemble_runs,
+            "max_workers_used": response.max_workers_used,
             "min_trades_target": response.min_trades_target,
             "strict_min_trades": response.strict_min_trades,
             "recommended_symbol_count": len(response.recommended_symbols),
@@ -3935,11 +4551,27 @@ async def optimize_strategy_configuration(
     Uses the same backtest engine and live-equivalence controls as /backtest,
     then recommends an objective-optimized parameter/symbol set.
     """
-    return _compute_strategy_optimization_response(
+    response = _compute_strategy_optimization_response(
         strategy_id=strategy_id,
         request=request,
         db=db,
     )
+    now_iso = datetime.now(timezone.utc).isoformat()
+    _persist_optimization_history_run(
+        db=db,
+        run_id=secrets.token_hex(12),
+        strategy_id=str(strategy_id),
+        source="sync",
+        status="completed",
+        request_payload=request.model_dump(exclude_none=True),
+        result_payload=response.model_dump(),
+        error=None,
+        job_id=None,
+        created_at=now_iso,
+        started_at=now_iso,
+        completed_at=now_iso,
+    )
+    return response
 
 
 def _run_optimizer_job(job_id: str) -> None:
@@ -3953,10 +4585,13 @@ def _run_optimizer_job(job_id: str) -> None:
             "message": "Running parameter search",
         },
     )
+    cancel_token_path = _optimizer_cancel_token_path(job_id)
 
     def _should_cancel() -> bool:
         row = _optimizer_get_job(job_id)
-        return bool(row and row.get("cancel_requested"))
+        return bool((row and row.get("cancel_requested")) or _optimizer_cancel_token_exists(job_id))
+
+    setattr(_should_cancel, "cancel_token_path", cancel_token_path)
 
     def _progress_update(completed: int, total: int, stage: str) -> None:
         row = _optimizer_get_job(job_id)
@@ -3972,11 +4607,14 @@ def _run_optimizer_job(job_id: str) -> None:
         total_safe = max(1, int(total))
         completed_safe = max(0, min(int(completed), total_safe))
         progress_pct = (completed_safe / total_safe) * 100.0
+        if progress_pct <= 0.0 and stage in {"parameter_search", "ensemble_search", "symbol_trim", "walk_forward"}:
+            progress_pct = 0.5
         avg = (elapsed / completed_safe) if completed_safe > 0 else None
         eta = (avg * (total_safe - completed_safe)) if avg is not None else None
         stage_label = {
             "initializing": "Initializing optimizer",
             "parameter_search": "Evaluating parameter candidates",
+            "ensemble_search": "Running Monte Carlo ensemble scenarios",
             "symbol_trim": "Testing symbol universe trims",
             "walk_forward": "Running walk-forward validation",
             "finalizing": "Finalizing best candidate",
@@ -4012,6 +4650,25 @@ def _run_optimizer_job(job_id: str) -> None:
                 "error": str(exc),
             },
         )
+        db = SessionLocal()
+        try:
+            failed_row = _optimizer_get_job(job_id) or {}
+            _persist_optimization_history_run(
+                db=db,
+                run_id=str(job_id),
+                strategy_id=str(strategy_id),
+                source="async",
+                status=str(failed_row.get("status") or "failed"),
+                request_payload=dict(request_payload) if isinstance(request_payload, dict) else {},
+                result_payload=None,
+                error=str(failed_row.get("error") or str(exc)),
+                job_id=str(job_id),
+                created_at=failed_row.get("created_at"),
+                started_at=failed_row.get("started_at"),
+                completed_at=failed_row.get("completed_at"),
+            )
+        finally:
+            db.close()
         return
 
     db = SessionLocal()
@@ -4076,6 +4733,22 @@ def _run_optimizer_job(job_id: str) -> None:
             },
         )
     finally:
+        final_row = _optimizer_get_job(job_id) or {}
+        _persist_optimization_history_run(
+            db=db,
+            run_id=str(job_id),
+            strategy_id=str(final_row.get("strategy_id") or strategy_id),
+            source="async",
+            status=str(final_row.get("status") or "failed"),
+            request_payload=dict(request_payload) if isinstance(request_payload, dict) else {},
+            result_payload=dict(final_row.get("result")) if isinstance(final_row.get("result"), dict) else None,
+            error=str(final_row.get("error")) if final_row.get("error") else None,
+            job_id=str(job_id),
+            created_at=final_row.get("created_at"),
+            started_at=final_row.get("started_at"),
+            completed_at=final_row.get("completed_at"),
+        )
+        _optimizer_clear_cancel_token(job_id)
         db.close()
 
 
@@ -4103,6 +4776,8 @@ async def start_strategy_optimization_job(
         daemon=True,
         name=f"optimizer-{job['job_id']}",
     )
+    with _optimizer_jobs_lock:
+        _optimizer_job_threads[str(job["job_id"])] = thread
     thread.start()
     return StrategyOptimizationJobStartResponse(
         job_id=str(job["job_id"]),
@@ -4122,7 +4797,11 @@ async def get_strategy_optimization_job_status(strategy_id: str, job_id: str):
 
 
 @router.post("/strategies/{strategy_id}/optimize/{job_id}/cancel", response_model=StrategyOptimizationJobCancelResponse)
-async def cancel_strategy_optimization_job(strategy_id: str, job_id: str):
+async def cancel_strategy_optimization_job(
+    strategy_id: str,
+    job_id: str,
+    force: bool = Query(default=False),
+):
     """Request cancellation for an async optimizer job."""
     row = _optimizer_get_job(job_id)
     if not row or str(row.get("strategy_id")) != str(strategy_id):
@@ -4136,19 +4815,142 @@ async def cancel_strategy_optimization_job(strategy_id: str, job_id: str):
             status=status,  # type: ignore[arg-type]
             message=f"Job already {status}",
         )
-    updated = _optimizer_update_job(
+    updated = _optimizer_request_cancel(
         job_id,
-        {
-            "cancel_requested": True,
-            "message": "Cancel requested",
-        },
+        message="Force cancel requested" if force else "Cancel requested",
     ) or row
     return StrategyOptimizationJobCancelResponse(
         success=True,
         job_id=job_id,
         strategy_id=strategy_id,
         status=str(updated.get("status") or "running"),  # type: ignore[arg-type]
-        message="Cancellation requested",
+        message="Force cancellation requested" if force else "Cancellation requested",
+    )
+
+
+@router.get("/optimizer/jobs")
+async def list_optimizer_jobs():
+    """List in-memory optimizer jobs for operational troubleshooting."""
+    with _optimizer_jobs_lock:
+        rows: List[Dict[str, Any]] = []
+        for job_id in list(_optimizer_jobs.keys()):
+            row = _optimizer_reconcile_job_liveness_locked(job_id)
+            if row is not None:
+                rows.append(row)
+    rows.sort(key=lambda row: str(row.get("created_at") or ""), reverse=True)
+    jobs: List[Dict[str, Any]] = []
+    for row in rows:
+        jobs.append(
+            {
+                "job_id": str(row.get("job_id") or ""),
+                "strategy_id": str(row.get("strategy_id") or ""),
+                "status": str(row.get("status") or "failed"),
+                "cancel_requested": bool(row.get("cancel_requested")),
+                "message": str(row.get("message") or ""),
+                "progress_pct": float(row.get("progress_pct") or 0.0),
+                "created_at": row.get("created_at"),
+                "started_at": row.get("started_at"),
+                "completed_at": row.get("completed_at"),
+            }
+        )
+    return {"jobs": jobs, "total_count": len(jobs)}
+
+
+@router.post("/optimizer/cancel-all")
+async def cancel_all_optimizer_jobs(force: bool = Query(default=False)):
+    """Request cancellation for all queued/running optimizer jobs."""
+    with _optimizer_jobs_lock:
+        candidates: List[Dict[str, Any]] = []
+        for job_id in list(_optimizer_jobs.keys()):
+            row = _optimizer_reconcile_job_liveness_locked(job_id)
+            if row and str(row.get("status") or "") in {"queued", "running"}:
+                candidates.append(row)
+    cancelled: List[Dict[str, str]] = []
+    for row in candidates:
+        job_id = str(row.get("job_id") or "")
+        strategy_id = str(row.get("strategy_id") or "")
+        if not job_id or not strategy_id:
+            continue
+        _optimizer_request_cancel(
+            job_id,
+            message="Force cancel requested (bulk)" if force else "Cancel requested (bulk)",
+        )
+        cancelled.append({"job_id": job_id, "strategy_id": strategy_id})
+    return {
+        "success": True,
+        "force": bool(force),
+        "requested_count": len(cancelled),
+        "jobs": cancelled,
+    }
+
+
+def _read_optimization_history(
+    *,
+    db: Session,
+    strategy_ids: Optional[List[int]],
+    statuses: List[str],
+    limit_per_strategy: int,
+    limit_total: int,
+    include_payload: bool,
+) -> StrategyOptimizationHistoryResponse:
+    storage = StorageService(db)
+    rows = storage.list_recent_optimization_runs(
+        strategy_ids=strategy_ids,
+        statuses=statuses or None,
+        limit_per_strategy=limit_per_strategy,
+        limit_total=limit_total,
+    )
+    items = [
+        _to_optimization_history_item(row, include_payload=include_payload)
+        for row in rows
+    ]
+    return StrategyOptimizationHistoryResponse(
+        runs=items,
+        total_count=len(items),
+    )
+
+
+@router.get("/strategies/{strategy_id}/optimization-history", response_model=StrategyOptimizationHistoryResponse)
+async def get_strategy_optimization_history(
+    strategy_id: str,
+    limit: int = Query(default=20, ge=1, le=100),
+    statuses: Optional[str] = Query(default=None, description="Comma-separated statuses"),
+    include_payload: bool = Query(default=False),
+    db: Session = Depends(get_db),
+):
+    """List persisted optimization runs for one strategy."""
+    try:
+        strategy_id_int = int(strategy_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid strategy ID")
+    return _read_optimization_history(
+        db=db,
+        strategy_ids=[strategy_id_int],
+        statuses=_parse_optimizer_statuses(statuses),
+        limit_per_strategy=limit,
+        limit_total=limit,
+        include_payload=include_payload,
+    )
+
+
+@router.get("/optimizer/history", response_model=StrategyOptimizationHistoryResponse)
+async def get_optimizer_history(
+    strategy_ids: Optional[str] = Query(default=None, description="Comma-separated strategy IDs"),
+    limit_per_strategy: int = Query(default=10, ge=1, le=100),
+    limit_total: int = Query(default=200, ge=1, le=500),
+    statuses: Optional[str] = Query(default=None, description="Comma-separated statuses"),
+    include_payload: bool = Query(default=False),
+    db: Session = Depends(get_db),
+):
+    """List persisted optimization runs across one or more strategies."""
+    parsed_ids = _parse_strategy_ids_csv(strategy_ids)
+    return _read_optimization_history(
+        db=db,
+        strategy_ids=parsed_ids or None,
+        statuses=_parse_optimizer_statuses(statuses),
+        limit_per_strategy=limit_per_strategy,
+        limit_total=limit_total,
+        include_payload=include_payload,
     )
 
 

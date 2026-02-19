@@ -16,6 +16,7 @@ import {
   startStrategyOptimization,
   getStrategyOptimizationStatus,
   cancelStrategyOptimization,
+  getOptimizerHistory,
   tuneParameter,
   getTradingPreferences,
   getScreenerAssets,
@@ -37,6 +38,7 @@ import {
   BacktestLiveParityReport,
   StrategyOptimizationResult,
   StrategyOptimizationJobStatus,
+  StrategyOptimizationHistoryItem,
   StrategyParameter,
   AssetTypePreference,
   TradingPreferences,
@@ -55,22 +57,26 @@ const STRATEGY_LIMITS = {
   backtestCapitalMin: 100,
   backtestCapitalMax: 100_000_000,
 };
-const OPTIMIZER_PROFILE_DEFAULTS: Record<'fast' | 'balanced' | 'robust', { iterations: number; minTrades: number }> = {
-  fast: { iterations: 24, minTrades: 8 },
-  balanced: { iterations: 60, minTrades: 15 },
-  robust: { iterations: 140, minTrades: 25 },
+const OPTIMIZER_PROFILE_DEFAULTS: Record<'fast' | 'balanced' | 'robust', { iterations: number; minTrades: number; ensembleRuns: number; maxWorkers: number }> = {
+  fast: { iterations: 24, minTrades: 8, ensembleRuns: 8, maxWorkers: 3 },
+  balanced: { iterations: 48, minTrades: 15, ensembleRuns: 16, maxWorkers: 4 },
+  robust: { iterations: 72, minTrades: 25, ensembleRuns: 24, maxWorkers: 5 },
 };
 const WORKSPACE_LAST_APPLIED_AT_KEY = 'stocksbot.workspace.lastAppliedAt';
 const WORKSPACE_SNAPSHOT_KEY = 'stocksbot.workspace.snapshot';
 const SCREENER_PRESET_UNIVERSE_MODE_KEY = 'stocksbot.screener.preset.universeMode';
 const SCREENER_PRESET_SEED_ONLY_KEY = 'stocksbot.screener.preset.seedOnly';
 const STRATEGY_ANALYSIS_UNIVERSE_MODE_KEY = 'stocksbot.strategy.analysis.universeMode';
+const STRATEGY_ANALYSIS_UNIVERSE_MODES_KEY = 'stocksbot.strategy.analysis.universeModes';
 const STRATEGY_SELECTED_ID_KEY = 'stocksbot.strategy.selectedId';
 const STRATEGY_OPTIMIZER_JOBS_KEY = 'stocksbot.strategy.optimizer.jobs';
+const OPTIMIZER_STATUS_POLL_INTERVAL_MS = 1000;
+const OPTIMIZER_STATUS_RETRY_INTERVAL_MS = 3000;
 const USD_FORMATTER = new Intl.NumberFormat('en-US', {
   style: 'currency',
   currency: 'USD',
 });
+type AnalysisUniverseMode = 'workspace_universe' | 'strategy_symbols';
 
 interface RunnerInputSummary {
   preferences: TradingPreferences | null;
@@ -141,6 +147,49 @@ function formatDurationSeconds(seconds: number | null | undefined): string {
 function safeNumber(value: unknown, fallback = 0): number {
   const parsed = typeof value === 'number' ? value : Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function readHistoryNumber(source: Record<string, unknown> | null | undefined, key: string, fallback = 0): number {
+  if (!source) return fallback;
+  const raw = source[key];
+  const parsed = typeof raw === 'number' ? raw : Number(raw);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function readHistoryText(source: Record<string, unknown> | null | undefined, key: string, fallback = ''): string {
+  if (!source) return fallback;
+  const raw = source[key];
+  return raw == null ? fallback : String(raw);
+}
+
+function formatParameterPreview(parameters: Record<string, number> | null | undefined, maxItems = 3): string {
+  if (!parameters) return 'n/a';
+  const entries = Object.entries(parameters).filter(([, value]) => Number.isFinite(Number(value)));
+  if (entries.length === 0) return 'n/a';
+  const preview = entries
+    .slice(0, maxItems)
+    .map(([name, value]) => `${name}=${Number(value).toFixed(3)}`)
+    .join(', ');
+  return entries.length > maxItems ? `${preview}, ...` : preview;
+}
+
+function getErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error || 'Unknown error');
+}
+
+function isOptimizerJobMissingError(error: unknown): boolean {
+  const message = getErrorMessage(error).toLowerCase();
+  return message.includes('optimization job not found') || message.includes('backend returned 404');
+}
+
+function isOptimizerStatusTransientError(error: unknown): boolean {
+  const message = getErrorMessage(error).toLowerCase();
+  if (!message) return false;
+  if (message.includes('timed out')) return true;
+  if (message.includes('failed to fetch')) return true;
+  if (message.includes('networkerror')) return true;
+  if (message.includes('backend returned 502') || message.includes('backend returned 503') || message.includes('backend returned 504')) return true;
+  return false;
 }
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, fallback: T): Promise<T> {
@@ -219,16 +268,59 @@ function readPresetUniverseModeSetting(): 'seed_only' | 'seed_guardrail_blend' |
   }
 }
 
-function readAnalysisUniverseModeSetting(): 'workspace_universe' | 'strategy_symbols' {
+function normalizeAnalysisUniverseMode(value: unknown): AnalysisUniverseMode | null {
+  if (value === 'strategy_symbols' || value === 'workspace_universe') {
+    return value;
+  }
+  return null;
+}
+
+function readLegacyAnalysisUniverseModeSetting(): AnalysisUniverseMode {
   if (typeof window === 'undefined') return 'workspace_universe';
   try {
-    const stored = window.localStorage.getItem(STRATEGY_ANALYSIS_UNIVERSE_MODE_KEY);
-    if (stored === 'strategy_symbols' || stored === 'workspace_universe') {
-      return stored;
-    }
-    return 'workspace_universe';
+    return normalizeAnalysisUniverseMode(window.localStorage.getItem(STRATEGY_ANALYSIS_UNIVERSE_MODE_KEY)) || 'workspace_universe';
   } catch {
     return 'workspace_universe';
+  }
+}
+
+function readAnalysisUniverseModeStore(): Record<string, AnalysisUniverseMode> {
+  if (typeof window === 'undefined') return {};
+  try {
+    const raw = window.localStorage.getItem(STRATEGY_ANALYSIS_UNIVERSE_MODES_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    if (!parsed || typeof parsed !== 'object') return {};
+    const normalized: Record<string, AnalysisUniverseMode> = {};
+    Object.entries(parsed).forEach(([strategyId, mode]) => {
+      const normalizedMode = normalizeAnalysisUniverseMode(mode);
+      if (strategyId && normalizedMode) {
+        normalized[strategyId] = normalizedMode;
+      }
+    });
+    return normalized;
+  } catch {
+    return {};
+  }
+}
+
+function readAnalysisUniverseModeForStrategy(strategyId: string | null | undefined): AnalysisUniverseMode {
+  if (!strategyId) return readLegacyAnalysisUniverseModeSetting();
+  const store = readAnalysisUniverseModeStore();
+  return store[strategyId] || readLegacyAnalysisUniverseModeSetting();
+}
+
+function writeAnalysisUniverseModeForStrategy(strategyId: string, mode: AnalysisUniverseMode): void {
+  if (typeof window === 'undefined') return;
+  if (!strategyId) return;
+  try {
+    const store = readAnalysisUniverseModeStore();
+    store[strategyId] = mode;
+    window.localStorage.setItem(STRATEGY_ANALYSIS_UNIVERSE_MODES_KEY, JSON.stringify(store));
+    // Keep legacy key aligned so first-run fallback remains deterministic.
+    window.localStorage.setItem(STRATEGY_ANALYSIS_UNIVERSE_MODE_KEY, mode);
+  } catch {
+    // ignore localStorage write failures
   }
 }
 
@@ -460,8 +552,11 @@ function StrategyPage() {
   const [optimizerJobStatus, setOptimizerJobStatus] = useState<StrategyOptimizationJobStatus | null>(null);
   const [optimizerJobId, setOptimizerJobId] = useState<string | null>(null);
   const [optimizerProfile, setOptimizerProfile] = useState<'fast' | 'balanced' | 'robust'>('balanced');
+  const [optimizerMode, setOptimizerMode] = useState<'baseline' | 'ensemble'>('baseline');
   const [optimizerLookbackYears, setOptimizerLookbackYears] = useState<'custom' | '1' | '2' | '3' | '5'>('custom');
   const [optimizerIterations, setOptimizerIterations] = useState('36');
+  const [optimizerEnsembleRuns, setOptimizerEnsembleRuns] = useState('16');
+  const [optimizerMaxWorkers, setOptimizerMaxWorkers] = useState('4');
   const [optimizerMinTrades, setOptimizerMinTrades] = useState('12');
   const [optimizerObjective, setOptimizerObjective] = useState<'balanced' | 'sharpe' | 'return'>('balanced');
   const [optimizerStrictMinTrades, setOptimizerStrictMinTrades] = useState(false);
@@ -470,7 +565,12 @@ function StrategyPage() {
   const [optimizerRandomSeed, setOptimizerRandomSeed] = useState('');
   const [optimizerApplyLoading, setOptimizerApplyLoading] = useState(false);
   const [optimizerApplyMessage, setOptimizerApplyMessage] = useState<{ type: 'success' | 'error' | 'info'; text: string } | null>(null);
-  const [analysisUniverseMode, setAnalysisUniverseMode] = useState<'workspace_universe' | 'strategy_symbols'>(() => readAnalysisUniverseModeSetting());
+  const [optimizerHistoryLoading, setOptimizerHistoryLoading] = useState(false);
+  const [optimizerHistoryError, setOptimizerHistoryError] = useState<string | null>(null);
+  const [optimizerHistoryRuns, setOptimizerHistoryRuns] = useState<StrategyOptimizationHistoryItem[]>([]);
+  const [compareStrategyIds, setCompareStrategyIds] = useState<string[]>([]);
+  const [selectedHistoryRunByStrategy, setSelectedHistoryRunByStrategy] = useState<Record<string, string>>({});
+  const [analysisUniverseMode, setAnalysisUniverseMode] = useState<AnalysisUniverseMode>(() => readLegacyAnalysisUniverseModeSetting());
   const analysisUsesWorkspaceUniverse = analysisUniverseMode === 'workspace_universe';
   const [detailTab, setDetailTab] = useState<'metrics' | 'config' | 'backtest'>('metrics');
   const activeStrategyCount = strategies.filter((s) => s.status === StrategyStatus.ACTIVE).length;
@@ -530,6 +630,8 @@ function StrategyPage() {
     const defaults = OPTIMIZER_PROFILE_DEFAULTS[optimizerProfile];
     setOptimizerIterations(String(defaults.iterations));
     setOptimizerMinTrades(String(defaults.minTrades));
+    setOptimizerEnsembleRuns(String(defaults.ensembleRuns));
+    setOptimizerMaxWorkers(String(defaults.maxWorkers));
   }, [optimizerProfile]);
 
   useEffect(() => {
@@ -549,13 +651,9 @@ function StrategyPage() {
   }, [optimizerLookbackYears, backtestEndDate]);
 
   useEffect(() => {
-    if (typeof window === 'undefined') return;
-    try {
-      window.localStorage.setItem(STRATEGY_ANALYSIS_UNIVERSE_MODE_KEY, analysisUniverseMode);
-    } catch {
-      // ignore localStorage write failures
-    }
-  }, [analysisUniverseMode]);
+    if (!selectedStrategy) return;
+    writeAnalysisUniverseModeForStrategy(selectedStrategy.id, analysisUniverseMode);
+  }, [analysisUniverseMode, selectedStrategy]);
 
   useEffect(() => {
     const readLastApplied = () => {
@@ -877,12 +975,29 @@ function StrategyPage() {
         if (!isTerminal) {
           timer = setTimeout(() => {
             void poll();
-          }, 1000);
+          }, OPTIMIZER_STATUS_POLL_INTERVAL_MS);
         }
       } catch (err) {
         if (cancelled) return;
-        setOptimizerLoading(false);
-        setOptimizerError(err instanceof Error ? err.message : 'Failed to fetch optimizer status');
+        if (isOptimizerJobMissingError(err)) {
+          clearPersistedOptimizerJobId(selectedStrategy.id);
+          setOptimizerLoading(false);
+          setOptimizerJobId(null);
+          setOptimizerJobStatus(null);
+          setOptimizerError('Optimizer job no longer exists on backend. Start a new run.');
+          return;
+        }
+        const message = getErrorMessage(err);
+        const transient = isOptimizerStatusTransientError(err);
+        setOptimizerError(
+          transient
+            ? `Status temporarily unavailable (${message}). Retrying...`
+            : `Status check failed (${message}). Retrying...`,
+        );
+        setOptimizerLoading(true);
+        timer = setTimeout(() => {
+          void poll();
+        }, OPTIMIZER_STATUS_RETRY_INTERVAL_MS);
       }
     };
     void poll();
@@ -932,13 +1047,110 @@ function StrategyPage() {
       if (isTerminal) {
         clearPersistedOptimizerJobId(strategyId);
       }
-    } catch {
-      clearPersistedOptimizerJobId(strategyId);
-      setOptimizerLoading(false);
-      setOptimizerJobId(null);
-      setOptimizerJobStatus(null);
+    } catch (err) {
+      if (isOptimizerJobMissingError(err)) {
+        clearPersistedOptimizerJobId(strategyId);
+        setOptimizerLoading(false);
+        setOptimizerJobId(null);
+        setOptimizerJobStatus(null);
+        setOptimizerError('Saved optimizer job no longer exists on backend.');
+        return;
+      }
+      setOptimizerLoading(true);
+      setOptimizerError(`Reconnecting optimizer status... (${getErrorMessage(err)})`);
     }
   }, []);
+
+  const loadOptimizationHistory = useCallback(async (
+    primaryStrategyId?: string,
+    compareIds?: string[],
+  ) => {
+    const baseStrategyId = primaryStrategyId || selectedStrategy?.id;
+    if (!baseStrategyId) {
+      setOptimizerHistoryRuns([]);
+      setOptimizerHistoryError(null);
+      setOptimizerHistoryLoading(false);
+      return;
+    }
+    const peers = (compareIds ?? compareStrategyIds)
+      .filter((id) => id && id !== baseStrategyId);
+    const strategyScope = Array.from(new Set([baseStrategyId, ...peers]));
+    if (strategyScope.length === 0) {
+      setOptimizerHistoryRuns([]);
+      setOptimizerHistoryError(null);
+      setOptimizerHistoryLoading(false);
+      return;
+    }
+    try {
+      setOptimizerHistoryLoading(true);
+      setOptimizerHistoryError(null);
+      const response = await getOptimizerHistory(strategyScope, 20, Math.max(40, strategyScope.length * 30));
+      const runs = response.runs || [];
+      setOptimizerHistoryRuns(runs);
+      setSelectedHistoryRunByStrategy((prev) => {
+        const next = { ...prev };
+        strategyScope.forEach((strategyId) => {
+          const strategyRuns = runs.filter((run) => run.strategy_id === strategyId);
+          if (strategyRuns.length === 0) {
+            delete next[strategyId];
+            return;
+          }
+          const selectedRunId = next[strategyId];
+          if (selectedRunId && strategyRuns.some((run) => run.run_id === selectedRunId)) {
+            return;
+          }
+          next[strategyId] = strategyRuns[0].run_id;
+        });
+        Object.keys(next).forEach((strategyId) => {
+          if (!strategyScope.includes(strategyId)) {
+            delete next[strategyId];
+          }
+        });
+        return next;
+      });
+    } catch (err) {
+      setOptimizerHistoryError(err instanceof Error ? err.message : 'Failed to load optimization history');
+      setOptimizerHistoryRuns([]);
+    } finally {
+      setOptimizerHistoryLoading(false);
+    }
+  }, [compareStrategyIds, selectedStrategy?.id]);
+
+  useEffect(() => {
+    if (!selectedStrategy) {
+      setCompareStrategyIds([]);
+      setSelectedHistoryRunByStrategy({});
+      setOptimizerHistoryRuns([]);
+      setOptimizerHistoryError(null);
+      return;
+    }
+    const validIds = new Set(strategies.map((strategy) => strategy.id));
+    const filteredCompareIds = compareStrategyIds.filter((id) => validIds.has(id) && id !== selectedStrategy.id);
+    if (filteredCompareIds.length !== compareStrategyIds.length) {
+      setCompareStrategyIds(filteredCompareIds);
+      return;
+    }
+    void loadOptimizationHistory(selectedStrategy.id, filteredCompareIds);
+  }, [
+    selectedStrategy,
+    compareStrategyIds,
+    strategies,
+    loadOptimizationHistory,
+  ]);
+
+  useEffect(() => {
+    if (!selectedStrategy || !optimizerJobStatus) return;
+    const terminal = optimizerJobStatus.status === 'completed'
+      || optimizerJobStatus.status === 'failed'
+      || optimizerJobStatus.status === 'canceled';
+    if (!terminal) return;
+    void loadOptimizationHistory(selectedStrategy.id);
+  }, [
+    selectedStrategy,
+    optimizerJobStatus?.status,
+    optimizerJobStatus?.completed_at,
+    loadOptimizationHistory,
+  ]);
 
   // Auto-refresh metrics every 10 seconds when a strategy is selected
   useEffect(() => {
@@ -954,6 +1166,7 @@ function StrategyPage() {
   const handleSelectStrategy = async (strategy: Strategy) => {
     persistSelectedStrategyId(strategy.id);
     setSelectedStrategy(strategy);
+    setAnalysisUniverseMode(readAnalysisUniverseModeForStrategy(strategy.id));
     setDetailTab('metrics');
     setStrategyConfig(null);
     setStrategyMetrics(null);
@@ -963,6 +1176,10 @@ function StrategyPage() {
     setOptimizerError(null);
     setOptimizerJobStatus(null);
     setOptimizerJobId(null);
+    setCompareStrategyIds([]);
+    setOptimizerHistoryRuns([]);
+    setOptimizerHistoryError(null);
+    setSelectedHistoryRunByStrategy({});
 
     await Promise.all([
       loadStrategyConfig(strategy.id),
@@ -977,6 +1194,7 @@ function StrategyPage() {
       let startPayload:
         | {
           use_workspace_universe: boolean;
+          target_strategy_id?: string;
           asset_type: 'stock' | 'etf';
           screener_mode: 'most_active' | 'preset';
           stock_preset: 'weekly_optimized' | 'three_to_five_weekly' | 'monthly_optimized' | 'small_budget_weekly' | 'micro_budget';
@@ -991,10 +1209,15 @@ function StrategyPage() {
         }
         | undefined;
       if (analysisUsesWorkspaceUniverse) {
+        if (!selectedStrategy) {
+          await showErrorNotification('Start Blocked', 'Select a strategy before using Workspace Universe mode for runner start.');
+          return;
+        }
         const prefs = await getTradingPreferences();
         const resolved = resolveWorkspaceUniverseInputs(prefs);
         startPayload = {
           ...resolved.request,
+          target_strategy_id: selectedStrategy.id,
         };
       }
       await loadRunnerInputSummary();
@@ -1365,6 +1588,8 @@ function StrategyPage() {
       const parsedContributionAmount = Math.max(0, Number.parseFloat(backtestContributionAmount) || 0);
       const contributionFrequency = parsedContributionAmount > 0 ? backtestContributionFrequency : 'none';
       const parsedIterations = Math.max(8, Math.min(240, Math.round(Number.parseFloat(optimizerIterations) || 36)));
+      const parsedEnsembleRuns = Math.max(1, Math.min(64, Math.round(Number.parseFloat(optimizerEnsembleRuns) || 16)));
+      const parsedMaxWorkers = Math.max(1, Math.min(6, Math.round(Number.parseFloat(optimizerMaxWorkers) || 4)));
       const parsedMinTrades = Math.max(0, Math.min(1000, Math.round(Number.parseFloat(optimizerMinTrades) || 12)));
       const parsedWalkForwardFolds = Math.max(2, Math.min(8, Math.round(Number.parseFloat(optimizerWalkForwardFolds) || 3)));
       const parsedSeed = optimizerRandomSeed.trim()
@@ -1411,6 +1636,9 @@ function StrategyPage() {
         strict_min_trades: optimizerStrictMinTrades,
         walk_forward_enabled: optimizerWalkForwardEnabled,
         walk_forward_folds: parsedWalkForwardFolds,
+        ensemble_mode: optimizerMode === 'ensemble',
+        ensemble_runs: parsedEnsembleRuns,
+        max_workers: parsedMaxWorkers,
         random_seed: Number.isFinite(parsedSeed) ? parsedSeed : undefined,
       });
       setOptimizerJobId(start.job_id);
@@ -1449,8 +1677,8 @@ function StrategyPage() {
   const handleCancelOptimizer = async () => {
     if (!selectedStrategy || !optimizerJobId) return;
     try {
-      await cancelStrategyOptimization(selectedStrategy.id, optimizerJobId);
-      await showSuccessNotification('Cancel Requested', 'Optimizer cancellation requested.');
+      await cancelStrategyOptimization(selectedStrategy.id, optimizerJobId, true);
+      await showSuccessNotification('Cancel Requested', 'Force cancellation requested. Current optimizer step will stop shortly.');
     } catch (err) {
       await showErrorNotification('Cancel Error', err instanceof Error ? err.message : 'Failed to cancel optimizer');
     }
@@ -1463,6 +1691,13 @@ function StrategyPage() {
     }
     if (!optimizerResult) {
       setOptimizerApplyMessage({ type: 'error', text: 'No optimizer result available yet. Run optimizer first.' });
+      return;
+    }
+    if (optimizerResult.strategy_id !== selectedStrategy.id) {
+      setOptimizerApplyMessage({
+        type: 'error',
+        text: 'Selected strategy does not match this optimizer result. Re-run optimizer for the selected strategy.',
+      });
       return;
     }
     try {
@@ -1630,6 +1865,60 @@ function StrategyPage() {
       stopLossPct: savedParameterMap.stop_loss_pct ?? 2,
     })
     : null;
+  const compareCandidateStrategies = selectedStrategy
+    ? strategies.filter((strategy) => strategy.id !== selectedStrategy.id)
+    : [];
+  const historyRunsByStrategy = optimizerHistoryRuns.reduce((acc, run) => {
+    if (!acc[run.strategy_id]) {
+      acc[run.strategy_id] = [];
+    }
+    acc[run.strategy_id].push(run);
+    return acc;
+  }, {} as Record<string, StrategyOptimizationHistoryItem[]>);
+  const compareStrategyScope = selectedStrategy
+    ? [selectedStrategy.id, ...compareStrategyIds.filter((id) => id !== selectedStrategy.id)]
+    : [];
+  const compareRows = compareStrategyScope
+    .map((strategyId) => {
+      const strategy = strategies.find((row) => row.id === strategyId) || null;
+      const runs = historyRunsByStrategy[strategyId] || [];
+      const selectedRunId = selectedHistoryRunByStrategy[strategyId];
+      const selectedRun = (selectedRunId
+        ? runs.find((run) => run.run_id === selectedRunId)
+        : null) || runs[0] || null;
+      return {
+        strategyId,
+        strategy,
+        runs,
+        selectedRun,
+        selectedRunId: selectedRun ? selectedRun.run_id : '',
+      };
+    })
+    .filter((row) => row.strategy !== null);
+
+  const toggleCompareStrategy = (strategyId: string) => {
+    if (!selectedStrategy || strategyId === selectedStrategy.id) return;
+    setCompareStrategyIds((prev) => {
+      if (prev.includes(strategyId)) {
+        const next = prev.filter((id) => id !== strategyId);
+        setSelectedHistoryRunByStrategy((current) => {
+          const updated = { ...current };
+          delete updated[strategyId];
+          return updated;
+        });
+        return next;
+      }
+      if (prev.length >= 4) return prev;
+      return [...prev, strategyId];
+    });
+  };
+
+  const handleSelectHistoryRun = (strategyId: string, runId: string) => {
+    setSelectedHistoryRunByStrategy((prev) => ({
+      ...prev,
+      [strategyId]: runId,
+    }));
+  };
 
   return (
     <div className="p-8">
@@ -1759,18 +2048,18 @@ function StrategyPage() {
             Start Runner executes active strategy symbols and applies risk/execution controls shown here.
           </p>
           <p className="mt-1 text-xs text-blue-200">
-            Workspace Universe mode resolves symbols from Screener at runner start without overwriting hardened strategy symbol lists.
+            Workspace Universe mode resolves symbols from Screener for the selected strategy only at runner start.
           </p>
           <div className="mt-3 grid grid-cols-1 gap-2 md:grid-cols-3">
             <label className="text-xs text-blue-100">
               Runner Universe Source
               <select
                 value={analysisUniverseMode}
-                onChange={(e) => setAnalysisUniverseMode(e.target.value as 'workspace_universe' | 'strategy_symbols')}
+                onChange={(e) => setAnalysisUniverseMode(e.target.value as AnalysisUniverseMode)}
                 className="mt-1 w-full rounded border border-blue-800 bg-blue-950/50 px-3 py-2 text-blue-100"
               >
                 <option value="strategy_symbols">Strategy Symbols (Hardened)</option>
-                <option value="workspace_universe">Workspace Universe (Override on Start)</option>
+                <option value="workspace_universe">Workspace Universe (Selected Strategy Override)</option>
               </select>
             </label>
             <div className="rounded bg-blue-950/40 px-3 py-2 text-xs text-blue-100">
@@ -2382,7 +2671,18 @@ function StrategyPage() {
                         />
                       </label>
                     </div>
-                    <div className="grid grid-cols-1 md:grid-cols-4 gap-3 mb-3">
+                    <div className="grid grid-cols-1 md:grid-cols-5 gap-3 mb-3">
+                      <label className="text-xs text-gray-300">
+                        Optimizer Mode
+                        <select
+                          value={optimizerMode}
+                          onChange={(e) => setOptimizerMode(e.target.value as 'baseline' | 'ensemble')}
+                          className="mt-1 bg-gray-700 text-white px-3 py-2 rounded border border-gray-600 w-full"
+                        >
+                          <option value="baseline">Baseline</option>
+                          <option value="ensemble">Monte Carlo Ensemble</option>
+                        </select>
+                      </label>
                       <label className="text-xs text-gray-300">
                         Optimization Profile
                         <select
@@ -2429,7 +2729,7 @@ function StrategyPage() {
                     <p className="text-[11px] text-gray-400 mb-2">
                       Backtest/optimizer symbol source is controlled from Runner Input Summary (Runner Universe Source).
                     </p>
-                    <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mb-3">
+                    <div className="grid grid-cols-1 md:grid-cols-5 gap-3 mb-3">
                       <label className="text-xs text-gray-300">
                         Iterations
                         <input
@@ -2450,6 +2750,38 @@ function StrategyPage() {
                           value={optimizerMinTrades}
                           onChange={(e) => setOptimizerMinTrades(e.target.value)}
                           className="mt-1 bg-gray-700 text-white px-3 py-2 rounded border border-gray-600 w-full"
+                        />
+                      </label>
+                      <label className="text-xs text-gray-300">
+                        Ensemble Runs
+                        <input
+                          type="number"
+                          min={1}
+                          max={64}
+                          disabled={optimizerMode !== 'ensemble'}
+                          value={optimizerEnsembleRuns}
+                          onChange={(e) => setOptimizerEnsembleRuns(e.target.value)}
+                          className={`mt-1 px-3 py-2 rounded border w-full ${
+                            optimizerMode === 'ensemble'
+                              ? 'bg-gray-700 text-white border-gray-600'
+                              : 'bg-gray-800 text-gray-500 border-gray-700'
+                          }`}
+                        />
+                      </label>
+                      <label className="text-xs text-gray-300">
+                        Max Workers
+                        <input
+                          type="number"
+                          min={1}
+                          max={6}
+                          disabled={optimizerMode !== 'ensemble'}
+                          value={optimizerMaxWorkers}
+                          onChange={(e) => setOptimizerMaxWorkers(e.target.value)}
+                          className={`mt-1 px-3 py-2 rounded border w-full ${
+                            optimizerMode === 'ensemble'
+                              ? 'bg-gray-700 text-white border-gray-600'
+                              : 'bg-gray-800 text-gray-500 border-gray-700'
+                          }`}
                         />
                       </label>
                       <label className="text-xs text-gray-300">
@@ -2527,7 +2859,7 @@ function StrategyPage() {
                     </div>
                     <p className="text-[11px] text-gray-400 mb-2">
                       Guidance: `fast` for quick screening, `balanced` for regular tuning, `robust` for deeper search on stable universes.
-                      Increase `iterations` when results are unstable across reruns; raise `min trades` to avoid overfitting tiny sample sizes.
+                      In ensemble mode, total work ~= `iterations x ensemble runs`; keep `max workers` at 3-5 on Mac for stability.
                     </p>
                     {optimizerError && (
                       <p className="text-red-300 text-xs mb-3">{optimizerError}</p>
@@ -2558,6 +2890,8 @@ function StrategyPage() {
                           Evaluated {optimizerResult.evaluated_iterations}/{optimizerResult.requested_iterations} candidates.
                           {' '}
                           Objective: {optimizerResult.objective.replace(/_/g, ' ')}.
+                          {' '}
+                          Mode: {optimizerResult.ensemble_mode ? `ensemble (${optimizerResult.ensemble_runs ?? 1} runs, ${optimizerResult.max_workers_used ?? 1} workers)` : 'baseline'}.
                           {' '}
                           Min trades target: {optimizerResult.min_trades_target}
                           {' '}
@@ -2688,6 +3022,136 @@ function StrategyPage() {
                             {optimizerApplyMessage.text}
                           </p>
                         )}
+                      </div>
+                    )}
+                  </div>
+                  <div className="mb-4 rounded border border-gray-700 bg-gray-900/40 p-4">
+                    <div className="flex items-center justify-between gap-3 mb-3">
+                      <div>
+                        <h4 className="text-sm font-semibold text-gray-100">Optimization History Compare</h4>
+                        <p className="text-xs text-gray-400">
+                          Compare optimizer inputs and key outcomes across the selected strategy and peer strategies.
+                        </p>
+                      </div>
+                      <button
+                        onClick={() => selectedStrategy && loadOptimizationHistory(selectedStrategy.id)}
+                        disabled={optimizerHistoryLoading || !selectedStrategy}
+                        className={`px-3 py-2 rounded text-xs font-medium ${
+                          optimizerHistoryLoading || !selectedStrategy
+                            ? 'bg-gray-700 text-gray-500 cursor-not-allowed'
+                            : 'bg-gray-700 hover:bg-gray-600 text-gray-100'
+                        }`}
+                      >
+                        {optimizerHistoryLoading ? 'Refreshing...' : 'Refresh History'}
+                      </button>
+                    </div>
+                    {selectedStrategy && compareCandidateStrategies.length > 0 && (
+                      <div className="mb-3">
+                        <div className="text-xs text-gray-400 mb-2">Compare with up to 4 additional strategies:</div>
+                        <div className="flex flex-wrap gap-2">
+                          {compareCandidateStrategies.map((strategy) => (
+                            <label
+                              key={`compare-toggle-${strategy.id}`}
+                              className="inline-flex items-center gap-2 rounded border border-gray-700 bg-gray-800 px-2 py-1 text-xs text-gray-300"
+                            >
+                              <input
+                                type="checkbox"
+                                checked={compareStrategyIds.includes(strategy.id)}
+                                onChange={() => toggleCompareStrategy(strategy.id)}
+                                className="h-3.5 w-3.5"
+                              />
+                              <span>{strategy.name}</span>
+                            </label>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                    {optimizerHistoryError && (
+                      <p className="text-xs text-red-300 mb-2">{optimizerHistoryError}</p>
+                    )}
+                    {compareRows.length === 0 ? (
+                      <p className="text-xs text-gray-400">
+                        No optimization history available yet for the selected strategy set.
+                      </p>
+                    ) : (
+                      <div className="space-y-3">
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                          {compareRows.map((row) => (
+                            <label
+                              key={`history-selector-${row.strategyId}`}
+                              className="rounded border border-gray-700 bg-gray-800 px-3 py-2 text-xs text-gray-300"
+                            >
+                              <span className="block text-gray-400 mb-1">{row.strategy?.name || row.strategyId}</span>
+                              <select
+                                value={row.selectedRunId}
+                                onChange={(e) => handleSelectHistoryRun(row.strategyId, e.target.value)}
+                                disabled={row.runs.length === 0}
+                                className="bg-gray-700 text-white px-2 py-1 rounded border border-gray-600 w-full"
+                              >
+                                {row.runs.length === 0 ? (
+                                  <option value="">No runs</option>
+                                ) : (
+                                  row.runs.map((run) => (
+                                    <option key={run.run_id} value={run.run_id}>
+                                      {new Date(run.created_at).toLocaleString()} | {run.status.toUpperCase()} | {readHistoryText((run.request_summary || {}) as Record<string, unknown>, 'objective', 'balanced')}
+                                    </option>
+                                  ))
+                                )}
+                              </select>
+                            </label>
+                          ))}
+                        </div>
+                        <div className="overflow-auto rounded border border-gray-700">
+                          <table className="w-full text-xs text-gray-300">
+                            <thead className="bg-gray-900 text-gray-400">
+                              <tr>
+                                <th className="px-2 py-1 text-left">Strategy</th>
+                                <th className="px-2 py-1 text-left">Status</th>
+                                <th className="px-2 py-1 text-left">Date Range</th>
+                                <th className="px-2 py-1 text-right">Score</th>
+                                <th className="px-2 py-1 text-right">Return</th>
+                                <th className="px-2 py-1 text-right">Sharpe</th>
+                                <th className="px-2 py-1 text-right">Max DD</th>
+                                <th className="px-2 py-1 text-right">Trades</th>
+                                <th className="px-2 py-1 text-right">Win %</th>
+                                <th className="px-2 py-1 text-right">Symbols</th>
+                                <th className="px-2 py-1 text-left">Input</th>
+                                <th className="px-2 py-1 text-left">Recommended Params</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {compareRows.map((row) => {
+                                const run = row.selectedRun;
+                                const requestSummary = ((run?.request_summary || {}) as Record<string, unknown>);
+                                const metricsSummary = ((run?.metrics_summary || {}) as Record<string, unknown>);
+                                const objective = readHistoryText(requestSummary, 'objective', 'n/a');
+                                const iterations = readHistoryNumber(metricsSummary, 'evaluated_iterations', readHistoryNumber(requestSummary, 'iterations', 0));
+                                const minTrades = readHistoryNumber(requestSummary, 'min_trades', 0);
+                                const startDate = readHistoryText(requestSummary, 'start_date', '');
+                                const endDate = readHistoryText(requestSummary, 'end_date', '');
+                                const inputSummary = `${objective}, ${iterations} iter, min trades ${minTrades}`;
+                                return (
+                                  <tr key={`compare-row-${row.strategyId}`} className="border-t border-gray-800">
+                                    <td className="px-2 py-1">{row.strategy?.name || row.strategyId}</td>
+                                    <td className="px-2 py-1">{run ? run.status.toUpperCase() : 'N/A'}</td>
+                                    <td className="px-2 py-1 font-mono">{startDate && endDate ? `${startDate} to ${endDate}` : 'n/a'}</td>
+                                    <td className="px-2 py-1 text-right">{readHistoryNumber(metricsSummary, 'score', 0).toFixed(2)}</td>
+                                    <td className={`px-2 py-1 text-right ${readHistoryNumber(metricsSummary, 'total_return', 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                                      {readHistoryNumber(metricsSummary, 'total_return', 0).toFixed(2)}%
+                                    </td>
+                                    <td className="px-2 py-1 text-right">{readHistoryNumber(metricsSummary, 'sharpe_ratio', 0).toFixed(2)}</td>
+                                    <td className="px-2 py-1 text-right">{readHistoryNumber(metricsSummary, 'max_drawdown', 0).toFixed(2)}%</td>
+                                    <td className="px-2 py-1 text-right">{Math.round(readHistoryNumber(metricsSummary, 'total_trades', 0))}</td>
+                                    <td className="px-2 py-1 text-right">{readHistoryNumber(metricsSummary, 'win_rate', 0).toFixed(1)}%</td>
+                                    <td className="px-2 py-1 text-right">{Math.round(readHistoryNumber(metricsSummary, 'recommended_symbol_count', run?.recommended_symbols.length ?? 0))}</td>
+                                    <td className="px-2 py-1">{inputSummary}</td>
+                                    <td className="px-2 py-1">{formatParameterPreview(run?.recommended_parameters)}</td>
+                                  </tr>
+                                );
+                              })}
+                            </tbody>
+                          </table>
+                        </div>
                       </div>
                     )}
                   </div>

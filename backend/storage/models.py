@@ -233,3 +233,40 @@ class PortfolioSnapshot(Base):
     unrealized_pnl = Column(Float, nullable=False, default=0.0)
     realized_pnl_total = Column(Float, nullable=False, default=0.0)
     open_positions = Column(Integer, nullable=False, default=0)
+
+
+class OptimizationRun(Base):
+    """
+    Persisted optimization run history for per-strategy comparisons.
+    """
+    __tablename__ = "optimization_runs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    run_id = Column(String(64), nullable=False, unique=True, index=True)
+    strategy_id = Column(Integer, nullable=False, index=True)
+    strategy_name = Column(String(100), nullable=False, default="")
+    source = Column(String(16), nullable=False, default="sync")  # sync | async
+    status = Column(String(16), nullable=False, index=True)  # queued | running | completed | failed | canceled
+    job_id = Column(String(64), nullable=True, index=True)
+
+    # Request/result payloads for replay and comparison workflows.
+    request_payload = Column(JSON, nullable=False, default={})
+    result_payload = Column(JSON, nullable=True)
+    error = Column(Text, nullable=True)
+
+    # Flattened metrics for quick listing/filtering.
+    objective = Column(String(120), nullable=True)
+    score = Column(Float, nullable=True)
+    total_return = Column(Float, nullable=True)
+    sharpe_ratio = Column(Float, nullable=True)
+    max_drawdown = Column(Float, nullable=True)
+    total_trades = Column(Integer, nullable=True)
+    win_rate = Column(Float, nullable=True)
+    recommended_symbol_count = Column(Integer, nullable=False, default=0)
+    requested_iterations = Column(Integer, nullable=True)
+    evaluated_iterations = Column(Integer, nullable=True)
+
+    created_at = Column(DateTime, default=func.now(), nullable=False, index=True)
+    started_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now(), nullable=False)

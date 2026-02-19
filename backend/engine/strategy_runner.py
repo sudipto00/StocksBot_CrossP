@@ -79,6 +79,7 @@ class StrategyRunner:
         self.last_reconciliation_at: Optional[datetime] = None
         self.last_reconciliation_discrepancies: int = 0
         self._last_reconciliation_ts = 0.0
+        self._last_reconciliation_signature: Optional[str] = None
         self.sleeping = False
         self.sleep_since: Optional[datetime] = None
         self.next_market_open_at: Optional[datetime] = None
@@ -510,6 +511,209 @@ class StrategyRunner:
         """
         self._stream_update_event.set()
 
+    @staticmethod
+    def _signed_quantity(raw_quantity: Any, raw_side: Any = None) -> float:
+        """Normalize quantity sign using side when available."""
+        try:
+            quantity = float(raw_quantity or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+        side_value = getattr(raw_side, "value", raw_side)
+        side = str(side_value or "").strip().lower()
+        if side == "short":
+            return -abs(quantity)
+        if side == "long":
+            return abs(quantity)
+        return quantity
+
+    def _aggregate_broker_quantities(self, broker_positions: List[Dict[str, Any]]) -> Dict[str, float]:
+        """Aggregate signed broker quantities by symbol."""
+        broker_qty: Dict[str, float] = {}
+        for row in broker_positions:
+            sym = str(row.get("symbol", "")).strip().upper()
+            if not sym:
+                continue
+            signed = self._signed_quantity(row.get("quantity", 0.0), row.get("side"))
+            broker_qty[sym] = broker_qty.get(sym, 0.0) + signed
+        return broker_qty
+
+    def _aggregate_local_quantities(self, local_positions: List[Any]) -> Dict[str, float]:
+        """Aggregate signed local quantities by symbol."""
+        local_qty: Dict[str, float] = {}
+        for row in local_positions:
+            sym = str(getattr(row, "symbol", "")).strip().upper()
+            if not sym:
+                continue
+            signed = self._signed_quantity(getattr(row, "quantity", 0.0), getattr(row, "side", None))
+            local_qty[sym] = local_qty.get(sym, 0.0) + signed
+        return local_qty
+
+    def _collect_quantity_discrepancies(
+        self,
+        broker_qty: Dict[str, float],
+        local_qty: Dict[str, float],
+        pending_symbols: set[str],
+        quantity_tolerance: float,
+    ) -> List[Dict[str, Any]]:
+        """Build discrepancy rows for non-pending symbols."""
+        rows: List[Dict[str, Any]] = []
+        for sym in sorted(set(broker_qty.keys()) | set(local_qty.keys())):
+            if sym in pending_symbols:
+                continue
+            broker_quantity = float(broker_qty.get(sym, 0.0))
+            local_quantity = float(local_qty.get(sym, 0.0))
+            diff = abs(broker_quantity - local_quantity)
+            if diff <= quantity_tolerance:
+                continue
+            rows.append(
+                {
+                    "symbol": sym,
+                    "broker_quantity": broker_quantity,
+                    "local_quantity": local_quantity,
+                    "difference": diff,
+                }
+            )
+        return rows
+
+    @staticmethod
+    def _discrepancy_signature(rows: List[Dict[str, Any]]) -> str:
+        """Stable signature for deduplicating repeated discrepancy audits."""
+        normalized = [
+            (
+                str(row.get("symbol", "")),
+                round(float(row.get("broker_quantity", 0.0)), 6),
+                round(float(row.get("local_quantity", 0.0)), 6),
+            )
+            for row in rows
+        ]
+        normalized.sort()
+        return json.dumps(normalized, separators=(",", ":"))
+
+    def _sync_local_positions_to_broker(
+        self,
+        broker_positions: List[Dict[str, Any]],
+        pending_symbols: set[str],
+        quantity_tolerance: float,
+    ) -> List[Dict[str, Any]]:
+        """Align local open-position rows to broker truth for settled symbols."""
+        if not self.storage:
+            return []
+        from storage.models import PositionSideEnum
+
+        broker_state: Dict[str, Dict[str, float]] = {}
+        for row in broker_positions:
+            sym = str(row.get("symbol", "")).strip().upper()
+            if not sym:
+                continue
+            signed_qty = self._signed_quantity(row.get("quantity", 0.0), row.get("side"))
+            if abs(signed_qty) <= quantity_tolerance:
+                continue
+            avg_entry_price = self._safe_float(row.get("avg_entry_price", row.get("price", 0.0)), 0.0)
+            state = broker_state.setdefault(
+                sym,
+                {"signed_qty": 0.0, "weighted_avg_sum": 0.0, "abs_qty_sum": 0.0},
+            )
+            abs_qty = abs(signed_qty)
+            state["signed_qty"] += signed_qty
+            state["weighted_avg_sum"] += max(0.0, avg_entry_price) * abs_qty
+            state["abs_qty_sum"] += abs_qty
+
+        local_positions = self.storage.get_open_positions()
+        local_by_symbol: Dict[str, List[Any]] = {}
+        for row in local_positions:
+            sym = str(getattr(row, "symbol", "")).strip().upper()
+            if not sym:
+                continue
+            local_by_symbol.setdefault(sym, []).append(row)
+
+        changes: List[Dict[str, Any]] = []
+        for sym in sorted(set(broker_state.keys()) | set(local_by_symbol.keys())):
+            if sym in pending_symbols:
+                continue
+            local_rows = sorted(local_by_symbol.get(sym, []), key=lambda row: int(getattr(row, "id", 0)))
+            target_state = broker_state.get(sym)
+
+            if target_state is None or abs(float(target_state.get("signed_qty", 0.0))) <= quantity_tolerance:
+                for row in local_rows:
+                    self.storage.positions.close_position(
+                        row,
+                        realized_pnl=self._safe_float(getattr(row, "realized_pnl", 0.0), 0.0),
+                    )
+                    changes.append(
+                        {
+                            "symbol": sym,
+                            "action": "close_local_position",
+                            "position_id": int(getattr(row, "id", 0) or 0),
+                        }
+                    )
+                continue
+
+            target_signed_qty = float(target_state["signed_qty"])
+            target_qty = abs(target_signed_qty)
+            target_side = PositionSideEnum.SHORT if target_signed_qty < 0 else PositionSideEnum.LONG
+            target_avg_entry = (
+                float(target_state["weighted_avg_sum"]) / float(target_state["abs_qty_sum"])
+                if float(target_state["abs_qty_sum"]) > 0
+                else 0.0
+            )
+            target_avg_entry = max(0.0, target_avg_entry)
+
+            if not local_rows:
+                created = self.storage.create_position(
+                    symbol=sym,
+                    side=target_side.value,
+                    quantity=target_qty,
+                    avg_entry_price=target_avg_entry,
+                )
+                changes.append(
+                    {
+                        "symbol": sym,
+                        "action": "create_local_position",
+                        "position_id": int(getattr(created, "id", 0) or 0),
+                        "quantity": round(target_qty, 6),
+                        "side": target_side.value,
+                    }
+                )
+                continue
+
+            primary = local_rows[0]
+            for duplicate in local_rows[1:]:
+                self.storage.positions.close_position(
+                    duplicate,
+                    realized_pnl=self._safe_float(getattr(duplicate, "realized_pnl", 0.0), 0.0),
+                )
+                changes.append(
+                    {
+                        "symbol": sym,
+                        "action": "close_duplicate_local_position",
+                        "position_id": int(getattr(duplicate, "id", 0) or 0),
+                    }
+                )
+
+            current_qty = abs(self._safe_float(getattr(primary, "quantity", 0.0), 0.0))
+            current_side_value = getattr(getattr(primary, "side", None), "value", getattr(primary, "side", "long"))
+            current_side = str(current_side_value).strip().lower()
+            current_avg = self._safe_float(getattr(primary, "avg_entry_price", 0.0), 0.0)
+            qty_changed = abs(current_qty - target_qty) > quantity_tolerance
+            side_changed = current_side != target_side.value
+            avg_changed = abs(current_avg - target_avg_entry) > 1e-4
+            if qty_changed or side_changed or avg_changed:
+                primary.side = target_side
+                primary.quantity = target_qty
+                primary.avg_entry_price = target_avg_entry
+                primary.cost_basis = target_qty * target_avg_entry
+                self.storage.positions.update(primary)
+                changes.append(
+                    {
+                        "symbol": sym,
+                        "action": "update_local_position",
+                        "position_id": int(getattr(primary, "id", 0) or 0),
+                        "quantity": round(target_qty, 6),
+                        "side": target_side.value,
+                    }
+                )
+        return changes
+
     def _maybe_reconcile_positions_with_broker(self) -> None:
         """Run position reconciliation every 5 minutes."""
         if not self.storage:
@@ -527,28 +731,75 @@ class StrategyRunner:
         self._last_reconciliation_ts = now
         broker_positions = self.broker.get_positions()
         local_positions = self.storage.get_open_positions()
-        broker_qty: Dict[str, float] = {}
-        local_qty: Dict[str, float] = {}
-        for row in broker_positions:
-            sym = str(row.get("symbol", "")).upper()
-            if not sym:
-                continue
-            broker_qty[sym] = broker_qty.get(sym, 0.0) + float(row.get("quantity", 0.0))
-        for row in local_positions:
-            sym = str(row.symbol).upper()
-            local_qty[sym] = local_qty.get(sym, 0.0) + float(row.quantity or 0.0)
-        discrepancies = 0
-        for sym in set(broker_qty.keys()) | set(local_qty.keys()):
-            if abs(float(broker_qty.get(sym, 0.0)) - float(local_qty.get(sym, 0.0))) > 1e-6:
-                discrepancies += 1
+        pending_symbols: set[str] = set()
+        try:
+            for order in self.storage.get_open_orders(limit=500):
+                symbol = str(getattr(order, "symbol", "")).strip().upper()
+                if symbol:
+                    pending_symbols.add(symbol)
+        except Exception:
+            logger.debug("Failed to inspect open orders for reconciliation context", exc_info=True)
+        quantity_tolerance = 1e-3
+        broker_qty = self._aggregate_broker_quantities(broker_positions)
+        local_qty = self._aggregate_local_quantities(local_positions)
+        discrepancy_rows = self._collect_quantity_discrepancies(
+            broker_qty=broker_qty,
+            local_qty=local_qty,
+            pending_symbols=pending_symbols,
+            quantity_tolerance=quantity_tolerance,
+        )
+
+        sync_changes: List[Dict[str, Any]] = []
+        if discrepancy_rows:
+            sync_changes = self._sync_local_positions_to_broker(
+                broker_positions=broker_positions,
+                pending_symbols=pending_symbols,
+                quantity_tolerance=quantity_tolerance,
+            )
+            if sync_changes:
+                local_positions = self.storage.get_open_positions()
+                local_qty = self._aggregate_local_quantities(local_positions)
+                discrepancy_rows = self._collect_quantity_discrepancies(
+                    broker_qty=broker_qty,
+                    local_qty=local_qty,
+                    pending_symbols=pending_symbols,
+                    quantity_tolerance=quantity_tolerance,
+                )
+
+        discrepancies = len(discrepancy_rows)
         self.last_reconciliation_at = datetime.now(timezone.utc)
         self.last_reconciliation_discrepancies = discrepancies
-        if discrepancies > 0:
+        if sync_changes:
             self.storage.create_audit_log(
-                event_type="error",
-                description=f"Runner reconciliation found {discrepancies} discrepancy(ies)",
+                event_type="config_updated",
+                description=f"Runner synchronized {len(sync_changes)} local position state change(s) with broker",
+                details={
+                    "source": "strategy_runner_reconciliation_sync",
+                    "changes": sync_changes[:100],
+                },
+            )
+        if discrepancies > 0:
+            signature = self._discrepancy_signature(discrepancy_rows)
+            if signature != self._last_reconciliation_signature:
+                self.storage.create_audit_log(
+                    event_type="error",
+                    description=f"Runner reconciliation found {discrepancies} unresolved discrepancy(ies)",
+                    details={
+                        "source": "strategy_runner_reconciliation",
+                        "pending_symbols_ignored": sorted(pending_symbols),
+                        "quantity_tolerance": quantity_tolerance,
+                        "discrepancies": discrepancy_rows[:100],
+                        "sync_applied_changes": len(sync_changes),
+                    },
+                )
+                self._last_reconciliation_signature = signature
+        elif self._last_reconciliation_signature is not None:
+            self.storage.create_audit_log(
+                event_type="config_updated",
+                description="Runner reconciliation resolved all previously-detected discrepancies",
                 details={"source": "strategy_runner_reconciliation"},
             )
+            self._last_reconciliation_signature = None
 
     def _audit_poll_error(self, message: str) -> None:
         """Write poll errors into audit trail with basic throttling."""
@@ -617,6 +868,62 @@ class StrategyRunner:
         trades = self.storage.get_all_trades(limit=5000)
         realized_pnl_total = sum(self._safe_float(getattr(t, "realized_pnl", 0.0), 0.0) for t in trades)
 
+        latest = self.storage.get_latest_portfolio_snapshot()
+        now_utc = datetime.now(timezone.utc)
+        if latest is not None:
+            latest_ts = latest.timestamp
+            latest_aware = (
+                latest_ts.replace(tzinfo=timezone.utc)
+                if latest_ts is not None and latest_ts.tzinfo is None
+                else latest_ts
+            )
+            latest_equity = self._safe_float(getattr(latest, "equity", 0.0), 0.0)
+            latest_cash = self._safe_float(getattr(latest, "cash", 0.0), 0.0)
+            latest_bp = self._safe_float(getattr(latest, "buying_power", 0.0), 0.0)
+            latest_mv = self._safe_float(getattr(latest, "market_value", 0.0), 0.0)
+            latest_unreal = self._safe_float(getattr(latest, "unrealized_pnl", 0.0), 0.0)
+            latest_realized = self._safe_float(getattr(latest, "realized_pnl_total", 0.0), 0.0)
+            latest_open_positions = int(getattr(latest, "open_positions", 0) or 0)
+            try:
+                market_open = bool(self.broker.is_market_open())
+            except Exception:
+                market_open = True
+
+            # Persist at most every 20s unless there is a meaningful portfolio change.
+            min_interval_seconds = 20.0
+            max_interval_seconds = 15.0 * 60.0
+            elapsed_seconds = (
+                (now_utc - latest_aware).total_seconds()
+                if latest_aware is not None
+                else max_interval_seconds
+            )
+            equity_eps = max(0.10, latest_equity * 0.0002)
+            market_value_eps = max(0.10, latest_mv * 0.0003)
+            cash_eps = 0.05
+            realized_eps = 0.01
+            # Off-hours: only persist true account state changes (fills/cash/realized),
+            # not quote jitter that can create sawtooth chart noise.
+            if not market_open:
+                off_hours_trade_change = (
+                    abs(cash - latest_cash) >= cash_eps
+                    or abs(realized_pnl_total - latest_realized) >= realized_eps
+                )
+                if not off_hours_trade_change:
+                    return
+            meaningful_change = (
+                abs(equity - latest_equity) >= equity_eps
+                or abs(cash - latest_cash) >= cash_eps
+                or abs(buying_power - latest_bp) >= cash_eps
+                or abs(market_value - latest_mv) >= market_value_eps
+                or abs(unrealized_pnl - latest_unreal) >= market_value_eps
+                or abs(realized_pnl_total - latest_realized) >= realized_eps
+                or len(positions) != latest_open_positions
+            )
+            if elapsed_seconds < min_interval_seconds and not meaningful_change:
+                return
+            if elapsed_seconds < max_interval_seconds and not meaningful_change:
+                return
+
         self.storage.record_portfolio_snapshot(
             equity=max(0.0, equity),
             cash=max(0.0, cash),
@@ -625,7 +932,7 @@ class StrategyRunner:
             unrealized_pnl=unrealized_pnl,
             realized_pnl_total=realized_pnl_total,
             open_positions=len(positions),
-            timestamp=datetime.now(timezone.utc),
+            timestamp=now_utc,
         )
 
     @staticmethod

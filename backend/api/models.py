@@ -413,6 +413,10 @@ class RunnerStartRequest(BaseModel):
         default=False,
         description="When true, resolve start-time symbol universe from Screener workspace controls.",
     )
+    target_strategy_id: Optional[str] = Field(
+        default=None,
+        description="Optional strategy ID to apply workspace-universe override to. Required when use_workspace_universe=true.",
+    )
     asset_type: Optional[Literal["stock", "etf"]] = Field(
         default=None,
         description="Optional workspace asset type override for runner universe resolution.",
@@ -644,6 +648,22 @@ class StrategyOptimizationRequest(BaseModel):
         le=8,
         description="Number of sequential walk-forward folds for validation when enabled",
     )
+    ensemble_mode: bool = Field(
+        default=False,
+        description="Enable Monte Carlo ensemble optimization mode (robustness-first scoring)",
+    )
+    ensemble_runs: int = Field(
+        default=8,
+        ge=1,
+        le=64,
+        description="Number of Monte Carlo scenario perturbations per candidate when ensemble_mode=true",
+    )
+    max_workers: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=6,
+        description="Optional process worker count for ensemble evaluation; defaults to min(4, cpu_count-1)",
+    )
     random_seed: Optional[int] = Field(default=None, ge=0, le=2_147_483_647, description="Optional deterministic random seed")
 
 
@@ -701,6 +721,9 @@ class StrategyOptimizationResponse(BaseModel):
     evaluated_iterations: int = Field(..., description="Actual number of evaluated candidates")
     objective: str = Field(..., description="Optimization objective description")
     score: float = Field(..., description="Best objective score")
+    ensemble_mode: bool = Field(default=False, description="Whether Monte Carlo ensemble mode was used")
+    ensemble_runs: int = Field(default=1, description="Scenario runs per candidate used by optimizer")
+    max_workers_used: int = Field(default=1, description="Worker process count used during optimization")
     min_trades_target: int = Field(default=0, description="Trade-count target used by optimizer")
     strict_min_trades: bool = Field(default=False, description="Whether strict min-trades gating was enabled")
     best_candidate_meets_min_trades: bool = Field(default=True, description="Whether selected candidate meets min_trades target")
@@ -750,6 +773,33 @@ class StrategyOptimizationJobCancelResponse(BaseModel):
     strategy_id: str = Field(..., description="Strategy ID")
     status: Literal["queued", "running", "completed", "failed", "canceled"] = Field(..., description="Job status after cancellation request")
     message: str = Field(..., description="Cancellation status message")
+
+
+class StrategyOptimizationHistoryItem(BaseModel):
+    """Persisted optimization run history item."""
+    run_id: str = Field(..., description="Stable optimization run ID")
+    strategy_id: str = Field(..., description="Strategy ID")
+    strategy_name: str = Field(..., description="Strategy name snapshot at run time")
+    source: Literal["sync", "async"] = Field(..., description="Execution source")
+    status: Literal["queued", "running", "completed", "failed", "canceled"] = Field(..., description="Run status")
+    job_id: Optional[str] = Field(default=None, description="Associated async job ID when source=async")
+    created_at: str = Field(..., description="Run creation timestamp (ISO)")
+    started_at: Optional[str] = Field(default=None, description="Run start timestamp (ISO)")
+    completed_at: Optional[str] = Field(default=None, description="Run completion timestamp (ISO)")
+    duration_seconds: Optional[float] = Field(default=None, description="Observed duration in seconds")
+    error: Optional[str] = Field(default=None, description="Error text when status=failed")
+    request_summary: Dict[str, Any] = Field(default_factory=dict, description="Normalized input summary for comparisons")
+    metrics_summary: Dict[str, Any] = Field(default_factory=dict, description="Normalized key output metrics")
+    recommended_parameters: Dict[str, float] = Field(default_factory=dict, description="Recommended parameter set")
+    recommended_symbols: List[str] = Field(default_factory=list, description="Recommended symbol universe")
+    request_payload: Optional[Dict[str, Any]] = Field(default=None, description="Raw optimizer request payload")
+    result_payload: Optional[StrategyOptimizationResponse] = Field(default=None, description="Raw optimizer result payload when completed")
+
+
+class StrategyOptimizationHistoryResponse(BaseModel):
+    """Optimization history list response."""
+    runs: List[StrategyOptimizationHistoryItem] = Field(default_factory=list, description="Optimization runs")
+    total_count: int = Field(default=0, description="Number of runs returned")
 
 
 # ============================================================================

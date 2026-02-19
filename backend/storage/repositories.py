@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import and_, or_
 
 from storage.models import (
-    Position, Order, Trade, Strategy, Config, AuditLog, PortfolioSnapshot,
+    Position, Order, Trade, Strategy, Config, AuditLog, PortfolioSnapshot, OptimizationRun,
     PositionSideEnum, OrderSideEnum, OrderTypeEnum, OrderStatusEnum, TradeTypeEnum,
     AuditEventTypeEnum
 )
@@ -459,3 +459,159 @@ class PortfolioSnapshotRepository:
             .order_by(PortfolioSnapshot.timestamp.desc())
             .first()
         )
+
+
+class OptimizationRunRepository:
+    """Repository for optimization run persistence and retrieval."""
+
+    def __init__(self, db: Session):
+        self.db = db
+
+    def get_by_run_id(self, run_id: str) -> Optional[OptimizationRun]:
+        return self.db.query(OptimizationRun).filter(OptimizationRun.run_id == run_id).first()
+
+    def upsert(
+        self,
+        *,
+        run_id: str,
+        strategy_id: int,
+        strategy_name: str,
+        source: str,
+        status: str,
+        job_id: Optional[str],
+        request_payload: Dict[str, Any],
+        result_payload: Optional[Dict[str, Any]],
+        error: Optional[str],
+        objective: Optional[str],
+        score: Optional[float],
+        total_return: Optional[float],
+        sharpe_ratio: Optional[float],
+        max_drawdown: Optional[float],
+        total_trades: Optional[int],
+        win_rate: Optional[float],
+        recommended_symbol_count: int,
+        requested_iterations: Optional[int],
+        evaluated_iterations: Optional[int],
+        created_at: Optional[datetime] = None,
+        started_at: Optional[datetime] = None,
+        completed_at: Optional[datetime] = None,
+    ) -> OptimizationRun:
+        row = self.get_by_run_id(run_id)
+        if row is None:
+            row = OptimizationRun(
+                run_id=run_id,
+                strategy_id=strategy_id,
+                strategy_name=strategy_name,
+                source=source,
+                status=status,
+                job_id=job_id,
+                request_payload=request_payload or {},
+                result_payload=result_payload,
+                error=error,
+                objective=objective,
+                score=score,
+                total_return=total_return,
+                sharpe_ratio=sharpe_ratio,
+                max_drawdown=max_drawdown,
+                total_trades=total_trades,
+                win_rate=win_rate,
+                recommended_symbol_count=max(0, int(recommended_symbol_count or 0)),
+                requested_iterations=requested_iterations,
+                evaluated_iterations=evaluated_iterations,
+                created_at=_to_db_datetime(created_at) if created_at is not None else datetime.now(timezone.utc).replace(tzinfo=None),
+                started_at=_to_db_datetime(started_at) if started_at is not None else None,
+                completed_at=_to_db_datetime(completed_at) if completed_at is not None else None,
+            )
+            self.db.add(row)
+        else:
+            row.strategy_id = int(strategy_id)
+            row.strategy_name = str(strategy_name or "")
+            row.source = str(source or row.source or "sync")
+            row.status = str(status or row.status or "failed")
+            row.job_id = str(job_id) if job_id else None
+            row.request_payload = request_payload or {}
+            row.result_payload = result_payload
+            row.error = error
+            row.objective = objective
+            row.score = score
+            row.total_return = total_return
+            row.sharpe_ratio = sharpe_ratio
+            row.max_drawdown = max_drawdown
+            row.total_trades = total_trades
+            row.win_rate = win_rate
+            row.recommended_symbol_count = max(0, int(recommended_symbol_count or 0))
+            row.requested_iterations = requested_iterations
+            row.evaluated_iterations = evaluated_iterations
+            if created_at is not None:
+                row.created_at = _to_db_datetime(created_at)
+            row.started_at = _to_db_datetime(started_at) if started_at is not None else None
+            row.completed_at = _to_db_datetime(completed_at) if completed_at is not None else None
+            row.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        self.db.commit()
+        self.db.refresh(row)
+        return row
+
+    def list_recent(
+        self,
+        *,
+        strategy_ids: Optional[List[int]] = None,
+        statuses: Optional[List[str]] = None,
+        limit_per_strategy: int = 10,
+        limit_total: int = 200,
+    ) -> List[OptimizationRun]:
+        per_strategy = max(1, min(int(limit_per_strategy or 10), 100))
+        total = max(1, min(int(limit_total or 200), 500))
+        status_set = {str(status).strip().lower() for status in (statuses or []) if str(status).strip()}
+        rows: List[OptimizationRun] = []
+        if strategy_ids:
+            seen: set[int] = set()
+            for strategy_id in strategy_ids:
+                try:
+                    strategy_id_int = int(strategy_id)
+                except (TypeError, ValueError):
+                    continue
+                if strategy_id_int in seen:
+                    continue
+                seen.add(strategy_id_int)
+                query = self.db.query(OptimizationRun).filter(OptimizationRun.strategy_id == strategy_id_int)
+                if status_set:
+                    query = query.filter(OptimizationRun.status.in_(list(status_set)))
+                strategy_rows = (
+                    query
+                    .order_by(OptimizationRun.created_at.desc())
+                    .limit(per_strategy)
+                    .all()
+                )
+                rows.extend(strategy_rows)
+            rows.sort(
+                key=lambda row: row.created_at or datetime.min,
+                reverse=True,
+            )
+            return rows[:total]
+
+        query = self.db.query(OptimizationRun)
+        if status_set:
+            query = query.filter(OptimizationRun.status.in_(list(status_set)))
+        return (
+            query.order_by(OptimizationRun.created_at.desc())
+            .limit(total)
+            .all()
+        )
+
+    def prune_strategy_history(self, strategy_id: int, keep: int) -> int:
+        keep_count = max(1, min(int(keep or 1), 500))
+        rows = (
+            self.db.query(OptimizationRun)
+            .filter(OptimizationRun.strategy_id == int(strategy_id))
+            .order_by(OptimizationRun.created_at.desc())
+            .offset(keep_count)
+            .all()
+        )
+        if not rows:
+            return 0
+        deleted = 0
+        for row in rows:
+            self.db.delete(row)
+            deleted += 1
+        self.db.commit()
+        return deleted

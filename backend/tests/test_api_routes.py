@@ -221,6 +221,9 @@ def test_optimize_strategy_returns_recommendation(monkeypatch):
         assert kwargs["strict_min_trades"] is True
         assert kwargs["walk_forward_enabled"] is True
         assert kwargs["walk_forward_folds"] == 4
+        assert kwargs["ensemble_mode"] is True
+        assert kwargs["ensemble_runs"] == 12
+        assert kwargs["max_workers"] == 4
         best = BacktestResult(
             strategy_id=strategy_id,
             start_date="2024-01-01",
@@ -244,6 +247,9 @@ def test_optimize_strategy_returns_recommendation(monkeypatch):
             "evaluated_iterations": 8,
             "objective": "return_priority",
             "score": 142.12,
+            "ensemble_mode": True,
+            "ensemble_runs": 12,
+            "max_workers_used": 4,
             "min_trades_target": 20,
             "strict_min_trades": True,
             "best_candidate_meets_min_trades": False,
@@ -315,6 +321,9 @@ def test_optimize_strategy_returns_recommendation(monkeypatch):
             "strict_min_trades": True,
             "walk_forward_enabled": True,
             "walk_forward_folds": 4,
+            "ensemble_mode": True,
+            "ensemble_runs": 12,
+            "max_workers": 4,
             "min_trades": 20,
         },
     )
@@ -327,6 +336,9 @@ def test_optimize_strategy_returns_recommendation(monkeypatch):
     assert payload["recommended_parameters"]["position_size"] == 450.0
     assert payload["best_result"]["sharpe_ratio"] == 1.35
     assert payload["objective"] == "return_priority"
+    assert payload["ensemble_mode"] is True
+    assert payload["ensemble_runs"] == 12
+    assert payload["max_workers_used"] == 4
     assert payload["strict_min_trades"] is True
     assert payload["min_trades_target"] == 20
     assert payload["best_candidate_meets_min_trades"] is False
@@ -519,6 +531,458 @@ def test_optimize_strategy_async_job_cancel(monkeypatch):
 
     assert final_payload is not None
     assert final_payload["status"] == "canceled"
+
+
+def test_optimize_strategy_async_job_force_cancel_query(monkeypatch):
+    """Force cancel query flag should be accepted and request cancellation."""
+    created = client.post(
+        "/strategies",
+        json={
+            "name": "Optimize Async Force Cancel Test",
+            "symbols": ["AAPL", "MSFT"],
+        },
+    )
+    assert created.status_code == 200
+    strategy_id = created.json()["id"]
+
+    def _slow_compute(*, strategy_id: str, request, db, progress_callback=None, should_cancel=None):
+        total = 40
+        for idx in range(total):
+            if should_cancel and should_cancel():
+                raise api_routes.OptimizationCancelledError("canceled")
+            if progress_callback:
+                progress_callback(idx + 1, total, "ensemble_search")
+            time.sleep(0.02)
+        return StrategyOptimizationResponse(
+            strategy_id=strategy_id,
+            requested_iterations=40,
+            evaluated_iterations=40,
+            objective="sharpe_ratio_with_trade_count_penalty",
+            score=50.0,
+            recommended_parameters={"position_size": 200.0},
+            recommended_symbols=["AAPL"],
+            top_candidates=[],
+            best_result=BacktestResponse(
+                strategy_id=strategy_id,
+                start_date="2024-01-01",
+                end_date="2024-03-31",
+                initial_capital=100000.0,
+                final_capital=101000.0,
+                total_return=1.0,
+                total_trades=5,
+                winning_trades=3,
+                losing_trades=2,
+                win_rate=60.0,
+                max_drawdown=2.0,
+                sharpe_ratio=0.6,
+                volatility=11.0,
+                trades=[],
+                equity_curve=[],
+                diagnostics={},
+            ),
+            notes=["ok"],
+        )
+
+    monkeypatch.setattr(api_routes, "_compute_strategy_optimization_response", _slow_compute)
+
+    start = client.post(
+        f"/strategies/{strategy_id}/optimize/start",
+        json={
+            "start_date": "2024-01-01",
+            "end_date": "2024-03-31",
+            "initial_capital": 100000,
+            "emulate_live_trading": False,
+            "use_workspace_universe": False,
+            "iterations": 40,
+        },
+    )
+    assert start.status_code == 200
+    job_id = start.json()["job_id"]
+
+    time.sleep(0.1)
+    cancel = client.post(f"/strategies/{strategy_id}/optimize/{job_id}/cancel?force=true")
+    assert cancel.status_code == 200
+    assert cancel.json()["success"] is True
+
+    final_payload = None
+    for _ in range(60):
+        status = client.get(f"/strategies/{strategy_id}/optimize/{job_id}")
+        assert status.status_code == 200
+        final_payload = status.json()
+        if final_payload["status"] in {"canceled", "failed", "completed"}:
+            break
+        time.sleep(0.05)
+
+    assert final_payload is not None
+    assert final_payload["status"] == "canceled"
+
+
+def test_optimizer_cancel_all_endpoint(monkeypatch):
+    """Bulk optimizer cancel endpoint should request cancel for all active jobs."""
+    create_one = client.post("/strategies", json={"name": "Bulk Cancel One", "symbols": ["AAPL"]})
+    create_two = client.post("/strategies", json={"name": "Bulk Cancel Two", "symbols": ["MSFT"]})
+    assert create_one.status_code == 200
+    assert create_two.status_code == 200
+    strategy_one = create_one.json()["id"]
+    strategy_two = create_two.json()["id"]
+
+    def _slow_compute(*, strategy_id: str, request, db, progress_callback=None, should_cancel=None):
+        total = 60
+        for idx in range(total):
+            if should_cancel and should_cancel():
+                raise api_routes.OptimizationCancelledError("canceled")
+            if progress_callback:
+                progress_callback(idx + 1, total, "parameter_search")
+            time.sleep(0.015)
+        return StrategyOptimizationResponse(
+            strategy_id=strategy_id,
+            requested_iterations=60,
+            evaluated_iterations=60,
+            objective="sharpe_ratio_with_trade_count_penalty",
+            score=70.0,
+            recommended_parameters={"position_size": 150.0},
+            recommended_symbols=["AAPL"],
+            top_candidates=[],
+            best_result=BacktestResponse(
+                strategy_id=strategy_id,
+                start_date="2024-01-01",
+                end_date="2024-03-31",
+                initial_capital=100000.0,
+                final_capital=101000.0,
+                total_return=1.0,
+                total_trades=5,
+                winning_trades=3,
+                losing_trades=2,
+                win_rate=60.0,
+                max_drawdown=2.0,
+                sharpe_ratio=0.6,
+                volatility=11.0,
+                trades=[],
+                equity_curve=[],
+                diagnostics={},
+            ),
+            notes=["ok"],
+        )
+
+    monkeypatch.setattr(api_routes, "_compute_strategy_optimization_response", _slow_compute)
+
+    start_one = client.post(
+        f"/strategies/{strategy_one}/optimize/start",
+        json={
+            "start_date": "2024-01-01",
+            "end_date": "2024-03-31",
+            "initial_capital": 100000,
+            "emulate_live_trading": False,
+            "use_workspace_universe": False,
+            "iterations": 60,
+        },
+    )
+    start_two = client.post(
+        f"/strategies/{strategy_two}/optimize/start",
+        json={
+            "start_date": "2024-01-01",
+            "end_date": "2024-03-31",
+            "initial_capital": 100000,
+            "emulate_live_trading": False,
+            "use_workspace_universe": False,
+            "iterations": 60,
+        },
+    )
+    assert start_one.status_code == 200
+    assert start_two.status_code == 200
+    job_one = start_one.json()["job_id"]
+    job_two = start_two.json()["job_id"]
+
+    time.sleep(0.1)
+    bulk = client.post("/optimizer/cancel-all?force=true")
+    assert bulk.status_code == 200
+    payload = bulk.json()
+    assert payload["success"] is True
+    assert payload["requested_count"] >= 2
+
+    def _wait_terminal(strategy_id: str, job_id: str) -> str:
+        status_value = "running"
+        for _ in range(60):
+            status = client.get(f"/strategies/{strategy_id}/optimize/{job_id}")
+            assert status.status_code == 200
+            status_value = status.json()["status"]
+            if status_value in {"canceled", "failed", "completed"}:
+                break
+            time.sleep(0.05)
+        return status_value
+
+    assert _wait_terminal(strategy_one, job_one) == "canceled"
+    assert _wait_terminal(strategy_two, job_two) == "canceled"
+
+
+def test_optimizer_jobs_endpoint_marks_stale_running_job_failed():
+    """Jobs endpoint should auto-finalize stale running jobs with no live worker thread."""
+    created = client.post(
+        "/strategies",
+        json={
+            "name": "Stale Optimizer Job Test",
+            "symbols": ["AAPL"],
+        },
+    )
+    assert created.status_code == 200
+    strategy_id = str(created.json()["id"])
+
+    job = api_routes._optimizer_create_job(
+        strategy_id=strategy_id,
+        request_payload={
+            "start_date": "2024-01-01",
+            "end_date": "2024-03-31",
+            "initial_capital": 100000,
+            "iterations": 12,
+        },
+    )
+    job_id = str(job["job_id"])
+    api_routes._optimizer_update_job(
+        job_id,
+        {
+            "status": "running",
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "message": "Running parameter search",
+        },
+    )
+
+    with api_routes._optimizer_jobs_lock:
+        api_routes._optimizer_job_threads.pop(job_id, None)
+
+    listing = client.get("/optimizer/jobs")
+    assert listing.status_code == 200
+    rows = listing.json().get("jobs", [])
+    matched = next((row for row in rows if str(row.get("job_id")) == job_id), None)
+    assert matched is not None
+    assert matched["status"] == "failed"
+    assert "not running" in str(matched.get("message", "")).lower()
+
+
+def test_optimize_strategy_persists_history_sync(monkeypatch):
+    """Synchronous optimize endpoint should persist optimization history rows."""
+    created = client.post(
+        "/strategies",
+        json={
+            "name": "Optimize Sync History Test",
+            "symbols": ["AAPL", "MSFT"],
+        },
+    )
+    assert created.status_code == 200
+    strategy_id = str(created.json()["id"])
+
+    def _fake_compute(*, strategy_id: str, request, db, progress_callback=None, should_cancel=None):
+        return StrategyOptimizationResponse(
+            strategy_id=strategy_id,
+            requested_iterations=10,
+            evaluated_iterations=10,
+            objective="balanced_score",
+            score=77.25,
+            recommended_parameters={"position_size": 320.0, "stop_loss_pct": 1.8},
+            recommended_symbols=["AAPL", "MSFT"],
+            top_candidates=[],
+            best_result=BacktestResponse(
+                strategy_id=strategy_id,
+                start_date="2024-01-01",
+                end_date="2024-04-01",
+                initial_capital=100000.0,
+                final_capital=104500.0,
+                total_return=4.5,
+                total_trades=14,
+                winning_trades=8,
+                losing_trades=6,
+                win_rate=57.1,
+                max_drawdown=2.4,
+                sharpe_ratio=1.12,
+                volatility=11.5,
+                trades=[],
+                equity_curve=[],
+                diagnostics={},
+            ),
+            notes=["ok"],
+        )
+
+    monkeypatch.setattr(api_routes, "_compute_strategy_optimization_response", _fake_compute)
+
+    optimize = client.post(
+        f"/strategies/{strategy_id}/optimize",
+        json={
+            "start_date": "2024-01-01",
+            "end_date": "2024-04-01",
+            "initial_capital": 100000,
+            "emulate_live_trading": False,
+            "use_workspace_universe": False,
+            "iterations": 10,
+        },
+    )
+    assert optimize.status_code == 200
+
+    history = client.get(f"/strategies/{strategy_id}/optimization-history?limit=5")
+    assert history.status_code == 200
+    payload = history.json()
+    assert payload["total_count"] >= 1
+    row = payload["runs"][0]
+    assert row["strategy_id"] == strategy_id
+    assert row["source"] == "sync"
+    assert row["status"] == "completed"
+    assert row["metrics_summary"]["total_return"] == pytest.approx(4.5, rel=1e-6)
+    assert row["recommended_parameters"]["position_size"] == pytest.approx(320.0, rel=1e-6)
+
+
+def test_optimize_strategy_async_job_persists_history(monkeypatch):
+    """Async optimize jobs should write terminal rows to optimization history."""
+    created = client.post(
+        "/strategies",
+        json={
+            "name": "Optimize Async History Test",
+            "symbols": ["AAPL", "MSFT"],
+        },
+    )
+    assert created.status_code == 200
+    strategy_id = str(created.json()["id"])
+
+    def _fake_compute(*, strategy_id: str, request, db, progress_callback=None, should_cancel=None):
+        if progress_callback:
+            progress_callback(1, 2, "parameter_search")
+            progress_callback(2, 2, "finalizing")
+        return StrategyOptimizationResponse(
+            strategy_id=strategy_id,
+            requested_iterations=12,
+            evaluated_iterations=12,
+            objective="balanced_score",
+            score=88.0,
+            recommended_parameters={"position_size": 280.0},
+            recommended_symbols=["AAPL"],
+            top_candidates=[],
+            best_result=BacktestResponse(
+                strategy_id=strategy_id,
+                start_date="2024-01-01",
+                end_date="2024-03-31",
+                initial_capital=100000.0,
+                final_capital=103000.0,
+                total_return=3.0,
+                total_trades=9,
+                winning_trades=6,
+                losing_trades=3,
+                win_rate=66.7,
+                max_drawdown=1.9,
+                sharpe_ratio=1.1,
+                volatility=10.2,
+                trades=[],
+                equity_curve=[],
+                diagnostics={},
+            ),
+            notes=["ok"],
+        )
+
+    monkeypatch.setattr(api_routes, "_compute_strategy_optimization_response", _fake_compute)
+
+    start = client.post(
+        f"/strategies/{strategy_id}/optimize/start",
+        json={
+            "start_date": "2024-01-01",
+            "end_date": "2024-03-31",
+            "initial_capital": 100000,
+            "emulate_live_trading": False,
+            "use_workspace_universe": False,
+            "iterations": 12,
+        },
+    )
+    assert start.status_code == 200
+    job_id = start.json()["job_id"]
+
+    status_payload = None
+    for _ in range(40):
+        status = client.get(f"/strategies/{strategy_id}/optimize/{job_id}")
+        assert status.status_code == 200
+        status_payload = status.json()
+        if status_payload["status"] in {"completed", "failed", "canceled"}:
+            break
+        time.sleep(0.05)
+    assert status_payload is not None
+    assert status_payload["status"] == "completed"
+
+    history = client.get(f"/strategies/{strategy_id}/optimization-history?limit=10")
+    assert history.status_code == 200
+    rows = history.json()["runs"]
+    matched = next((row for row in rows if row["run_id"] == job_id), None)
+    assert matched is not None
+    assert matched["source"] == "async"
+    assert matched["status"] == "completed"
+
+
+def test_optimizer_history_supports_multi_strategy_compare_query(monkeypatch):
+    """Global optimization history endpoint should scope rows by strategy ids."""
+    create_one = client.post("/strategies", json={"name": "History Compare One", "symbols": ["AAPL"]})
+    create_two = client.post("/strategies", json={"name": "History Compare Two", "symbols": ["MSFT"]})
+    assert create_one.status_code == 200
+    assert create_two.status_code == 200
+    strategy_one = str(create_one.json()["id"])
+    strategy_two = str(create_two.json()["id"])
+
+    def _fake_compute(*, strategy_id: str, request, db, progress_callback=None, should_cancel=None):
+        return StrategyOptimizationResponse(
+            strategy_id=strategy_id,
+            requested_iterations=8,
+            evaluated_iterations=8,
+            objective="balanced_score",
+            score=60.0 if strategy_id == strategy_one else 45.0,
+            recommended_parameters={"position_size": 200.0 if strategy_id == strategy_one else 150.0},
+            recommended_symbols=["AAPL"] if strategy_id == strategy_one else ["MSFT"],
+            top_candidates=[],
+            best_result=BacktestResponse(
+                strategy_id=strategy_id,
+                start_date="2024-01-01",
+                end_date="2024-02-29",
+                initial_capital=100000.0,
+                final_capital=101000.0,
+                total_return=1.0,
+                total_trades=5,
+                winning_trades=3,
+                losing_trades=2,
+                win_rate=60.0,
+                max_drawdown=1.5,
+                sharpe_ratio=0.8,
+                volatility=9.5,
+                trades=[],
+                equity_curve=[],
+                diagnostics={},
+            ),
+            notes=["ok"],
+        )
+
+    monkeypatch.setattr(api_routes, "_compute_strategy_optimization_response", _fake_compute)
+
+    first = client.post(
+        f"/strategies/{strategy_one}/optimize",
+        json={
+            "start_date": "2024-01-01",
+            "end_date": "2024-02-29",
+            "initial_capital": 100000,
+            "emulate_live_trading": False,
+            "use_workspace_universe": False,
+            "iterations": 8,
+        },
+    )
+    second = client.post(
+        f"/strategies/{strategy_two}/optimize",
+        json={
+            "start_date": "2024-01-01",
+            "end_date": "2024-02-29",
+            "initial_capital": 100000,
+            "emulate_live_trading": False,
+            "use_workspace_universe": False,
+            "iterations": 8,
+        },
+    )
+    assert first.status_code == 200
+    assert second.status_code == 200
+
+    listing = client.get(f"/optimizer/history?strategy_ids={strategy_one},{strategy_two}&limit_per_strategy=1")
+    assert listing.status_code == 200
+    payload = listing.json()
+    assert payload["total_count"] == 2
+    strategy_ids = sorted(row["strategy_id"] for row in payload["runs"])
+    assert strategy_ids == sorted([strategy_one, strategy_two])
 
 
 # ============================================================================
@@ -889,7 +1353,7 @@ def test_start_runner_no_strategies():
 
 
 def test_start_runner_workspace_universe_override(monkeypatch):
-    """Runner start should pass workspace universe symbols as non-destructive overrides."""
+    """Runner start should scope workspace universe symbols to the requested strategy."""
     captured: dict[str, object] = {}
 
     class _DummyBroker:
@@ -900,17 +1364,24 @@ def test_start_runner_workspace_universe_override(monkeypatch):
         return (["AAPL", "MSFT", "INTC"], {"symbols_source": "workspace_universe"})
 
     def _fake_start_runner(**kwargs):
-        captured["symbol_universe_override"] = kwargs.get("symbol_universe_override")
+        captured["symbol_universe_overrides"] = kwargs.get("symbol_universe_overrides")
         return {"success": True, "message": "Runner started", "status": "running"}
 
     monkeypatch.setattr(api_routes, "get_broker", lambda: _DummyBroker())
     monkeypatch.setattr(api_routes, "_resolve_workspace_universe_for_backtest", _fake_resolve_workspace)
     monkeypatch.setattr(api_routes.runner_manager, "start_runner", _fake_start_runner)
 
+    create_response = client.post("/strategies", json={"name": "Workspace Override Test", "symbols": ["AAPL"]})
+    assert create_response.status_code == 200
+    strategy_id = str(create_response.json()["id"])
+    activate_response = client.put(f"/strategies/{strategy_id}", json={"status": "active"})
+    assert activate_response.status_code == 200
+
     response = client.post(
         "/runner/start",
         json={
             "use_workspace_universe": True,
+            "target_strategy_id": strategy_id,
             "asset_type": "stock",
             "screener_mode": "preset",
             "stock_preset": "micro_budget",
@@ -921,7 +1392,20 @@ def test_start_runner_workspace_universe_override(monkeypatch):
     assert response.status_code == 200
     payload = response.json()
     assert payload["success"] is True
-    assert captured.get("symbol_universe_override") == ["AAPL", "MSFT", "INTC"]
+    assert captured.get("symbol_universe_overrides") == {strategy_id: ["AAPL", "MSFT", "INTC"]}
+
+
+def test_start_runner_workspace_universe_requires_target_strategy(monkeypatch):
+    """Workspace universe runner starts must explicitly scope to one strategy."""
+    class _DummyBroker:
+        def get_account_info(self):
+            return {"equity": 10000.0, "buying_power": 10000.0}
+
+    monkeypatch.setattr(api_routes, "get_broker", lambda: _DummyBroker())
+
+    response = client.post("/runner/start", json={"use_workspace_universe": True})
+    assert response.status_code == 400
+    assert "target_strategy_id is required" in response.json()["detail"]
 
 
 def test_start_stop_runner():
@@ -1133,6 +1617,154 @@ def test_analytics_persists_snapshot_points():
     second_data = second.json()
     second_len = len(second_data["time_series"])
     assert second_len >= first_len
+
+
+def test_holdings_snapshot_uses_broker_truth_when_empty():
+    """Broker empty-position response should not fall back to stale local rows."""
+    db = TestingSessionLocal()
+    try:
+        storage = StorageService(db)
+        storage.create_position(symbol="AAPL", side="long", quantity=5.0, avg_entry_price=100.0)
+
+        class EmptyBroker:
+            def get_positions(self):
+                return []
+
+        holdings = api_routes._load_holdings_snapshot(storage, EmptyBroker())  # type: ignore[arg-type]
+        assert holdings == []
+    finally:
+        db.close()
+
+
+def test_capture_portfolio_snapshot_filters_micro_drift_between_polls():
+    """Repeated API polls should not persist extra rows for tiny quote drift."""
+    db = TestingSessionLocal()
+    try:
+        storage = StorageService(db)
+
+        class TinyDriftBroker:
+            def __init__(self):
+                self.tick = 0
+
+            def is_market_open(self) -> bool:
+                return True
+
+            def get_account_info(self):
+                drift = self.tick * 0.005
+                return {
+                    "equity": 1_000.0 + drift,
+                    "cash": 500.0,
+                    "buying_power": 2_000.0,
+                }
+
+            def get_positions(self):
+                drift = self.tick * 0.005
+                return [
+                    {
+                        "symbol": "SPY",
+                        "quantity": 1.0,
+                        "side": "long",
+                        "avg_entry_price": 500.0,
+                        "current_price": 500.0 + drift,
+                        "market_value": 500.0 + drift,
+                    }
+                ]
+
+        broker = TinyDriftBroker()
+        first = api_routes._capture_portfolio_snapshot(storage, broker)  # type: ignore[arg-type]
+        assert first is not None
+        assert len(storage.get_recent_portfolio_snapshots(limit=100)) == 1
+
+        broker.tick += 1
+        second = api_routes._capture_portfolio_snapshot(storage, broker)  # type: ignore[arg-type]
+        assert second is not None
+
+        snapshots = storage.get_recent_portfolio_snapshots(limit=100)
+        assert len(snapshots) == 1
+        assert snapshots[0].equity == pytest.approx(float(first["equity"]))
+    finally:
+        db.close()
+
+
+def test_capture_portfolio_snapshot_off_hours_ignores_transient_position_flicker():
+    """Off-hours empty-position flicker should not persist a new snapshot row."""
+    db = TestingSessionLocal()
+    try:
+        storage = StorageService(db)
+
+        class FlickerBroker:
+            def __init__(self):
+                self.empty = False
+
+            def is_market_open(self) -> bool:
+                return False
+
+            def get_account_info(self):
+                return {
+                    "equity": 1_000.0,
+                    "cash": 500.0,
+                    "buying_power": 2_000.0,
+                }
+
+            def get_positions(self):
+                if self.empty:
+                    return []
+                return [
+                    {
+                        "symbol": "SPY",
+                        "quantity": 1.0,
+                        "side": "long",
+                        "avg_entry_price": 500.0,
+                        "current_price": 500.0,
+                        "market_value": 500.0,
+                    }
+                ]
+
+        broker = FlickerBroker()
+        first = api_routes._capture_portfolio_snapshot(storage, broker)  # type: ignore[arg-type]
+        assert first is not None
+        assert len(storage.get_recent_portfolio_snapshots(limit=100)) == 1
+
+        broker.empty = True
+        second = api_routes._capture_portfolio_snapshot(storage, broker)  # type: ignore[arg-type]
+        assert second is not None
+        snapshots = storage.get_recent_portfolio_snapshots(limit=100)
+        assert len(snapshots) == 1
+        assert float(second["equity"]) == pytest.approx(float(first["equity"]))
+    finally:
+        db.close()
+
+
+def test_normalize_portfolio_time_series_suppresses_transient_spike():
+    """A short-lived A->B->A equity blip without PnL change should be dropped."""
+    rows = [
+        {
+            "timestamp": datetime(2026, 2, 17, 10, 0, tzinfo=timezone.utc).isoformat(),
+            "equity": 100000.0,
+            "pnl": 0.0,
+            "cumulative_pnl": 0.0,
+            "symbol": "PORTFOLIO",
+        },
+        {
+            "timestamp": datetime(2026, 2, 17, 10, 5, tzinfo=timezone.utc).isoformat(),
+            "equity": 100180.0,
+            "pnl": 0.0,
+            "cumulative_pnl": 0.0,
+            "symbol": "PORTFOLIO",
+        },
+        {
+            "timestamp": datetime(2026, 2, 17, 10, 10, tzinfo=timezone.utc).isoformat(),
+            "equity": 100000.0,
+            "pnl": 0.0,
+            "cumulative_pnl": 0.0,
+            "symbol": "PORTFOLIO",
+        },
+    ]
+
+    normalized = api_routes._normalize_portfolio_time_series(rows)
+    assert len(normalized) == 2
+    assert normalized[0]["equity"] == pytest.approx(100000.0)
+    assert normalized[-1]["equity"] == pytest.approx(100000.0)
 
 
 # ============================================================================

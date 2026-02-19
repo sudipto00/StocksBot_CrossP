@@ -8,10 +8,11 @@ from sqlalchemy.orm import Session
 
 from storage.repositories import (
     PositionRepository, OrderRepository, TradeRepository,
-    StrategyRepository, ConfigRepository, AuditLogRepository, PortfolioSnapshotRepository
+    StrategyRepository, ConfigRepository, AuditLogRepository, PortfolioSnapshotRepository,
+    OptimizationRunRepository,
 )
 from storage.models import (
-    Position, Order, Trade, Strategy, Config, AuditLog, PortfolioSnapshot,
+    Position, Order, Trade, Strategy, Config, AuditLog, PortfolioSnapshot, OptimizationRun,
     PositionSideEnum, OrderSideEnum, OrderTypeEnum, OrderStatusEnum, TradeTypeEnum,
     AuditEventTypeEnum
 )
@@ -33,6 +34,7 @@ class StorageService:
         self.config = ConfigRepository(db)
         self.audit_logs = AuditLogRepository(db)
         self.portfolio_snapshots = PortfolioSnapshotRepository(db)
+        self.optimization_runs = OptimizationRunRepository(db)
     
     # Position operations
     
@@ -291,3 +293,81 @@ class StorageService:
             if ts_utc >= cutoff_utc:
                 filtered.append(snapshot)
         return filtered
+
+    # Optimization history operations
+
+    def upsert_optimization_run(
+        self,
+        *,
+        run_id: str,
+        strategy_id: int,
+        strategy_name: str,
+        source: str,
+        status: str,
+        job_id: Optional[str],
+        request_payload: Dict[str, Any],
+        result_payload: Optional[Dict[str, Any]],
+        error: Optional[str],
+        objective: Optional[str],
+        score: Optional[float],
+        total_return: Optional[float],
+        sharpe_ratio: Optional[float],
+        max_drawdown: Optional[float],
+        total_trades: Optional[int],
+        win_rate: Optional[float],
+        recommended_symbol_count: int,
+        requested_iterations: Optional[int],
+        evaluated_iterations: Optional[int],
+        created_at: Optional[datetime] = None,
+        started_at: Optional[datetime] = None,
+        completed_at: Optional[datetime] = None,
+    ) -> OptimizationRun:
+        """Create or update an optimization run row."""
+        return self.optimization_runs.upsert(
+            run_id=run_id,
+            strategy_id=strategy_id,
+            strategy_name=strategy_name,
+            source=source,
+            status=status,
+            job_id=job_id,
+            request_payload=request_payload,
+            result_payload=result_payload,
+            error=error,
+            objective=objective,
+            score=score,
+            total_return=total_return,
+            sharpe_ratio=sharpe_ratio,
+            max_drawdown=max_drawdown,
+            total_trades=total_trades,
+            win_rate=win_rate,
+            recommended_symbol_count=recommended_symbol_count,
+            requested_iterations=requested_iterations,
+            evaluated_iterations=evaluated_iterations,
+            created_at=created_at,
+            started_at=started_at,
+            completed_at=completed_at,
+        )
+
+    def list_recent_optimization_runs(
+        self,
+        *,
+        strategy_ids: Optional[List[int]] = None,
+        statuses: Optional[List[str]] = None,
+        limit_per_strategy: int = 10,
+        limit_total: int = 200,
+    ) -> List[OptimizationRun]:
+        """List recent optimization runs for one or more strategies."""
+        return self.optimization_runs.list_recent(
+            strategy_ids=strategy_ids,
+            statuses=statuses,
+            limit_per_strategy=limit_per_strategy,
+            limit_total=limit_total,
+        )
+
+    def get_optimization_run_by_run_id(self, run_id: str) -> Optional[OptimizationRun]:
+        """Fetch optimization run by stable run_id."""
+        return self.optimization_runs.get_by_run_id(run_id)
+
+    def prune_strategy_optimization_history(self, strategy_id: int, keep: int) -> int:
+        """Prune older optimization runs for a strategy."""
+        return self.optimization_runs.prune_strategy_history(strategy_id=strategy_id, keep=keep)

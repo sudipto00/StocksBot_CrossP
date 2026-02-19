@@ -345,6 +345,7 @@ export interface RunnerActionResponse {
 
 export interface RunnerStartRequest {
   use_workspace_universe?: boolean;
+  target_strategy_id?: string;
   asset_type?: 'stock' | 'etf';
   screener_mode?: 'most_active' | 'preset';
   stock_preset?: 'weekly_optimized' | 'three_to_five_weekly' | 'monthly_optimized' | 'small_budget_weekly' | 'micro_budget';
@@ -677,6 +678,9 @@ export interface StrategyOptimizationRequest {
   strict_min_trades?: boolean;
   walk_forward_enabled?: boolean;
   walk_forward_folds?: number;
+  ensemble_mode?: boolean;
+  ensemble_runs?: number;
+  max_workers?: number;
   random_seed?: number;
 }
 
@@ -730,6 +734,9 @@ export interface StrategyOptimizationResult {
   evaluated_iterations: number;
   objective: string;
   score: number;
+  ensemble_mode: boolean;
+  ensemble_runs: number;
+  max_workers_used: number;
   min_trades_target: number;
   strict_min_trades: boolean;
   best_candidate_meets_min_trades: boolean;
@@ -775,6 +782,31 @@ export interface StrategyOptimizationJobCancelResponse {
   strategy_id: string;
   status: StrategyOptimizationJobState;
   message: string;
+}
+
+export interface StrategyOptimizationHistoryItem {
+  run_id: string;
+  strategy_id: string;
+  strategy_name: string;
+  source: 'sync' | 'async';
+  status: StrategyOptimizationJobState;
+  job_id?: string | null;
+  created_at: string;
+  started_at?: string | null;
+  completed_at?: string | null;
+  duration_seconds?: number | null;
+  error?: string | null;
+  request_summary: Record<string, unknown>;
+  metrics_summary: Record<string, unknown>;
+  recommended_parameters: Record<string, number>;
+  recommended_symbols: string[];
+  request_payload?: Record<string, unknown> | null;
+  result_payload?: StrategyOptimizationResult | null;
+}
+
+export interface StrategyOptimizationHistoryResponse {
+  runs: StrategyOptimizationHistoryItem[];
+  total_count: number;
 }
 
 export interface ParameterTuneRequest {

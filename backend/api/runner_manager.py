@@ -152,6 +152,7 @@ class RunnerManager:
         alpaca_client: Optional[Dict[str, str]] = None,
         require_real_data: bool = False,
         symbol_universe_override: Optional[list[str]] = None,
+        symbol_universe_overrides: Optional[Dict[str, list[str]]] = None,
     ) -> Dict[str, Any]:
         """
         Start the strategy runner.
@@ -228,11 +229,21 @@ class RunnerManager:
                 existing_positions = storage.get_open_positions()
                 existing_position_count = len(existing_positions)
                 override_symbols = self._normalize_symbols(symbol_universe_override or [])
+                per_strategy_override_symbols: Dict[str, list[str]] = {}
+                for strategy_id, symbols in (symbol_universe_overrides or {}).items():
+                    normalized_override = self._normalize_symbols(symbols or [])
+                    if normalized_override:
+                        per_strategy_override_symbols[str(strategy_id)] = normalized_override
                 for db_strategy in active_strategies:
                     config = db_strategy.config or {}
                     raw_symbols = config.get("symbols", [])
-                    symbols = list(override_symbols) if override_symbols else self._normalize_symbols(
-                        raw_symbols if isinstance(raw_symbols, list) else []
+                    strategy_specific_override = per_strategy_override_symbols.get(str(db_strategy.id), [])
+                    symbols = (
+                        list(strategy_specific_override)
+                        if strategy_specific_override
+                        else (list(override_symbols) if override_symbols else self._normalize_symbols(
+                            raw_symbols if isinstance(raw_symbols, list) else []
+                        ))
                     )
                     if not symbols:
                         skipped_invalid.append(db_strategy.name)
@@ -302,8 +313,17 @@ class RunnerManager:
                         'account_buying_power': account_buying_power,
                         'remaining_weekly_budget': remaining_weekly_budget,
                         'existing_position_count': existing_position_count,
-                        'workspace_universe_override': bool(override_symbols),
-                        'workspace_override_symbol_count': len(override_symbols),
+                        'workspace_universe_override': bool(override_symbols or per_strategy_override_symbols),
+                        'workspace_override_symbol_count': (
+                            len(override_symbols)
+                            if override_symbols
+                            else sum(len(symbols) for symbols in per_strategy_override_symbols.values())
+                        ),
+                        'workspace_override_strategy_count': (
+                            1
+                            if override_symbols
+                            else len(per_strategy_override_symbols)
+                        ),
                     }
                 )
             finally:
@@ -314,15 +334,21 @@ class RunnerManager:
             success = runner.start()
             
             if success:
+                override_message = ""
+                if symbol_universe_override:
+                    override_message = f" using workspace universe override ({len(symbol_universe_override)} symbols)"
+                elif symbol_universe_overrides:
+                    override_strategy_count = len([1 for symbols in symbol_universe_overrides.values() if symbols])
+                    override_symbol_count = sum(len(symbols) for symbols in symbol_universe_overrides.values() if symbols)
+                    override_message = (
+                        f" using workspace universe override on {override_strategy_count} strategy(ies)"
+                        f" ({override_symbol_count} symbols)"
+                    )
                 return {
                     "success": True,
                     "message": (
                         f"Runner started with {strategy_count} strategies"
-                        + (
-                            f" using workspace universe override ({len(symbol_universe_override or [])} symbols)"
-                            if symbol_universe_override
-                            else ""
-                        )
+                        + override_message
                     ),
                     "status": runner.status.value
                 }

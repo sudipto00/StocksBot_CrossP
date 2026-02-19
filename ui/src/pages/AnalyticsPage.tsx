@@ -160,7 +160,7 @@ function AnalyticsPage() {
                       labelFormatter={(label) => formatDate(label)}
                     />
                     <Area 
-                      type="monotone" 
+                      type="linear" 
                       dataKey="equity" 
                       stroke="#3b82f6" 
                       fillOpacity={1} 
@@ -193,7 +193,7 @@ function AnalyticsPage() {
                     />
                     <Legend />
                     <Line 
-                      type="monotone" 
+                      type="linear" 
                       dataKey="cumulative_pnl" 
                       stroke="#10b981" 
                       name="Cumulative P&L"
