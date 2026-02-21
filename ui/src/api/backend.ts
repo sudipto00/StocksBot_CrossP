@@ -40,6 +40,7 @@ import {
   // Analytics types
   PortfolioAnalyticsResponse,
   PortfolioSummaryResponse,
+  DashboardAnalyticsBundleResponse,
   EquityPoint,
   PortfolioAnalytics,
   // Strategy configuration types
@@ -403,10 +404,17 @@ export async function deleteStrategy(id: string): Promise<void> {
 /**
  * Get audit logs.
  */
-export async function getAuditLogs(limit?: number, eventType?: AuditEventType): Promise<AuditLogsResponse> {
+export async function getAuditLogs(
+  limit?: number,
+  eventType?: AuditEventType,
+  offset?: number,
+): Promise<AuditLogsResponse> {
   const params = new URLSearchParams();
   if (limit) params.append('limit', limit.toString());
   if (eventType) params.append('event_type', eventType);
+  if (typeof offset === 'number' && Number.isFinite(offset) && offset > 0) {
+    params.append('offset', String(Math.max(0, Math.floor(offset))));
+  }
   
   const url = `${BACKEND_URL}/audit/logs${params.toString() ? '?' + params.toString() : ''}`;
   const response = await authFetch(url);
@@ -421,9 +429,12 @@ export async function getAuditLogs(limit?: number, eventType?: AuditEventType): 
 /**
  * Get complete trade history for audit mode.
  */
-export async function getAuditTrades(limit?: number): Promise<TradeHistoryResponse> {
+export async function getAuditTrades(limit?: number, offset?: number): Promise<TradeHistoryResponse> {
   const params = new URLSearchParams();
   if (limit) params.append('limit', limit.toString());
+  if (typeof offset === 'number' && Number.isFinite(offset) && offset > 0) {
+    params.append('offset', String(Math.max(0, Math.floor(offset))));
+  }
 
   const url = `${BACKEND_URL}/audit/trades${params.toString() ? '?' + params.toString() : ''}`;
   const response = await authFetch(url);
@@ -459,7 +470,13 @@ export async function startRunner(request?: RunnerStartRequest): Promise<RunnerA
   });
   
   if (!response.ok) {
-    throw new Error(`Backend returned ${response.status}`);
+    let body: { detail?: string; message?: string } | null = null;
+    try {
+      body = await response.json();
+    } catch {
+      body = null;
+    }
+    throw new Error(body?.detail || body?.message || `Backend returned ${response.status}`);
   }
   
   return response.json();
@@ -660,6 +677,10 @@ export async function getPortfolioAnalytics(days?: number): Promise<PortfolioAna
   }
   
   const data: PortfolioAnalyticsResponse = await response.json();
+  return mapPortfolioAnalyticsResponse(data);
+}
+
+function mapPortfolioAnalyticsResponse(data: PortfolioAnalyticsResponse): PortfolioAnalytics {
   const normalizedSeries = data.time_series
     .map((point, index) => ({
       point,
@@ -690,6 +711,31 @@ export async function getPortfolioAnalytics(days?: number): Promise<PortfolioAna
     total_trades: data.total_trades,
     current_equity: data.current_equity,
     total_pnl: data.total_pnl,
+  };
+}
+
+/**
+ * Get pre-aggregated dashboard analytics bundle.
+ */
+export async function getDashboardAnalyticsBundle(days?: number): Promise<{
+  generated_at: string;
+  analytics: PortfolioAnalytics;
+  summary: PortfolioSummaryResponse;
+  broker_account: BrokerAccountResponse;
+}> {
+  const params = new URLSearchParams();
+  if (typeof days === 'number' && Number.isFinite(days)) params.set('days', String(days));
+  const response = await authFetch(`${BACKEND_URL}/analytics/dashboard${params.toString() ? `?${params.toString()}` : ''}`);
+  if (!response.ok) {
+    const body = await response.json().catch(() => null);
+    throw new Error(body?.detail || `Backend returned ${response.status}`);
+  }
+  const payload: DashboardAnalyticsBundleResponse = await response.json();
+  return {
+    generated_at: payload.generated_at,
+    analytics: mapPortfolioAnalyticsResponse(payload.analytics),
+    summary: payload.summary,
+    broker_account: payload.broker_account,
   };
 }
 
@@ -907,7 +953,10 @@ export async function cancelStrategyOptimization(
  * List optimizer jobs from in-memory + persisted backend state.
  */
 export async function listOptimizerJobs(): Promise<OptimizerJobsListResponse> {
-  const response = await authFetch(`${BACKEND_URL}/optimizer/jobs`);
+  const params = new URLSearchParams();
+  params.set('limit', '100');
+  params.set('include_terminal', 'false');
+  const response = await authFetch(`${BACKEND_URL}/optimizer/jobs?${params.toString()}`);
   if (!response.ok) {
     const body = await response.json().catch(() => null);
     throw new Error(body?.detail || `Backend returned ${response.status}`);
@@ -1048,9 +1097,20 @@ export async function getTradingPreferences(): Promise<TradingPreferences> {
 
   const raw = (await response.json()) as TradingPreferences;
   const normalizedAssetType = raw.asset_type === 'etf' ? 'etf' : 'stock';
+  const fallbackLimit = Math.max(10, Math.min(200, Math.round(Number(raw.screener_limit || 50))));
+  const stockMostActiveLimit = Math.max(10, Math.min(200, Math.round(Number(raw.stock_most_active_limit || fallbackLimit))));
+  const stockPresetLimit = Math.max(10, Math.min(200, Math.round(Number(raw.stock_preset_limit || fallbackLimit))));
+  const etfPresetLimit = Math.max(10, Math.min(200, Math.round(Number(raw.etf_preset_limit || fallbackLimit))));
+  const activeLimit = normalizedAssetType === 'etf'
+    ? etfPresetLimit
+    : ((raw.screener_mode || 'most_active') === 'preset' ? stockPresetLimit : stockMostActiveLimit);
   return {
     ...raw,
     asset_type: normalizedAssetType,
+    screener_limit: activeLimit,
+    stock_most_active_limit: stockMostActiveLimit,
+    stock_preset_limit: stockPresetLimit,
+    etf_preset_limit: etfPresetLimit,
     screener_mode: normalizedAssetType === 'stock' ? raw.screener_mode : 'preset',
   };
 }
@@ -1075,9 +1135,20 @@ export async function updateTradingPreferences(
 
   const raw = (await response.json()) as TradingPreferences;
   const normalizedAssetType = raw.asset_type === 'etf' ? 'etf' : 'stock';
+  const fallbackLimit = Math.max(10, Math.min(200, Math.round(Number(raw.screener_limit || 50))));
+  const stockMostActiveLimit = Math.max(10, Math.min(200, Math.round(Number(raw.stock_most_active_limit || fallbackLimit))));
+  const stockPresetLimit = Math.max(10, Math.min(200, Math.round(Number(raw.stock_preset_limit || fallbackLimit))));
+  const etfPresetLimit = Math.max(10, Math.min(200, Math.round(Number(raw.etf_preset_limit || fallbackLimit))));
+  const activeLimit = normalizedAssetType === 'etf'
+    ? etfPresetLimit
+    : ((raw.screener_mode || 'most_active') === 'preset' ? stockPresetLimit : stockMostActiveLimit);
   return {
     ...raw,
     asset_type: normalizedAssetType,
+    screener_limit: activeLimit,
+    stock_most_active_limit: stockMostActiveLimit,
+    stock_preset_limit: stockPresetLimit,
+    etf_preset_limit: etfPresetLimit,
     screener_mode: normalizedAssetType === 'stock' ? raw.screener_mode : 'preset',
   };
 }

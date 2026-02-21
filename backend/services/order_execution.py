@@ -469,7 +469,8 @@ class OrderExecutionService:
             quantity=filled_quantity,
             price=avg_fill_price,
             commission=0.0,  # TODO: Get commission from broker
-            fees=0.0
+            fees=0.0,
+            strategy_id=getattr(order, "strategy_id", None),
         )
         
         logger.info(

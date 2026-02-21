@@ -130,20 +130,21 @@ class Trade(Base):
     id = Column(Integer, primary_key=True, index=True)
     order_id = Column(Integer, nullable=False, index=True)
     external_id = Column(String(100), nullable=True)  # Broker trade ID
-    
+    strategy_id = Column(Integer, nullable=True, index=True)  # Link to strategy
+
     symbol = Column(String(20), nullable=False, index=True)
     side = Column(SQLEnum(OrderSideEnum), nullable=False)
     type = Column(SQLEnum(TradeTypeEnum), nullable=False)
-    
+
     # Trade details
     quantity = Column(Float, nullable=False)
     price = Column(Float, nullable=False)
     commission = Column(Float, default=0.0)
     fees = Column(Float, default=0.0)
-    
+
     # P&L tracking
     realized_pnl = Column(Float, nullable=True)
-    
+
     # Timestamps
     executed_at = Column(DateTime, default=func.now(), nullable=False)
     created_at = Column(DateTime, default=func.now(), nullable=False)

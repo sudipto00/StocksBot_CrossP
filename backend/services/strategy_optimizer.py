@@ -20,6 +20,13 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from config.strategy_config import BacktestRequest, BacktestResult, get_default_parameters
 from services.strategy_analytics import StrategyAnalyticsService, BacktestCancelledError
 
+try:
+    import optuna  # type: ignore[import-untyped]
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    _OPTUNA_AVAILABLE = True
+except ImportError:
+    _OPTUNA_AVAILABLE = False
+
 
 @dataclass
 class OptimizationContext:
@@ -140,7 +147,8 @@ def _jitter_window(start_iso: str, end_iso: str, rng: random.Random) -> Tuple[st
     if end <= start:
         return (start.isoformat(), end.isoformat())
     span_days = max(1, (end - start).days)
-    jitter = max(0, min(3, span_days // 120))
+    # Jitter up to ~1/12 of the span (e.g. ~30 days for a 360-day window).
+    jitter = max(0, min(45, span_days // 12))
     if jitter <= 0:
         return (start.isoformat(), end.isoformat())
     shifted_start = start + timedelta(days=rng.randint(-jitter, jitter))
@@ -271,6 +279,9 @@ def _evaluate_ensemble_candidate_worker(payload: Dict[str, Any]) -> Dict[str, An
         )
         scenario_fee_bps = max(0.0, base_fee_bps + rng.uniform(-1.5, 4.0))
         scenario_slippage_bps = max(1.0, min(75.0, 5.0 + rng.uniform(-2.0, 12.0)))
+        # Price path perturbation: ~5-20 bps noise stdev per bar.
+        scenario_price_noise_bps = rng.uniform(5.0, 20.0)
+        scenario_price_noise_seed = rng.randint(0, 2_147_483_647)
         scenario_universe_context = dict(base_universe_context)
         optimizer_ctx = (
             dict(scenario_universe_context.get("optimizer"))
@@ -307,6 +318,8 @@ def _evaluate_ensemble_candidate_worker(payload: Dict[str, Any]) -> Dict[str, An
             max_position_size=float(context.get("max_position_size") or 0.0) or None,
             risk_limit_daily=float(context.get("risk_limit_daily") or 0.0) or None,
             fee_bps=float(scenario_fee_bps),
+            price_noise_bps=float(scenario_price_noise_bps),
+            price_noise_seed=int(scenario_price_noise_seed),
             universe_context=scenario_universe_context,
         )
         try:
@@ -422,9 +435,55 @@ class StrategyOptimizerService:
 
         _emit("initializing")
         outcomes: List[OptimizationOutcome] = []
+        # Detect nested subprocess to avoid ProcessPoolExecutor deadlock on macOS.
+        _in_child_process = bool(os.environ.get("STOCKSBOT_OPTIMIZER_CHILD"))
         if ensemble_enabled:
             base_seed = random_seed if isinstance(random_seed, int) else 0
             worker_context = self._build_ensemble_worker_context(context=context)
+            if _in_child_process:
+                # Already inside a subprocess worker — run ensemble candidates
+                # sequentially to avoid nested fork() deadlocks on macOS.
+                for cand_idx, params in enumerate(candidates):
+                    if should_cancel and should_cancel():
+                        raise OptimizationCancelledError("Optimization canceled")
+                    candidate_seed = base_seed + (cand_idx * 1009) + 17
+                    payload = {
+                        "context": worker_context,
+                        "parameters": params,
+                        "base_symbols": list(symbols),
+                        "ensemble_runs": safe_ensemble_runs,
+                        "min_trades": int(min_trades),
+                        "objective": objective_key,
+                        "strict_min_trades": bool(strict_min_trades),
+                        "seed": int(candidate_seed),
+                    }
+                    result_payload = _evaluate_ensemble_candidate_worker(payload)
+                    robustness = (
+                        dict(result_payload.get("robustness"))
+                        if isinstance(result_payload.get("robustness"), dict)
+                        else None
+                    )
+                    representative = self._build_summary_backtest_result(
+                        context=context,
+                        parameters=params,
+                        robustness=robustness,
+                    )
+                    outcomes.append(
+                        OptimizationOutcome(
+                            score=float(result_payload.get("score", -1_000_000.0)),
+                            meets_min_trades=bool(result_payload.get("meets_min_trades", False)),
+                            parameters=dict(params),
+                            symbols=list(symbols),
+                            result=representative,
+                            robustness=robustness,
+                        )
+                    )
+                    completed_steps += safe_ensemble_runs
+                    _emit("ensemble_search")
+            else:
+                # Not in a child — safe to use ProcessPoolExecutor.
+                pass
+        if ensemble_enabled and not _in_child_process:
             try:
                 future_to_payload: Dict[Future, Tuple[int, Dict[str, float]]] = {}
                 next_candidate_idx = 0
@@ -565,6 +624,62 @@ class StrategyOptimizerService:
                 ensemble_enabled = False
                 safe_ensemble_runs = 1
                 resolved_max_workers = 1
+        elif _OPTUNA_AVAILABLE and iterations >= 12:
+            # Bayesian optimization via Optuna TPE for better sample efficiency.
+            _optuna_self = self
+            _optuna_outcomes: List[OptimizationOutcome] = []
+
+            def _optuna_objective(trial: Any) -> float:
+                nonlocal completed_steps
+                if should_cancel and should_cancel():
+                    raise OptimizationCancelledError("Optimization canceled")
+                if trial.number == 0:
+                    params = dict(base_params)
+                else:
+                    params = _optuna_self._optuna_suggest_parameters(trial, base_params)
+                result = _optuna_self._run_backtest(
+                    context=context,
+                    symbols=symbols,
+                    parameters=params,
+                    should_cancel=should_cancel,
+                )
+                score, meets = _optuna_self._objective_score(
+                    result=result,
+                    min_trades=min_trades,
+                    objective=objective_key,
+                    strict_min_trades=strict_min_trades,
+                )
+                _optuna_outcomes.append(
+                    OptimizationOutcome(
+                        score=score,
+                        meets_min_trades=meets,
+                        parameters=params,
+                        symbols=list(symbols),
+                        result=result,
+                    )
+                )
+                completed_steps += 1
+                _emit("parameter_search")
+                return score
+
+            sampler = optuna.samplers.TPESampler(
+                seed=random_seed,
+                n_startup_trials=max(3, iterations // 4),
+            )
+            study = optuna.create_study(direction="maximize", sampler=sampler)
+            # Enqueue baseline as the first trial.
+            study.enqueue_trial(
+                {name: base_params.get(name, 0.0) for name in self._TUNABLE_PARAMETER_NAMES if name in self._bounds}
+            )
+            try:
+                study.optimize(_optuna_objective, n_trials=iterations, show_progress_bar=False)
+            except OptimizationCancelledError:
+                raise
+            except Exception:
+                if should_cancel and should_cancel():
+                    raise OptimizationCancelledError("Optimization canceled")
+                raise
+            outcomes = _optuna_outcomes
         else:
             for params in candidates:
                 if should_cancel and should_cancel():
@@ -902,6 +1017,36 @@ class StrategyOptimizerService:
             candidates.append(self._mutate_parameters(base=base, rng=rng))
         return candidates
 
+    def _optuna_suggest_parameters(
+        self,
+        trial: Any,
+        base: Dict[str, float],
+    ) -> Dict[str, float]:
+        """Use an Optuna trial to suggest a parameter set respecting bounds/steps."""
+        candidate = dict(base)
+        for name in self._TUNABLE_PARAMETER_NAMES:
+            bounds = self._bounds.get(name)
+            if bounds is None:
+                continue
+            low, high, step = bounds
+            if name in self._INTEGER_PARAMETERS:
+                candidate[name] = float(trial.suggest_int(name, int(low), int(high), step=max(1, int(step))))
+            else:
+                # Optuna suggest_float with step for grid-aligned search.
+                candidate[name] = trial.suggest_float(name, low, high, step=step)
+        # Enforce parameter constraints (same as _mutate_parameters).
+        stop_loss = float(candidate.get("stop_loss_pct", base.get("stop_loss_pct", 2.0)))
+        min_take_profit = stop_loss * 1.8
+        tp_bounds = self._bounds.get("take_profit_pct", (1.0, 20.0, 0.5))
+        candidate["take_profit_pct"] = max(min_take_profit, candidate.get("take_profit_pct", 5.0))
+        candidate["take_profit_pct"] = min(float(tp_bounds[1]), candidate["take_profit_pct"])
+        candidate["take_profit_pct"] = self._snap(candidate["take_profit_pct"], tp_bounds[2])
+        trail_bounds = self._bounds.get("trailing_stop_pct", (0.5, 15.0, 0.25))
+        candidate["trailing_stop_pct"] = max(candidate.get("trailing_stop_pct", 2.5), stop_loss * 0.9)
+        candidate["trailing_stop_pct"] = min(float(trail_bounds[1]), candidate["trailing_stop_pct"])
+        candidate["trailing_stop_pct"] = self._snap(candidate["trailing_stop_pct"], trail_bounds[2])
+        return self._normalize_parameters(candidate)
+
     def _mutate_parameters(self, *, base: Dict[str, float], rng: random.Random) -> Dict[str, float]:
         candidate = dict(base)
         for name in self._TUNABLE_PARAMETER_NAMES:
@@ -979,6 +1124,9 @@ class StrategyOptimizerService:
             strict_min_trades=strict_min_trades,
         )
 
+    # Number of mini-optimization iterations per walk-forward fold.
+    _WF_FOLD_ITERATIONS = 12
+
     def _compute_walk_forward_report(
         self,
         *,
@@ -991,6 +1139,10 @@ class StrategyOptimizerService:
         folds: int,
         should_cancel: Optional[Callable[[], bool]] = None,
     ) -> Dict[str, Any]:
+        """Adaptive walk-forward: re-optimize on each fold's train window,
+        then score on the OOS test window.  Falls back to the globally-
+        optimized parameters when the train window is too short to re-optimize.
+        """
         safe_folds = max(2, int(folds))
         start_date = self._parse_iso_date(context.start_date)
         end_date = self._parse_iso_date(context.end_date)
@@ -1033,7 +1185,58 @@ class StrategyOptimizerService:
             if (test_end - test_start).days + 1 < 20:
                 break
 
-            fold_context = OptimizationContext(
+            # --- Adaptive: re-optimize on the train window ---
+            train_days = (train_end - train_start).days + 1
+            fold_params = dict(parameters)
+            reoptimized = False
+            if train_days >= 90:
+                train_context = OptimizationContext(
+                    strategy_id=context.strategy_id,
+                    start_date=train_start.isoformat(),
+                    end_date=train_end.isoformat(),
+                    initial_capital=context.initial_capital,
+                    contribution_amount=context.contribution_amount,
+                    contribution_frequency=context.contribution_frequency,
+                    emulate_live_trading=context.emulate_live_trading,
+                    require_fractionable=context.require_fractionable,
+                    max_position_size=context.max_position_size,
+                    risk_limit_daily=context.risk_limit_daily,
+                    fee_bps=context.fee_bps,
+                    universe_context=dict(context.universe_context or {}),
+                    symbol_capabilities=dict(context.symbol_capabilities or {}),
+                    alpaca_creds=dict(context.alpaca_creds) if isinstance(context.alpaca_creds, dict) else None,
+                    require_real_data=bool(context.require_real_data),
+                    cancel_token_path=context.cancel_token_path,
+                )
+                rng = random.Random(idx * 7919)
+                fold_candidates = self._build_parameter_candidates(
+                    base=parameters,
+                    iterations=self._WF_FOLD_ITERATIONS,
+                    rng=rng,
+                )
+                best_fold_score = -1e18
+                for cand in fold_candidates:
+                    if should_cancel and should_cancel():
+                        raise OptimizationCancelledError("Optimization canceled")
+                    cand_result = self._run_backtest(
+                        context=train_context,
+                        symbols=symbols,
+                        parameters=cand,
+                        should_cancel=should_cancel,
+                    )
+                    cand_score, _ = self._objective_score(
+                        result=cand_result,
+                        min_trades=max(1, min_trades // 2),
+                        objective=objective,
+                        strict_min_trades=False,
+                    )
+                    if cand_score > best_fold_score:
+                        best_fold_score = cand_score
+                        fold_params = dict(cand)
+                reoptimized = True
+
+            # --- Score on OOS test window ---
+            test_context = OptimizationContext(
                 strategy_id=context.strategy_id,
                 start_date=test_start.isoformat(),
                 end_date=test_end.isoformat(),
@@ -1052,9 +1255,9 @@ class StrategyOptimizerService:
                 cancel_token_path=context.cancel_token_path,
             )
             fold_result = self._run_backtest(
-                context=fold_context,
+                context=test_context,
                 symbols=symbols,
-                parameters=parameters,
+                parameters=fold_params,
                 should_cancel=should_cancel,
             )
             fold_score, fold_meets = self._objective_score(
@@ -1077,6 +1280,7 @@ class StrategyOptimizerService:
                     "win_rate": round(float(fold_result.win_rate or 0.0), 6),
                     "total_trades": int(fold_result.total_trades or 0),
                     "meets_min_trades": bool(fold_meets),
+                    "reoptimized": reoptimized,
                 }
             )
 
@@ -1089,16 +1293,24 @@ class StrategyOptimizerService:
             ]
             return report
 
+        reopt_count = sum(1 for row in fold_rows if row.get("reoptimized"))
         pass_count = sum(1 for row in fold_rows if bool(row.get("meets_min_trades")))
         report["pass_rate_pct"] = round((pass_count / completed) * 100.0, 2)
         report["average_score"] = round(sum(float(row["score"]) for row in fold_rows) / completed, 6)
         report["average_return"] = round(sum(float(row["total_return"]) for row in fold_rows) / completed, 6)
         report["average_sharpe"] = round(sum(float(row["sharpe_ratio"]) for row in fold_rows) / completed, 6)
         report["worst_fold_return"] = round(min(float(row["total_return"]) for row in fold_rows), 6)
-        report["notes"] = [
-            "Walk-forward uses expanding train windows with sequential out-of-sample test windows.",
-            "Folds are scored with the same objective and trade-count gating as the optimizer run.",
+        notes = [
+            "Adaptive walk-forward: re-optimizes parameters on each fold's training window before OOS scoring.",
         ]
+        if reopt_count < completed:
+            notes.append(
+                f"{completed - reopt_count} fold(s) used global parameters (train window < 90 days)."
+            )
+        notes.append(
+            "Folds are scored with the same objective and trade-count gating as the optimizer run."
+        )
+        report["notes"] = notes
         return report
 
     def _normalize_symbols(self, symbols: Sequence[str]) -> List[str]:

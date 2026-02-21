@@ -15,6 +15,8 @@ from api.routes import (
     router as api_router,
     start_summary_scheduler,
     stop_summary_scheduler,
+    start_optimizer_dispatcher,
+    stop_optimizer_dispatcher,
 )
 from config.settings import get_settings
 from storage.database import init_db, ensure_optimization_runs_schema
@@ -46,8 +48,20 @@ async def _lifespan(_app: FastAPI):
     except (RuntimeError, ValueError, TypeError):
         logger.exception("Failed to start summary notification scheduler")
     try:
+        optimizer_started = start_optimizer_dispatcher()
+        if optimizer_started:
+            logger.info("Optimizer dispatcher started")
+    except (RuntimeError, ValueError, TypeError):
+        logger.exception("Failed to start optimizer dispatcher")
+    try:
         yield
     finally:
+        try:
+            optimizer_stopped = stop_optimizer_dispatcher()
+            if optimizer_stopped:
+                logger.info("Optimizer dispatcher stopped")
+        except (RuntimeError, ValueError, TypeError):
+            logger.exception("Failed to stop optimizer dispatcher")
         try:
             stopped = stop_summary_scheduler()
             if stopped:

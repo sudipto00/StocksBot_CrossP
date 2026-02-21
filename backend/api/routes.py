@@ -14,6 +14,9 @@ import threading
 import time
 import asyncio
 import tempfile
+import signal
+import subprocess
+import sys
 from pathlib import Path
 from fastapi import APIRouter, HTTPException, Depends, Query, Header, WebSocket, WebSocketDisconnect
 from typing import List, Optional, Dict, Any
@@ -22,7 +25,12 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from storage.database import SessionLocal, get_db
 from storage.service import StorageService
-from storage.models import AuditLog as DBAuditLog, Trade as DBTrade, OptimizationRun as DBOptimizationRun
+from storage.models import (
+    AuditLog as DBAuditLog,
+    Trade as DBTrade,
+    Strategy as DBStrategy,
+    OptimizationRun as DBOptimizationRun,
+)
 from services.broker import BrokerInterface, PaperBroker
 from services.order_execution import (
     OrderExecutionService,
@@ -179,6 +187,52 @@ def _resolve_alpaca_credentials_for_mode(mode: str) -> Optional[Dict[str, str]]:
     return None
 
 
+def _optimizer_worker_env_with_runtime_credentials(base_env: Dict[str, str]) -> Dict[str, str]:
+    """Attach runtime credentials so detached workers can resolve strict-data requirements."""
+    env = dict(base_env)
+    paper_creds = _get_runtime_credentials("paper")
+    live_creds = _get_runtime_credentials("live")
+    paper_api = str(paper_creds.get("api_key") or "").strip()
+    paper_secret = str(paper_creds.get("secret_key") or "").strip()
+    live_api = str(live_creds.get("api_key") or "").strip()
+    live_secret = str(live_creds.get("secret_key") or "").strip()
+
+    if paper_api and paper_secret:
+        env[_OPTIMIZER_WORKER_ENV_PAPER_API_KEY] = paper_api
+        env[_OPTIMIZER_WORKER_ENV_PAPER_SECRET_KEY] = paper_secret
+    else:
+        env.pop(_OPTIMIZER_WORKER_ENV_PAPER_API_KEY, None)
+        env.pop(_OPTIMIZER_WORKER_ENV_PAPER_SECRET_KEY, None)
+
+    if live_api and live_secret:
+        env[_OPTIMIZER_WORKER_ENV_LIVE_API_KEY] = live_api
+        env[_OPTIMIZER_WORKER_ENV_LIVE_SECRET_KEY] = live_secret
+    else:
+        env.pop(_OPTIMIZER_WORKER_ENV_LIVE_API_KEY, None)
+        env.pop(_OPTIMIZER_WORKER_ENV_LIVE_SECRET_KEY, None)
+    return env
+
+
+def _optimizer_hydrate_runtime_credentials_from_env(source_env: Optional[Dict[str, str]] = None) -> bool:
+    """Hydrate in-memory runtime credentials from worker environment variables."""
+    env = source_env if source_env is not None else os.environ
+    paper_api = str(env.get(_OPTIMIZER_WORKER_ENV_PAPER_API_KEY) or "").strip()
+    paper_secret = str(env.get(_OPTIMIZER_WORKER_ENV_PAPER_SECRET_KEY) or "").strip()
+    live_api = str(env.get(_OPTIMIZER_WORKER_ENV_LIVE_API_KEY) or "").strip()
+    live_secret = str(env.get(_OPTIMIZER_WORKER_ENV_LIVE_SECRET_KEY) or "").strip()
+
+    updated = False
+    if paper_api and paper_secret:
+        _set_runtime_credentials("paper", paper_api, paper_secret)
+        updated = True
+    if live_api and live_secret:
+        _set_runtime_credentials("live", live_api, live_secret)
+        updated = True
+    if updated:
+        _invalidate_broker_instance()
+    return updated
+
+
 def _invalidate_broker_instance() -> None:
     """Invalidate cached broker instance and disconnect previous instance safely."""
     global _broker_instance
@@ -234,7 +288,17 @@ def get_broker() -> BrokerInterface:
             broker_name = "paper"
 
         if not broker.connect():
-            raise RuntimeError("Failed to connect to broker")
+            connect_error = ""
+            try:
+                connect_error = str(broker.get_last_connection_error() or "").strip()
+            except Exception:
+                connect_error = ""
+            mode_label = "paper" if bool(config.paper_trading) else "live"
+            if connect_error:
+                raise RuntimeError(
+                    f"Failed to connect to broker ({broker_name}/{mode_label}): {connect_error}"
+                )
+            raise RuntimeError(f"Failed to connect to broker ({broker_name}/{mode_label})")
         _broker_instance = broker
         _config = _config.model_copy(update={"broker": broker_name})
         return _broker_instance
@@ -328,13 +392,52 @@ _market_screener_instances_lock = threading.Lock()
 _preference_recommendation_cache: Dict[str, Dict[str, Any]] = {}
 _preference_recommendation_cache_lock = threading.Lock()
 _PREFERENCE_RECOMMENDATION_CACHE_TTL_SECONDS = 10
+_portfolio_analytics_cache: Dict[str, Dict[str, Any]] = {}
+_portfolio_analytics_cache_lock = threading.Lock()
+_PORTFOLIO_ANALYTICS_CACHE_TTL_SECONDS = 6
+_portfolio_summary_cache: Dict[str, Any] = {}
+_portfolio_summary_cache_lock = threading.Lock()
+_PORTFOLIO_SUMMARY_CACHE_TTL_SECONDS = 6
 _optimizer_jobs: Dict[str, Dict[str, Any]] = {}
 _optimizer_jobs_lock = threading.Lock()
 _optimizer_job_threads: Dict[str, threading.Thread] = {}
+_optimizer_job_processes: Dict[str, subprocess.Popen] = {}
 _optimizer_start_lock = threading.Lock()
+_optimizer_dispatcher_thread: Optional[threading.Thread] = None
+_optimizer_dispatcher_stop_event = threading.Event()
+_optimizer_dispatcher_wakeup_event = threading.Event()
+_optimizer_dispatcher_lock = threading.Lock()
 _OPTIMIZER_MAX_JOB_HISTORY = 40
 _OPTIMIZATION_HISTORY_LIMIT_PER_STRATEGY = 40
-_OPTIMIZER_DB_PROGRESS_FLUSH_SECONDS = 2.0
+_OPTIMIZER_DB_PROGRESS_FLUSH_SECONDS = 5.0  # Reduced flush frequency to avoid DB contention in long jobs
+_OPTIMIZER_RUNTIME_META_KEY = "_runtime"
+_OPTIMIZER_RUNTIME_META_FIELDS = {
+    "status",
+    "message",
+    "error",
+    "worker_pid",
+    "worker_mode",
+    "worker_started_at",
+    "last_heartbeat_at",
+    "progress_pct",
+    "completed_iterations",
+    "total_iterations",
+    "elapsed_seconds",
+    "eta_seconds",
+    "avg_seconds_per_iteration",
+    "cancel_requested_at",
+    "force_cancel_requested_at",
+    "terminate_sent_at",
+}
+_OPTIMIZER_WORKER_ENV_PAPER_API_KEY = "STOCKSBOT_OPTIMIZER_PAPER_API_KEY"
+_OPTIMIZER_WORKER_ENV_PAPER_SECRET_KEY = "STOCKSBOT_OPTIMIZER_PAPER_SECRET_KEY"
+_OPTIMIZER_WORKER_ENV_LIVE_API_KEY = "STOCKSBOT_OPTIMIZER_LIVE_API_KEY"
+_OPTIMIZER_WORKER_ENV_LIVE_SECRET_KEY = "STOCKSBOT_OPTIMIZER_LIVE_SECRET_KEY"
+_OPTIMIZER_CANCEL_GRACE_SECONDS = 12.0
+_OPTIMIZER_FORCE_KILL_GRACE_SECONDS = 6.0
+_OPTIMIZER_DISPATCHER_POLL_SECONDS = 1.0
+_OPTIMIZER_RUNNING_STALE_SECONDS = 300.0  # 5 min; ensemble jobs can block for minutes per candidate
+_STRATEGY_CONFIG_VERSION_KEY = "_config_version"
 
 _SUMMARY_NOTIFICATION_PREFERENCES_KEY = "summary_notification_preferences"
 _SUMMARY_NOTIFICATION_SCHEDULE_STATE_KEY = "summary_notification_schedule_state"
@@ -490,6 +593,141 @@ def _preference_recommendation_cache_set(
         }
 
 
+def _portfolio_analytics_cache_get(cache_key: str) -> Optional[Dict[str, Any]]:
+    if "PYTEST_CURRENT_TEST" in os.environ:
+        return None
+    now_ts = time.time()
+    with _portfolio_analytics_cache_lock:
+        entry = _portfolio_analytics_cache.get(cache_key)
+        if not entry:
+            return None
+        if float(entry.get("expires_at", 0.0)) <= now_ts:
+            _portfolio_analytics_cache.pop(cache_key, None)
+            return None
+        payload = entry.get("payload")
+    return dict(payload) if isinstance(payload, dict) else None
+
+
+def _portfolio_analytics_cache_set(
+    cache_key: str,
+    payload: Dict[str, Any],
+    ttl_seconds: int = _PORTFOLIO_ANALYTICS_CACHE_TTL_SECONDS,
+) -> None:
+    if "PYTEST_CURRENT_TEST" in os.environ:
+        return
+    ttl = max(2, int(ttl_seconds))
+    with _portfolio_analytics_cache_lock:
+        _portfolio_analytics_cache[cache_key] = {
+            "payload": dict(payload),
+            "expires_at": time.time() + ttl,
+        }
+
+
+def _portfolio_summary_cache_get() -> Optional[Dict[str, Any]]:
+    if "PYTEST_CURRENT_TEST" in os.environ:
+        return None
+    now_ts = time.time()
+    with _portfolio_summary_cache_lock:
+        expires_at = float(_portfolio_summary_cache.get("expires_at", 0.0))
+        if expires_at <= now_ts:
+            _portfolio_summary_cache.clear()
+            return None
+        payload = _portfolio_summary_cache.get("payload")
+    return dict(payload) if isinstance(payload, dict) else None
+
+
+def _portfolio_summary_cache_set(
+    payload: Dict[str, Any],
+    ttl_seconds: int = _PORTFOLIO_SUMMARY_CACHE_TTL_SECONDS,
+) -> None:
+    if "PYTEST_CURRENT_TEST" in os.environ:
+        return
+    ttl = max(2, int(ttl_seconds))
+    with _portfolio_summary_cache_lock:
+        _portfolio_summary_cache.clear()
+        _portfolio_summary_cache.update(
+            {
+                "payload": dict(payload),
+                "expires_at": time.time() + ttl,
+            }
+        )
+
+
+def _optimizer_use_subprocess_workers() -> bool:
+    mode = str(os.getenv("STOCKSBOT_OPTIMIZER_WORKER_MODE", "process")).strip().lower()
+    if mode in {"thread", "inline"}:
+        return False
+    if "PYTEST_CURRENT_TEST" in os.environ and mode != "process_forced":
+        return False
+    return mode in {"process", "process_forced"}
+
+
+def _optimizer_max_concurrent_workers() -> int:
+    raw = os.getenv("STOCKSBOT_OPTIMIZER_MAX_CONCURRENT_JOBS", "1")
+    try:
+        parsed = int(raw)
+    except (TypeError, ValueError):
+        parsed = 1
+    return max(1, min(parsed, 8))
+
+
+def _optimizer_dispatcher_is_running() -> bool:
+    thread = _optimizer_dispatcher_thread
+    return bool(thread and thread.is_alive())
+
+
+def _optimizer_signal_dispatcher() -> None:
+    _optimizer_dispatcher_wakeup_event.set()
+
+
+def _optimizer_runtime_meta_from_request_payload(request_payload: Dict[str, Any]) -> Dict[str, Any]:
+    runtime = request_payload.get(_OPTIMIZER_RUNTIME_META_KEY) if isinstance(request_payload, dict) else None
+    return dict(runtime) if isinstance(runtime, dict) else {}
+
+
+def _optimizer_row_apply_runtime_meta(row: Dict[str, Any], request_payload: Dict[str, Any]) -> None:
+    runtime = _optimizer_runtime_meta_from_request_payload(request_payload)
+    for key in _OPTIMIZER_RUNTIME_META_FIELDS:
+        if key in runtime and key not in row:
+            row[key] = runtime.get(key)
+
+
+def _optimizer_request_with_runtime_meta(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    request_payload = dict(snapshot.get("request")) if isinstance(snapshot.get("request"), dict) else {}
+    runtime = _optimizer_runtime_meta_from_request_payload(request_payload)
+    for key in _OPTIMIZER_RUNTIME_META_FIELDS:
+        value = snapshot.get(key)
+        if value is None:
+            runtime.pop(key, None)
+            continue
+        runtime[key] = value
+    if runtime:
+        request_payload[_OPTIMIZER_RUNTIME_META_KEY] = runtime
+    else:
+        request_payload.pop(_OPTIMIZER_RUNTIME_META_KEY, None)
+    return request_payload
+
+
+def _optimizer_pid_alive(pid: int) -> bool:
+    if not isinstance(pid, int) or pid <= 1:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _optimizer_signal_pid(pid: int, sig: int) -> bool:
+    if not isinstance(pid, int) or pid <= 1:
+        return False
+    try:
+        os.kill(pid, sig)
+        return True
+    except OSError:
+        return False
+
+
 def _optimizer_prune_jobs_locked() -> None:
     """Keep optimizer in-memory job history bounded."""
     if len(_optimizer_jobs) <= _OPTIMIZER_MAX_JOB_HISTORY:
@@ -506,6 +744,7 @@ def _optimizer_prune_jobs_locked() -> None:
         job_id, _ = completed.pop(0)
         _optimizer_jobs.pop(job_id, None)
         _optimizer_job_threads.pop(job_id, None)
+        _optimizer_job_processes.pop(job_id, None)
         _optimizer_clear_cancel_token(job_id)
 
 
@@ -541,26 +780,32 @@ def _optimizer_clear_cancel_token(job_id: str) -> None:
         return
 
 
-def _optimizer_request_cancel(job_id: str, *, message: str = "Cancel requested") -> Optional[Dict[str, Any]]:
+def _optimizer_request_cancel(
+    job_id: str,
+    *,
+    message: str = "Cancel requested",
+    force: bool = False,
+) -> Optional[Dict[str, Any]]:
     _optimizer_write_cancel_token(job_id)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    updates: Dict[str, Any] = {
+        "cancel_requested": True,
+        "message": message,
+    }
+    if not (_optimizer_get_job(job_id) or {}).get("cancel_requested_at"):
+        updates["cancel_requested_at"] = now_iso
+    if force:
+        updates["force_cancel_requested_at"] = now_iso
     updated = _optimizer_update_job(
         job_id,
-        {
-            "cancel_requested": True,
-            "message": message,
-        },
+        updates,
     )
     if updated is not None:
         return updated
     persisted = _optimizer_get_persisted_job(job_id)
     if persisted is None:
         return None
-    persisted.update(
-        {
-            "cancel_requested": True,
-            "message": message,
-        }
-    )
+    persisted.update(updates)
     _optimizer_persist_snapshot(persisted, prune_history=False)
     return persisted
 
@@ -570,6 +815,8 @@ def _optimizer_create_job(strategy_id: str, request_payload: Dict[str, Any]) -> 
     created_at = datetime.now(timezone.utc).isoformat()
     job_id = secrets.token_hex(12)
     _optimizer_clear_cancel_token(job_id)
+    runtime_request = dict(request_payload) if isinstance(request_payload, dict) else {}
+    runtime_request.pop(_OPTIMIZER_RUNTIME_META_KEY, None)
     row = {
         "job_id": job_id,
         "strategy_id": strategy_id,
@@ -586,9 +833,16 @@ def _optimizer_create_job(strategy_id: str, request_payload: Dict[str, Any]) -> 
         "created_at": created_at,
         "started_at": None,
         "completed_at": None,
-        "request": dict(request_payload),
+        "request": runtime_request,
         "result": None,
         "cancel_token_path": _optimizer_cancel_token_path(job_id),
+        "worker_pid": None,
+        "worker_mode": "process" if _optimizer_use_subprocess_workers() else "thread",
+        "worker_started_at": None,
+        "last_heartbeat_at": None,
+        "cancel_requested_at": None,
+        "force_cancel_requested_at": None,
+        "terminate_sent_at": None,
         "_last_db_flush_monotonic": 0.0,
     }
     with _optimizer_jobs_lock:
@@ -606,9 +860,49 @@ def _optimizer_reconcile_job_liveness_locked(job_id: str) -> Optional[Dict[str, 
     status = str(row.get("status") or "failed")
     if status in {"completed", "failed", "canceled"}:
         return dict(row)
+    if status == "queued":
+        return dict(row)
     worker = _optimizer_job_threads.get(job_id)
     if worker is not None and worker.is_alive():
         return dict(row)
+    process = _optimizer_job_processes.get(job_id)
+    if process is not None and process.poll() is None:
+        return dict(row)
+    pid_value = _safe_int(row.get("worker_pid"), 0)
+    if _optimizer_pid_alive(pid_value):
+        return dict(row)
+    heartbeat_at = _parse_iso_datetime(row.get("last_heartbeat_at"))
+    if heartbeat_at is not None:
+        age_seconds = max(0.0, (datetime.now(timezone.utc) - heartbeat_at).total_seconds())
+        if age_seconds < _OPTIMIZER_RUNNING_STALE_SECONDS:
+            return dict(row)
+    if bool(row.get("cancel_requested")):
+        row.update(
+            {
+                "status": "canceled",
+                "message": "Canceled by user",
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "error": None,
+            }
+        )
+        snapshot = dict(row)
+        _optimizer_persist_snapshot(snapshot, prune_history=True)
+        return snapshot
+    if status == "running":
+        row.update(
+            {
+                "status": "queued",
+                "message": "Recovered after worker restart; queued for retry",
+                "worker_pid": None,
+                "worker_started_at": None,
+                "last_heartbeat_at": None,
+                "terminate_sent_at": None,
+            }
+        )
+        snapshot = dict(row)
+        _optimizer_persist_snapshot(snapshot, prune_history=False)
+        return snapshot
+
     canceled = bool(row.get("cancel_requested")) or _optimizer_cancel_token_exists(job_id)
     row.update(
         {
@@ -619,19 +913,104 @@ def _optimizer_reconcile_job_liveness_locked(job_id: str) -> Optional[Dict[str, 
         }
     )
     _optimizer_job_threads.pop(job_id, None)
+    _optimizer_job_processes.pop(job_id, None)
     _optimizer_clear_cancel_token(job_id)
     snapshot = dict(row)
     _optimizer_persist_snapshot(snapshot, prune_history=True)
     return snapshot
 
 
+def _optimizer_should_prefer_persisted_row(
+    local_row: Dict[str, Any],
+    persisted_row: Dict[str, Any],
+) -> bool:
+    """Return True when persisted snapshot is fresher than in-memory row."""
+    local_status = str(local_row.get("status") or "").lower()
+    persisted_status = str(persisted_row.get("status") or "").lower()
+    terminal = {"completed", "failed", "canceled"}
+    if persisted_status in terminal and local_status not in terminal:
+        return True
+    if local_status in terminal and persisted_status not in terminal:
+        return False
+    if local_status == "queued" and persisted_status == "running":
+        return True
+
+    # Preserve immediate local cancel actions until they are flushed to durable storage.
+    if bool(local_row.get("cancel_requested")) and not bool(persisted_row.get("cancel_requested")):
+        return False
+
+    # Prefer persisted snapshots when runtime heartbeat advances.
+    local_heartbeat = _parse_iso_datetime(local_row.get("last_heartbeat_at"))
+    persisted_heartbeat = _parse_iso_datetime(persisted_row.get("last_heartbeat_at"))
+    if persisted_heartbeat is not None and local_heartbeat is None:
+        return True
+    if (
+        persisted_heartbeat is not None
+        and local_heartbeat is not None
+        and persisted_heartbeat > (local_heartbeat + timedelta(seconds=1))
+    ):
+        return True
+
+    # Prefer persisted snapshots when runtime progress metrics have advanced.
+    local_progress = _safe_float(local_row.get("progress_pct"), 0.0)
+    persisted_progress = _safe_float(persisted_row.get("progress_pct"), 0.0)
+    if persisted_progress > (local_progress + 0.05):
+        return True
+
+    local_completed = _safe_int(local_row.get("completed_iterations"), 0)
+    persisted_completed = _safe_int(persisted_row.get("completed_iterations"), 0)
+    if persisted_completed > local_completed:
+        return True
+
+    # Promote rows that transitioned out of setup/preparing phases.
+    local_message = str(local_row.get("message") or "").strip().lower()
+    persisted_message = str(persisted_row.get("message") or "").strip().lower()
+    local_preparing = local_message.startswith("queued") or "preparing" in local_message
+    persisted_preparing = persisted_message.startswith("queued") or "preparing" in persisted_message
+    if local_preparing and not persisted_preparing and persisted_message:
+        return True
+    return False
+
+
+def _optimizer_apply_persisted_row_locally(job_id: str, persisted_row: Dict[str, Any]) -> Dict[str, Any]:
+    """Update local in-memory row with persisted state snapshot."""
+    snapshot = dict(persisted_row)
+    status_value = str(snapshot.get("status") or "").lower()
+    with _optimizer_jobs_lock:
+        local_row = _optimizer_jobs.get(str(job_id))
+        if local_row is None:
+            return snapshot
+        # Keep local cancellation intent while persistence catches up.
+        if bool(local_row.get("cancel_requested")) and not bool(snapshot.get("cancel_requested")):
+            snapshot["cancel_requested"] = True
+            if local_row.get("cancel_requested_at") and not snapshot.get("cancel_requested_at"):
+                snapshot["cancel_requested_at"] = local_row.get("cancel_requested_at")
+            if local_row.get("force_cancel_requested_at") and not snapshot.get("force_cancel_requested_at"):
+                snapshot["force_cancel_requested_at"] = local_row.get("force_cancel_requested_at")
+            if local_row.get("terminate_sent_at") and not snapshot.get("terminate_sent_at"):
+                snapshot["terminate_sent_at"] = local_row.get("terminate_sent_at")
+        snapshot["_last_db_flush_monotonic"] = float(local_row.get("_last_db_flush_monotonic") or 0.0)
+        _optimizer_jobs[str(job_id)] = snapshot
+        if status_value in {"completed", "failed", "canceled"}:
+            _optimizer_job_threads.pop(str(job_id), None)
+            _optimizer_job_processes.pop(str(job_id), None)
+    if status_value in {"completed", "failed", "canceled"}:
+        _optimizer_clear_cancel_token(str(job_id))
+    return dict(snapshot)
+
+
 def _optimizer_get_job(job_id: str) -> Optional[Dict[str, Any]]:
     """Get optimizer job snapshot by ID."""
     with _optimizer_jobs_lock:
         row = _optimizer_reconcile_job_liveness_locked(job_id)
-    if row is not None:
+    persisted = _optimizer_get_persisted_job(job_id)
+    if row is None:
+        return persisted
+    if persisted is None:
         return row
-    return _optimizer_get_persisted_job(job_id)
+    if _optimizer_should_prefer_persisted_row(row, persisted):
+        return _optimizer_apply_persisted_row_locally(job_id, persisted)
+    return row
 
 
 def _optimizer_update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -669,8 +1048,303 @@ def _optimizer_update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict
     if status_value in {"completed", "failed", "canceled"}:
         with _optimizer_jobs_lock:
             _optimizer_job_threads.pop(job_id, None)
+            _optimizer_job_processes.pop(job_id, None)
         _optimizer_clear_cancel_token(job_id)
     return snapshot
+
+
+def _optimizer_attach_persisted_job_locally(job_id: str) -> Optional[Dict[str, Any]]:
+    """Load persisted job into local process memory for throttled updates."""
+    existing = _optimizer_get_job(job_id)
+    if existing is not None:
+        return existing
+    persisted = _optimizer_get_persisted_job(job_id)
+    if persisted is None:
+        return None
+    local_row = dict(persisted)
+    local_row["_last_db_flush_monotonic"] = 0.0
+    with _optimizer_jobs_lock:
+        _optimizer_jobs[str(job_id)] = local_row
+        _optimizer_prune_jobs_locked()
+    return dict(local_row)
+
+
+def _optimizer_escalate_cancel(job_id: str, *, force_now: bool = False) -> Optional[Dict[str, Any]]:
+    row = _optimizer_get_job(job_id)
+    if row is None:
+        return None
+    status = str(row.get("status") or "").lower()
+    if status in {"completed", "failed", "canceled"}:
+        return row
+
+    now = datetime.now(timezone.utc)
+    updates: Dict[str, Any] = {}
+    if not row.get("cancel_requested"):
+        updates["cancel_requested"] = True
+        updates["cancel_requested_at"] = now.isoformat()
+    elif not row.get("cancel_requested_at"):
+        updates["cancel_requested_at"] = now.isoformat()
+    if force_now and not row.get("force_cancel_requested_at"):
+        updates["force_cancel_requested_at"] = now.isoformat()
+    if updates:
+        row = _optimizer_update_job(job_id, updates) or row
+        status = str(row.get("status") or "").lower()
+        if status in {"completed", "failed", "canceled"}:
+            return row
+
+    if status == "queued":
+        return _optimizer_update_job(
+            job_id,
+            {
+                "status": "canceled",
+                "message": "Canceled before execution",
+                "completed_at": now.isoformat(),
+                "error": None,
+                "eta_seconds": 0.0,
+            },
+        )
+
+    pid_value = _safe_int(row.get("worker_pid"), 0)
+    if not _optimizer_pid_alive(pid_value):
+        return _optimizer_update_job(
+            job_id,
+            {
+                "status": "canceled",
+                "message": "Canceled (worker already stopped)",
+                "completed_at": now.isoformat(),
+                "error": None,
+                "eta_seconds": 0.0,
+            },
+        )
+
+    cancel_requested_at = _parse_iso_datetime(row.get("cancel_requested_at")) or now
+    force_requested_at = _parse_iso_datetime(row.get("force_cancel_requested_at"))
+    terminate_sent_at = _parse_iso_datetime(row.get("terminate_sent_at"))
+    cancel_age = max(0.0, (now - cancel_requested_at).total_seconds())
+
+    should_terminate = bool(force_now or force_requested_at is not None or cancel_age >= _OPTIMIZER_CANCEL_GRACE_SECONDS)
+    if should_terminate and terminate_sent_at is None:
+        sigterm_value = getattr(signal, "SIGTERM", None)
+        sent = bool(sigterm_value is not None and _optimizer_signal_pid(pid_value, int(sigterm_value)))
+        row = _optimizer_update_job(
+            job_id,
+            {
+                "terminate_sent_at": now.isoformat(),
+                "message": "Cancellation escalating: sent SIGTERM" if sent else "Cancellation escalating: terminate requested",
+            },
+        ) or row
+        terminate_sent_at = _parse_iso_datetime(row.get("terminate_sent_at")) or now
+
+    terminate_age = (
+        max(0.0, (now - terminate_sent_at).total_seconds())
+        if terminate_sent_at is not None
+        else 0.0
+    )
+    if terminate_sent_at is not None and terminate_age >= _OPTIMIZER_FORCE_KILL_GRACE_SECONDS and _optimizer_pid_alive(pid_value):
+        sigkill_value = getattr(signal, "SIGKILL", None)
+        if sigkill_value is not None:
+            _optimizer_signal_pid(pid_value, int(sigkill_value))
+        else:
+            _optimizer_signal_pid(pid_value, getattr(signal, "SIGTERM", 15))
+        return _optimizer_update_job(
+            job_id,
+            {
+                "status": "canceled",
+                "message": "Canceled by force kill",
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "error": None,
+                "eta_seconds": 0.0,
+            },
+        )
+    return row
+
+
+def _optimizer_active_worker_count() -> int:
+    alive_threads = 0
+    alive_processes = 0
+    with _optimizer_jobs_lock:
+        for job_id, thread in list(_optimizer_job_threads.items()):
+            if thread.is_alive():
+                alive_threads += 1
+                continue
+            _optimizer_job_threads.pop(job_id, None)
+        for job_id, process in list(_optimizer_job_processes.items()):
+            if process.poll() is None:
+                alive_processes += 1
+                continue
+            _optimizer_job_processes.pop(job_id, None)
+    return alive_processes if _optimizer_use_subprocess_workers() else alive_threads
+
+
+def _optimizer_launch_worker(job_id: str) -> bool:
+    with _optimizer_jobs_lock:
+        existing_thread = _optimizer_job_threads.get(str(job_id))
+        if existing_thread is not None and existing_thread.is_alive():
+            return True
+        existing_process = _optimizer_job_processes.get(str(job_id))
+        if existing_process is not None and existing_process.poll() is None:
+            return True
+    if _optimizer_use_subprocess_workers():
+        backend_dir = Path(__file__).resolve().parent.parent
+        env = _optimizer_worker_env_with_runtime_credentials(os.environ.copy())
+        env["STOCKSBOT_OPTIMIZER_CHILD"] = "1"
+        cmd = [sys.executable, "-m", "api.optimizer_worker", "--job-id", str(job_id)]
+        # Write worker output to a log file for debugging instead of /dev/null.
+        log_dir = os.path.join(str(backend_dir), "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        worker_log_path = os.path.join(log_dir, f"optimizer_worker_{job_id}.log")
+        try:
+            worker_log_fh = open(worker_log_path, "w", encoding="utf-8")  # noqa: SIM115
+        except Exception:
+            worker_log_fh = subprocess.DEVNULL
+        try:
+            process = subprocess.Popen(  # noqa: S603
+                cmd,
+                cwd=str(backend_dir),
+                env=env,
+                stdout=worker_log_fh,
+                stderr=worker_log_fh,
+                start_new_session=True,
+            )
+        except Exception as exc:
+            _optimizer_update_job(
+                str(job_id),
+                {
+                    "status": "failed",
+                    "message": "Failed to launch optimizer worker process",
+                    "error": str(exc),
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+            return False
+        with _optimizer_jobs_lock:
+            _optimizer_job_processes[str(job_id)] = process
+        _optimizer_update_job(
+            str(job_id),
+            {
+                "message": "Queued (worker process launching)",
+            },
+        )
+        return True
+
+    thread = threading.Thread(
+        target=_run_optimizer_job,
+        args=(str(job_id),),
+        daemon=True,
+        name=f"optimizer-{job_id}",
+    )
+    with _optimizer_jobs_lock:
+        _optimizer_job_threads[str(job_id)] = thread
+    thread.start()
+    return True
+
+
+def _optimizer_dispatch_once() -> None:
+    active_limit = _optimizer_max_concurrent_workers()
+
+    db = SessionLocal()
+    try:
+        storage = StorageService(db)
+        persisted_rows = storage.list_recent_optimization_runs(
+            statuses=["queued", "running"],
+            sources=["async"],
+            limit_total=500,
+        )
+    except Exception:
+        persisted_rows = []
+    finally:
+        db.close()
+
+    rows: List[Dict[str, Any]] = []
+    for persisted in persisted_rows:
+        job_id = str(persisted.run_id or "")
+        if not job_id:
+            continue
+        row = _optimizer_get_job(job_id)
+        if row is not None:
+            rows.append(row)
+
+    # First pass: escalate pending cancellations and recover stale jobs.
+    for row in rows:
+        job_id = str(row.get("job_id") or "")
+        if not job_id:
+            continue
+        if bool(row.get("cancel_requested")):
+            _optimizer_escalate_cancel(
+                job_id,
+                force_now=bool(row.get("force_cancel_requested_at")),
+            )
+
+    current_active = _optimizer_active_worker_count()
+    if current_active >= active_limit:
+        return
+
+    queued = [
+        row for row in rows
+        if str(row.get("status") or "").lower() == "queued"
+    ]
+    queued.sort(key=lambda item: str(item.get("created_at") or ""))
+    for row in queued:
+        if current_active >= active_limit:
+            break
+        job_id = str(row.get("job_id") or "")
+        if not job_id:
+            continue
+        if bool(row.get("cancel_requested")):
+            _optimizer_escalate_cancel(job_id, force_now=bool(row.get("force_cancel_requested_at")))
+            continue
+        launched = _optimizer_launch_worker(job_id)
+        if launched:
+            current_active += 1
+
+
+def _optimizer_dispatcher_loop() -> None:
+    logger.info(
+        "Optimizer dispatcher started (mode=%s, max_concurrent=%s)",
+        "process" if _optimizer_use_subprocess_workers() else "thread",
+        _optimizer_max_concurrent_workers(),
+    )
+    while not _optimizer_dispatcher_stop_event.is_set():
+        try:
+            _optimizer_dispatch_once()
+        except Exception:
+            logger.exception("Optimizer dispatcher cycle failed")
+        _optimizer_dispatcher_wakeup_event.wait(timeout=_OPTIMIZER_DISPATCHER_POLL_SECONDS)
+        _optimizer_dispatcher_wakeup_event.clear()
+    logger.info("Optimizer dispatcher stopped")
+
+
+def start_optimizer_dispatcher() -> bool:
+    """Start optimizer queue dispatcher thread (idempotent)."""
+    global _optimizer_dispatcher_thread
+    if "PYTEST_CURRENT_TEST" in os.environ:
+        return False
+    with _optimizer_dispatcher_lock:
+        if _optimizer_dispatcher_thread and _optimizer_dispatcher_thread.is_alive():
+            return False
+        _optimizer_dispatcher_stop_event.clear()
+        _optimizer_dispatcher_wakeup_event.clear()
+        _optimizer_dispatcher_thread = threading.Thread(
+            target=_optimizer_dispatcher_loop,
+            daemon=True,
+            name="stocksbot-optimizer-dispatcher",
+        )
+        _optimizer_dispatcher_thread.start()
+        return True
+
+
+def stop_optimizer_dispatcher() -> bool:
+    """Stop optimizer queue dispatcher thread (idempotent)."""
+    global _optimizer_dispatcher_thread
+    with _optimizer_dispatcher_lock:
+        thread = _optimizer_dispatcher_thread
+        if thread is None or not thread.is_alive():
+            return False
+        _optimizer_dispatcher_stop_event.set()
+        _optimizer_dispatcher_wakeup_event.set()
+        thread.join(timeout=5.0)
+        _optimizer_dispatcher_thread = None
+        return True
 
 
 def _optimizer_progress_snapshot(row: Dict[str, Any]) -> StrategyOptimizationJobStatusResponse:
@@ -718,56 +1392,94 @@ def _optimizer_persist_snapshot(snapshot: Dict[str, Any], *, prune_history: bool
     strategy_id = str(snapshot.get("strategy_id") or "").strip()
     if not job_id or not strategy_id:
         return
+    request_payload = _optimizer_request_with_runtime_meta(snapshot)
     db = SessionLocal()
     try:
-        _persist_optimization_history_run(
-            db=db,
-            run_id=job_id,
-            strategy_id=strategy_id,
-            source="async",
-            status=str(snapshot.get("status") or "failed"),
-            request_payload=dict(snapshot.get("request")) if isinstance(snapshot.get("request"), dict) else {},
-            result_payload=dict(snapshot.get("result")) if isinstance(snapshot.get("result"), dict) else None,
-            error=str(snapshot.get("error")) if snapshot.get("error") else None,
-            job_id=job_id,
-            created_at=snapshot.get("created_at"),
-            started_at=snapshot.get("started_at"),
-            completed_at=snapshot.get("completed_at"),
-            prune_history=prune_history,
-        )
+        try:
+            _persist_optimization_history_run(
+                db=db,
+                run_id=job_id,
+                strategy_id=strategy_id,
+                source="async",
+                status=str(snapshot.get("status") or "failed"),
+                request_payload=request_payload,
+                result_payload=dict(snapshot.get("result")) if isinstance(snapshot.get("result"), dict) else None,
+                error=str(snapshot.get("error")) if snapshot.get("error") else None,
+                job_id=job_id,
+                created_at=snapshot.get("created_at"),
+                started_at=snapshot.get("started_at"),
+                completed_at=snapshot.get("completed_at"),
+                prune_history=prune_history,
+            )
+        except Exception as exc:
+            logger.debug("Skipping optimizer snapshot persistence for job_id=%s: %s", job_id, exc)
     finally:
         db.close()
 
 
 def _optimizer_row_from_db(run: DBOptimizationRun) -> Dict[str, Any]:
     """Convert persisted async run row to optimizer job payload shape."""
+    request_payload = dict(run.request_payload) if isinstance(run.request_payload, dict) else {}
+    runtime_meta = _optimizer_runtime_meta_from_request_payload(request_payload)
+    status_value = str(run.status or "failed")
+    terminal = status_value in {"completed", "failed", "canceled"}
+    default_progress = 100.0 if terminal else 0.0
+    progress_pct = max(0.0, min(100.0, _safe_float(runtime_meta.get("progress_pct"), default_progress)))
+    completed_iterations = _safe_int(runtime_meta.get("completed_iterations"), int(run.evaluated_iterations or 0))
+    total_iterations = _safe_int(
+        runtime_meta.get("total_iterations"),
+        int(run.requested_iterations or run.evaluated_iterations or 0),
+    )
+    elapsed_seconds = _safe_float(runtime_meta.get("elapsed_seconds"), 0.0)
+    eta_seconds: Optional[float]
+    if isinstance(runtime_meta.get("eta_seconds"), (int, float)):
+        eta_seconds = float(runtime_meta.get("eta_seconds"))
+    else:
+        eta_seconds = 0.0 if terminal else None
+    avg_seconds_per_iteration = (
+        float(runtime_meta.get("avg_seconds_per_iteration"))
+        if isinstance(runtime_meta.get("avg_seconds_per_iteration"), (int, float))
+        else None
+    )
+    message_default = str(run.error or ("Completed" if status_value == "completed" else "Running optimizer"))
+    message_value = str(runtime_meta.get("message") or message_default)
+    error_value = str(runtime_meta.get("error") or run.error) if (runtime_meta.get("error") or run.error) else None
     row: Dict[str, Any] = {
         "job_id": str(run.run_id),
         "strategy_id": str(run.strategy_id),
-        "status": str(run.status or "failed"),
-        "progress_pct": 100.0 if str(run.status or "") in {"completed", "failed", "canceled"} else 0.0,
-        "completed_iterations": int(run.evaluated_iterations or 0),
-        "total_iterations": int(run.requested_iterations or run.evaluated_iterations or 0),
-        "elapsed_seconds": 0.0,
-        "eta_seconds": 0.0 if str(run.status or "") in {"completed", "failed", "canceled"} else None,
-        "avg_seconds_per_iteration": None,
-        "message": str(run.error or ("Completed" if str(run.status or "") == "completed" else "Running optimizer")),
+        "status": status_value,
+        "progress_pct": progress_pct,
+        "completed_iterations": completed_iterations,
+        "total_iterations": total_iterations,
+        "elapsed_seconds": elapsed_seconds,
+        "eta_seconds": eta_seconds,
+        "avg_seconds_per_iteration": avg_seconds_per_iteration,
+        "message": message_value,
         "cancel_requested": bool(_optimizer_cancel_token_exists(str(run.run_id))),
-        "error": str(run.error) if run.error else None,
+        "error": error_value,
         "created_at": _iso_or_none(_ensure_utc_datetime(run.created_at)),
         "started_at": _iso_or_none(_ensure_utc_datetime(run.started_at)),
         "completed_at": _iso_or_none(_ensure_utc_datetime(run.completed_at)),
-        "request": dict(run.request_payload) if isinstance(run.request_payload, dict) else {},
+        "request": request_payload,
         "result": dict(run.result_payload) if isinstance(run.result_payload, dict) else None,
+        "worker_pid": _safe_int(runtime_meta.get("worker_pid"), 0) or None,
+        "worker_mode": str(runtime_meta.get("worker_mode") or ""),
+        "worker_started_at": runtime_meta.get("worker_started_at"),
+        "last_heartbeat_at": runtime_meta.get("last_heartbeat_at"),
+        "cancel_requested_at": runtime_meta.get("cancel_requested_at"),
+        "force_cancel_requested_at": runtime_meta.get("force_cancel_requested_at"),
+        "terminate_sent_at": runtime_meta.get("terminate_sent_at"),
     }
     started_at = _parse_iso_datetime(row.get("started_at"))
     completed_at = _parse_iso_datetime(row.get("completed_at"))
     if started_at is not None:
-        terminal = str(row.get("status") or "") in {"completed", "failed", "canceled"}
-        if terminal and completed_at is not None:
+        row_terminal = str(row.get("status") or "") in {"completed", "failed", "canceled"}
+        if row_terminal and completed_at is not None:
             elapsed = max(0.0, (completed_at - started_at).total_seconds())
-        else:
+        elif elapsed_seconds <= 0.0:
             elapsed = max(0.0, (datetime.now(timezone.utc) - started_at).total_seconds())
+        else:
+            elapsed = elapsed_seconds
         row["elapsed_seconds"] = round(elapsed, 3)
     return row
 
@@ -776,36 +1488,68 @@ def _optimizer_get_persisted_job(job_id: str) -> Optional[Dict[str, Any]]:
     """Fetch async optimizer job state from persistent storage."""
     db = SessionLocal()
     try:
-        storage = StorageService(db)
-        run = storage.get_optimization_run_by_run_id(str(job_id))
-        if run is None or str(run.source or "").lower() != "async":
+        try:
+            storage = StorageService(db)
+            run = storage.get_optimization_run_by_run_id(str(job_id))
+            if run is None or str(run.source or "").lower() != "async":
+                return None
+            row = _optimizer_row_from_db(run)
+        except Exception:
             return None
-        row = _optimizer_row_from_db(run)
     finally:
         db.close()
 
-    status = str(row.get("status") or "failed")
+    status = str(row.get("status") or "failed").lower()
     if status in {"completed", "failed", "canceled"}:
         return row
-
-    # Running/queued rows with no local worker are stale after process restart.
-    with _optimizer_jobs_lock:
-        worker = _optimizer_job_threads.get(str(job_id))
-    if worker is not None and worker.is_alive():
+    if status == "queued":
         return row
 
+    # Running rows may execute in detached subprocess even when this API process restarted.
+    with _optimizer_jobs_lock:
+        worker_thread = _optimizer_job_threads.get(str(job_id))
+        worker_process = _optimizer_job_processes.get(str(job_id))
+    if worker_thread is not None and worker_thread.is_alive():
+        return row
+    if worker_process is not None and worker_process.poll() is None:
+        return row
+    pid_value = _safe_int(row.get("worker_pid"), 0)
+    if _optimizer_pid_alive(pid_value):
+        return row
+    heartbeat_at = _parse_iso_datetime(row.get("last_heartbeat_at"))
+    if heartbeat_at is not None:
+        heartbeat_age = max(0.0, (datetime.now(timezone.utc) - heartbeat_at).total_seconds())
+        if heartbeat_age < _OPTIMIZER_RUNNING_STALE_SECONDS:
+            return row
+
     canceled = bool(row.get("cancel_requested")) or _optimizer_cancel_token_exists(str(job_id))
+    if canceled:
+        row.update(
+            {
+                "status": "canceled",
+                "message": "Canceled by user",
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "error": None,
+                "eta_seconds": 0.0,
+            }
+        )
+        _optimizer_persist_snapshot(row, prune_history=True)
+        _optimizer_clear_cancel_token(str(job_id))
+        return row
+
+    # Requeue stale running rows so dispatcher can restart them after API restarts.
     row.update(
         {
-            "status": "canceled" if canceled else "failed",
-            "message": "Canceled by user" if canceled else "Optimizer worker not running",
-            "completed_at": datetime.now(timezone.utc).isoformat(),
-            "error": None if canceled else str(row.get("error") or "Worker exited unexpectedly"),
+            "status": "queued",
+            "message": "Recovered after worker restart; queued for retry",
+            "worker_pid": None,
+            "worker_started_at": None,
+            "last_heartbeat_at": None,
+            "terminate_sent_at": None,
             "eta_seconds": 0.0,
         }
     )
-    _optimizer_persist_snapshot(row, prune_history=True)
-    _optimizer_clear_cancel_token(str(job_id))
+    _optimizer_persist_snapshot(row, prune_history=False)
     return row
 
 
@@ -986,6 +1730,34 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _strategy_config_payload(config: Any) -> Dict[str, Any]:
+    """Return strategy config JSON as mutable dict."""
+    return dict(config) if isinstance(config, dict) else {}
+
+
+def _strategy_config_version(config: Any) -> int:
+    """Read monotonic strategy config version with safe default."""
+    payload = _strategy_config_payload(config)
+    raw = payload.get(_STRATEGY_CONFIG_VERSION_KEY)
+    parsed = _safe_int(raw, 1)
+    return parsed if parsed >= 1 else 1
+
+
+def _strategy_set_config_version(db_strategy: DBStrategy, version: int) -> int:
+    """Persist strategy config version in JSON payload."""
+    payload = _strategy_config_payload(db_strategy.config)
+    resolved = max(1, int(version))
+    payload[_STRATEGY_CONFIG_VERSION_KEY] = resolved
+    db_strategy.config = payload
+    return resolved
+
+
+def _strategy_bump_config_version(db_strategy: DBStrategy) -> int:
+    """Increment and persist strategy config version."""
+    current = _strategy_config_version(db_strategy.config)
+    return _strategy_set_config_version(db_strategy, current + 1)
 
 
 def _build_optimization_request_summary(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -1962,6 +2734,13 @@ def _normalize_portfolio_time_series(rows: List[Dict[str, Any]]) -> List[Dict[st
     if not entries:
         return []
     entries.sort(key=lambda item: item["ts"])
+    deduped_entries: List[Dict[str, Any]] = []
+    for entry in entries:
+        if deduped_entries and deduped_entries[-1]["ts"] == entry["ts"]:
+            deduped_entries[-1] = entry
+            continue
+        deduped_entries.append(entry)
+    entries = deduped_entries
 
     span_seconds = (
         (entries[-1]["ts"] - entries[0]["ts"]).total_seconds()
@@ -2880,7 +3659,7 @@ async def create_strategy(request: StrategyCreateRequest, db: Session = Depends(
         name=request.name,
         description=request.description or "",
         strategy_type="custom",
-        config={"symbols": symbols},
+        config={"symbols": symbols, _STRATEGY_CONFIG_VERSION_KEY: 1},
     )
 
     storage.create_audit_log(
@@ -2948,11 +3727,22 @@ async def update_strategy(strategy_id: str, request: StrategyUpdateRequest, db: 
     if request.description is not None:
         db_strategy.description = request.description
     if request.symbols is not None:
-        if not db_strategy.config:
-            db_strategy.config = {}
-        db_strategy.config["symbols"] = _normalize_symbols(request.symbols)
-        from sqlalchemy.orm.attributes import flag_modified
-        flag_modified(db_strategy, "config")
+        symbols_changed = False
+        current_symbols = _normalize_symbols(
+            db_strategy.config.get("symbols", [])
+            if isinstance(db_strategy.config, dict)
+            else []
+        )
+        next_symbols = _normalize_symbols(request.symbols)
+        if current_symbols != next_symbols:
+            config_payload = _strategy_config_payload(db_strategy.config)
+            config_payload["symbols"] = next_symbols
+            db_strategy.config = config_payload
+            _strategy_bump_config_version(db_strategy)
+            symbols_changed = True
+        if symbols_changed:
+            from sqlalchemy.orm.attributes import flag_modified
+            flag_modified(db_strategy, "config")
     if request.status is not None:
         db_strategy.is_active = (request.status == StrategyStatus.ACTIVE)
         storage.create_audit_log(
@@ -3018,7 +3808,8 @@ async def delete_strategy(strategy_id: str, db: Session = Depends(get_db)):
 
 @router.get("/audit/logs", response_model=AuditLogsResponse)
 async def get_audit_logs(
-    limit: int = 100,
+    limit: int = Query(default=100, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
     event_type: Optional[AuditEventType] = None,
     db: Session = Depends(get_db)
 ):
@@ -3029,7 +3820,7 @@ async def get_audit_logs(
     _run_housekeeping(storage)
 
     event_type_str = event_type.value if event_type else None
-    db_logs = storage.get_audit_logs(limit=limit, event_type=event_type_str)
+    db_logs = storage.get_audit_logs(limit=limit, offset=offset, event_type=event_type_str)
     total_count = storage.count_audit_logs(event_type=event_type_str)
 
     logs = []
@@ -3052,14 +3843,16 @@ async def get_audit_logs(
 
 @router.get("/audit/trades", response_model=TradeHistoryResponse)
 async def get_audit_trades(
-    limit: int = Query(default=5000, ge=1, le=10000),
+    limit: int = Query(default=1000, ge=1, le=10000),
+    offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db)
 ):
     """
     Get complete trade history for audit mode.
     """
     storage = StorageService(db)
-    db_trades = storage.get_all_trades(limit=limit)
+    db_trades = storage.get_all_trades(limit=limit, offset=offset)
+    total_count = storage.count_all_trades()
 
     trades = []
     for trade in db_trades:
@@ -3080,7 +3873,7 @@ async def get_audit_trades(
 
     return TradeHistoryResponse(
         trades=trades,
-        total_count=len(trades),
+        total_count=total_count,
     )
 
 
@@ -3745,6 +4538,11 @@ async def get_portfolio_analytics(
     Get portfolio analytics time series data.
     Returns equity curve and P&L over time.
     """
+    cache_key = f"days:{int(days) if days is not None else 'all'}"
+    cached = _portfolio_analytics_cache_get(cache_key)
+    if cached is not None:
+        return cached
+
     storage = StorageService(db)
 
     trades = storage.get_recent_trades(limit=5000)
@@ -3815,12 +4613,14 @@ async def get_portfolio_analytics(
             account_snapshot = _load_account_snapshot(broker)
             current_equity = _safe_float(account_snapshot.get("equity", 0.0), 0.0)
 
-        return {
+        payload = {
             "time_series": time_series,
             "total_trades": len(scoped_trades),
             "current_equity": current_equity,
             "total_pnl": total_realized_pnl,
         }
+        _portfolio_analytics_cache_set(cache_key, payload)
+        return payload
 
     holdings_snapshot = _load_holdings_snapshot(storage, broker)
     holdings_value = sum(_safe_float(h.get("market_value", 0.0), 0.0) for h in holdings_snapshot)
@@ -3866,12 +4666,15 @@ async def get_portfolio_analytics(
             "symbol": trade.symbol,
         })
 
-    return {
+    time_series = _normalize_portfolio_time_series(time_series)
+    payload = {
         "time_series": time_series,
         "total_trades": len(scoped_trades),
         "current_equity": current_equity,
         "total_pnl": cumulative_pnl,
     }
+    _portfolio_analytics_cache_set(cache_key, payload)
+    return payload
 
 
 @router.get("/analytics/summary")
@@ -3880,6 +4683,10 @@ async def get_portfolio_summary(db: Session = Depends(get_db)):
     Get portfolio summary statistics.
     Returns aggregate metrics and performance stats.
     """
+    cached = _portfolio_summary_cache_get()
+    if cached is not None:
+        return cached
+
     storage = StorageService(db)
 
     broker: Optional[BrokerInterface]
@@ -3914,7 +4721,7 @@ async def get_portfolio_summary(db: Session = Depends(get_db)):
         if equity <= 0.0:
             equity = max(0.0, total_position_value + total_pnl)
 
-    return {
+    payload = {
         'total_trades': total_trades,
         'total_pnl': total_pnl,
         'winning_trades': winning_trades,
@@ -3923,6 +4730,28 @@ async def get_portfolio_summary(db: Session = Depends(get_db)):
         'total_positions': total_positions,
         'total_position_value': total_position_value,
         'equity': equity,
+    }
+    _portfolio_summary_cache_set(payload)
+    return payload
+
+
+@router.get("/analytics/dashboard")
+async def get_dashboard_analytics_bundle(
+    days: Optional[int] = Query(default=None, ge=1, le=3650),
+    db: Session = Depends(get_db),
+):
+    """
+    Pre-aggregated dashboard analytics bundle.
+    Reduces frontend round trips by returning summary + curve + account snapshot together.
+    """
+    summary_payload = await get_portfolio_summary(db=db)
+    analytics_payload = await get_portfolio_analytics(days=days, db=db)
+    broker_account_payload = (await get_broker_account(db=db)).model_dump()
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "summary": summary_payload,
+        "analytics": analytics_payload,
+        "broker_account": broker_account_payload,
     }
 
 
@@ -4014,7 +4843,15 @@ def _resolve_workspace_universe_for_backtest(
     else:
         final_mode = prefs.screener_mode if prefs.screener_mode in (ScreenerMode.MOST_ACTIVE, ScreenerMode.PRESET) else ScreenerMode.MOST_ACTIVE
 
-    final_limit = int(request.screener_limit) if request.screener_limit is not None else int(prefs.screener_limit)
+    final_limit = (
+        int(request.screener_limit)
+        if request.screener_limit is not None
+        else _resolve_preference_screener_limit(
+            prefs,
+            asset_type=final_asset_type,
+            screener_mode=final_mode,
+        )
+    )
     final_limit = max(10, min(200, final_limit))
     min_dollar_volume = _safe_float(request.min_dollar_volume, 10_000_000.0)
     max_spread_bps = _safe_float(request.max_spread_bps, 50.0)
@@ -4336,7 +5173,10 @@ def _prepare_backtest_execution_context(
         "symbol_capabilities": symbol_capabilities,
         "max_position_size": max_position_size,
         "risk_limit_daily": risk_limit_daily,
-        "fee_bps": 0.0,
+        # In live-emulation mode SEC/TAF fees are modeled explicitly on sells,
+        # so generic fee_bps stays at 0.  For standard backtests, apply a small
+        # generic cost (1 bps per side) to avoid zero-cost optimism.
+        "fee_bps": 0.0 if emulate_live_trading else 1.0,
     }
 
 
@@ -4608,6 +5448,7 @@ async def get_strategy_config(strategy_id: str, db: Session = Depends(get_db)):
         symbols=normalized_symbols,
         parameters=parameters,
         enabled=db_strategy.is_enabled,
+        config_version=_strategy_config_version(db_strategy.config),
     )
 
 
@@ -4635,15 +5476,33 @@ async def update_strategy_config(
     param_defs = {param.name: param for param in default_params}
     
     # Update config
-    if not db_strategy.config:
+    if not isinstance(db_strategy.config, dict):
         db_strategy.config = {}
-    
+    current_config_version = _strategy_config_version(db_strategy.config)
+    if (
+        request.expected_config_version is not None
+        and int(request.expected_config_version) != int(current_config_version)
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Strategy config version mismatch. Refresh and retry. "
+                f"expected={int(request.expected_config_version)} current={int(current_config_version)}"
+            ),
+        )
+
     config_changed = False
     if request.symbols is not None:
         normalized_symbols = _normalize_symbols(request.symbols)
-        db_strategy.config['symbols'] = normalized_symbols
-        config_changed = True
-    
+        current_symbols = _normalize_symbols(
+            db_strategy.config.get("symbols", [])
+            if isinstance(db_strategy.config.get("symbols"), list)
+            else []
+        )
+        if normalized_symbols != current_symbols:
+            db_strategy.config['symbols'] = normalized_symbols
+            config_changed = True
+
     if request.parameters is not None:
         if 'parameters' not in db_strategy.config:
             db_strategy.config['parameters'] = {}
@@ -4658,10 +5517,15 @@ async def update_strategy_config(
                     status_code=400,
                     detail=f"Parameter {param_name} must be within [{param_def.min_value}, {param_def.max_value}]",
                 )
-            db_strategy.config['parameters'][param_name] = param_value
-        config_changed = True
-    
+            current_value = _safe_float(db_strategy.config['parameters'].get(param_name), param_def.value)
+            normalized_value = float(param_value)
+            if not math.isclose(current_value, normalized_value, rel_tol=0.0, abs_tol=1e-12):
+                db_strategy.config['parameters'][param_name] = normalized_value
+                config_changed = True
+
+    enabled_changed = False
     if request.enabled is not None:
+        enabled_changed = bool(request.enabled) != bool(db_strategy.is_enabled)
         db_strategy.is_enabled = request.enabled
         if request.enabled is False and db_strategy.is_active:
             db_strategy.is_active = False
@@ -4670,9 +5534,12 @@ async def update_strategy_config(
                 description=f"Strategy auto-stopped because it was disabled: {db_strategy.name}",
                 details={"strategy_id": db_strategy.id},
             )
+
+    if config_changed or enabled_changed:
+        _strategy_bump_config_version(db_strategy)
     
     # Mark config as modified if changed (needed for SQLAlchemy JSON fields)
-    if config_changed:
+    if config_changed or enabled_changed:
         from sqlalchemy.orm.attributes import flag_modified
         flag_modified(db_strategy, 'config')
     
@@ -4682,7 +5549,11 @@ async def update_strategy_config(
     storage.create_audit_log(
         event_type="config_updated",
         description=f"Strategy config updated: {db_strategy.name}",
-        details={"strategy_id": db_strategy.id, "updates": request.model_dump(exclude_none=True)},
+        details={
+            "strategy_id": db_strategy.id,
+            "updates": request.model_dump(exclude_none=True),
+            "config_version": _strategy_config_version(db_strategy.config),
+        },
     )
     
     # Return updated config
@@ -4853,16 +5724,41 @@ async def optimize_strategy_configuration(
 
 def _run_optimizer_job(job_id: str) -> None:
     """Background worker for async optimizer jobs."""
+    _optimizer_attach_persisted_job_locally(job_id)
     started_at = datetime.now(timezone.utc).isoformat()
+    worker_mode = "process" if _optimizer_use_subprocess_workers() else "thread"
+    worker_pid = os.getpid() if _optimizer_use_subprocess_workers() else None
     _optimizer_update_job(
         job_id,
         {
             "status": "running",
             "started_at": started_at,
+            "worker_mode": worker_mode,
+            "worker_pid": worker_pid,
+            "worker_started_at": started_at,
+            "last_heartbeat_at": started_at,
+            "terminate_sent_at": None,
             "message": "Preparing optimization context",
         },
     )
     cancel_token_path = _optimizer_cancel_token_path(job_id)
+    heartbeat_stop = threading.Event()
+
+    def _heartbeat_loop() -> None:
+        while not heartbeat_stop.wait(timeout=2.0):
+            _optimizer_update_job(
+                job_id,
+                {
+                    "last_heartbeat_at": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+
+    heartbeat_thread = threading.Thread(
+        target=_heartbeat_loop,
+        daemon=True,
+        name=f"optimizer-heartbeat-{job_id}",
+    )
+    heartbeat_thread.start()
 
     def _should_cancel() -> bool:
         row = _optimizer_get_job(job_id)
@@ -4916,6 +5812,7 @@ def _run_optimizer_job(job_id: str) -> None:
                 "eta_seconds": round(eta, 3) if eta is not None else None,
                 "avg_seconds_per_iteration": round(avg, 3) if avg is not None else None,
                 "message": stage_label,
+                "last_heartbeat_at": datetime.now(timezone.utc).isoformat(),
             },
         )
 
@@ -4959,6 +5856,15 @@ def _run_optimizer_job(job_id: str) -> None:
 
     db = SessionLocal()
     try:
+        # Detached workers may start with default in-memory config; refresh from DB first.
+        try:
+            storage = StorageService(db)
+            runtime_config = _load_runtime_config(storage)
+            _set_config_snapshot(runtime_config)
+            set_global_trading_enabled(bool(runtime_config.trading_enabled))
+        except Exception:
+            logger.exception("Optimizer worker failed to refresh runtime config from storage")
+
         response = _compute_strategy_optimization_response(
             strategy_id=strategy_id,
             request=request,
@@ -5019,21 +5925,26 @@ def _run_optimizer_job(job_id: str) -> None:
             },
         )
     finally:
+        heartbeat_stop.set()
+        heartbeat_thread.join(timeout=1.5)
         final_row = _optimizer_get_job(job_id) or {}
-        _persist_optimization_history_run(
-            db=db,
-            run_id=str(job_id),
-            strategy_id=str(final_row.get("strategy_id") or strategy_id),
-            source="async",
-            status=str(final_row.get("status") or "failed"),
-            request_payload=dict(request_payload) if isinstance(request_payload, dict) else {},
-            result_payload=dict(final_row.get("result")) if isinstance(final_row.get("result"), dict) else None,
-            error=str(final_row.get("error")) if final_row.get("error") else None,
-            job_id=str(job_id),
-            created_at=final_row.get("created_at"),
-            started_at=final_row.get("started_at"),
-            completed_at=final_row.get("completed_at"),
-        )
+        try:
+            _persist_optimization_history_run(
+                db=db,
+                run_id=str(job_id),
+                strategy_id=str(final_row.get("strategy_id") or strategy_id),
+                source="async",
+                status=str(final_row.get("status") or "failed"),
+                request_payload=dict(request_payload) if isinstance(request_payload, dict) else {},
+                result_payload=dict(final_row.get("result")) if isinstance(final_row.get("result"), dict) else None,
+                error=str(final_row.get("error")) if final_row.get("error") else None,
+                job_id=str(job_id),
+                created_at=final_row.get("created_at"),
+                started_at=final_row.get("started_at"),
+                completed_at=final_row.get("completed_at"),
+            )
+        except Exception:
+            pass
         _optimizer_clear_cancel_token(job_id)
         db.close()
 
@@ -5090,15 +6001,12 @@ async def start_strategy_optimization_job(
             )
 
         job = _optimizer_create_job(strategy_id=strategy_id, request_payload=payload)
-    thread = threading.Thread(
-        target=_run_optimizer_job,
-        args=(str(job["job_id"]),),
-        daemon=True,
-        name=f"optimizer-{job['job_id']}",
-    )
-    with _optimizer_jobs_lock:
-        _optimizer_job_threads[str(job["job_id"])] = thread
-    thread.start()
+    started = start_optimizer_dispatcher()
+    if started or _optimizer_dispatcher_is_running():
+        _optimizer_signal_dispatcher()
+    else:
+        # pytest/unit test fallback: dispatch synchronously without background loop.
+        _optimizer_dispatch_once()
     return StrategyOptimizationJobStartResponse(
         job_id=str(job["job_id"]),
         strategy_id=str(strategy_id),
@@ -5138,7 +6046,10 @@ async def cancel_strategy_optimization_job(
     updated = _optimizer_request_cancel(
         job_id,
         message="Force cancel requested" if force else "Cancel requested",
+        force=bool(force),
     ) or row
+    updated = _optimizer_escalate_cancel(job_id, force_now=bool(force)) or updated
+    _optimizer_signal_dispatcher()
     return StrategyOptimizationJobCancelResponse(
         success=True,
         job_id=job_id,
@@ -5149,14 +6060,24 @@ async def cancel_strategy_optimization_job(
 
 
 @router.get("/optimizer/jobs")
-async def list_optimizer_jobs():
-    """List async optimizer jobs (in-memory active + durable history fallback)."""
+async def list_optimizer_jobs(
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    statuses: Optional[str] = Query(default=None, description="Comma-separated statuses"),
+    strategy_id: Optional[int] = Query(default=None, ge=1),
+    include_terminal: bool = Query(default=True),
+):
+    """List async optimizer jobs (in-memory active + durable history fallback) with pagination/filtering."""
+    parsed_statuses = set(_parse_optimizer_statuses(statuses))
+    if not include_terminal and not parsed_statuses:
+        parsed_statuses = {"queued", "running"}
     rows_by_id: Dict[str, Dict[str, Any]] = {}
     with _optimizer_jobs_lock:
-        for job_id in list(_optimizer_jobs.keys()):
-            row = _optimizer_reconcile_job_liveness_locked(job_id)
-            if row is not None:
-                rows_by_id[str(row.get("job_id") or job_id)] = row
+        local_job_ids = list(_optimizer_jobs.keys())
+    for job_id in local_job_ids:
+        row = _optimizer_get_job(job_id)
+        if row is not None:
+            rows_by_id[str(row.get("job_id") or job_id)] = row
 
     db = SessionLocal()
     try:
@@ -5180,13 +6101,15 @@ async def list_optimizer_jobs():
             continue
         rows_by_id[persisted_job_id] = row
 
-    rows = sorted(
-        rows_by_id.values(),
-        key=lambda row: str(row.get("created_at") or ""),
-        reverse=True,
-    )
+    rows = list(rows_by_id.values())
+    if strategy_id is not None:
+        rows = [row for row in rows if str(row.get("strategy_id") or "") == str(strategy_id)]
+    if parsed_statuses:
+        rows = [row for row in rows if str(row.get("status") or "").lower() in parsed_statuses]
+    rows.sort(key=lambda row: str(row.get("created_at") or ""), reverse=True)
+    paged_rows = rows[offset: offset + limit]
     jobs: List[Dict[str, Any]] = []
-    for row in rows:
+    for row in paged_rows:
         jobs.append(
             {
                 "job_id": str(row.get("job_id") or ""),
@@ -5200,7 +6123,12 @@ async def list_optimizer_jobs():
                 "completed_at": row.get("completed_at"),
             }
         )
-    return {"jobs": jobs, "total_count": len(jobs)}
+    return {
+        "jobs": jobs,
+        "total_count": len(rows),
+        "limit": int(limit),
+        "offset": int(offset),
+    }
 
 
 @router.get("/optimizer/health")
@@ -5238,6 +6166,8 @@ async def optimizer_health_snapshot(db: Session = Depends(get_db)):
                 "message": str(row.get("message") or ""),
                 "progress_pct": float(row.get("progress_pct") or 0.0),
                 "elapsed_seconds": float(row.get("elapsed_seconds") or 0.0),
+                "cancel_requested": bool(row.get("cancel_requested")),
+                "last_heartbeat_at": row.get("last_heartbeat_at"),
                 "created_at": row.get("created_at"),
                 "started_at": row.get("started_at"),
             }
@@ -5254,6 +6184,7 @@ async def optimizer_health_snapshot(db: Session = Depends(get_db)):
     with _optimizer_jobs_lock:
         in_memory_jobs = len(_optimizer_jobs)
         worker_threads_alive = sum(1 for thread in _optimizer_job_threads.values() if thread.is_alive())
+        worker_processes_alive = sum(1 for proc in _optimizer_job_processes.values() if proc.poll() is None)
 
     last_created_at = None
     if persisted_rows:
@@ -5269,13 +6200,14 @@ async def optimizer_health_snapshot(db: Session = Depends(get_db)):
         "max_active_job_age_seconds": round(max_active_job_age_seconds, 3),
         "in_memory_job_count": int(in_memory_jobs),
         "worker_threads_alive": int(worker_threads_alive),
+        "worker_processes_alive": int(worker_processes_alive),
+        "queue_depth": int(status_counts.get("queued", 0)),
         "last_created_at": last_created_at,
     }
 
 
-@router.post("/optimizer/cancel-all")
-async def cancel_all_optimizer_jobs(force: bool = Query(default=False)):
-    """Request cancellation for all queued/running async optimizer jobs."""
+def admin_cancel_all_optimizer_jobs(*, force: bool = False) -> Dict[str, Any]:
+    """Shared admin helper used by API + CLI to cancel active optimizer jobs."""
     candidates_by_id: Dict[str, Dict[str, Any]] = {}
     with _optimizer_jobs_lock:
         for job_id in list(_optimizer_jobs.keys()):
@@ -5314,14 +6246,29 @@ async def cancel_all_optimizer_jobs(force: bool = Query(default=False)):
         _optimizer_request_cancel(
             job_id,
             message="Force cancel requested (bulk)" if force else "Cancel requested (bulk)",
+            force=bool(force),
         )
+        _optimizer_escalate_cancel(job_id, force_now=bool(force))
         cancelled.append({"job_id": job_id, "strategy_id": strategy_id})
+    _optimizer_signal_dispatcher()
     return {
         "success": True,
         "force": bool(force),
         "requested_count": len(cancelled),
         "jobs": cancelled,
     }
+
+
+@router.post("/optimizer/cancel-all")
+async def cancel_all_optimizer_jobs(force: bool = Query(default=False)):
+    """Request cancellation for all queued/running async optimizer jobs."""
+    return admin_cancel_all_optimizer_jobs(force=bool(force))
+
+
+@router.post("/optimizer/admin/cancel-active")
+async def admin_cancel_active_optimizer_jobs(force: bool = Query(default=True)):
+    """Admin endpoint: cancel all queued/running optimizer jobs (with optional hard force)."""
+    return admin_cancel_all_optimizer_jobs(force=bool(force))
 
 
 @router.delete("/optimizer/jobs")
@@ -5375,6 +6322,7 @@ async def purge_optimizer_jobs(
         for job_id in removable_job_ids:
             _optimizer_jobs.pop(job_id, None)
             _optimizer_job_threads.pop(job_id, None)
+            _optimizer_job_processes.pop(job_id, None)
             _optimizer_clear_cancel_token(job_id)
 
     return {
@@ -5480,6 +6428,20 @@ async def tune_strategy_parameter(
     db_strategy = storage.strategies.get_by_id(strategy_id_int)
     if not db_strategy:
         raise HTTPException(status_code=404, detail="Strategy not found")
+    if not isinstance(db_strategy.config, dict):
+        db_strategy.config = {}
+    current_config_version = _strategy_config_version(db_strategy.config)
+    if (
+        request.expected_config_version is not None
+        and int(request.expected_config_version) != int(current_config_version)
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Strategy config version mismatch. Refresh and retry. "
+                f"expected={int(request.expected_config_version)} current={int(current_config_version)}"
+            ),
+        )
     
     # Get default parameters to validate constraints
     default_params = get_default_parameters()
@@ -5499,14 +6461,24 @@ async def tune_strategy_parameter(
         )
     
     # Update parameter
-    if not db_strategy.config:
-        db_strategy.config = {}
     if 'parameters' not in db_strategy.config:
         db_strategy.config['parameters'] = {}
     
     old_value = db_strategy.config['parameters'].get(request.parameter_name, param_def.value)
-    db_strategy.config['parameters'][request.parameter_name] = request.value
-    
+    normalized_new_value = float(request.value)
+    changed = not math.isclose(
+        _safe_float(old_value, param_def.value),
+        normalized_new_value,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    )
+    db_strategy.config['parameters'][request.parameter_name] = normalized_new_value
+    next_config_version = current_config_version
+    if changed:
+        next_config_version = _strategy_bump_config_version(db_strategy)
+    else:
+        next_config_version = _strategy_set_config_version(db_strategy, current_config_version)
+
     # Mark config as modified (needed for SQLAlchemy JSON fields)
     from sqlalchemy.orm.attributes import flag_modified
     flag_modified(db_strategy, 'config')
@@ -5522,6 +6494,7 @@ async def tune_strategy_parameter(
             "parameter": request.parameter_name,
             "old_value": old_value,
             "new_value": request.value,
+            "config_version": next_config_version,
         },
     )
     
@@ -5530,6 +6503,7 @@ async def tune_strategy_parameter(
         parameter_name=request.parameter_name,
         old_value=old_value,
         new_value=request.value,
+        config_version=next_config_version,
         success=True,
         message=f"Parameter {request.parameter_name} updated successfully",
     )
@@ -5554,6 +6528,9 @@ _trading_preferences = TradingPreferencesResponse(
     risk_profile=RiskProfile.BALANCED,
     weekly_budget=200.0,
     screener_limit=50,
+    stock_most_active_limit=50,
+    stock_preset_limit=50,
+    etf_preset_limit=50,
     screener_mode=ScreenerMode.MOST_ACTIVE,
     stock_preset=StockPreset.WEEKLY_OPTIMIZED,
     etf_preset=EtfPreset.BALANCED,
@@ -5562,17 +6539,51 @@ _trading_preferences = TradingPreferencesResponse(
 _TRADING_PREFERENCES_KEY = "trading_preferences"
 
 
+def _resolve_preference_screener_limit(
+    preferences: TradingPreferencesResponse,
+    *,
+    asset_type: Optional[AssetType] = None,
+    screener_mode: Optional[ScreenerMode] = None,
+) -> int:
+    """Resolve effective symbol limit for a specific workspace asset/mode context."""
+    resolved_asset = asset_type or preferences.asset_type
+    resolved_mode = screener_mode or preferences.screener_mode
+    fallback = max(10, min(200, int(preferences.screener_limit or 50)))
+    stock_most_active = max(10, min(200, int(preferences.stock_most_active_limit or fallback)))
+    stock_preset = max(10, min(200, int(preferences.stock_preset_limit or fallback)))
+    etf_preset = max(10, min(200, int(preferences.etf_preset_limit or fallback)))
+
+    if resolved_asset == AssetType.ETF:
+        return etf_preset
+    if resolved_asset == AssetType.STOCK and resolved_mode == ScreenerMode.PRESET:
+        return stock_preset
+    return stock_most_active
+
+
+def _normalize_trading_preference_limits(
+    preferences: TradingPreferencesResponse,
+) -> TradingPreferencesResponse:
+    """Backfill per-mode limits and keep legacy screener_limit aligned with active context."""
+    fallback = max(10, min(200, int(preferences.screener_limit or 50)))
+    preferences.stock_most_active_limit = max(10, min(200, int(preferences.stock_most_active_limit or fallback)))
+    preferences.stock_preset_limit = max(10, min(200, int(preferences.stock_preset_limit or fallback)))
+    preferences.etf_preset_limit = max(10, min(200, int(preferences.etf_preset_limit or fallback)))
+    preferences.screener_limit = _resolve_preference_screener_limit(preferences)
+    return preferences
+
+
 def _load_trading_preferences(storage: StorageService) -> TradingPreferencesResponse:
     """Load trading preferences from DB config, fallback to in-memory defaults."""
     config_entry = storage.config.get_by_key(_TRADING_PREFERENCES_KEY)
     if not config_entry:
-        return _trading_preferences
+        return _normalize_trading_preference_limits(_trading_preferences.model_copy(deep=True))
 
     try:
         raw = json.loads(config_entry.value)
-        return TradingPreferencesResponse(**raw)
+        parsed = TradingPreferencesResponse(**raw)
+        return _normalize_trading_preference_limits(parsed)
     except (TypeError, ValueError, json.JSONDecodeError):
-        return _trading_preferences
+        return _normalize_trading_preference_limits(_trading_preferences.model_copy(deep=True))
 
 
 def _save_trading_preferences(storage: StorageService, preferences: TradingPreferencesResponse) -> None:
@@ -5746,9 +6757,16 @@ async def get_screener_results(
 
     # Use preferences if not overridden
     final_asset_type = asset_type or prefs.asset_type
-    final_limit = limit or prefs.screener_limit
     final_mode = screener_mode or prefs.screener_mode
-    final_limit = max(10, min(200, final_limit))
+    final_limit = (
+        max(10, min(200, int(limit)))
+        if limit is not None
+        else _resolve_preference_screener_limit(
+            prefs,
+            asset_type=final_asset_type,
+            screener_mode=final_mode,
+        )
+    )
     if not math.isfinite(min_dollar_volume) or not math.isfinite(max_spread_bps) or not math.isfinite(max_sector_weight_pct):
         raise HTTPException(status_code=400, detail="Guardrail values must be finite numbers")
     
@@ -6096,6 +7114,12 @@ async def update_trading_preferences(request: TradingPreferencesRequest, db: Ses
             raise HTTPException(status_code=400, detail="weekly_budget must be within [50, 1000000]")
     if request.screener_limit is not None and (request.screener_limit < 10 or request.screener_limit > 200):
         raise HTTPException(status_code=400, detail="screener_limit must be within [10, 200]")
+    if request.stock_most_active_limit is not None and (request.stock_most_active_limit < 10 or request.stock_most_active_limit > 200):
+        raise HTTPException(status_code=400, detail="stock_most_active_limit must be within [10, 200]")
+    if request.stock_preset_limit is not None and (request.stock_preset_limit < 10 or request.stock_preset_limit > 200):
+        raise HTTPException(status_code=400, detail="stock_preset_limit must be within [10, 200]")
+    if request.etf_preset_limit is not None and (request.etf_preset_limit < 10 or request.etf_preset_limit > 200):
+        raise HTTPException(status_code=400, detail="etf_preset_limit must be within [10, 200]")
 
     if request.asset_type is not None:
         current.asset_type = request.asset_type
@@ -6111,6 +7135,16 @@ async def update_trading_preferences(request: TradingPreferencesRequest, db: Ses
     
     if request.screener_limit is not None:
         current.screener_limit = request.screener_limit
+        # Legacy global field updates all scoped limits to preserve backward compatibility.
+        current.stock_most_active_limit = request.screener_limit
+        current.stock_preset_limit = request.screener_limit
+        current.etf_preset_limit = request.screener_limit
+    if request.stock_most_active_limit is not None:
+        current.stock_most_active_limit = request.stock_most_active_limit
+    if request.stock_preset_limit is not None:
+        current.stock_preset_limit = request.stock_preset_limit
+    if request.etf_preset_limit is not None:
+        current.etf_preset_limit = request.etf_preset_limit
     if request.screener_mode is not None:
         current.screener_mode = request.screener_mode
     if request.stock_preset is not None:
@@ -6128,6 +7162,7 @@ async def update_trading_preferences(request: TradingPreferencesRequest, db: Ses
         raise HTTPException(status_code=400, detail="Most active mode is available only for stock asset_type")
     if current.asset_type == AssetType.STOCK and current.screener_mode == ScreenerMode.PRESET and current.stock_preset is None:
         raise HTTPException(status_code=400, detail="Stock preset is required for stock preset mode")
+    current = _normalize_trading_preference_limits(current)
 
     _trading_preferences = current
     _save_trading_preferences(storage, current)
@@ -6174,6 +7209,9 @@ async def get_preference_recommendation(
                 "etf_preset": prefs.etf_preset.value,
                 "weekly_budget": _safe_float(prefs.weekly_budget, 0.0),
                 "screener_limit": int(prefs.screener_limit),
+                "stock_most_active_limit": int(prefs.stock_most_active_limit),
+                "stock_preset_limit": int(prefs.stock_preset_limit),
+                "etf_preset_limit": int(prefs.etf_preset_limit),
             },
             "config": {
                 "broker": str(config_snapshot.broker).lower(),

@@ -12,6 +12,28 @@ export enum NotificationSeverity {
   SUCCESS = 'success',
 }
 
+const NOTIFICATION_DEDUPE_TTL_MS = 5000;
+const recentNotificationKeys = new Map<string, number>();
+
+function pruneNotificationDedupe(nowMs: number): void {
+  for (const [key, expiry] of recentNotificationKeys.entries()) {
+    if (expiry <= nowMs) {
+      recentNotificationKeys.delete(key);
+    }
+  }
+}
+
+function shouldSuppressNotification(key: string): boolean {
+  const nowMs = Date.now();
+  pruneNotificationDedupe(nowMs);
+  const expiry = recentNotificationKeys.get(key);
+  if (typeof expiry === 'number' && expiry > nowMs) {
+    return true;
+  }
+  recentNotificationKeys.set(key, nowMs + NOTIFICATION_DEDUPE_TTL_MS);
+  return false;
+}
+
 /**
  * Show a system notification.
  * 
@@ -27,6 +49,10 @@ export async function showNotification(
   body: string,
   severity: NotificationSeverity = NotificationSeverity.INFO
 ): Promise<void> {
+  const dedupeKey = `${severity}|${title.trim()}|${body.trim()}`;
+  if (shouldSuppressNotification(dedupeKey)) {
+    return;
+  }
   try {
     const permission = await getNotificationPermission();
     if (permission !== 'granted') {

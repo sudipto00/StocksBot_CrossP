@@ -7,6 +7,7 @@ import { formatDateTime, parseTimestamp } from '../utils/datetime';
 
 type AuditView = 'events' | 'trades' | 'exports';
 type QuickScope = 'all' | 'errors' | 'runner';
+const AUDIT_PAGE_SIZE = 500;
 
 function toDateInputValue(date: Date): string {
   const year = date.getFullYear();
@@ -27,6 +28,10 @@ function AuditPage() {
   const [filter, setFilter] = useState<AuditEventType | 'all'>('all');
   const [view, setView] = useState<AuditView>('events');
   const [quickScope, setQuickScope] = useState<QuickScope>('all');
+  const [logsOffset, setLogsOffset] = useState(0);
+  const [tradesOffset, setTradesOffset] = useState(0);
+  const [logsTotalCount, setLogsTotalCount] = useState(0);
+  const [tradesTotalCount, setTradesTotalCount] = useState(0);
 
   const [symbolFilter, setSymbolFilter] = useState('');
   const [dateFrom, setDateFrom] = useState('');
@@ -43,17 +48,23 @@ function AuditPage() {
       setError(null);
 
       const [logsResponse, tradesResponse] = await Promise.all([
-        getAuditLogs(5000, filter === 'all' ? undefined : filter),
-        getAuditTrades(10000),
+        getAuditLogs(AUDIT_PAGE_SIZE, filter === 'all' ? undefined : filter, logsOffset),
+        getAuditTrades(AUDIT_PAGE_SIZE, tradesOffset),
       ]);
 
       setLogs(logsResponse.logs || []);
+      setLogsTotalCount(Number(logsResponse.total_count || 0));
       setTrades(tradesResponse.trades || []);
+      setTradesTotalCount(Number(tradesResponse.total_count || 0));
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load audit mode data');
     } finally {
       setLoading(false);
     }
+  }, [filter, logsOffset, tradesOffset]);
+
+  useEffect(() => {
+    setLogsOffset(0);
   }, [filter]);
 
   useEffect(() => {
@@ -113,12 +124,23 @@ function AuditPage() {
     () => filteredLogs.filter((log) => log.event_type === AuditEventType.ERROR).length,
     [filteredLogs]
   );
+  const logsPage = Math.floor(logsOffset / AUDIT_PAGE_SIZE) + 1;
+  const logsHasPrev = logsOffset > 0;
+  const logsHasNext = (logsOffset + logs.length) < logsTotalCount;
+  const tradesPage = Math.floor(tradesOffset / AUDIT_PAGE_SIZE) + 1;
+  const tradesHasPrev = tradesOffset > 0;
+  const tradesHasNext = (tradesOffset + trades.length) < tradesTotalCount;
 
   const clearTradeFilters = () => {
     setSymbolFilter('');
     setDateFrom('');
     setDateTo('');
   };
+
+  const pageLogsPrev = () => setLogsOffset((prev) => Math.max(0, prev - AUDIT_PAGE_SIZE));
+  const pageLogsNext = () => setLogsOffset((prev) => prev + AUDIT_PAGE_SIZE);
+  const pageTradesPrev = () => setTradesOffset((prev) => Math.max(0, prev - AUDIT_PAGE_SIZE));
+  const pageTradesNext = () => setTradesOffset((prev) => prev + AUDIT_PAGE_SIZE);
 
   const saveCurrentPreset = () => {
     const label = `${quickScope}|${filter}|${symbolFilter || '-'}|${dateFrom || '-'}|${dateTo || '-'}`;
@@ -480,12 +502,29 @@ function AuditPage() {
                   <option value={AuditEventType.RUNNER_STOPPED}>Runner Stopped</option>
                   <option value={AuditEventType.ERROR}>Errors</option>
                 </select>
+                <div className="ml-auto flex items-center gap-2 text-xs text-gray-300">
+                  <button
+                    onClick={pageLogsPrev}
+                    disabled={!logsHasPrev}
+                    className="rounded border border-gray-600 px-2 py-1 text-gray-200 disabled:opacity-40"
+                  >
+                    Prev
+                  </button>
+                  <span>Page {logsPage}</span>
+                  <button
+                    onClick={pageLogsNext}
+                    disabled={!logsHasNext}
+                    className="rounded border border-gray-600 px-2 py-1 text-gray-200 disabled:opacity-40"
+                  >
+                    Next
+                  </button>
+                </div>
               </div>
 
               <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
                 <div className="bg-gray-800 rounded-lg border border-gray-700 p-4">
                   <p className="text-gray-400 text-sm">System Events</p>
-                  <p className="text-2xl font-bold text-white">{filteredLogs.length}</p>
+                  <p className="text-2xl font-bold text-white">{logsTotalCount}</p>
                 </div>
                 <div className="bg-gray-800 rounded-lg border border-gray-700 p-4">
                   <p className="text-gray-400 text-sm">Critical Alerts</p>
@@ -586,7 +625,24 @@ function AuditPage() {
                   </div>
                 </div>
                 <div className="mt-3 text-xs text-gray-400">
-                  Showing {filteredTrades.length} of {trades.length} trades.
+                  Showing {filteredTrades.length} of {trades.length} loaded trades ({tradesTotalCount} total in backend).
+                </div>
+                <div className="mt-2 flex items-center gap-2 text-xs text-gray-300">
+                  <button
+                    onClick={pageTradesPrev}
+                    disabled={!tradesHasPrev}
+                    className="rounded border border-gray-600 px-2 py-1 text-gray-200 disabled:opacity-40"
+                  >
+                    Prev
+                  </button>
+                  <span>Page {tradesPage}</span>
+                  <button
+                    onClick={pageTradesNext}
+                    disabled={!tradesHasNext}
+                    className="rounded border border-gray-600 px-2 py-1 text-gray-200 disabled:opacity-40"
+                  >
+                    Next
+                  </button>
                 </div>
               </div>
 

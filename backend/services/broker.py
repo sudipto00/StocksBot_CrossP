@@ -231,6 +231,13 @@ class BrokerInterface(ABC):
         """
         return None
 
+    def get_last_connection_error(self) -> Optional[str]:
+        """
+        Optional: most recent connection failure reason.
+        Default None for brokers that do not expose connection diagnostics.
+        """
+        return None
+
 
 class PaperBroker(BrokerInterface):
     """

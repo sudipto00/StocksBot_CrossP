@@ -5,7 +5,7 @@ Provides abstraction layer between services and database models.
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timezone
 from sqlalchemy.orm import Session
-from sqlalchemy import and_, or_
+from sqlalchemy import and_, or_, insert
 
 from storage.models import (
     Position, Order, Trade, Strategy, Config, AuditLog, PortfolioSnapshot, OptimizationRun,
@@ -89,19 +89,31 @@ class OrderRepository:
                strategy_id: Optional[int] = None,
                external_id: Optional[str] = None) -> Order:
         """Create a new order."""
-        order = Order(
-            symbol=symbol,
-            side=side,
-            type=type,
-            quantity=quantity,
-            price=price,
-            status=OrderStatusEnum.PENDING,
-            strategy_id=strategy_id,
-            external_id=external_id
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        stmt = (
+            insert(Order)
+            .values(
+                symbol=symbol,
+                side=side,
+                type=type,
+                quantity=quantity,
+                price=price,
+                status=OrderStatusEnum.PENDING,
+                strategy_id=strategy_id,
+                external_id=external_id,
+                created_at=now,
+                updated_at=now,
+            )
         )
-        self.db.add(order)
+        result = self.db.execute(stmt)
         self.db.commit()
-        self.db.refresh(order)
+        inserted_ids = list(result.inserted_primary_key or [])
+        order_id = int(inserted_ids[0]) if inserted_ids else None
+        if order_id is None:
+            raise RuntimeError("Failed to persist order")
+        order = self.get_by_id(order_id)
+        if order is None:
+            raise RuntimeError(f"Persisted order {order_id} not found")
         return order
     
     def get_by_id(self, order_id: int) -> Optional[Order]:
@@ -165,7 +177,8 @@ class TradeRepository:
                type: TradeTypeEnum, quantity: float, price: float,
                commission: float = 0.0, fees: float = 0.0,
                external_id: Optional[str] = None,
-               executed_at: Optional[datetime] = None) -> Trade:
+               executed_at: Optional[datetime] = None,
+               strategy_id: Optional[int] = None) -> Trade:
         """Create a new trade."""
         trade = Trade(
             order_id=order_id,
@@ -177,7 +190,8 @@ class TradeRepository:
             commission=commission,
             fees=fees,
             external_id=external_id,
-            executed_at=executed_at or datetime.now()
+            executed_at=executed_at or datetime.now(),
+            strategy_id=strategy_id,
         )
         self.db.add(trade)
         self.db.commit()
@@ -192,6 +206,16 @@ class TradeRepository:
         """Get all trades for an order."""
         return self.db.query(Trade).filter(Trade.order_id == order_id).all()
     
+    def get_by_strategy_id(self, strategy_id: int, limit: int = 5000) -> List[Trade]:
+        """Get trades for a specific strategy."""
+        return (
+            self.db.query(Trade)
+            .filter(Trade.strategy_id == strategy_id)
+            .order_by(Trade.executed_at.desc())
+            .limit(limit)
+            .all()
+        )
+
     def get_by_symbol(self, symbol: str, limit: int = 100) -> List[Trade]:
         """Get trades by symbol."""
         return self.db.query(Trade).filter(Trade.symbol == symbol).limit(limit).all()
@@ -200,9 +224,19 @@ class TradeRepository:
         """Get recent trades."""
         return self.db.query(Trade).order_by(Trade.executed_at.desc()).limit(limit).all()
     
-    def get_all(self, limit: int = 1000) -> List[Trade]:
-        """Get all trades ordered by execution time."""
-        return self.db.query(Trade).order_by(Trade.executed_at.asc()).limit(limit).all()
+    def get_all(self, limit: int = 1000, offset: int = 0) -> List[Trade]:
+        """Get paginated trades ordered by execution time."""
+        return (
+            self.db.query(Trade)
+            .order_by(Trade.executed_at.asc())
+            .offset(max(0, int(offset or 0)))
+            .limit(max(1, int(limit or 1)))
+            .all()
+        )
+
+    def count_all(self) -> int:
+        """Count total trade rows."""
+        return int(self.db.query(Trade).count())
 
 
 class StrategyRepository:

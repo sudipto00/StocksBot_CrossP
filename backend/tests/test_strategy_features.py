@@ -82,6 +82,7 @@ class TestStrategyConfiguration:
         assert "AAPL" in data["symbols"]
         assert "MSFT" in data["symbols"]
         assert len(data["parameters"]) > 0
+        assert int(data["config_version"]) >= 1
     
     def test_get_strategy_config_not_found(self):
         """Test getting config for non-existent strategy."""
@@ -90,9 +91,15 @@ class TestStrategyConfiguration:
     
     def test_update_strategy_config_symbols(self, test_strategy):
         """Test updating strategy symbols."""
+        baseline = client.get(f"/strategies/{test_strategy.id}/config")
+        assert baseline.status_code == 200
+        expected_version = int(baseline.json()["config_version"])
         response = client.put(
             f"/strategies/{test_strategy.id}/config",
-            json={"symbols": ["TSLA", "GOOGL", "AMZN"]}
+            json={
+                "symbols": ["TSLA", "GOOGL", "AMZN"],
+                "expected_config_version": expected_version,
+            }
         )
         assert response.status_code == 200
         
@@ -100,14 +107,22 @@ class TestStrategyConfiguration:
         assert "TSLA" in data["symbols"]
         assert "GOOGL" in data["symbols"]
         assert "AMZN" in data["symbols"]
+        assert int(data["config_version"]) == expected_version + 1
     
     def test_update_strategy_config_parameters(self, test_strategy):
         """Test updating strategy parameters."""
+        baseline = client.get(f"/strategies/{test_strategy.id}/config")
+        assert baseline.status_code == 200
+        expected_version = int(baseline.json()["config_version"])
         response = client.put(
             f"/strategies/{test_strategy.id}/config",
-            json={"parameters": {"position_size": 2000.0, "stop_loss_pct": 3.5}}
+            json={
+                "parameters": {"position_size": 2000.0, "stop_loss_pct": 3.5},
+                "expected_config_version": expected_version,
+            }
         )
         assert response.status_code == 200
+        assert int(response.json()["config_version"]) == expected_version + 1
         
         # Verify parameters were updated
         config_response = client.get(f"/strategies/{test_strategy.id}/config")
@@ -120,14 +135,21 @@ class TestStrategyConfiguration:
     
     def test_update_strategy_config_enabled(self, test_strategy):
         """Test enabling/disabling strategy."""
+        baseline = client.get(f"/strategies/{test_strategy.id}/config")
+        assert baseline.status_code == 200
+        expected_version = int(baseline.json()["config_version"])
         response = client.put(
             f"/strategies/{test_strategy.id}/config",
-            json={"enabled": False}
+            json={
+                "enabled": False,
+                "expected_config_version": expected_version,
+            }
         )
         assert response.status_code == 200
         
         data = response.json()
         assert data["enabled"] is False
+        assert int(data["config_version"]) == expected_version + 1
 
     def test_update_strategy_config_disable_auto_stops_active(self, test_strategy):
         """Disabling config should also stop an active strategy."""
@@ -138,9 +160,15 @@ class TestStrategyConfiguration:
         assert activate.status_code == 200
         assert activate.json()["status"] == "active"
 
+        baseline = client.get(f"/strategies/{test_strategy.id}/config")
+        assert baseline.status_code == 200
+        expected_version = int(baseline.json()["config_version"])
         disable = client.put(
             f"/strategies/{test_strategy.id}/config",
-            json={"enabled": False},
+            json={
+                "enabled": False,
+                "expected_config_version": expected_version,
+            },
         )
         assert disable.status_code == 200
         assert disable.json()["enabled"] is False
@@ -148,6 +176,32 @@ class TestStrategyConfiguration:
         strategy = client.get(f"/strategies/{test_strategy.id}")
         assert strategy.status_code == 200
         assert strategy.json()["status"] == "stopped"
+
+    def test_update_strategy_config_rejects_stale_expected_version(self, test_strategy):
+        """Config updates should reject stale expected version from older tabs/sessions."""
+        baseline = client.get(f"/strategies/{test_strategy.id}/config")
+        assert baseline.status_code == 200
+        stale_version = int(baseline.json()["config_version"])
+
+        first = client.put(
+            f"/strategies/{test_strategy.id}/config",
+            json={
+                "parameters": {"position_size": 1500.0},
+                "expected_config_version": stale_version,
+            },
+        )
+        assert first.status_code == 200
+        assert int(first.json()["config_version"]) == stale_version + 1
+
+        second = client.put(
+            f"/strategies/{test_strategy.id}/config",
+            json={
+                "parameters": {"position_size": 1800.0},
+                "expected_config_version": stale_version,
+            },
+        )
+        assert second.status_code == 409
+        assert "version mismatch" in str(second.json().get("detail", "")).lower()
 
     def test_get_strategy_config_uses_adaptive_defaults_when_missing_params(self):
         """Config response should provide adaptive defaults for unset parameters."""
@@ -451,11 +505,15 @@ class TestParameterTuning:
     
     def test_tune_parameter(self, test_strategy):
         """Test tuning a parameter."""
+        baseline = client.get(f"/strategies/{test_strategy.id}/config")
+        assert baseline.status_code == 200
+        expected_version = int(baseline.json()["config_version"])
         response = client.post(
             f"/strategies/{test_strategy.id}/tune",
             json={
                 "parameter_name": "position_size",
                 "value": 1500.0,
+                "expected_config_version": expected_version,
             }
         )
         assert response.status_code == 200
@@ -464,7 +522,36 @@ class TestParameterTuning:
         assert data["strategy_id"] == str(test_strategy.id)
         assert data["parameter_name"] == "position_size"
         assert data["new_value"] == 1500.0
+        assert int(data["config_version"]) == expected_version + 1
         assert data["success"] is True
+
+    def test_tune_parameter_rejects_stale_expected_version(self, test_strategy):
+        """Parameter tune should reject stale expected config version."""
+        baseline = client.get(f"/strategies/{test_strategy.id}/config")
+        assert baseline.status_code == 200
+        stale_version = int(baseline.json()["config_version"])
+
+        first = client.post(
+            f"/strategies/{test_strategy.id}/tune",
+            json={
+                "parameter_name": "position_size",
+                "value": 1200.0,
+                "expected_config_version": stale_version,
+            },
+        )
+        assert first.status_code == 200
+        assert int(first.json()["config_version"]) == stale_version + 1
+
+        second = client.post(
+            f"/strategies/{test_strategy.id}/tune",
+            json={
+                "parameter_name": "position_size",
+                "value": 1300.0,
+                "expected_config_version": stale_version,
+            },
+        )
+        assert second.status_code == 409
+        assert "version mismatch" in str(second.json().get("detail", "")).lower()
     
     def test_tune_parameter_validation(self, test_strategy):
         """Test parameter tuning with invalid value."""

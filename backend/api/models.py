@@ -474,6 +474,7 @@ class StrategyConfigResponse(BaseModel):
     symbols: List[str] = Field(default_factory=list, description="Trading symbols")
     parameters: List[StrategyParameter] = Field(default_factory=list, description="Strategy parameters")
     enabled: bool = Field(default=True, description="Whether strategy is enabled")
+    config_version: int = Field(default=1, ge=1, description="Monotonic strategy configuration version")
 
 
 class StrategyConfigUpdateRequest(BaseModel):
@@ -481,6 +482,11 @@ class StrategyConfigUpdateRequest(BaseModel):
     symbols: Optional[List[str]] = Field(None, description="Trading symbols")
     parameters: Optional[Dict[str, float]] = Field(None, description="Parameter updates")
     enabled: Optional[bool] = Field(None, description="Enable/disable strategy")
+    expected_config_version: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description="Optimistic concurrency guard. When provided, update is rejected if version is stale.",
+    )
 
 
 class StrategyMetricsResponse(BaseModel):
@@ -570,6 +576,11 @@ class ParameterTuneRequest(BaseModel):
     """Parameter tuning request model."""
     parameter_name: str = Field(..., description="Parameter to tune")
     value: float = Field(..., description="New parameter value")
+    expected_config_version: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description="Optimistic concurrency guard. Rejects stale updates when provided.",
+    )
 
 
 class ParameterTuneResponse(BaseModel):
@@ -578,6 +589,7 @@ class ParameterTuneResponse(BaseModel):
     parameter_name: str = Field(..., description="Parameter name")
     old_value: float = Field(..., description="Previous value")
     new_value: float = Field(..., description="New value")
+    config_version: int = Field(..., ge=1, description="Updated strategy configuration version")
     success: bool = Field(..., description="Whether update was successful")
     message: str = Field(..., description="Result message")
 
@@ -938,6 +950,24 @@ class TradingPreferencesRequest(BaseModel):
     risk_profile: Optional[RiskProfile] = Field(None, description="Risk profile")
     weekly_budget: Optional[float] = Field(None, description="Weekly budget", gt=0)
     screener_limit: Optional[int] = Field(None, description="Screener result limit", ge=10, le=200)
+    stock_most_active_limit: Optional[int] = Field(
+        None,
+        description="Stock most-active universe limit",
+        ge=10,
+        le=200,
+    )
+    stock_preset_limit: Optional[int] = Field(
+        None,
+        description="Stock preset universe limit",
+        ge=10,
+        le=200,
+    )
+    etf_preset_limit: Optional[int] = Field(
+        None,
+        description="ETF preset universe limit",
+        ge=10,
+        le=200,
+    )
     screener_mode: Optional[ScreenerMode] = Field(None, description="Screener mode")
     stock_preset: Optional[StockPreset] = Field(None, description="Stock preset")
     etf_preset: Optional[EtfPreset] = Field(None, description="ETF preset")
@@ -949,6 +979,9 @@ class TradingPreferencesResponse(BaseModel):
     risk_profile: RiskProfile = Field(..., description="Current risk profile")
     weekly_budget: float = Field(..., description="Weekly trading budget")
     screener_limit: int = Field(..., description="Screener result limit")
+    stock_most_active_limit: int = Field(50, description="Stock most-active universe limit")
+    stock_preset_limit: int = Field(50, description="Stock preset universe limit")
+    etf_preset_limit: int = Field(50, description="ETF preset universe limit")
     screener_mode: ScreenerMode = Field(..., description="Screener mode")
     stock_preset: StockPreset = Field(..., description="Stock strategy preset")
     etf_preset: EtfPreset = Field(..., description="ETF strategy preset")

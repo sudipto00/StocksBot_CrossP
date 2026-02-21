@@ -478,6 +478,13 @@ export interface PortfolioSummaryResponse {
   equity: number;
 }
 
+export interface DashboardAnalyticsBundleResponse {
+  generated_at: string;
+  summary: PortfolioSummaryResponse;
+  analytics: PortfolioAnalyticsResponse;
+  broker_account: BrokerAccountResponse;
+}
+
 // ============================================================================
 // Strategy Configuration Types
 // ============================================================================
@@ -498,12 +505,14 @@ export interface StrategyConfig {
   symbols: string[];
   parameters: StrategyParameter[];
   enabled: boolean;
+  config_version: number;
 }
 
 export interface StrategyConfigUpdateRequest {
   symbols?: string[];
   parameters?: Record<string, number>;
   enabled?: boolean;
+  expected_config_version?: number;
 }
 
 export interface StrategyMetrics {
@@ -800,6 +809,8 @@ export interface OptimizerJobListItem {
 export interface OptimizerJobsListResponse {
   jobs: OptimizerJobListItem[];
   total_count: number;
+  limit?: number;
+  offset?: number;
 }
 
 export interface OptimizerCancelAllResponse {
@@ -853,6 +864,8 @@ export interface OptimizerHealthActiveJob {
   message: string;
   progress_pct: number;
   elapsed_seconds: number;
+  cancel_requested?: boolean;
+  last_heartbeat_at?: string | null;
   created_at?: string | null;
   started_at?: string | null;
 }
@@ -866,12 +879,15 @@ export interface OptimizerHealthResponse {
   max_active_job_age_seconds: number;
   in_memory_job_count: number;
   worker_threads_alive: number;
+  worker_processes_alive?: number;
+  queue_depth?: number;
   last_created_at?: string | null;
 }
 
 export interface ParameterTuneRequest {
   parameter_name: string;
   value: number;
+  expected_config_version?: number;
 }
 
 export interface ParameterTuneResponse {
@@ -879,6 +895,7 @@ export interface ParameterTuneResponse {
   parameter_name: string;
   old_value: number;
   new_value: number;
+  config_version: number;
   success: boolean;
   message: string;
 }
@@ -899,6 +916,9 @@ export interface TradingPreferences {
   risk_profile: RiskProfilePreference;
   weekly_budget: number;
   screener_limit: number;
+  stock_most_active_limit: number;
+  stock_preset_limit: number;
+  etf_preset_limit: number;
   screener_mode: ScreenerModePreference;
   stock_preset: StockPresetPreference;
   etf_preset: EtfPresetPreference;
@@ -909,6 +929,9 @@ export interface TradingPreferencesUpdateRequest {
   risk_profile?: RiskProfilePreference;
   weekly_budget?: number;
   screener_limit?: number;
+  stock_most_active_limit?: number;
+  stock_preset_limit?: number;
+  etf_preset_limit?: number;
   screener_mode?: ScreenerModePreference;
   stock_preset?: StockPresetPreference;
   etf_preset?: EtfPresetPreference;

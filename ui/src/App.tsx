@@ -1,5 +1,6 @@
-import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
-import { lazy, Suspense, useEffect, useRef } from 'react';
+import { BrowserRouter, Routes, Route, Navigate, useNavigate } from 'react-router-dom';
+import { Component, lazy, Suspense, useEffect, useRef } from 'react';
+import type { ErrorInfo, ReactNode } from 'react';
 import Sidebar from './components/Sidebar';
 import AppTopBar from './components/AppTopBar';
 import { invoke } from '@tauri-apps/api/core';
@@ -8,6 +9,7 @@ import {
   createWebSocketAuthTicket,
   getApiAuthKey,
   getAuditLogs,
+  getOptimizerHealth,
   getPositions,
   getStrategies,
   getSystemHealthSnapshot,
@@ -18,6 +20,7 @@ import {
 } from './api/backend';
 import { AuditEventType, StrategyStatus } from './api/types';
 import { showSuccessNotification } from './utils/notifications';
+import GlobalJobTray from './components/GlobalJobTray';
 
 const DashboardPage = lazy(() => import('./pages/DashboardPage'));
 const StrategyPage = lazy(() => import('./pages/StrategyPage'));
@@ -35,6 +38,76 @@ interface KeychainCredentialStatus {
 interface StoredCredentials {
   api_key: string;
   secret_key: string;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   PAGE ERROR BOUNDARY
+   Catches render errors in individual pages so the sidebar/navigation
+   remains functional even if a page component crashes.
+   ───────────────────────────────────────────────────────────────────────────── */
+
+interface PageErrorBoundaryProps {
+  children: ReactNode;
+}
+
+interface PageErrorBoundaryState {
+  hasError: boolean;
+  error: Error | null;
+}
+
+function PageErrorFallback() {
+  const navigate = useNavigate();
+  return (
+    <div className="p-8 text-center">
+      <div className="text-4xl mb-4">⚠️</div>
+      <h2 className="text-xl font-semibold text-white mb-2">Something went wrong</h2>
+      <p className="text-gray-400 mb-4 text-sm">
+        This page encountered an error. Navigation still works — use the sidebar to go to another page.
+      </p>
+      <div className="flex justify-center gap-3">
+        <button
+          onClick={() => navigate('/')}
+          className="rounded bg-blue-600 px-4 py-2 text-sm text-white hover:bg-blue-500"
+        >
+          Go to Dashboard
+        </button>
+        <button
+          onClick={() => window.location.reload()}
+          className="rounded bg-gray-700 px-4 py-2 text-sm text-gray-200 hover:bg-gray-600"
+        >
+          Reload App
+        </button>
+      </div>
+    </div>
+  );
+}
+
+class PageErrorBoundary extends Component<PageErrorBoundaryProps, PageErrorBoundaryState> {
+  constructor(props: PageErrorBoundaryProps) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+
+  static getDerivedStateFromError(error: Error): PageErrorBoundaryState {
+    return { hasError: true, error };
+  }
+
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    console.error('[PageErrorBoundary] Caught render error:', error, info.componentStack);
+  }
+
+  componentDidUpdate(prevProps: PageErrorBoundaryProps) {
+    if (prevProps.children !== this.props.children && this.state.hasError) {
+      this.setState({ hasError: false, error: null });
+    }
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return <PageErrorFallback />;
+    }
+    return this.props.children;
+  }
 }
 
 function App() {
@@ -136,6 +209,9 @@ function App() {
       open_positions?: number;
       active_strategy?: string;
       universe?: string;
+      optimizer_active_jobs?: number;
+      optimizer_queue_depth?: number;
+      optimizer_stalled_jobs?: number;
       last_update?: string;
     }) => {
       try {
@@ -147,11 +223,12 @@ function App() {
 
     const syncTraySummary = async () => {
       try {
-        const [health, prefs, positionsRes, strategiesRes] = await Promise.all([
+        const [health, prefs, positionsRes, strategiesRes, optimizerHealth] = await Promise.all([
           getSystemHealthSnapshot(),
           getTradingPreferences(),
           getPositions(),
           getStrategies(),
+          getOptimizerHealth().catch(() => null),
         ]);
         const active = (strategiesRes.strategies || []).filter((s) => s.status === StrategyStatus.ACTIVE);
         const activeLabel = active.length ? active.map((s) => s.name).join(', ') : 'No active strategy';
@@ -165,6 +242,13 @@ function App() {
             : prefs.screener_mode === 'most_active'
             ? `Stocks Most Active (${prefs.screener_limit})`
             : `Stocks ${prefs.stock_preset}`;
+        const stalledJobs = (optimizerHealth?.active_jobs || []).filter((job) => {
+          if (String(job.status || '').toLowerCase() !== 'running') return false;
+          if (!job.last_heartbeat_at) return false;
+          const ts = new Date(job.last_heartbeat_at).getTime();
+          if (!Number.isFinite(ts)) return false;
+          return (Date.now() - ts) >= 25_000;
+        });
 
         trayFailureCountRef.current = 0;
         trayLastSuccessMsRef.current = Date.now();
@@ -175,6 +259,9 @@ function App() {
           open_positions: positionsRes.positions.length,
           active_strategy: activeLabel,
           universe: universeLabel,
+          optimizer_active_jobs: optimizerHealth?.active_job_count || 0,
+          optimizer_queue_depth: Number(optimizerHealth?.queue_depth || 0),
+          optimizer_stalled_jobs: stalledJobs.length,
           last_update: new Date().toLocaleTimeString(),
         });
       } catch {
@@ -189,6 +276,9 @@ function App() {
           open_positions: 0,
           active_strategy: 'Unavailable',
           universe: 'Unavailable',
+          optimizer_active_jobs: 0,
+          optimizer_queue_depth: 0,
+          optimizer_stalled_jobs: 0,
           last_update: secondsDown > 0 ? `Down ${secondsDown}s` : 'Disconnected',
         });
       }
@@ -283,17 +373,20 @@ function App() {
         <main className="flex-1 overflow-auto">
           <AppTopBar />
           <Suspense fallback={<div className="p-6 text-gray-400">Loading page...</div>}>
-            <Routes>
-              <Route path="/" element={<DashboardPage />} />
-              <Route path="/dashboard" element={<DashboardPage />} />
-              <Route path="/strategy" element={<StrategyPage />} />
-              <Route path="/analytics" element={<Navigate to="/" replace />} />
-              <Route path="/screener" element={<ScreenerPage />} />
-              <Route path="/audit" element={<AuditPage />} />
-              <Route path="/settings" element={<SettingsPage />} />
-              <Route path="/help" element={<HelpPage />} />
-            </Routes>
+            <PageErrorBoundary>
+              <Routes>
+                <Route path="/" element={<DashboardPage />} />
+                <Route path="/dashboard" element={<DashboardPage />} />
+                <Route path="/strategy" element={<StrategyPage />} />
+                <Route path="/analytics" element={<Navigate to="/" replace />} />
+                <Route path="/screener" element={<ScreenerPage />} />
+                <Route path="/audit" element={<AuditPage />} />
+                <Route path="/settings" element={<SettingsPage />} />
+                <Route path="/help" element={<HelpPage />} />
+              </Routes>
+            </PageErrorBoundary>
           </Suspense>
+          <GlobalJobTray />
         </main>
       </div>
     </BrowserRouter>

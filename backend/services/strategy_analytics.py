@@ -6,6 +6,7 @@ and performance analysis.
 from typing import List, Dict, Any, Optional, Callable
 from datetime import datetime, timedelta, timezone, date as date_type
 import math
+import random as _random_mod
 from sqlalchemy.orm import Session
 
 from storage.service import StorageService
@@ -179,6 +180,12 @@ class StrategyAnalyticsService:
         max_position_size = max(1.0, float(request.max_position_size or params.get("position_size", 1000.0)))
         daily_risk_limit = max(1.0, float(request.risk_limit_daily or max(50.0, initial_capital * 0.05)))
         fee_bps = max(0.0, float(request.fee_bps or 0.0))
+        # Monte Carlo price noise: per-bar multiplicative Gaussian noise.
+        price_noise_bps = max(0.0, float(getattr(request, "price_noise_bps", 0.0) or 0.0))
+        _price_noise_rng: Optional[_random_mod.Random] = None
+        if price_noise_bps > 0:
+            _price_noise_seed = getattr(request, "price_noise_seed", None)
+            _price_noise_rng = _random_mod.Random(_price_noise_seed)
         risk_manager = RiskManager(
             max_position_size=max_position_size,
             daily_loss_limit=daily_risk_limit,
@@ -367,6 +374,12 @@ class StrategyAnalyticsService:
                 close = float(point["close"])
                 high = float(point["high"])
                 low = float(point["low"])
+                # Monte Carlo price noise: apply per-bar multiplicative jitter.
+                if _price_noise_rng is not None and price_noise_bps > 0 and close > 0:
+                    noise_factor = 1.0 + _price_noise_rng.gauss(0.0, price_noise_bps / 10000.0)
+                    close = close * noise_factor
+                    high = max(close, high * noise_factor)
+                    low = min(close, low * noise_factor)
                 latest_price_by_symbol[symbol] = close
 
                 capability = symbol_capabilities.get(symbol, {})
@@ -456,7 +469,8 @@ class StrategyAnalyticsService:
                         exit_price = close * (1.0 - exit_slippage_bps / 10000.0)
                         exit_reason = "time_exit"
                     elif low <= effective_stop:
-                        # Apply slippage to stop fills (fills slightly worse).
+                        # On gap-downs, the fill occurs at or below the low,
+                        # not at the stop level.  Use the worse of the two.
                         exit_slippage_bps = self._effective_slippage_bps(
                             base_bps=slippage_bps,
                             close=close,
@@ -464,7 +478,8 @@ class StrategyAnalyticsService:
                             low=low,
                             emulate_live=emulate_live_trading,
                         )
-                        exit_price = effective_stop * (1.0 - exit_slippage_bps / 10000.0)
+                        raw_stop_fill = min(effective_stop, low)
+                        exit_price = raw_stop_fill * (1.0 - exit_slippage_bps / 10000.0)
                         exit_reason = "stop_exit"
                     elif high >= take_profit_price:
                         # TP fills can also experience minor slippage.
@@ -677,6 +692,8 @@ class StrategyAnalyticsService:
                 trade_id += 1
                 del open_positions[symbol]
             equity_curve.append({"timestamp": final_ts.isoformat(), "equity": round(cash, 2)})
+
+        equity_curve = self._normalize_equity_curve(equity_curve)
 
         final_capital = round(cash, 2)
         capital_base_for_return = max(1.0, initial_capital + total_contributions)
@@ -901,6 +918,104 @@ class StrategyAnalyticsService:
             resolved[key] = parsed
         return resolved
 
+    def _equity_curve_bucket_seconds_for_span(self, span_seconds: float) -> int:
+        """Choose adaptive equity-curve bucket size for downsampling."""
+        if span_seconds <= 2 * 86400:
+            return 5 * 60
+        if span_seconds <= 14 * 86400:
+            return 15 * 60
+        if span_seconds <= 90 * 86400:
+            return 60 * 60
+        if span_seconds <= 730 * 86400:
+            return 24 * 60 * 60
+        return 7 * 24 * 60 * 60
+
+    def _normalize_equity_curve(
+        self,
+        points: List[Dict[str, Any]],
+        *,
+        max_points: int = 1500,
+    ) -> List[Dict[str, Any]]:
+        """
+        Normalize equity curve for chart stability:
+        1) sort and sanitize values,
+        2) dedupe identical timestamps (keep latest),
+        3) adaptive time-bucket resample for very large ranges.
+        """
+        if not points:
+            return []
+
+        normalized: List[Dict[str, Any]] = []
+        for row in points:
+            ts = self._parse_point_timestamp(row.get("timestamp"))
+            if ts is None:
+                continue
+            try:
+                equity = float(row.get("equity", 0.0))
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(equity):
+                continue
+            normalized.append(
+                {
+                    "ts": ts.astimezone(timezone.utc),
+                    "equity": round(equity, 2),
+                }
+            )
+        if not normalized:
+            return []
+
+        normalized.sort(key=lambda item: item["ts"])
+
+        # Collapse exact duplicate timestamps to the latest value.
+        deduped: List[Dict[str, Any]] = []
+        for item in normalized:
+            if deduped and deduped[-1]["ts"] == item["ts"]:
+                deduped[-1] = item
+            else:
+                deduped.append(item)
+        if len(deduped) <= 2:
+            return [
+                {"timestamp": row["ts"].isoformat(), "equity": row["equity"]}
+                for row in deduped
+            ]
+
+        span_seconds = (deduped[-1]["ts"] - deduped[0]["ts"]).total_seconds()
+        bucket_seconds = self._equity_curve_bucket_seconds_for_span(span_seconds)
+        if len(deduped) <= max_points:
+            return [
+                {"timestamp": row["ts"].isoformat(), "equity": row["equity"]}
+                for row in deduped
+            ]
+
+        # Increase bucket width for very dense curves to keep payload bounded.
+        if span_seconds > 0 and max_points > 0:
+            adaptive_bucket = int(math.ceil(span_seconds / float(max_points)))
+            bucket_seconds = max(bucket_seconds, adaptive_bucket)
+
+        bucketed: List[Dict[str, Any]] = []
+        for row in deduped:
+            bucket_key = int(row["ts"].timestamp()) // max(1, int(bucket_seconds))
+            if bucketed and bucketed[-1]["bucket_key"] == bucket_key:
+                bucketed[-1]["timestamp"] = row["ts"].isoformat()
+                bucketed[-1]["equity"] = row["equity"]
+            else:
+                bucketed.append(
+                    {
+                        "bucket_key": bucket_key,
+                        "timestamp": row["ts"].isoformat(),
+                        "equity": row["equity"],
+                    }
+                )
+
+        return [
+            {
+                "timestamp": row["timestamp"],
+                "equity": row["equity"],
+            }
+            for row in bucketed
+        ]
+
     # ------------------------------------------------------------------
     # Series helpers
     # ------------------------------------------------------------------
@@ -1084,8 +1199,12 @@ class StrategyAnalyticsService:
             if prev <= 0:
                 continue
             returns.append((data[i] - prev) / prev)
-        # Daily volatility (stdev of daily returns).
-        vol = (sum(r * r for r in returns) / len(returns)) ** 0.5 if returns else 0.0
+        # Daily volatility (sample stdev of daily returns).
+        if len(returns) >= 2:
+            mean_r = sum(returns) / len(returns)
+            vol = (sum((r - mean_r) ** 2 for r in returns) / (len(returns) - 1)) ** 0.5
+        else:
+            vol = 0.0
         # Tighter threshold (0.015 daily ~ 23.8% annualized) for better separation.
         if trend > 0.04 and vol < 0.015:
             return "trending_up"
@@ -1182,13 +1301,13 @@ class StrategyAnalyticsService:
         return round(max_drawdown, 2)
 
     def _calculate_sharpe_ratio(self, returns: List[float], risk_free_rate: float = 0.02) -> float:
-        """Calculate annualized Sharpe ratio."""
-        if len(returns) < 2:
+        """Calculate annualized Sharpe ratio using sample variance (Bessel-corrected)."""
+        n = len(returns)
+        if n < 2:
             return 0.0
-        mean_return = sum(returns) / len(returns)
-        mean_sq = sum(r * r for r in returns) / len(returns)
-        variance = mean_sq - mean_return * mean_return
-        daily_vol = max(0.0, variance) ** 0.5
+        mean_return = sum(returns) / n
+        variance = sum((r - mean_return) ** 2 for r in returns) / (n - 1)
+        daily_vol = variance ** 0.5
         if daily_vol == 0:
             return 0.0
         annualized_return = mean_return * 252
@@ -1196,15 +1315,19 @@ class StrategyAnalyticsService:
         return round((annualized_return - risk_free_rate) / annualized_vol, 4)
 
     def _calculate_sortino_ratio(self, returns: List[float], risk_free_rate: float = 0.02) -> float:
-        """Calculate annualized Sortino ratio (penalizes only downside vol)."""
-        if len(returns) < 2:
+        """Calculate annualized Sortino ratio (penalizes only downside vol).
+
+        Standard Sortino denominator divides sum-of-squared-downside-deviations
+        by the *total* observation count, not just the count of negative returns.
+        """
+        n = len(returns)
+        if n < 2:
             return 0.0
-        mean_return = sum(returns) / len(returns)
-        downside = [r for r in returns if r < 0]
-        if not downside:
+        mean_return = sum(returns) / n
+        downside_sq_sum = sum(r * r for r in returns if r < 0)
+        if downside_sq_sum == 0:
             return 0.0
-        downside_var = sum(r * r for r in downside) / len(downside)
-        downside_vol = downside_var ** 0.5
+        downside_vol = (downside_sq_sum / n) ** 0.5
         if downside_vol == 0:
             return 0.0
         annualized_return = mean_return * 252

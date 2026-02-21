@@ -61,23 +61,41 @@ def _reset_runtime_singletons() -> None:
         pass
     # Cancel and clear optimizer background state to avoid cross-test leakage.
     try:
+        try:
+            api_routes.stop_optimizer_dispatcher()
+        except Exception:
+            pass
         with api_routes._optimizer_jobs_lock:
             active_job_ids = list(api_routes._optimizer_jobs.keys())
             active_threads = list(api_routes._optimizer_job_threads.values())
+            active_processes = list(api_routes._optimizer_job_processes.values())
         for job_id in active_job_ids:
             try:
-                api_routes._optimizer_request_cancel(job_id, message="Test reset")
+                api_routes._optimizer_request_cancel(job_id, message="Test reset", force=True)
+                api_routes._optimizer_escalate_cancel(job_id, force_now=True)
             except Exception:
                 pass
         for thread in active_threads:
             try:
-                thread.join(timeout=0.25)
+                thread.join(timeout=2.0)
+            except Exception:
+                pass
+        for process in active_processes:
+            try:
+                if process.poll() is None:
+                    process.terminate()
+                    process.wait(timeout=0.5)
             except Exception:
                 pass
         with api_routes._optimizer_jobs_lock:
-            job_ids = set(api_routes._optimizer_jobs.keys()) | set(api_routes._optimizer_job_threads.keys())
+            job_ids = (
+                set(api_routes._optimizer_jobs.keys())
+                | set(api_routes._optimizer_job_threads.keys())
+                | set(api_routes._optimizer_job_processes.keys())
+            )
             api_routes._optimizer_jobs.clear()
             api_routes._optimizer_job_threads.clear()
+            api_routes._optimizer_job_processes.clear()
         for job_id in job_ids:
             try:
                 api_routes._optimizer_clear_cancel_token(str(job_id))
@@ -478,6 +496,138 @@ def test_optimize_strategy_async_job_lifecycle(monkeypatch):
     assert status_payload["result"]["recommended_symbols"] == ["AAPL"]
 
 
+def test_optimizer_worker_refreshes_runtime_config_from_storage(monkeypatch):
+    """Detached worker path should load persisted runtime config before compute."""
+    created = client.post(
+        "/strategies",
+        json={
+            "name": "Optimize Worker Config Refresh Test",
+            "symbols": ["AAPL", "MSFT"],
+        },
+    )
+    assert created.status_code == 200
+    strategy_id = str(created.json()["id"])
+
+    observed: dict[str, str] = {}
+
+    def _fake_compute(*, strategy_id: str, request, db, progress_callback=None, should_cancel=None):
+        snapshot = api_routes._get_config_snapshot()
+        observed["broker"] = str(snapshot.broker)
+        observed["paper_trading"] = str(bool(snapshot.paper_trading)).lower()
+        return StrategyOptimizationResponse(
+            strategy_id=strategy_id,
+            requested_iterations=4,
+            evaluated_iterations=4,
+            objective="balanced",
+            score=10.0,
+            recommended_parameters={"position_size": 200.0},
+            recommended_symbols=["AAPL"],
+            top_candidates=[],
+            best_result=BacktestResponse(
+                strategy_id=strategy_id,
+                start_date="2024-01-01",
+                end_date="2024-03-31",
+                initial_capital=100000.0,
+                final_capital=101500.0,
+                total_return=1.5,
+                total_trades=6,
+                winning_trades=4,
+                losing_trades=2,
+                win_rate=66.7,
+                max_drawdown=2.1,
+                sharpe_ratio=0.7,
+                volatility=10.0,
+                trades=[],
+                equity_curve=[],
+                diagnostics={},
+            ),
+            notes=["ok"],
+        )
+
+    monkeypatch.setattr(api_routes, "_compute_strategy_optimization_response", _fake_compute)
+
+    previous_snapshot = api_routes._get_config_snapshot()
+    try:
+        db = TestingSessionLocal()
+        try:
+            storage = StorageService(db)
+            persisted_cfg = previous_snapshot.model_copy(
+                update={
+                    "broker": "alpaca",
+                    "paper_trading": True,
+                    "trading_enabled": True,
+                }
+            )
+            api_routes._save_runtime_config(storage, persisted_cfg)
+        finally:
+            db.close()
+
+        # Simulate stale in-memory state inherited by child process import.
+        api_routes._set_config_snapshot(previous_snapshot.model_copy(update={"broker": "paper"}))
+
+        job = api_routes._optimizer_create_job(
+            strategy_id=strategy_id,
+            request_payload={
+                "start_date": "2024-01-01",
+                "end_date": "2024-03-31",
+                "initial_capital": 100000,
+                "emulate_live_trading": True,
+                "use_workspace_universe": False,
+                "iterations": 8,
+            },
+        )
+        job_id = str(job["job_id"])
+        api_routes._run_optimizer_job(job_id)
+
+        status = api_routes._optimizer_get_job(job_id)
+        assert status is not None
+        assert str(status.get("status")) == "completed"
+        assert observed.get("broker") == "alpaca"
+        assert observed.get("paper_trading") == "true"
+    finally:
+        api_routes._set_config_snapshot(previous_snapshot)
+
+
+def test_optimizer_worker_credential_env_roundtrip():
+    """Detached worker credential env should round-trip runtime paper/live credentials."""
+    with api_routes._state_lock:
+        original = {
+            "paper": dict(api_routes._runtime_broker_credentials.get("paper", {})),
+            "live": dict(api_routes._runtime_broker_credentials.get("live", {})),
+        }
+    try:
+        api_routes._set_runtime_credentials("paper", "paper_key_12345678", "paper_secret_12345678")
+        api_routes._set_runtime_credentials("live", "live_key_12345678", "live_secret_12345678")
+
+        worker_env = api_routes._optimizer_worker_env_with_runtime_credentials({})
+        assert worker_env.get("STOCKSBOT_OPTIMIZER_PAPER_API_KEY") == "paper_key_12345678"
+        assert worker_env.get("STOCKSBOT_OPTIMIZER_PAPER_SECRET_KEY") == "paper_secret_12345678"
+        assert worker_env.get("STOCKSBOT_OPTIMIZER_LIVE_API_KEY") == "live_key_12345678"
+        assert worker_env.get("STOCKSBOT_OPTIMIZER_LIVE_SECRET_KEY") == "live_secret_12345678"
+
+        with api_routes._state_lock:
+            api_routes._runtime_broker_credentials["paper"]["api_key"] = None
+            api_routes._runtime_broker_credentials["paper"]["secret_key"] = None
+            api_routes._runtime_broker_credentials["live"]["api_key"] = None
+            api_routes._runtime_broker_credentials["live"]["secret_key"] = None
+
+        hydrated = api_routes._optimizer_hydrate_runtime_credentials_from_env(worker_env)
+        assert hydrated is True
+        paper_creds = api_routes._get_runtime_credentials("paper")
+        live_creds = api_routes._get_runtime_credentials("live")
+        assert paper_creds.get("api_key") == "paper_key_12345678"
+        assert paper_creds.get("secret_key") == "paper_secret_12345678"
+        assert live_creds.get("api_key") == "live_key_12345678"
+        assert live_creds.get("secret_key") == "live_secret_12345678"
+    finally:
+        with api_routes._state_lock:
+            api_routes._runtime_broker_credentials["paper"]["api_key"] = original["paper"].get("api_key")
+            api_routes._runtime_broker_credentials["paper"]["secret_key"] = original["paper"].get("secret_key")
+            api_routes._runtime_broker_credentials["live"]["api_key"] = original["live"].get("api_key")
+            api_routes._runtime_broker_credentials["live"]["secret_key"] = original["live"].get("secret_key")
+        api_routes._invalidate_broker_instance()
+
+
 def test_optimize_strategy_async_job_cancel(monkeypatch):
     """Async optimizer cancel endpoint should mark running jobs for cancellation."""
     created = client.post(
@@ -740,6 +890,42 @@ def test_optimizer_health_endpoint_reports_snapshot():
     assert payload["active_job_count"] >= 1
 
 
+def test_optimizer_prefers_persisted_row_when_runtime_progress_advances():
+    """Persisted row should replace stale in-memory row when heartbeat/progress is newer."""
+    local_row = {
+        "status": "running",
+        "message": "Preparing symbols, universe, and live constraints",
+        "progress_pct": 0.5,
+        "completed_iterations": 0,
+        "last_heartbeat_at": "2026-02-21T01:01:44+00:00",
+    }
+    persisted_row = {
+        "status": "running",
+        "message": "Running Monte Carlo ensemble scenarios",
+        "progress_pct": 4.13,
+        "completed_iterations": 32,
+        "last_heartbeat_at": "2026-02-21T01:08:56+00:00",
+    }
+    assert api_routes._optimizer_should_prefer_persisted_row(local_row, persisted_row) is True
+
+
+def test_optimizer_keeps_local_row_when_cancel_requested_not_flushed():
+    """Local cancel intent should not be hidden by stale persisted snapshots."""
+    local_row = {
+        "status": "running",
+        "cancel_requested": True,
+        "cancel_requested_at": datetime.now(timezone.utc).isoformat(),
+        "progress_pct": 10.0,
+    }
+    persisted_row = {
+        "status": "running",
+        "cancel_requested": False,
+        "progress_pct": 11.0,
+        "last_heartbeat_at": datetime.now(timezone.utc).isoformat(),
+    }
+    assert api_routes._optimizer_should_prefer_persisted_row(local_row, persisted_row) is False
+
+
 def test_optimize_strategy_async_job_force_cancel_query(monkeypatch):
     """Force cancel query flag should be accepted and request cancellation."""
     created = client.post(
@@ -922,8 +1108,8 @@ def test_optimizer_cancel_all_endpoint(monkeypatch):
     assert _wait_terminal(strategy_two, job_two) == "canceled"
 
 
-def test_optimizer_jobs_endpoint_marks_stale_running_job_failed():
-    """Jobs endpoint should auto-finalize stale running jobs with no live worker thread."""
+def test_optimizer_jobs_endpoint_requeues_stale_running_job():
+    """Jobs endpoint should requeue stale running jobs for dispatcher recovery."""
     created = client.post(
         "/strategies",
         json={
@@ -961,8 +1147,112 @@ def test_optimizer_jobs_endpoint_marks_stale_running_job_failed():
     rows = listing.json().get("jobs", [])
     matched = next((row for row in rows if str(row.get("job_id")) == job_id), None)
     assert matched is not None
-    assert matched["status"] == "failed"
-    assert "not running" in str(matched.get("message", "")).lower()
+    assert matched["status"] in {"queued", "failed"}
+    assert "queued for retry" in str(matched.get("message", "")).lower() or "not running" in str(matched.get("message", "")).lower()
+
+
+def test_optimizer_status_endpoint_prefers_persisted_terminal_over_stale_local_queued():
+    """Job status endpoint should return persisted terminal state over stale local queued row."""
+    created = client.post(
+        "/strategies",
+        json={
+            "name": "Optimizer Persisted Terminal Preference Test",
+            "symbols": ["AAPL"],
+        },
+    )
+    assert created.status_code == 200
+    strategy_id = str(created.json()["id"])
+
+    job = api_routes._optimizer_create_job(
+        strategy_id=strategy_id,
+        request_payload={
+            "start_date": "2024-01-01",
+            "end_date": "2024-03-31",
+            "initial_capital": 100000,
+            "iterations": 12,
+        },
+    )
+    job_id = str(job["job_id"])
+    with api_routes._optimizer_jobs_lock:
+        assert str(api_routes._optimizer_jobs[job_id].get("status")) == "queued"
+
+    failed_snapshot = dict(job)
+    failed_snapshot.update(
+        {
+            "status": "failed",
+            "message": "Failed",
+            "error": "Synthetic persisted failure",
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+            "progress_pct": 100.0,
+            "eta_seconds": 0.0,
+        }
+    )
+    api_routes._optimizer_persist_snapshot(failed_snapshot, prune_history=True)
+
+    status = client.get(f"/strategies/{strategy_id}/optimize/{job_id}")
+    assert status.status_code == 200
+    payload = status.json()
+    assert payload["status"] == "failed"
+    assert "synthetic persisted failure" in str(payload.get("error", "")).lower()
+
+    with api_routes._optimizer_jobs_lock:
+        assert str(api_routes._optimizer_jobs[job_id].get("status")) == "failed"
+
+
+def test_optimizer_status_endpoint_prefers_persisted_running_over_stale_local_queued():
+    """Job status endpoint should surface persisted running state when local row is stale queued."""
+    created = client.post(
+        "/strategies",
+        json={
+            "name": "Optimizer Persisted Running Preference Test",
+            "symbols": ["AAPL"],
+        },
+    )
+    assert created.status_code == 200
+    strategy_id = str(created.json()["id"])
+
+    job = api_routes._optimizer_create_job(
+        strategy_id=strategy_id,
+        request_payload={
+            "start_date": "2024-01-01",
+            "end_date": "2024-03-31",
+            "initial_capital": 100000,
+            "iterations": 16,
+        },
+    )
+    job_id = str(job["job_id"])
+    with api_routes._optimizer_jobs_lock:
+        assert str(api_routes._optimizer_jobs[job_id].get("status")) == "queued"
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    running_snapshot = dict(job)
+    running_snapshot.update(
+        {
+            "status": "running",
+            "message": "Running optimizer",
+            "started_at": now_iso,
+            "last_heartbeat_at": now_iso,
+            "progress_pct": 33.0,
+            "completed_iterations": 5,
+            "total_iterations": 16,
+            "elapsed_seconds": 4.2,
+        }
+    )
+    api_routes._optimizer_persist_snapshot(running_snapshot, prune_history=False)
+
+    status = client.get(f"/strategies/{strategy_id}/optimize/{job_id}")
+    assert status.status_code == 200
+    payload = status.json()
+    assert payload["status"] == "running"
+    assert float(payload.get("progress_pct", 0.0)) >= 30.0
+
+    listing = client.get("/optimizer/jobs?statuses=running")
+    assert listing.status_code == 200
+    rows = listing.json().get("jobs", [])
+    matched = next((row for row in rows if str(row.get("job_id")) == job_id), None)
+    assert matched is not None
+    assert str(matched.get("status")) == "running"
 
 
 def test_optimize_strategy_persists_history_sync(monkeypatch):
@@ -1231,7 +1521,7 @@ def test_optimizer_status_falls_back_to_persisted_job_row_after_memory_loss():
     assert status.status_code == 200
     payload = status.json()
     assert payload["job_id"] == job_id
-    assert payload["status"] in {"failed", "canceled", "completed", "running"}
+    assert payload["status"] in {"failed", "canceled", "completed", "running", "queued"}
 
 
 def test_optimizer_jobs_endpoint_includes_persisted_async_rows():
@@ -1275,6 +1565,62 @@ def test_optimizer_jobs_endpoint_includes_persisted_async_rows():
     matched = next((row for row in rows if str(row.get("job_id")) == job_id), None)
     assert matched is not None
     assert matched["status"] in {"completed", "failed", "canceled"}
+
+
+def test_optimizer_jobs_endpoint_supports_filters_and_pagination():
+    """Optimizer jobs endpoint should honor status filter + offset pagination."""
+    created = client.post(
+        "/strategies",
+        json={
+            "name": "Optimizer Jobs Paging Test",
+            "symbols": ["AAPL"],
+        },
+    )
+    assert created.status_code == 200
+    strategy_id = str(created.json()["id"])
+
+    first = api_routes._optimizer_create_job(
+        strategy_id=strategy_id,
+        request_payload={
+            "start_date": "2024-01-01",
+            "end_date": "2024-03-31",
+            "initial_capital": 100000,
+            "iterations": 8,
+        },
+    )
+    second = api_routes._optimizer_create_job(
+        strategy_id=strategy_id,
+        request_payload={
+            "start_date": "2024-01-01",
+            "end_date": "2024-03-31",
+            "initial_capital": 100000,
+            "iterations": 10,
+        },
+    )
+    api_routes._optimizer_update_job(
+        str(first["job_id"]),
+        {
+            "status": "completed",
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+            "message": "Completed",
+        },
+    )
+
+    listing = client.get("/optimizer/jobs?statuses=queued,running&limit=1&offset=0")
+    assert listing.status_code == 200
+    payload = listing.json()
+    assert int(payload.get("total_count", 0)) >= 1
+    assert int(payload.get("limit", 0)) == 1
+    assert int(payload.get("offset", 0)) == 0
+    assert len(payload.get("jobs", [])) == 1
+    assert payload["jobs"][0]["status"] in {"queued", "running"}
+
+    second_page = client.get("/optimizer/jobs?statuses=queued,running&limit=1&offset=1")
+    assert second_page.status_code == 200
+    second_payload = second_page.json()
+    assert int(second_payload.get("offset", 0)) == 1
+    assert int(second_payload.get("total_count", 0)) >= 1
+    assert str(second["job_id"]) != str(first["job_id"])
 
 
 def test_purge_optimizer_jobs_endpoint_removes_canceled_async_rows():
@@ -1870,6 +2216,47 @@ def test_analytics_with_days_param():
     data = response.json()
     assert "time_series" in data
     assert len(data["time_series"]) >= 1
+
+
+def test_dashboard_analytics_bundle_endpoint():
+    """Dashboard analytics bundle should include summary + analytics + broker account sections."""
+    response = client.get("/analytics/dashboard?days=30")
+    assert response.status_code == 200
+    data = response.json()
+    assert "generated_at" in data
+    assert "summary" in data
+    assert "analytics" in data
+    assert "broker_account" in data
+    assert "time_series" in data["analytics"]
+    assert "equity" in data["summary"]
+
+
+def test_normalize_portfolio_time_series_dedupes_identical_timestamps():
+    """Time-series normalization should collapse duplicate timestamps to the latest row."""
+    ts = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    rows = [
+        {
+            "timestamp": ts,
+            "equity": 100000.0,
+            "pnl": 5.0,
+            "cumulative_pnl": 5.0,
+            "symbol": "AAPL",
+        },
+        {
+            "timestamp": ts,
+            "equity": 100010.0,
+            "pnl": 1.0,
+            "cumulative_pnl": 6.0,
+            "symbol": "MSFT",
+        },
+    ]
+
+    normalized = api_routes._normalize_portfolio_time_series(rows)
+    assert len(normalized) == 1
+    assert abs(float(normalized[0]["equity"]) - 100010.0) < 1e-6
+    assert abs(float(normalized[0]["pnl"]) - 1.0) < 1e-6
+    assert abs(float(normalized[0]["cumulative_pnl"]) - 6.0) < 1e-6
+    assert normalized[0]["symbol"] == "MSFT"
 
 
 def test_analytics_days_filters_old_trades():

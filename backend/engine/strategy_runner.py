@@ -1034,7 +1034,8 @@ class StrategyRunner:
                             symbol=symbol,
                             side=side.value,
                             quantity=quantity,
-                            price=fill_price
+                            price=fill_price,
+                            strategy_id=strategy.config.get("strategy_id"),
                         )
                         
                         print(f"[StrategyRunner] Recorded order and trade in storage")

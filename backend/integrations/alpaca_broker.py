@@ -71,6 +71,7 @@ class AlpacaBroker(BrokerInterface):
         self._trade_update_callback: Optional[Callable[[Dict[str, Any]], None]] = None
         self._asset_capabilities_cache: Dict[str, Dict[str, Any]] = {}
         self._asset_capabilities_ttl = timedelta(minutes=15)
+        self._last_connect_error: Optional[str] = None
     
     def connect(self) -> bool:
         """
@@ -80,6 +81,7 @@ class AlpacaBroker(BrokerInterface):
             True if connected successfully
         """
         try:
+            self._last_connect_error = None
             # Initialize trading client
             self._trading_client = TradingClient(
                 api_key=self.api_key,
@@ -103,6 +105,7 @@ class AlpacaBroker(BrokerInterface):
             
         except Exception as e:
             logger.error(f"Failed to connect to Alpaca: {e}")
+            self._last_connect_error = str(e)
             self._connected = False
             return False
     
@@ -129,6 +132,10 @@ class AlpacaBroker(BrokerInterface):
             True if connected
         """
         return self._connected and self._trading_client is not None
+
+    def get_last_connection_error(self) -> Optional[str]:
+        """Return the most recent Alpaca connection error if one occurred."""
+        return self._last_connect_error
     
     def get_account_info(self) -> Dict[str, Any]:
         """

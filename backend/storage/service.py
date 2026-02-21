@@ -128,7 +128,8 @@ class StorageService:
     
     def record_trade(self, order_id: int, symbol: str, side: str,
                     quantity: float, price: float,
-                    commission: float = 0.0, fees: float = 0.0) -> Trade:
+                    commission: float = 0.0, fees: float = 0.0,
+                    strategy_id: Optional[int] = None) -> Trade:
         """Record a trade execution."""
         return self.trades.create(
             order_id=order_id,
@@ -138,16 +139,21 @@ class StorageService:
             quantity=quantity,
             price=price,
             commission=commission,
-            fees=fees
+            fees=fees,
+            strategy_id=strategy_id,
         )
     
     def get_recent_trades(self, limit: int = 100) -> List[Trade]:
         """Get recent trades."""
         return self.trades.get_recent(limit)
 
-    def get_all_trades(self, limit: int = 5000) -> List[Trade]:
-        """Get full trade history ordered by execution time."""
-        return self.trades.get_all(limit=limit)
+    def get_all_trades(self, limit: int = 5000, offset: int = 0) -> List[Trade]:
+        """Get paginated trade history ordered by execution time."""
+        return self.trades.get_all(limit=limit, offset=offset)
+
+    def count_all_trades(self) -> int:
+        """Count all recorded trades."""
+        return self.trades.count_all()
     
     # Strategy operations
     
@@ -237,9 +243,7 @@ class StorageService:
     
     def get_trades_by_strategy(self, strategy_id: int) -> List[Trade]:
         """Get all trades for a specific strategy."""
-        # For now, return recent trades since we don't have strategy_id on trades
-        # In a full implementation, Trade model would have a strategy_id field
-        return self.trades.get_recent(limit=1000)
+        return self.trades.get_by_strategy_id(strategy_id)
 
     # Portfolio snapshot operations
 

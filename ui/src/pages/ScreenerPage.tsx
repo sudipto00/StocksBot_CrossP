@@ -28,6 +28,9 @@ interface Preferences {
   risk_profile: 'conservative' | 'balanced' | 'aggressive' | 'micro_budget';
   weekly_budget: number;
   screener_limit: number;
+  stock_most_active_limit: number;
+  stock_preset_limit: number;
+  etf_preset_limit: number;
   screener_mode: 'most_active' | 'preset';
   stock_preset: 'weekly_optimized' | 'three_to_five_weekly' | 'monthly_optimized' | 'small_budget_weekly' | 'micro_budget';
   etf_preset: 'conservative' | 'balanced' | 'aggressive';
@@ -134,6 +137,9 @@ function persistWorkspaceSnapshot(snapshot: {
   preset_universe_mode: PresetUniverseMode;
   seed_only_preset: boolean;
   screener_limit: number;
+  stock_most_active_limit: number;
+  stock_preset_limit: number;
+  etf_preset_limit: number;
   min_dollar_volume: number;
   max_spread_bps: number;
   max_sector_weight_pct: number;
@@ -147,6 +153,61 @@ function persistWorkspaceSnapshot(snapshot: {
   }
 }
 
+function resolveScreenerLimitForContext(
+  prefs: Pick<Preferences, 'stock_most_active_limit' | 'stock_preset_limit' | 'etf_preset_limit' | 'screener_limit'>,
+  assetType: Preferences['asset_type'],
+  mode: ScreenerMode,
+): number {
+  const fallback = clamp(Number(prefs.screener_limit || 50), 10, 200);
+  if (assetType === 'etf') {
+    return clamp(Number(prefs.etf_preset_limit || fallback), 10, 200);
+  }
+  if (mode === 'preset') {
+    return clamp(Number(prefs.stock_preset_limit || fallback), 10, 200);
+  }
+  return clamp(Number(prefs.stock_most_active_limit || fallback), 10, 200);
+}
+
+function withContextScreenerLimit(
+  prefs: Preferences,
+  assetType: Preferences['asset_type'],
+  mode: ScreenerMode,
+  limit: number,
+): Preferences {
+  const next = { ...prefs };
+  const clamped = clamp(Math.round(limit), 10, 200);
+  if (assetType === 'etf') {
+    next.etf_preset_limit = clamped;
+  } else if (mode === 'preset') {
+    next.stock_preset_limit = clamped;
+  } else {
+    next.stock_most_active_limit = clamped;
+  }
+  next.screener_limit = resolveScreenerLimitForContext(next, assetType, mode);
+  return next;
+}
+
+function normalizePreferences(raw: Partial<Preferences>): Preferences {
+  const normalizedAssetType: Preferences['asset_type'] = raw.asset_type === 'etf' ? 'etf' : 'stock';
+  const normalizedMode: ScreenerMode =
+    normalizedAssetType === 'stock' ? (raw.screener_mode || 'most_active') : 'preset';
+  const fallback = clamp(Number(raw.screener_limit || 50), 10, 200);
+  const normalized: Preferences = {
+    asset_type: normalizedAssetType,
+    risk_profile: (raw.risk_profile || 'balanced') as Preferences['risk_profile'],
+    weekly_budget: Number(raw.weekly_budget || 200),
+    screener_limit: fallback,
+    stock_most_active_limit: clamp(Number(raw.stock_most_active_limit || fallback), 10, 200),
+    stock_preset_limit: clamp(Number(raw.stock_preset_limit || fallback), 10, 200),
+    etf_preset_limit: clamp(Number(raw.etf_preset_limit || fallback), 10, 200),
+    screener_mode: normalizedMode,
+    stock_preset: (raw.stock_preset || 'weekly_optimized') as StockPreset,
+    etf_preset: (raw.etf_preset || 'balanced') as EtfPreset,
+  };
+  normalized.screener_limit = resolveScreenerLimitForContext(normalized, normalized.asset_type, normalized.screener_mode);
+  return normalized;
+}
+
 const ScreenerPage: React.FC = () => {
   const [assets, setAssets] = useState<Asset[]>([]);
   const [preferences, setPreferences] = useState<Preferences>({
@@ -154,9 +215,23 @@ const ScreenerPage: React.FC = () => {
     risk_profile: 'balanced',
     weekly_budget: 200,
     screener_limit: 50,
+    stock_most_active_limit: 50,
+    stock_preset_limit: 50,
+    etf_preset_limit: 50,
     screener_mode: 'most_active',
     stock_preset: 'weekly_optimized',
     etf_preset: 'balanced',
+  });
+  const [appliedUniverseQuery, setAppliedUniverseQuery] = useState({
+    asset_type: 'stock' as Preferences['asset_type'],
+    screener_mode: 'most_active' as ScreenerMode,
+    preset: 'weekly_optimized' as PresetType,
+    preset_universe_mode: 'seed_guardrail_blend' as PresetUniverseMode,
+    screener_limit: 50,
+    min_dollar_volume: 10000000,
+    max_spread_bps: 50,
+    max_sector_weight_pct: 45,
+    auto_regime_adjust: true,
   });
   const [budgetStatus, setBudgetStatus] = useState<BudgetStatus | null>(null);
   const [screenerMode, setScreenerMode] = useState<ScreenerMode>('most_active');
@@ -231,24 +306,36 @@ const ScreenerPage: React.FC = () => {
       const response = await authFetch(`${BACKEND_URL}/preferences`);
       if (!response.ok) throw new Error('Failed to fetch preferences');
       const data = await response.json();
-      const normalizedAssetType: Preferences['asset_type'] = data.asset_type === 'etf' ? 'etf' : 'stock';
-      const normalizedScreenerMode: ScreenerMode =
-        normalizedAssetType === 'stock' ? (data.screener_mode || 'most_active') : 'preset';
-      setPreferences({
-        ...data,
-        asset_type: normalizedAssetType,
-        screener_mode: normalizedScreenerMode,
-      });
-      setScreenerMode(normalizedScreenerMode);
-      if (normalizedAssetType === 'stock') {
-        setPreset(data.stock_preset || 'weekly_optimized');
+      const normalized = normalizePreferences(data as Partial<Preferences>);
+      setPreferences(normalized);
+      setScreenerMode(normalized.screener_mode);
+      if (normalized.asset_type === 'stock') {
+        setPreset(normalized.stock_preset);
       } else {
-        setPreset(data.etf_preset || 'balanced');
+        setPreset(normalized.etf_preset);
       }
+      setAppliedUniverseQuery((prev) => ({
+        ...prev,
+        asset_type: normalized.asset_type,
+        screener_mode: normalized.screener_mode,
+        preset: normalized.asset_type === 'etf' ? normalized.etf_preset : normalized.stock_preset,
+        screener_limit: resolveScreenerLimitForContext(
+          normalized,
+          normalized.asset_type,
+          normalized.screener_mode,
+        ),
+      }));
       setPrefsLoaded(true);
     } catch (err) {
       console.error('Error fetching preferences:', err);
     }
+  }, []);
+
+  const resetUniverseSelectionState = useCallback(() => {
+    setCurrentPage(1);
+    setSelectedSymbol(null);
+    setChartData([]);
+    setChartError(null);
   }, []);
 
   const fetchBudgetStatus = useCallback(async () => {
@@ -333,14 +420,14 @@ const ScreenerPage: React.FC = () => {
     setLoading(true);
     setError(null);
     try {
-      let url = `${BACKEND_URL}/screener/all?asset_type=${preferences.asset_type}&limit=${preferences.screener_limit}&screener_mode=${screenerMode}`;
-      let dataSource: string = screenerMode;
-      if (screenerMode === 'preset') {
-        const seedOnly = presetUniverseMode === 'seed_only';
-        url = `${BACKEND_URL}/screener/preset?asset_type=${preferences.asset_type}&preset=${preset}&limit=${preferences.screener_limit}&seed_only=${seedOnly}&preset_universe_mode=${presetUniverseMode}`;
-        dataSource = `${preferences.asset_type}_preset:${preset}:${presetUniverseMode}`;
+      let url = `${BACKEND_URL}/screener/all?asset_type=${appliedUniverseQuery.asset_type}&limit=${appliedUniverseQuery.screener_limit}&screener_mode=${appliedUniverseQuery.screener_mode}`;
+      let dataSource: string = appliedUniverseQuery.screener_mode;
+      if (appliedUniverseQuery.screener_mode === 'preset') {
+        const seedOnly = appliedUniverseQuery.preset_universe_mode === 'seed_only';
+        url = `${BACKEND_URL}/screener/preset?asset_type=${appliedUniverseQuery.asset_type}&preset=${appliedUniverseQuery.preset}&limit=${appliedUniverseQuery.screener_limit}&seed_only=${seedOnly}&preset_universe_mode=${appliedUniverseQuery.preset_universe_mode}`;
+        dataSource = `${appliedUniverseQuery.asset_type}_preset:${appliedUniverseQuery.preset}:${appliedUniverseQuery.preset_universe_mode}`;
       }
-      url = `${url}&page=${currentPage}&page_size=${pageSize}&min_dollar_volume=${minDollarVolume}&max_spread_bps=${maxSpreadBps}&max_sector_weight_pct=${maxSectorWeightPct}&auto_regime_adjust=${autoRegimeAdjust}`;
+      url = `${url}&page=${currentPage}&page_size=${pageSize}&min_dollar_volume=${appliedUniverseQuery.min_dollar_volume}&max_spread_bps=${appliedUniverseQuery.max_spread_bps}&max_sector_weight_pct=${appliedUniverseQuery.max_sector_weight_pct}&auto_regime_adjust=${appliedUniverseQuery.auto_regime_adjust}`;
       const response = await authFetch(url);
       if (!response.ok) {
         const body = await response.json().catch(() => null);
@@ -374,7 +461,7 @@ const ScreenerPage: React.FC = () => {
     } finally {
       setLoading(false);
     }
-  }, [preferences.asset_type, preferences.screener_limit, screenerMode, preset, presetUniverseMode, currentPage, pageSize, minDollarVolume, maxSpreadBps, maxSectorWeightPct, autoRegimeAdjust]);
+  }, [appliedUniverseQuery, currentPage, pageSize]);
 
   const updatePreferences = async (updates: Partial<Preferences>): Promise<Preferences | null> => {
     try {
@@ -388,14 +475,7 @@ const ScreenerPage: React.FC = () => {
         throw new Error(body?.detail || 'Failed to update preferences');
       }
       const data = await response.json();
-      const normalizedAssetType: Preferences['asset_type'] = data.asset_type === 'etf' ? 'etf' : 'stock';
-      const normalizedScreenerMode: ScreenerMode =
-        normalizedAssetType === 'stock' ? (data.screener_mode || 'most_active') : 'preset';
-      const normalized: Preferences = {
-        ...data,
-        asset_type: normalizedAssetType,
-        screener_mode: normalizedScreenerMode,
-      };
+      const normalized = normalizePreferences(data as Partial<Preferences>);
       setPreferences(normalized);
       return normalized;
     } catch (err) {
@@ -442,41 +522,74 @@ const ScreenerPage: React.FC = () => {
       const nextMaxPosition = Math.max(WORKSPACE_LIMITS.maxPositionMin, Math.min(WORKSPACE_LIMITS.maxPositionMax, guardrails.max_position_size));
       const nextRiskDaily = Math.max(WORKSPACE_LIMITS.riskDailyMin, Math.min(WORKSPACE_LIMITS.riskDailyMax, guardrails.risk_limit_daily));
       const nextScreenerLimit = Math.max(10, Math.min(200, Math.round(guardrails.screener_limit)));
+      const optimizedDraft = withContextScreenerLimit(
+        {
+          ...preferences,
+          asset_type: assetType,
+          risk_profile: recommendation.risk_profile as RiskProfile,
+          screener_mode: assetType === 'stock' ? mode : 'preset',
+          stock_preset: assetType === 'stock' && mode === 'preset' ? (presetValue as StockPreset) : preferences.stock_preset,
+          etf_preset: assetType === 'etf' ? (presetValue as EtfPreset) : preferences.etf_preset,
+        },
+        assetType,
+        assetType === 'stock' ? mode : 'preset',
+        nextScreenerLimit,
+      );
 
       setMinDollarVolume(nextMinDollar);
       setMaxSpreadBps(nextSpread);
       setMaxSectorWeightPct(nextSector);
       setMaxPositionSize(nextMaxPosition);
       setRiskLimitDaily(nextRiskDaily);
+      setPreferences(optimizedDraft);
+      setScreenerMode(optimizedDraft.screener_mode);
+      setPreset(assetType === 'etf' ? optimizedDraft.etf_preset : optimizedDraft.stock_preset);
       const [, updatedPrefs] = await Promise.all([
         updateConfig({
           max_position_size: nextMaxPosition,
           risk_limit_daily: nextRiskDaily,
         }),
         updatePreferences({
-          asset_type: assetType,
-          risk_profile: recommendation.risk_profile,
-          screener_mode: assetType === 'stock' ? mode : 'preset',
-          stock_preset: assetType === 'stock' && mode === 'preset' ? (presetValue as StockPreset) : preferences.stock_preset,
-          etf_preset: assetType === 'etf' ? (presetValue as EtfPreset) : preferences.etf_preset,
-          screener_limit: assetType === 'stock' && mode === 'most_active'
-            ? Math.max(10, Math.min(200, Math.round((preferences.screener_limit + nextScreenerLimit) / 2)))
-            : preferences.screener_limit,
+          asset_type: optimizedDraft.asset_type,
+          risk_profile: optimizedDraft.risk_profile,
+          weekly_budget: optimizedDraft.weekly_budget,
+          screener_mode: optimizedDraft.screener_mode,
+          stock_preset: optimizedDraft.stock_preset,
+          etf_preset: optimizedDraft.etf_preset,
+          screener_limit: optimizedDraft.screener_limit,
+          stock_most_active_limit: optimizedDraft.stock_most_active_limit,
+          stock_preset_limit: optimizedDraft.stock_preset_limit,
+          etf_preset_limit: optimizedDraft.etf_preset_limit,
         }),
       ]);
-      const snapshotPrefs = updatedPrefs || {
-        stock_preset: preferences.stock_preset,
-        etf_preset: preferences.etf_preset,
-        screener_limit: preferences.screener_limit,
-      };
+      const snapshotPrefs = updatedPrefs || optimizedDraft;
+      const effectiveMode = snapshotPrefs.asset_type === 'stock' ? snapshotPrefs.screener_mode : 'preset';
+      const effectivePreset = snapshotPrefs.asset_type === 'etf' ? snapshotPrefs.etf_preset : snapshotPrefs.stock_preset;
+      setCurrentPage(1);
+      resetUniverseSelectionState();
+      setAppliedUniverseQuery((prev) => ({
+        ...prev,
+        asset_type: snapshotPrefs.asset_type,
+        screener_mode: effectiveMode,
+        preset: effectivePreset,
+        preset_universe_mode: presetUniverseMode,
+        screener_limit: resolveScreenerLimitForContext(snapshotPrefs, snapshotPrefs.asset_type, effectiveMode),
+        min_dollar_volume: nextMinDollar,
+        max_spread_bps: nextSpread,
+        max_sector_weight_pct: nextSector,
+        auto_regime_adjust: autoRegimeAdjust,
+      }));
       persistWorkspaceSnapshot({
-        asset_type: assetType,
-        screener_mode: assetType === 'stock' ? mode : 'preset',
+        asset_type: snapshotPrefs.asset_type,
+        screener_mode: effectiveMode,
         stock_preset: snapshotPrefs.stock_preset,
         etf_preset: snapshotPrefs.etf_preset,
         preset_universe_mode: presetUniverseMode,
         seed_only_preset: presetUniverseMode === 'seed_only',
-        screener_limit: snapshotPrefs.screener_limit,
+        screener_limit: resolveScreenerLimitForContext(snapshotPrefs, snapshotPrefs.asset_type, effectiveMode),
+        stock_most_active_limit: snapshotPrefs.stock_most_active_limit,
+        stock_preset_limit: snapshotPrefs.stock_preset_limit,
+        etf_preset_limit: snapshotPrefs.etf_preset_limit,
         min_dollar_volume: nextMinDollar,
         max_spread_bps: nextSpread,
         max_sector_weight_pct: nextSector,
@@ -495,7 +608,13 @@ const ScreenerPage: React.FC = () => {
         setOptimizingWorkspace(false);
       }
     }
-  }, [autoRegimeAdjust, preferences.asset_type, preferences.etf_preset, preferences.screener_limit, preferences.stock_preset, preferences.weekly_budget, screenerMode, presetUniverseMode]);
+  }, [
+    autoRegimeAdjust,
+    preferences,
+    screenerMode,
+    presetUniverseMode,
+    resetUniverseSelectionState,
+  ]);
 
   const fetchConfig = useCallback(async () => {
     try {
@@ -580,32 +699,58 @@ const ScreenerPage: React.FC = () => {
         preferences.asset_type === 'etf' ? preferences.etf_preset : preferences.risk_profile;
       const effectiveScreenerMode: ScreenerMode =
         preferences.asset_type === 'stock' ? screenerMode : 'preset';
-
-      await updatePreferences({
-        asset_type: preferences.asset_type,
-        risk_profile: effectiveRiskProfile,
-        weekly_budget: preferences.weekly_budget,
-        screener_limit: preferences.screener_limit,
+      const draftToCommit = normalizePreferences({
+        ...preferences,
         screener_mode: effectiveScreenerMode,
-        stock_preset: preferences.stock_preset,
-        etf_preset: preferences.etf_preset,
+        risk_profile: effectiveRiskProfile,
+      });
+
+      const committedPrefs = await updatePreferences({
+        asset_type: draftToCommit.asset_type,
+        risk_profile: draftToCommit.risk_profile,
+        weekly_budget: draftToCommit.weekly_budget,
+        screener_limit: resolveScreenerLimitForContext(draftToCommit, draftToCommit.asset_type, effectiveScreenerMode),
+        stock_most_active_limit: draftToCommit.stock_most_active_limit,
+        stock_preset_limit: draftToCommit.stock_preset_limit,
+        etf_preset_limit: draftToCommit.etf_preset_limit,
+        screener_mode: effectiveScreenerMode,
+        stock_preset: draftToCommit.stock_preset,
+        etf_preset: draftToCommit.etf_preset,
       });
       await updateConfig({
         max_position_size: maxPositionSize,
         risk_limit_daily: riskLimitDaily,
       });
-      await fetchAssets();
+      const snapshotPrefs = committedPrefs || draftToCommit;
+      const effectiveMode = snapshotPrefs.asset_type === 'stock' ? snapshotPrefs.screener_mode : 'preset';
+      const effectivePreset = snapshotPrefs.asset_type === 'etf' ? snapshotPrefs.etf_preset : snapshotPrefs.stock_preset;
+      setCurrentPage(1);
+      setAppliedUniverseQuery((prev) => ({
+        ...prev,
+        asset_type: snapshotPrefs.asset_type,
+        screener_mode: effectiveMode,
+        preset: effectivePreset,
+        preset_universe_mode: presetUniverseMode,
+        screener_limit: resolveScreenerLimitForContext(snapshotPrefs, snapshotPrefs.asset_type, effectiveMode),
+        min_dollar_volume: clamp(minDollarVolume, WORKSPACE_LIMITS.minDollarVolumeMin, WORKSPACE_LIMITS.minDollarVolumeMax),
+        max_spread_bps: clamp(maxSpreadBps, WORKSPACE_LIMITS.maxSpreadBpsMin, WORKSPACE_LIMITS.maxSpreadBpsMax),
+        max_sector_weight_pct: clamp(maxSectorWeightPct, WORKSPACE_LIMITS.maxSectorWeightMin, WORKSPACE_LIMITS.maxSectorWeightMax),
+        auto_regime_adjust: autoRegimeAdjust,
+      }));
       await fetchBudgetStatus();
       await fetchPortfolioSummary();
       await fetchBrokerAccount();
       persistWorkspaceSnapshot({
-        asset_type: preferences.asset_type,
-        screener_mode: effectiveScreenerMode,
-        stock_preset: preferences.stock_preset,
-        etf_preset: preferences.etf_preset,
+        asset_type: snapshotPrefs.asset_type,
+        screener_mode: effectiveMode,
+        stock_preset: snapshotPrefs.stock_preset,
+        etf_preset: snapshotPrefs.etf_preset,
         preset_universe_mode: presetUniverseMode,
         seed_only_preset: presetUniverseMode === 'seed_only',
-        screener_limit: preferences.screener_limit,
+        screener_limit: resolveScreenerLimitForContext(snapshotPrefs, snapshotPrefs.asset_type, effectiveMode),
+        stock_most_active_limit: snapshotPrefs.stock_most_active_limit,
+        stock_preset_limit: snapshotPrefs.stock_preset_limit,
+        etf_preset_limit: snapshotPrefs.etf_preset_limit,
         min_dollar_volume: minDollarVolume,
         max_spread_bps: maxSpreadBps,
         max_sector_weight_pct: maxSectorWeightPct,
@@ -653,8 +798,7 @@ const ScreenerPage: React.FC = () => {
   }, [selectedSymbol, fetchSafetyPreflight]);
 
   /* Restore workspace guardrails once preferences have been loaded from the API.
-     First tries the localStorage snapshot (instant, no API call).
-     Falls back to auto-optimization (fetches preset-specific guardrails from backend). */
+     First tries the localStorage snapshot (instant, no API call). */
   useEffect(() => {
     if (!prefsLoaded) return;
 
@@ -668,6 +812,19 @@ const ScreenerPage: React.FC = () => {
           snapshot.asset_type === preferences.asset_type &&
           (snapshot.stock_preset === currentPreset || snapshot.etf_preset === currentPreset)
         ) {
+          const restoredPrefs = normalizePreferences({
+            ...preferences,
+            stock_most_active_limit: Number.isFinite(snapshot.stock_most_active_limit)
+              ? Number(snapshot.stock_most_active_limit)
+              : preferences.stock_most_active_limit,
+            stock_preset_limit: Number.isFinite(snapshot.stock_preset_limit)
+              ? Number(snapshot.stock_preset_limit)
+              : preferences.stock_preset_limit,
+            etf_preset_limit: Number.isFinite(snapshot.etf_preset_limit)
+              ? Number(snapshot.etf_preset_limit)
+              : preferences.etf_preset_limit,
+          });
+          setPreferences(restoredPrefs);
           if (
             snapshot.preset_universe_mode === 'seed_only'
             || snapshot.preset_universe_mode === 'seed_guardrail_blend'
@@ -681,19 +838,38 @@ const ScreenerPage: React.FC = () => {
           if (Number.isFinite(snapshot.max_spread_bps)) setMaxSpreadBps(snapshot.max_spread_bps);
           if (Number.isFinite(snapshot.max_sector_weight_pct)) setMaxSectorWeightPct(snapshot.max_sector_weight_pct);
           if (typeof snapshot.auto_regime_adjust === 'boolean') setAutoRegimeAdjust(snapshot.auto_regime_adjust);
+          setAppliedUniverseQuery((prev) => ({
+            ...prev,
+            asset_type: restoredPrefs.asset_type,
+            screener_mode: restoredPrefs.asset_type === 'stock' ? restoredPrefs.screener_mode : 'preset',
+            preset: (restoredPrefs.asset_type === 'etf' ? restoredPrefs.etf_preset : restoredPrefs.stock_preset),
+            preset_universe_mode:
+              snapshot.preset_universe_mode === 'seed_only'
+              || snapshot.preset_universe_mode === 'seed_guardrail_blend'
+              || snapshot.preset_universe_mode === 'guardrail_only'
+                ? snapshot.preset_universe_mode
+                : presetUniverseMode,
+            screener_limit: resolveScreenerLimitForContext(
+              restoredPrefs,
+              restoredPrefs.asset_type,
+              restoredPrefs.asset_type === 'stock' ? restoredPrefs.screener_mode : 'preset',
+            ),
+            min_dollar_volume: Number.isFinite(snapshot.min_dollar_volume) ? Number(snapshot.min_dollar_volume) : prev.min_dollar_volume,
+            max_spread_bps: Number.isFinite(snapshot.max_spread_bps) ? Number(snapshot.max_spread_bps) : prev.max_spread_bps,
+            max_sector_weight_pct: Number.isFinite(snapshot.max_sector_weight_pct) ? Number(snapshot.max_sector_weight_pct) : prev.max_sector_weight_pct,
+            auto_regime_adjust: typeof snapshot.auto_regime_adjust === 'boolean' ? snapshot.auto_regime_adjust : prev.auto_regime_adjust,
+          }));
           return; // Restored successfully
         }
       }
     } catch { /* ignore parse errors */ }
-
-    // No matching snapshot — fetch preset-specific guardrails from backend
-    void applyAdaptiveOptimization();
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [prefsLoaded]);
 
   useEffect(() => {
-    fetchAssets();
-  }, [fetchAssets]);
+    if (!prefsLoaded) return;
+    void fetchAssets();
+  }, [prefsLoaded, fetchAssets]);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -773,21 +949,38 @@ const ScreenerPage: React.FC = () => {
   };
 
   const formatPercent = (value: number) => `${value >= 0 ? '+' : ''}${value.toFixed(2)}%`;
-  const presetUniverseModeLabel =
-    presetUniverseMode === 'seed_only'
+  const appliedPresetUniverseModeLabel =
+    appliedUniverseQuery.preset_universe_mode === 'seed_only'
       ? 'Seed Only'
-      : presetUniverseMode === 'guardrail_only'
+      : appliedUniverseQuery.preset_universe_mode === 'guardrail_only'
       ? 'Guardrail Universe Only'
       : 'Seed + Guardrail Blend';
-  const activePresetLabel = preferences.asset_type === 'etf' ? preferences.etf_preset : preferences.stock_preset;
+  const activePresetLabel = String(appliedUniverseQuery.preset || '').replace(/_/g, ' ');
+  const draftScreenerLimit = resolveScreenerLimitForContext(
+    preferences,
+    preferences.asset_type,
+    preferences.asset_type === 'stock' ? screenerMode : 'preset',
+  );
   const activeUniverseLabel =
-    preferences.asset_type === 'stock'
-      ? screenerMode === 'most_active'
-        ? `Most Active (${preferences.screener_limit})`
-        : `Stock Preset: ${activePresetLabel} (${presetUniverseModeLabel})`
-      : preferences.asset_type === 'etf'
-      ? `ETF Preset: ${activePresetLabel} (${presetUniverseModeLabel})`
+    appliedUniverseQuery.asset_type === 'stock'
+      ? appliedUniverseQuery.screener_mode === 'most_active'
+        ? `Most Active (${appliedUniverseQuery.screener_limit})`
+        : `Stock Preset: ${activePresetLabel} (${appliedPresetUniverseModeLabel})`
+      : appliedUniverseQuery.asset_type === 'etf'
+      ? `ETF Preset: ${activePresetLabel} (${appliedPresetUniverseModeLabel})`
       : `Stock Preset: ${activePresetLabel}`;
+  const draftMode = preferences.asset_type === 'stock' ? screenerMode : 'preset';
+  const draftPreset = preferences.asset_type === 'etf' ? preferences.etf_preset : preferences.stock_preset;
+  const hasPendingUniverseChanges =
+    appliedUniverseQuery.asset_type !== preferences.asset_type
+    || appliedUniverseQuery.screener_mode !== draftMode
+    || appliedUniverseQuery.preset !== draftPreset
+    || appliedUniverseQuery.preset_universe_mode !== presetUniverseMode
+    || appliedUniverseQuery.screener_limit !== draftScreenerLimit
+    || appliedUniverseQuery.min_dollar_volume !== clamp(minDollarVolume, WORKSPACE_LIMITS.minDollarVolumeMin, WORKSPACE_LIMITS.minDollarVolumeMax)
+    || appliedUniverseQuery.max_spread_bps !== clamp(maxSpreadBps, WORKSPACE_LIMITS.maxSpreadBpsMin, WORKSPACE_LIMITS.maxSpreadBpsMax)
+    || appliedUniverseQuery.max_sector_weight_pct !== clamp(maxSectorWeightPct, WORKSPACE_LIMITS.maxSectorWeightMin, WORKSPACE_LIMITS.maxSectorWeightMax)
+    || appliedUniverseQuery.auto_regime_adjust !== autoRegimeAdjust;
 
   const stockPresets: Array<{ value: StockPreset; label: string }> = [
     { value: 'weekly_optimized', label: 'Weekly Optimized' },
@@ -863,6 +1056,11 @@ const ScreenerPage: React.FC = () => {
             {' | '}
             <span className="font-semibold">Weekly Budget {formatCurrency(preferences.weekly_budget)}</span>
           </p>
+          {hasPendingUniverseChanges && (
+            <p className="mt-1 text-xs text-amber-200">
+              Draft changes pending. Click <span className="font-semibold">Apply Universe &amp; Guardrails</span> to refresh the active universe.
+            </p>
+          )}
           <p className="mt-1 text-xs text-emerald-200/90">
             Last refresh: <span className="font-semibold">{prettyLastRefresh}</span>
             {' | '}
@@ -969,23 +1167,31 @@ const ScreenerPage: React.FC = () => {
                 value={preferences.asset_type}
                 onChange={(e) => {
                   const next = e.target.value as Preferences['asset_type'];
-                  setCurrentPage(1);
-                  setSelectedSymbol(null);
-                  setChartData([]);
-                  setChartError(null);
+                  resetUniverseSelectionState();
                   if (next === 'etf') {
                     const nextPreset = preferences.etf_preset || 'balanced';
                     setPreset(nextPreset);
                     setScreenerMode('preset');
-                    updatePreferences({ asset_type: next, risk_profile: preferences.etf_preset, screener_mode: 'preset', etf_preset: nextPreset });
-                    void applyAdaptiveOptimization({ assetType: next, mode: 'preset', preset: nextPreset });
+                    setPreferences((prev) =>
+                      normalizePreferences({
+                        ...prev,
+                        asset_type: next,
+                        screener_mode: 'preset',
+                        risk_profile: nextPreset as RiskProfile,
+                        etf_preset: nextPreset,
+                      })
+                    );
                   } else {
-                    updatePreferences({ asset_type: next, screener_mode: screenerMode });
-                    void applyAdaptiveOptimization({ assetType: next, mode: screenerMode, preset: preferences.stock_preset });
-                  }
-                  if (next === 'stock') {
                     const nextPreset = preferences.stock_preset || 'weekly_optimized';
                     setPreset(nextPreset);
+                    setPreferences((prev) =>
+                      normalizePreferences({
+                        ...prev,
+                        asset_type: next,
+                        screener_mode: screenerMode,
+                        stock_preset: nextPreset,
+                      })
+                    );
                   }
                 }}
                 className="w-full px-3 py-2 bg-gray-700 text-white border border-gray-600 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
@@ -1004,12 +1210,13 @@ const ScreenerPage: React.FC = () => {
                   onChange={(e) => {
                     const nextMode = e.target.value as ScreenerMode;
                     setScreenerMode(nextMode);
-                    setCurrentPage(1);
-                    setSelectedSymbol(null);
-                    setChartData([]);
-                    setChartError(null);
-                    updatePreferences({ screener_mode: nextMode });
-                    void applyAdaptiveOptimization({ assetType: 'stock', mode: nextMode, preset: nextMode === 'preset' ? preset : preferences.stock_preset });
+                    resetUniverseSelectionState();
+                    setPreferences((prev) =>
+                      normalizePreferences({
+                        ...prev,
+                        screener_mode: nextMode,
+                      })
+                    );
                   }}
                   className="w-full px-3 py-2 bg-gray-700 text-white border border-gray-600 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
                 >
@@ -1028,19 +1235,22 @@ const ScreenerPage: React.FC = () => {
                   onChange={(e) => {
                     const nextPreset = e.target.value as PresetType;
                     setPreset(nextPreset);
-                    setCurrentPage(1);
-                    setSelectedSymbol(null);
-                    setChartData([]);
-                    setChartError(null);
+                    resetUniverseSelectionState();
                     if (preferences.asset_type === 'stock') {
-                      updatePreferences({ stock_preset: nextPreset as StockPreset });
-                      void applyAdaptiveOptimization({ assetType: 'stock', mode: 'preset', preset: nextPreset });
+                      setPreferences((prev) =>
+                        normalizePreferences({
+                          ...prev,
+                          stock_preset: nextPreset as StockPreset,
+                        })
+                      );
                     } else if (preferences.asset_type === 'etf') {
-                      updatePreferences({
-                        etf_preset: nextPreset as EtfPreset,
-                        risk_profile: nextPreset as RiskProfile,
-                      });
-                      void applyAdaptiveOptimization({ assetType: 'etf', mode: 'preset', preset: nextPreset });
+                      setPreferences((prev) =>
+                        normalizePreferences({
+                          ...prev,
+                          etf_preset: nextPreset as EtfPreset,
+                          risk_profile: nextPreset as RiskProfile,
+                        })
+                      );
                     }
                   }}
                   className="w-full px-3 py-2 bg-gray-700 text-white border border-gray-600 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
@@ -1063,10 +1273,7 @@ const ScreenerPage: React.FC = () => {
                   onChange={(e) => {
                     const nextMode = e.target.value as PresetUniverseMode;
                     setPresetUniverseMode(nextMode);
-                    setCurrentPage(1);
-                    setSelectedSymbol(null);
-                    setChartData([]);
-                    setChartError(null);
+                    resetUniverseSelectionState();
                   }}
                   className="w-full px-3 py-2 bg-gray-700 text-white border border-gray-600 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
                 >
@@ -1078,29 +1285,115 @@ const ScreenerPage: React.FC = () => {
               </div>
             )}
 
-            {preferences.asset_type === 'stock' && screenerMode === 'most_active' && (
-              <div>
-                <label className="block text-sm font-medium text-gray-200 mb-2">Step 2: Most Active Count <HelpTooltip text="Number of top active stock symbols to include." /></label>
+            <div>
+              <label className="block text-sm font-medium text-gray-200 mb-2">
+                Step 2: Symbol Count
+                <HelpTooltip text="Set universe size for the selected Stock/ETF mode. Applied only when you click Apply Universe & Guardrails." />
+              </label>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    resetUniverseSelectionState();
+                    setPreferences((prev) =>
+                      withContextScreenerLimit(
+                        prev,
+                        prev.asset_type,
+                        prev.asset_type === 'stock' ? screenerMode : 'preset',
+                        draftScreenerLimit - 5,
+                      )
+                    );
+                  }}
+                  className="rounded border border-gray-600 bg-gray-700 px-2 py-2 text-sm text-gray-200 hover:bg-gray-600"
+                >
+                  -5
+                </button>
                 <input
-                  type="range"
+                  type="number"
                   min={10}
                   max={200}
-                  step={5}
-                  value={preferences.screener_limit}
+                  step={1}
+                  value={draftScreenerLimit}
                   onChange={(e) => {
-                    setCurrentPage(1);
-                    setSelectedSymbol(null);
-                    setChartData([]);
-                    setChartError(null);
-                    updatePreferences({ screener_limit: parseInt(e.target.value, 10) });
-                    void applyAdaptiveOptimization({ assetType: 'stock', mode: 'most_active', preset: preferences.stock_preset });
+                    const parsed = Number.parseInt(e.target.value, 10);
+                    resetUniverseSelectionState();
+                    if (Number.isFinite(parsed)) {
+                      setPreferences((prev) =>
+                        withContextScreenerLimit(
+                          prev,
+                          prev.asset_type,
+                          prev.asset_type === 'stock' ? screenerMode : 'preset',
+                          parsed,
+                        )
+                      );
+                    }
                   }}
-                  className="w-full"
+                  onBlur={(e) => {
+                    const parsed = Number.parseInt(e.target.value, 10);
+                    const target = Number.isFinite(parsed) ? parsed : draftScreenerLimit;
+                    setPreferences((prev) =>
+                      withContextScreenerLimit(
+                        prev,
+                        prev.asset_type,
+                        prev.asset_type === 'stock' ? screenerMode : 'preset',
+                        target,
+                      )
+                    );
+                  }}
+                  className="w-full rounded border border-gray-600 bg-gray-700 px-3 py-2 text-white"
                 />
-                <p className="text-sm text-gray-400 mt-1">{preferences.screener_limit} symbols</p>
-                <p className="text-xs text-gray-500">How many top active stock symbols to fetch from Alpaca/fallback.</p>
+                <button
+                  type="button"
+                  onClick={() => {
+                    resetUniverseSelectionState();
+                    setPreferences((prev) =>
+                      withContextScreenerLimit(
+                        prev,
+                        prev.asset_type,
+                        prev.asset_type === 'stock' ? screenerMode : 'preset',
+                        draftScreenerLimit + 5,
+                      )
+                    );
+                  }}
+                  className="rounded border border-gray-600 bg-gray-700 px-2 py-2 text-sm text-gray-200 hover:bg-gray-600"
+                >
+                  +5
+                </button>
               </div>
-            )}
+              <div className="mt-2 flex flex-wrap gap-2">
+                {[25, 50, 75, 100, 150, 200].map((count) => (
+                  <button
+                    key={count}
+                    type="button"
+                    onClick={() => {
+                      resetUniverseSelectionState();
+                      setPreferences((prev) =>
+                        withContextScreenerLimit(
+                          prev,
+                          prev.asset_type,
+                          prev.asset_type === 'stock' ? screenerMode : 'preset',
+                          count,
+                        )
+                      );
+                    }}
+                    className={`rounded border px-2 py-1 text-xs ${
+                      draftScreenerLimit === count
+                        ? 'border-blue-400 bg-blue-800/50 text-blue-100'
+                        : 'border-gray-600 bg-gray-700 text-gray-300 hover:bg-gray-600'
+                    }`}
+                  >
+                    {count}
+                  </button>
+                ))}
+              </div>
+              <p className="mt-1 text-xs text-gray-500">
+                {preferences.asset_type === 'etf'
+                  ? 'Applies to ETF preset universe size.'
+                  : screenerMode === 'preset'
+                    ? 'Applies to Stock preset universe size.'
+                    : 'Applies to Stock Most Active universe size.'}
+              </p>
+            </div>
 
             <div>
               <label className="block text-sm font-medium text-gray-200 mb-2">Step 3: Weekly Budget ($)</label>
@@ -1119,7 +1412,7 @@ const ScreenerPage: React.FC = () => {
                 onBlur={(e) => {
                   const parsed = Number.parseFloat(e.target.value);
                   const value = Number.isFinite(parsed) ? clamp(parsed, WORKSPACE_LIMITS.weeklyBudgetMin, WORKSPACE_LIMITS.weeklyBudgetMax) : WORKSPACE_LIMITS.weeklyBudgetMin;
-                  updatePreferences({ weekly_budget: value });
+                  setPreferences((prev) => ({ ...prev, weekly_budget: value }));
                 }}
                 className="w-full px-3 py-2 bg-gray-700 text-white border border-gray-600 rounded-md"
               />

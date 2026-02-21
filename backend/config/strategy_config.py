@@ -59,7 +59,9 @@ class BacktestRequest(BaseModel):
     require_fractionable: bool = False
     max_position_size: Optional[float] = None
     risk_limit_daily: Optional[float] = None
-    fee_bps: float = 0.0
+    fee_bps: float = 1.0  # Generic per-side cost in bps; 0.0 for live-emulation with SEC/TAF
+    price_noise_bps: float = 0.0  # Monte Carlo: per-bar multiplicative noise stdev in bps (0 = off)
+    price_noise_seed: Optional[int] = None  # Deterministic seed for price noise RNG
     universe_context: Optional[Dict[str, Any]] = None
 
 

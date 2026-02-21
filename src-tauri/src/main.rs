@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tauri::menu::{MenuBuilder, MenuItem, MenuItemBuilder, PredefinedMenuItem};
-use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_notification::{NotificationExt, PermissionState};
 
@@ -34,6 +34,9 @@ struct TraySummaryPayload {
     open_positions: Option<u64>,
     active_strategy: Option<String>,
     universe: Option<String>,
+    optimizer_active_jobs: Option<u64>,
+    optimizer_queue_depth: Option<u64>,
+    optimizer_stalled_jobs: Option<u64>,
     last_update: Option<String>,
 }
 
@@ -43,6 +46,7 @@ struct TrayState {
     summary_item: Mutex<Option<MenuItem<tauri::Wry>>>,
     toggle_runner_item: Mutex<Option<MenuItem<tauri::Wry>>>,
     runner_running: Mutex<bool>,
+    last_snapshot: Mutex<String>,
 }
 
 struct SidecarState {
@@ -65,6 +69,7 @@ impl Default for TrayState {
             summary_item: Mutex::new(None),
             toggle_runner_item: Mutex::new(None),
             runner_running: Mutex::new(false),
+            last_snapshot: Mutex::new("Status unavailable".to_string()),
         }
     }
 }
@@ -112,7 +117,27 @@ fn update_tray_status_ui(app: &AppHandle, payload: &TraySummaryPayload) -> Resul
     let open_positions = payload.open_positions.unwrap_or(0);
     let strategy = sanitize_short(payload.active_strategy.clone(), "None", 36);
     let universe = sanitize_short(payload.universe.clone(), "N/A", 28);
+    let active_jobs = payload.optimizer_active_jobs.unwrap_or(0);
+    let queue_depth = payload.optimizer_queue_depth.unwrap_or(0);
+    let stalled_jobs = payload.optimizer_stalled_jobs.unwrap_or(0);
     let last_update = sanitize_short(payload.last_update.clone(), "-", 24);
+    let snapshot = format!(
+        "Runner: {} | Broker: {} | Poll Errors: {} | Open Positions: {} | Jobs: {} active / {} queued{} | Strategy: {} | Universe: {} | Updated: {}",
+        runner,
+        broker,
+        poll_errors,
+        open_positions,
+        active_jobs,
+        queue_depth,
+        if stalled_jobs > 0 {
+            format!(" | Stalled: {}", stalled_jobs)
+        } else {
+            "".to_string()
+        },
+        strategy,
+        universe,
+        last_update
+    );
 
     if let Some(state) = app.try_state::<TrayState>() {
         let is_running = runner == "RUNNING";
@@ -134,7 +159,18 @@ fn update_tray_status_ui(app: &AppHandle, payload: &TraySummaryPayload) -> Resul
         }
         if let Ok(guard) = state.summary_item.lock() {
             if let Some(item) = &*guard {
-                let _ = item.set_text(format!("Strategy: {} | Universe: {}", strategy, universe));
+                let _ = item.set_text(format!(
+                    "Strategy: {} | Universe: {} | Jobs: {}/{}{}",
+                    strategy,
+                    universe,
+                    active_jobs,
+                    queue_depth,
+                    if stalled_jobs > 0 {
+                        format!(" | Stalled {}", stalled_jobs)
+                    } else {
+                        "".to_string()
+                    },
+                ));
             }
         }
         if let Ok(guard) = state.toggle_runner_item.lock() {
@@ -143,12 +179,26 @@ fn update_tray_status_ui(app: &AppHandle, payload: &TraySummaryPayload) -> Resul
                 let _ = item.set_text(label);
             }
         }
+        if let Ok(mut guard) = state.last_snapshot.lock() {
+            *guard = snapshot.clone();
+        }
     }
 
     if let Some(tray) = app.tray_by_id(TRAY_ID) {
         let _ = tray.set_tooltip(Some(format!(
-            "StocksBot | Runner {} | Broker {} | Errors {} | Positions {} | {}",
-            runner, broker, poll_errors, open_positions, last_update
+            "StocksBot | Runner {} | Broker {} | Errors {} | Positions {} | Jobs {}/{}{} | {}",
+            runner,
+            broker,
+            poll_errors,
+            open_positions,
+            active_jobs,
+            queue_depth,
+            if stalled_jobs > 0 {
+                format!(" | Stalled {}", stalled_jobs)
+            } else {
+                "".to_string()
+            },
+            last_update
         )));
     }
     Ok(())
@@ -495,7 +545,9 @@ fn main() {
 
             TrayIconBuilder::with_id(TRAY_ID)
                 .menu(&tray_menu)
-                .show_menu_on_left_click(false)
+                // On macOS, tooltip/notifications are unreliable as a primary status surface.
+                // Always open tray menu on left click so summary rows are visible consistently.
+                .show_menu_on_left_click(true)
                 .tooltip("StocksBot running in background")
                 .on_menu_event(|app, event| {
                     match event.id().as_ref() {
@@ -506,13 +558,6 @@ fn main() {
                         }
                         MENU_ID_QUIT => app.exit(0),
                         _ => {}
-                    }
-                })
-                .on_tray_icon_event(|tray, event| {
-                    if let TrayIconEvent::Click { button, button_state, .. } = event {
-                        if button == MouseButton::Left && button_state == MouseButtonState::Up {
-                            show_main_window(&tray.app_handle().clone());
-                        }
                     }
                 })
                 .build(app)

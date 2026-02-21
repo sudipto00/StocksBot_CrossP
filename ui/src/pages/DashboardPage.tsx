@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { getBackendStatus, getPositions, getRunnerStatus, startRunner, stopRunner, getPortfolioAnalytics, getPortfolioSummary, getBrokerAccount, getTradingPreferences, getScreenerAssets, getSafetyStatus, runPanicStop, getSafetyPreflight } from '../api/backend';
+import { getBackendStatus, getPositions, getRunnerStatus, startRunner, stopRunner, getDashboardAnalyticsBundle, getTradingPreferences, getScreenerAssets, getSafetyStatus, runPanicStop, getSafetyPreflight } from '../api/backend';
 import { StatusResponse, Position, RunnerState, RunnerStatus, PortfolioAnalytics, PortfolioSummaryResponse, BrokerAccountResponse, TradingPreferences } from '../api/types';
 import EquityCurveChart from '../components/EquityCurveChart';
 import PnLChart from '../components/PnLChart';
@@ -86,20 +86,18 @@ function DashboardPage() {
 
   const refreshPortfolioData = useCallback(async () => {
     try {
-      const [positionsData, analyticsData, summaryData, brokerAccountData] = await Promise.all([
+      const [positionsData, dashboardBundle] = await Promise.all([
         getPositions(),
-        getPortfolioAnalytics(analyticsDays === 'all' ? undefined : analyticsDays),
-        getPortfolioSummary(),
-        getBrokerAccount(),
+        getDashboardAnalyticsBundle(analyticsDays === 'all' ? undefined : analyticsDays),
       ]);
       setPositions(positionsData.positions);
       setPositionsAsOf(positionsData.as_of || null);
       setPositionsDataSource(positionsData.data_source || 'broker');
       setPositionsDegraded(Boolean(positionsData.degraded));
       setPositionsDegradedReason(positionsData.degraded_reason || '');
-      setAnalytics(analyticsData);
-      setSummary(summaryData);
-      setBrokerAccount(brokerAccountData);
+      setAnalytics(dashboardBundle.analytics);
+      setSummary(dashboardBundle.summary);
+      setBrokerAccount(dashboardBundle.broker_account);
     } catch (err) {
       console.error('Failed to refresh dashboard portfolio data:', err);
     }
@@ -126,13 +124,11 @@ function DashboardPage() {
       setError(null);
       
       // Fetch status, positions, runner state, and analytics in parallel
-      const [statusData, positionsData, runnerData, analyticsData, summaryData, brokerAccountData, prefsData, safety] = await Promise.all([
+      const [statusData, positionsData, runnerData, dashboardBundle, prefsData, safety] = await Promise.all([
         getBackendStatus(),
         getPositions(),
         getRunnerStatus(),
-        getPortfolioAnalytics(analyticsDays === 'all' ? undefined : analyticsDays),
-        getPortfolioSummary(),
-        getBrokerAccount(),
+        getDashboardAnalyticsBundle(analyticsDays === 'all' ? undefined : analyticsDays),
         getTradingPreferences(),
         getSafetyStatus().catch(() => ({ kill_switch_active: false, last_broker_sync_at: null })),
       ]);
@@ -163,9 +159,9 @@ function DashboardPage() {
         market_session_open: runnerData.market_session_open,
         last_state_persisted_at: runnerData.last_state_persisted_at,
       });
-      setAnalytics(analyticsData);
-      setSummary(summaryData);
-      setBrokerAccount(brokerAccountData);
+      setAnalytics(dashboardBundle.analytics);
+      setSummary(dashboardBundle.summary);
+      setBrokerAccount(dashboardBundle.broker_account);
       setTradingPrefs(prefsData);
       setKillSwitchActive(Boolean(safety.kill_switch_active));
       void refreshKnownEtfSymbols();

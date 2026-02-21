@@ -15,6 +15,7 @@ const tocSections = [
   { id: 'screener',           label: 'Screener',            color: 'gray' },
   { id: 'strategy',           label: 'Strategy',            color: 'gray' },
   { id: 'backtest',           label: 'Backtest Guide',      color: 'gray' },
+  { id: 'optimizer',          label: 'Optimizer & MC',      color: 'gray' },
   { id: 'audit',              label: 'Audit',               color: 'gray' },
   { id: 'settings',           label: 'Settings',            color: 'gray' },
   { id: 'strategy-params',    label: 'Strategy Params',     color: 'gray' },
@@ -374,7 +375,8 @@ const metricDefinitions = [
   { name: 'Win Rate', meaning: 'Percentage of closed trades that made money. 50%+ is typical for dip-buy strategies.' },
   { name: 'Drawdown', meaning: 'The largest peak-to-trough drop in your account value. Smaller is better.' },
   { name: 'Volatility', meaning: 'How much your account value fluctuates. Lower volatility means smoother returns.' },
-  { name: 'Sharpe Ratio', meaning: 'Risk-adjusted return score. Above 1.0 is good, above 2.0 is excellent. Negative means returns do not justify the risk.' },
+  { name: 'Sharpe Ratio', meaning: 'Risk-adjusted return using sample standard deviation (Bessel-corrected). Above 1.0 is good, above 2.0 is excellent. Negative means returns do not justify the risk.' },
+  { name: 'Sortino Ratio', meaning: 'Like Sharpe but only penalizes downside volatility. Uses downside deviation divided by total observation count. Higher is better; above 1.5 is strong.' },
   { name: 'Cost Basis', meaning: 'Total amount of capital currently tied up in open positions.' },
   { name: 'SMA50 / SMA250', meaning: '50-day and 250-day moving averages. Price above both = uptrend. Price below SMA50 = potential dip-buy zone.' },
 ];
@@ -413,6 +415,8 @@ const troubleshootingTips = [
   { title: 'Reset Audit Data does nothing', detail: 'The runner must be stopped first. Reset is intentionally blocked while the runner is running or sleeping.' },
   { title: 'Send Summary Now returns a delivery error', detail: 'Summary delivery requires real SMTP or Twilio credentials. Configure the required env vars and enable summary preferences before retrying.' },
   { title: 'SMS recipient is rejected', detail: 'Use E.164 format for phone numbers, for example: +15551234567. Save Settings again after correcting.' },
+  { title: 'Optimizer job stuck at low progress', detail: 'Check logs/optimizer_worker_<job_id>.log for errors. Common causes: macOS fork() issues with nested parallelism (resolved in latest update), or stale heartbeat timeout. Restart the job if needed.' },
+  { title: 'Optimizer job marked as stale', detail: 'The heartbeat timeout is 5 minutes. If the job is doing heavy Monte Carlo ensemble work, it may legitimately take time between heartbeats. Check the worker log file for actual progress.' },
   { title: 'Backtest shows 0 trades', detail: 'Entry thresholds are likely too strict. Lower dip_buy_threshold_pct and raise zscore_entry_threshold toward 0. See the Backtest Guide section.' },
   { title: 'Backtest has trades but negative Sharpe', detail: 'Exit thresholds may be too wide. Reduce take_profit_pct and trailing_stop_pct so trades close faster. See the Backtest Guide section.' },
   { title: 'Positions never sell', detail: 'Check that take_profit_pct, trailing_stop_pct, and stop_loss_pct are not set to very large values. Also check max_hold_days.' },
@@ -458,6 +462,18 @@ const faqItems = [
   {
     q: 'How do I know if my backtest settings are good?',
     a: 'A healthy backtest shows: positive total return, Sharpe ratio above 0.5, drawdown under 10-15%, and win rate near 50% or above. If you see 0 trades, loosen entries. If Sharpe is negative, tighten exits. See the Backtest Guide section for details.',
+  },
+  {
+    q: 'What is Monte Carlo ensemble optimization?',
+    a: 'Monte Carlo ensemble runs each parameter candidate through multiple randomized scenarios: perturbed symbol lists, varied fee/slippage levels, shifted date windows, and price path noise (5-20 bps per bar). The optimizer scores each candidate on the median result across all scenarios, making it far more robust than a single backtest.',
+  },
+  {
+    q: 'What is Bayesian optimization (Optuna TPE)?',
+    a: 'When Optuna is installed, the optimizer uses Tree-structured Parzen Estimator (TPE) instead of random search. TPE learns from previous trials to intelligently sample the parameter space, converging on good configurations faster. It activates automatically for non-ensemble runs with 12+ iterations.',
+  },
+  {
+    q: 'What is walk-forward validation?',
+    a: 'Walk-forward splits your backtest period into sequential train/test folds. The optimizer re-optimizes parameters on each fold\'s training window (expanding window), then scores on the out-of-sample test period. This prevents overfitting by ensuring parameters generalize to unseen data.',
   },
   {
     q: 'Can I run the bot and forget about it?',
@@ -749,6 +765,27 @@ function exportHelpPdf() {
     ${callout('Note', 'Use at least 1 year (250+ trading days) of history for reliable backtest results.')}
   `);
 
+  const optimizerHtml = section('Optimizer &amp; Monte Carlo Ensemble', `
+    <p>The optimizer searches for the best strategy parameters by evaluating candidates against historical data using advanced techniques.</p>
+    <h3>Key Features</h3>
+    ${table(['Feature', 'Description'], [
+      ['Monte Carlo Ensemble', 'Each candidate is tested across multiple randomized scenarios with perturbed symbols, fees, slippage, date windows, and price path noise (5-20 bps/bar). Scoring uses the median across scenarios.'],
+      ['Bayesian Optimization (Optuna TPE)', 'When Optuna is available, uses Tree-structured Parzen Estimator for intelligent parameter sampling instead of random search. Activates for non-ensemble runs with 12+ iterations.'],
+      ['Walk-Forward Validation', 'Splits data into sequential train/test folds with expanding windows. Re-optimizes on each training window, then scores out-of-sample to prevent overfitting.'],
+      ['Price Path Perturbation', 'Applies multiplicative Gaussian noise (5-20 bps) to each price bar during Monte Carlo scenarios, testing robustness against micro-structure variations.'],
+      ['Adaptive Date Jitter', 'Shifts backtest start/end dates by up to span/12 (~30 days on a 360-day window) per scenario for temporal robustness.'],
+      ['Regime Detection', 'Multi-timeframe (20/60-day) classification using trend magnitude and proper sample standard deviation. Classifies market as trending_up, trending_down, or range_bound.'],
+    ])}
+    <h3>Metrics &amp; Scoring</h3>
+    ${table(['Metric', 'Details'], [
+      ['Sharpe Ratio', 'Uses Bessel-corrected sample variance (divides by n-1) for unbiased estimation.'],
+      ['Sortino Ratio', 'Downside deviation uses total observation count as denominator, not just count of negative returns.'],
+      ['Transaction Costs', 'Default 1 bps fee applied in standard backtests. Set to 0 when emulating live trading (broker handles fees).'],
+      ['Stop Fill Realism', 'On gap-down bars, stop fills at min(stop_price, bar_low) instead of the stop price, reflecting real market behavior.'],
+    ])}
+    ${callout('Tip', 'Worker logs are saved to logs/optimizer_worker_&lt;job_id&gt;.log for debugging slow or failed jobs.')}
+  `);
+
   const auditHtml = section('Audit', ul([
     '<strong>Events tab</strong> shows system events with severity context.',
     '<strong>Trades tab</strong> shows complete trade history with symbol and date filtering.',
@@ -867,6 +904,7 @@ function exportHelpPdf() {
   ${screenerHtml}
   ${strategyHtml}
   ${backtestHtml}
+  ${optimizerHtml}
   ${auditHtml}
   ${settingsHtml}
   ${stratParamsHtml}
@@ -1454,9 +1492,120 @@ function HelpPage() {
             <li><strong>Win rate under 40%?</strong> Entry thresholds may be too loose (buying false dips). Tighten zscore_entry_threshold (more negative).</li>
           </ol>
 
+          <h4 className="font-semibold text-amber-200 mt-2">Accuracy Notes</h4>
+          <ul className="list-disc pl-5 space-y-1.5 text-sm">
+            <li><strong>Transaction costs:</strong> Standard backtests now apply a default 1 bps fee per trade. This prevents unrealistically inflated returns. Live-trading emulation sets fees to 0.</li>
+            <li><strong>Stop fills on gaps:</strong> When a stock gaps down below your stop, the backtest now fills at the actual low (or worse), not at your stop price. This matches real-world execution.</li>
+            <li><strong>Sharpe ratio</strong> uses Bessel-corrected sample variance (n-1 denominator) for unbiased estimation.</li>
+            <li><strong>Sortino ratio</strong> uses total observation count as denominator for downside deviation, not just count of negative returns.</li>
+          </ul>
+
           <Callout type="info">
             A backtest is only as good as its data. Use at least 1 year (250+ trading days) of history for reliable results.
-            Short periods may not include enough market conditions to be representative.
+            Short periods may not include enough market conditions to be representative. For robust parameter selection,
+            use the Optimizer with Monte Carlo ensemble mode.
+          </Callout>
+        </div>
+      </CollapsibleSection>
+
+      {/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+         7b. OPTIMIZER & MONTE CARLO
+         ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */}
+      <CollapsibleSection
+        id="optimizer"
+        title="Optimizer & Monte Carlo Ensemble"
+        subtitle="Automated parameter search, ensemble stress-testing, and walk-forward validation."
+        accentColor="purple"
+      >
+        <div className="text-sm text-purple-100 space-y-4">
+          <p>
+            The optimizer searches for the best strategy parameters by evaluating candidates against historical
+            data. It supports multiple search strategies and robustness techniques.
+          </p>
+
+          <h4 className="font-semibold text-purple-200">Search Methods</h4>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <div className="rounded bg-purple-950/30 p-3 text-xs">
+              <p className="font-medium text-purple-200">Bayesian Optimization (Optuna TPE)</p>
+              <p>When Optuna is installed, uses Tree-structured Parzen Estimator to intelligently sample the parameter
+                space. Learns from prior trials to converge faster than random search. Activates automatically for
+                non-ensemble runs with 12+ iterations.</p>
+            </div>
+            <div className="rounded bg-purple-950/30 p-3 text-xs">
+              <p className="font-medium text-purple-200">Random Mutation (Fallback)</p>
+              <p>If Optuna is not available, falls back to random mutation search with the same evaluation pipeline.
+                Still effective but may require more iterations to find optimal parameters.</p>
+            </div>
+          </div>
+
+          <h4 className="font-semibold text-purple-200 mt-2">Monte Carlo Ensemble</h4>
+          <p>Each parameter candidate is evaluated across multiple randomized scenarios for robustness:</p>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <div className="rounded bg-purple-950/30 p-3 text-xs">
+              <p className="font-medium text-purple-200">Symbol Perturbation</p>
+              <p>Randomly drops a subset of symbols from each scenario to test robustness to universe composition changes.</p>
+            </div>
+            <div className="rounded bg-purple-950/30 p-3 text-xs">
+              <p className="font-medium text-purple-200">Fee & Slippage Variation</p>
+              <p>Varies transaction costs and slippage assumptions across scenarios to ensure profitability is not fee-sensitive.</p>
+            </div>
+            <div className="rounded bg-purple-950/30 p-3 text-xs">
+              <p className="font-medium text-purple-200">Date Window Jitter</p>
+              <p>Shifts backtest start/end dates by up to ~30 days (span/12) per scenario, testing temporal robustness across different market regimes.</p>
+            </div>
+            <div className="rounded bg-purple-950/30 p-3 text-xs">
+              <p className="font-medium text-purple-200">Price Path Noise</p>
+              <p>Applies multiplicative Gaussian noise (5-20 bps per bar) to OHLC prices, simulating micro-structure
+                variations and testing sensitivity to exact price levels.</p>
+            </div>
+          </div>
+          <p className="text-xs text-purple-300">
+            Scoring uses the <strong>median</strong> result across all scenarios, making it far more robust than
+            optimizing on a single backtest run.
+          </p>
+
+          <h4 className="font-semibold text-purple-200 mt-2">Walk-Forward Validation</h4>
+          <p>
+            Splits the backtest period into sequential train/test folds with expanding training windows. The optimizer
+            <strong> re-optimizes parameters</strong> on each fold&apos;s training window (12 mini-iterations), then scores on
+            the out-of-sample test period. This prevents overfitting by ensuring parameters generalize to unseen data.
+            Walk-forward activates when the training window is at least 90 days.
+          </p>
+
+          <h4 className="font-semibold text-purple-200 mt-2">Regime Detection</h4>
+          <p>
+            Multi-timeframe (20/60-day) market regime classification using trend magnitude and proper sample standard
+            deviation. Classifies each bar as <strong>trending_up</strong>, <strong>trending_down</strong>, or{' '}
+            <strong>range_bound</strong>. The dip-buy strategy only enters during range-bound regimes.
+          </p>
+
+          <h4 className="font-semibold text-purple-200 mt-2">Backtest Accuracy Improvements</h4>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <div className="rounded bg-purple-950/30 p-3 text-xs">
+              <p className="font-medium text-purple-200">Realistic Stop Fills</p>
+              <p>On gap-down bars, stops fill at min(stop_price, bar_low) instead of the stop price, reflecting real
+                market behavior where gaps bypass your stop level.</p>
+            </div>
+            <div className="rounded bg-purple-950/30 p-3 text-xs">
+              <p className="font-medium text-purple-200">Default Transaction Costs</p>
+              <p>Standard backtests now apply 1 bps transaction fee by default. Live-trading emulation mode sets fees
+                to 0 (broker handles costs). This prevents unrealistically inflated backtest returns.</p>
+            </div>
+            <div className="rounded bg-purple-950/30 p-3 text-xs">
+              <p className="font-medium text-purple-200">Corrected Sharpe Ratio</p>
+              <p>Uses Bessel-corrected sample variance (divides by n-1) instead of population variance for unbiased
+                risk-adjusted return estimation.</p>
+            </div>
+            <div className="rounded bg-purple-950/30 p-3 text-xs">
+              <p className="font-medium text-purple-200">Corrected Sortino Ratio</p>
+              <p>Downside deviation now uses total observation count as denominator, not just the count of negative
+                returns, giving a more accurate downside risk measure.</p>
+            </div>
+          </div>
+
+          <Callout type="info">
+            Worker logs are saved to <code className="text-purple-200">logs/optimizer_worker_&lt;job_id&gt;.log</code> for
+            debugging slow or failed optimizer jobs.
           </Callout>
         </div>
       </CollapsibleSection>
