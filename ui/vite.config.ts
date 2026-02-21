@@ -15,4 +15,18 @@ export default defineConfig({
       ignored: ["**/src-tauri/**"],
     },
   },
+
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          // Split vendor libraries into stable, cacheable chunks
+          "vendor-react": ["react", "react-dom", "react-router-dom"],
+          "vendor-charts": ["recharts"],
+          "vendor-tauri": ["@tauri-apps/api"],
+          "vendor-virtual": ["@tanstack/react-virtual"],
+        },
+      },
+    },
+  },
 });

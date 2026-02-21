@@ -1,3 +1,4 @@
+import { useMemo } from 'react';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 import { EquityPoint } from '../api/types';
 
@@ -19,73 +20,73 @@ function EquityCurveChart({ data, initialCapital }: EquityCurveChartProps) {
     return date.toLocaleString(undefined, options);
   };
 
-  // Preserve timestamp precision, then adaptive-bucket to reduce high-frequency
-  // mark noise while keeping meaningful changes visible across the selected range.
-  const sortedPoints = data
-    .map((point, index) => {
-      const ts = new Date(point.timestamp).getTime();
-      const parsedValue = Number(point.value);
-      return {
-        ts: Number.isFinite(ts) ? ts : index,
-        value: Number.isFinite(parsedValue) ? parsedValue : NaN,
-      };
-    })
-    .filter((point) => Number.isFinite(point.value))
-    .sort((a, b) => a.ts - b.ts);
-  const dedupedPoints = sortedPoints.reduce<Array<{ ts: number; value: number }>>((acc, point) => {
-    const last = acc[acc.length - 1];
-    if (last && last.ts === point.ts) {
-      last.value = point.value;
+  // Memoize the expensive sort → dedup → bucket → spike-filter pipeline
+  // so it only recalculates when the raw data array changes.
+  const chartData = useMemo(() => {
+    const sortedPoints = data
+      .map((point, index) => {
+        const ts = new Date(point.timestamp).getTime();
+        const parsedValue = Number(point.value);
+        return {
+          ts: Number.isFinite(ts) ? ts : index,
+          value: Number.isFinite(parsedValue) ? parsedValue : NaN,
+        };
+      })
+      .filter((point) => Number.isFinite(point.value))
+      .sort((a, b) => a.ts - b.ts);
+    const dedupedPoints = sortedPoints.reduce<Array<{ ts: number; value: number }>>((acc, point) => {
+      const last = acc[acc.length - 1];
+      if (last && last.ts === point.ts) {
+        last.value = point.value;
+        return acc;
+      }
+      acc.push({ ts: point.ts, value: point.value });
       return acc;
-    }
-    acc.push({ ts: point.ts, value: point.value });
-    return acc;
-  }, []);
-  const spanMs = dedupedPoints.length > 1
-    ? Math.max(0, dedupedPoints[dedupedPoints.length - 1].ts - dedupedPoints[0].ts)
-    : 0;
-  const bucketMs = spanMs > 60 * 24 * 60 * 60 * 1000
-    ? 4 * 60 * 60 * 1000
-    : spanMs > 14 * 24 * 60 * 60 * 1000
-    ? 60 * 60 * 1000
-    : spanMs > 2 * 24 * 60 * 60 * 1000
-    ? 15 * 60 * 1000
-    : spanMs > 6 * 60 * 60 * 1000
-    ? 5 * 60 * 1000
-    : 60 * 1000;
-  const bucketedData = dedupedPoints.reduce<Array<{ ts: number; value: number }>>((acc, point) => {
-    const bucket = Math.floor(point.ts / bucketMs) * bucketMs;
-    const last = acc[acc.length - 1];
-    if (last && last.ts === bucket) {
-      // Keep latest value in each bucket.
-      last.value = point.value;
+    }, []);
+    const spanMs = dedupedPoints.length > 1
+      ? Math.max(0, dedupedPoints[dedupedPoints.length - 1].ts - dedupedPoints[0].ts)
+      : 0;
+    const bucketMs = spanMs > 60 * 24 * 60 * 60 * 1000
+      ? 4 * 60 * 60 * 1000
+      : spanMs > 14 * 24 * 60 * 60 * 1000
+      ? 60 * 60 * 1000
+      : spanMs > 2 * 24 * 60 * 60 * 1000
+      ? 15 * 60 * 1000
+      : spanMs > 6 * 60 * 60 * 1000
+      ? 5 * 60 * 1000
+      : 60 * 1000;
+    const bucketedData = dedupedPoints.reduce<Array<{ ts: number; value: number }>>((acc, point) => {
+      const bucket = Math.floor(point.ts / bucketMs) * bucketMs;
+      const last = acc[acc.length - 1];
+      if (last && last.ts === bucket) {
+        last.value = point.value;
+        return acc;
+      }
+      acc.push({ ts: bucket, value: point.value });
       return acc;
-    }
-    acc.push({ ts: bucket, value: point.value });
-    return acc;
-  }, []);
-  const chartData = bucketedData.length < 3
-    ? bucketedData
-    : bucketedData.reduce<Array<{ ts: number; value: number }>>((acc, point, index, arr) => {
-        if (index === 0 || index === arr.length - 1) {
-          acc.push(point);
-          return acc;
-        }
-        const prev = acc[acc.length - 1];
-        const next = arr[index + 1];
-        const gapPrev = point.ts - prev.ts;
-        const gapNext = next.ts - point.ts;
-        const eqEps = Math.max(0.2, Math.abs(prev.value) * 0.00025);
-        const reverts = Math.abs(prev.value - next.value) <= eqEps;
-        const spike = Math.abs(point.value - prev.value) >= eqEps * 3
-          && Math.abs(point.value - next.value) >= eqEps * 3;
-        const transient = gapPrev > 0 && gapNext > 0 && gapPrev <= 20 * 60 * 1000 && gapNext <= 20 * 60 * 1000;
-        if (transient && reverts && spike) {
-          return acc;
-        }
+    }, []);
+    if (bucketedData.length < 3) return bucketedData;
+    return bucketedData.reduce<Array<{ ts: number; value: number }>>((acc, point, index, arr) => {
+      if (index === 0 || index === arr.length - 1) {
         acc.push(point);
         return acc;
-      }, []);
+      }
+      const prev = acc[acc.length - 1];
+      const next = arr[index + 1];
+      const gapPrev = point.ts - prev.ts;
+      const gapNext = next.ts - point.ts;
+      const eqEps = Math.max(0.2, Math.abs(prev.value) * 0.00025);
+      const reverts = Math.abs(prev.value - next.value) <= eqEps;
+      const spike = Math.abs(point.value - prev.value) >= eqEps * 3
+        && Math.abs(point.value - next.value) >= eqEps * 3;
+      const transient = gapPrev > 0 && gapNext > 0 && gapPrev <= 20 * 60 * 1000 && gapNext <= 20 * 60 * 1000;
+      if (transient && reverts && spike) {
+        return acc;
+      }
+      acc.push(point);
+      return acc;
+    }, []);
+  }, [data]);
 
   // If no data, show empty state
   if (chartData.length === 0) {

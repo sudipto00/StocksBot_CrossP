@@ -1,3 +1,4 @@
+import { useMemo } from 'react';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell } from 'recharts';
 
 interface PnLPoint {
@@ -15,12 +16,12 @@ interface PnLChartProps {
  * Displays profit and loss over time as a bar chart.
  */
 function PnLChart({ data }: PnLChartProps) {
-  // Format data for recharts
-  const chartData = data.map((point) => ({
+  // Format data for recharts (memoized to avoid re-parsing on every render)
+  const chartData = useMemo(() => data.map((point) => ({
     timestamp: new Date(point.timestamp).toLocaleDateString(),
     pnl: point.pnl,
     cumulative_pnl: point.cumulative_pnl,
-  }));
+  })), [data]);
 
   // If no data, show empty state
   if (chartData.length === 0) {

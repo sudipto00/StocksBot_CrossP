@@ -1,4 +1,6 @@
-import { useState, useEffect, useCallback, useMemo } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import { useVirtualizer } from '@tanstack/react-virtual';
+import { useVisibilityAwareInterval } from '../hooks/useVisibilityAwareInterval';
 import { getAuditLogs, getAuditTrades, resetAuditData } from '../api/backend';
 import { AuditLog, AuditEventType, TradeHistoryItem } from '../api/types';
 import HelpTooltip from '../components/HelpTooltip';
@@ -41,8 +43,14 @@ function AuditPage() {
   const [resetLoading, setResetLoading] = useState(false);
   const [resetSummary, setResetSummary] = useState<string | null>(null);
   const [resetConfirmOpen, setResetConfirmOpen] = useState(false);
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const tradeTableScrollRef = useRef<HTMLDivElement>(null);
 
   const loadAuditData = useCallback(async () => {
+    abortControllerRef.current?.abort();
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
     try {
       setLoading(true);
       setError(null);
@@ -52,14 +60,17 @@ function AuditPage() {
         getAuditTrades(AUDIT_PAGE_SIZE, tradesOffset),
       ]);
 
+      if (controller.signal.aborted) return;
+
       setLogs(logsResponse.logs || []);
       setLogsTotalCount(Number(logsResponse.total_count || 0));
       setTrades(tradesResponse.trades || []);
       setTradesTotalCount(Number(tradesResponse.total_count || 0));
     } catch (err) {
+      if (controller.signal.aborted) return;
       setError(err instanceof Error ? err.message : 'Failed to load audit mode data');
     } finally {
-      setLoading(false);
+      if (!controller.signal.aborted) setLoading(false);
     }
   }, [filter, logsOffset, tradesOffset]);
 
@@ -69,6 +80,9 @@ function AuditPage() {
 
   useEffect(() => {
     loadAuditData();
+    return () => {
+      abortControllerRef.current?.abort();
+    };
   }, [loadAuditData]);
 
   useEffect(() => {
@@ -85,12 +99,7 @@ function AuditPage() {
     }
   }, []);
 
-  useEffect(() => {
-    const interval = setInterval(() => {
-      loadAuditData();
-    }, 15000);
-    return () => clearInterval(interval);
-  }, [loadAuditData]);
+  useVisibilityAwareInterval(loadAuditData, 15000);
 
   const filteredTrades = useMemo(() => {
     const normalizedSymbol = symbolFilter.trim().toUpperCase();
@@ -124,6 +133,13 @@ function AuditPage() {
     () => filteredLogs.filter((log) => log.event_type === AuditEventType.ERROR).length,
     [filteredLogs]
   );
+  const tradeRowVirtualizer = useVirtualizer({
+    count: filteredTrades.length,
+    getScrollElement: () => tradeTableScrollRef.current,
+    estimateSize: () => 44,
+    overscan: 20,
+  });
+
   const logsPage = Math.floor(logsOffset / AUDIT_PAGE_SIZE) + 1;
   const logsHasPrev = logsOffset > 0;
   const logsHasNext = (logsOffset + logs.length) < logsTotalCount;
@@ -653,9 +669,9 @@ function AuditPage() {
                 {filteredTrades.length === 0 ? (
                   <div className="p-6 text-gray-400">{trades.length === 0 ? 'No trades recorded yet.' : 'No trades match current filters.'}</div>
                 ) : (
-                  <div className="overflow-x-auto max-h-[560px] overflow-y-auto">
+                  <div ref={tradeTableScrollRef} className="overflow-x-auto max-h-[560px] overflow-y-auto">
                     <table className="w-full text-sm text-left text-gray-200">
-                      <thead className="text-xs uppercase bg-gray-900 text-gray-400 sticky top-0">
+                      <thead className="text-xs uppercase bg-gray-900 text-gray-400 sticky top-0 z-10">
                         <tr>
                           <th className="px-4 py-3">Time</th>
                           <th className="px-4 py-3">Symbol</th>
@@ -667,21 +683,36 @@ function AuditPage() {
                           <th className="px-4 py-3">Order ID</th>
                         </tr>
                       </thead>
-                      <tbody>
-                        {filteredTrades.map((trade) => (
-                          <tr key={trade.id} className="border-b border-gray-700 hover:bg-gray-750">
-                            <td className="px-4 py-3">{formatDateTime(trade.executed_at)}</td>
-                            <td className="px-4 py-3 font-semibold text-white">{trade.symbol}</td>
-                            <td className={`px-4 py-3 ${trade.side === 'buy' ? 'text-green-400' : 'text-yellow-400'}`}>{trade.side.toUpperCase()}</td>
-                            <td className="px-4 py-3">{trade.quantity}</td>
-                            <td className="px-4 py-3">${trade.price.toFixed(2)}</td>
-                            <td className="px-4 py-3">${(trade.commission + trade.fees).toFixed(2)}</td>
-                            <td className={`px-4 py-3 ${(trade.realized_pnl ?? 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                              {trade.realized_pnl == null ? '-' : `$${trade.realized_pnl.toFixed(2)}`}
-                            </td>
-                            <td className="px-4 py-3 text-gray-400">{trade.order_id}</td>
-                          </tr>
-                        ))}
+                      <tbody style={{ height: `${tradeRowVirtualizer.getTotalSize()}px`, position: 'relative' }}>
+                        {tradeRowVirtualizer.getVirtualItems().map((virtualRow) => {
+                          const trade = filteredTrades[virtualRow.index];
+                          return (
+                            <tr
+                              key={trade.id}
+                              className="border-b border-gray-700 hover:bg-gray-750"
+                              style={{
+                                position: 'absolute',
+                                top: 0,
+                                left: 0,
+                                width: '100%',
+                                height: `${virtualRow.size}px`,
+                                transform: `translateY(${virtualRow.start}px)`,
+                                display: 'table-row',
+                              }}
+                            >
+                              <td className="px-4 py-3">{formatDateTime(trade.executed_at)}</td>
+                              <td className="px-4 py-3 font-semibold text-white">{trade.symbol}</td>
+                              <td className={`px-4 py-3 ${trade.side === 'buy' ? 'text-green-400' : 'text-yellow-400'}`}>{trade.side.toUpperCase()}</td>
+                              <td className="px-4 py-3">{trade.quantity}</td>
+                              <td className="px-4 py-3">${trade.price.toFixed(2)}</td>
+                              <td className="px-4 py-3">${(trade.commission + trade.fees).toFixed(2)}</td>
+                              <td className={`px-4 py-3 ${(trade.realized_pnl ?? 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                                {trade.realized_pnl == null ? '-' : `$${trade.realized_pnl.toFixed(2)}`}
+                              </td>
+                              <td className="px-4 py-3 text-gray-400">{trade.order_id}</td>
+                            </tr>
+                          );
+                        })}
                       </tbody>
                     </table>
                   </div>

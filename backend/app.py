@@ -1,11 +1,22 @@
 """
 StocksBot FastAPI Backend
 Main application entry point for the sidecar backend.
+
+Production features:
+- Real health check with subsystem status
+- Request correlation IDs for log tracing
+- Structured JSON logging
+- Rate limiting per endpoint
+- Graceful shutdown with in-flight request draining
 """
+import asyncio
 import secrets
+import signal
+import threading
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.gzip import GZipMiddleware
 from starlette.requests import Request
 from starlette.responses import Response, JSONResponse
 import logging
@@ -17,7 +28,15 @@ from api.routes import (
     stop_summary_scheduler,
     start_optimizer_dispatcher,
     stop_optimizer_dispatcher,
+    admin_cancel_all_optimizer_jobs,
 )
+from api.middleware import (
+    correlation_id_middleware,
+    configure_structured_logging,
+    limiter,
+    rate_limit_exceeded_handler,
+)
+from api.health import build_health_response, mark_startup
 from config.settings import get_settings
 from storage.database import init_db, ensure_optimization_runs_schema
 
@@ -26,21 +45,47 @@ SENSITIVE_KEYS = {"api_key", "secret_key", "password", "token", "authorization"}
 AUTH_SKIP_PATHS = {
     "/",
     "/status",
+    "/errors/frontend",
     "/openapi.json",
     "/docs",
     "/docs/oauth2-redirect",
     "/redoc",
 }
 
+# ── Graceful Shutdown State ──────────────────────────────────────────────────
+_shutdown_event = threading.Event()
+_SHUTDOWN_TIMEOUT_SECONDS = 10
+
+
+def _is_shutting_down() -> bool:
+    return _shutdown_event.is_set()
+
+
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
-    """Manage background service lifecycle."""
+    """Manage background service lifecycle with graceful shutdown."""
+    settings = get_settings()
+    configure_structured_logging(settings.log_level)
+    mark_startup()
+    logger.info("StocksBot backend starting up (env=%s)", settings.environment)
+
+    # ── Database init ────────────────────────────────────────────────────
     try:
         init_db()
         ensure_optimization_runs_schema()
+        logger.info("Database initialized successfully")
     except (RuntimeError, ValueError, TypeError):
         logger.exception("Failed to initialize database schema")
         raise
+
+    # ── Startup validation ───────────────────────────────────────────────
+    if settings.environment == "production" and not settings.api_auth_key:
+        logger.warning(
+            "Production environment detected but STOCKSBOT_API_KEY is not set. "
+            "API authentication is disabled."
+        )
+
+    # ── Start background services ────────────────────────────────────────
     try:
         started = start_summary_scheduler()
         if started:
@@ -53,15 +98,48 @@ async def _lifespan(_app: FastAPI):
             logger.info("Optimizer dispatcher started")
     except (RuntimeError, ValueError, TypeError):
         logger.exception("Failed to start optimizer dispatcher")
+
     try:
         yield
     finally:
+        # ── Graceful shutdown sequence ───────────────────────────────────
+        logger.info("Initiating graceful shutdown...")
+        _shutdown_event.set()
+
+        # 1. Stop accepting new optimizer jobs and cancel running ones
+        try:
+            cancel_result = admin_cancel_all_optimizer_jobs(force=True)
+            cancelled_count = cancel_result.get("requested_count", 0)
+            if cancelled_count > 0:
+                logger.info("Cancelled %d active optimizer job(s)", cancelled_count)
+        except Exception:
+            logger.exception("Error cancelling optimizer jobs during shutdown")
+
+        # 2. Stop the strategy runner gracefully
+        try:
+            from api.runner_manager import runner_manager
+            status = runner_manager.get_status()
+            runner_status = str(status.get("status", "stopped")).lower()
+            if runner_status in {"running", "sleeping"}:
+                from storage.database import SessionLocal
+                db = SessionLocal()
+                try:
+                    runner_manager.stop_runner(db=db)
+                    logger.info("Strategy runner stopped gracefully")
+                finally:
+                    db.close()
+        except Exception:
+            logger.exception("Error stopping strategy runner during shutdown")
+
+        # 3. Stop optimizer dispatcher
         try:
             optimizer_stopped = stop_optimizer_dispatcher()
             if optimizer_stopped:
                 logger.info("Optimizer dispatcher stopped")
         except (RuntimeError, ValueError, TypeError):
             logger.exception("Failed to stop optimizer dispatcher")
+
+        # 4. Stop summary scheduler
         try:
             stopped = stop_summary_scheduler()
             if stopped:
@@ -69,13 +147,42 @@ async def _lifespan(_app: FastAPI):
         except (RuntimeError, ValueError, TypeError):
             logger.exception("Failed to stop summary notification scheduler")
 
+        # 5. Allow in-flight requests to drain
+        await asyncio.sleep(0.5)
+        logger.info("Graceful shutdown complete")
+
 
 app = FastAPI(
     title="StocksBot API",
     description="Cross-platform StocksBot backend service",
     version="0.1.0",
     lifespan=_lifespan,
+    openapi_tags=[
+        {"name": "Config", "description": "Application configuration"},
+        {"name": "Broker", "description": "Broker connection and account management"},
+        {"name": "Positions", "description": "Portfolio positions"},
+        {"name": "Orders", "description": "Order creation and management"},
+        {"name": "Notifications", "description": "Notification preferences and delivery"},
+        {"name": "Strategies", "description": "Strategy CRUD and configuration"},
+        {"name": "Audit", "description": "Audit logs and trade history"},
+        {"name": "Runner", "description": "Strategy runner lifecycle"},
+        {"name": "Safety", "description": "Kill switch, panic stop, and safety controls"},
+        {"name": "Maintenance", "description": "Cleanup and data management"},
+        {"name": "Analytics", "description": "Portfolio analytics and metrics"},
+        {"name": "Backtesting", "description": "Strategy backtesting and parameter tuning"},
+        {"name": "Optimizer", "description": "Strategy optimization jobs"},
+        {"name": "Screener", "description": "Market screener and symbol universe"},
+        {"name": "Preferences", "description": "Trading preferences and risk profiles"},
+        {"name": "Budget", "description": "Budget tracking and limits"},
+    ],
 )
+
+# ── Rate Limiter ─────────────────────────────────────────────────────────────
+app.state.limiter = limiter
+app.add_exception_handler(429, rate_limit_exceeded_handler)
+
+# Compress responses >= 500 bytes (applied first, outermost middleware)
+app.add_middleware(GZipMiddleware, minimum_size=500)
 
 # Configure CORS for Tauri frontend
 app.add_middleware(
@@ -129,6 +236,12 @@ def _should_skip_auth(path: str) -> bool:
     return False
 
 
+# ── Correlation ID middleware (outermost - wraps everything) ─────────────────
+@app.middleware("http")
+async def _correlation_id(request: Request, call_next):
+    return await correlation_id_middleware(request, call_next)
+
+
 @app.middleware("http")
 async def api_auth_middleware(request: Request, call_next):
     """
@@ -170,6 +283,20 @@ async def security_logging_middleware(request: Request, call_next):
     return response
 
 
+# ── Shutdown rejection middleware ────────────────────────────────────────────
+@app.middleware("http")
+async def shutdown_rejection_middleware(request: Request, call_next):
+    """Reject new write requests during graceful shutdown."""
+    if _is_shutting_down() and request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+        # Allow health checks and status during shutdown
+        if request.url.path not in {"/", "/status"}:
+            return JSONResponse(
+                status_code=503,
+                content={"detail": "Server is shutting down. Please retry shortly."},
+            )
+    return await call_next(request)
+
+
 @app.get("/")
 async def root():
     """Root endpoint."""
@@ -179,14 +306,41 @@ async def root():
 @app.get("/status")
 async def status():
     """
-    Health check endpoint.
-    Returns the status of the backend service.
+    Production health check endpoint.
+    Reports real subsystem status: database, broker, runner, optimizer, scheduler.
     """
-    return {
-        "status": "running",
-        "service": "StocksBot Backend",
-        "version": "0.1.0"
-    }
+    return build_health_response()
+
+
+# ── Frontend Error Reporting ─────────────────────────────────────────────────
+from pydantic import BaseModel, Field
+from typing import Optional
+
+
+class FrontendErrorReport(BaseModel):
+    """Frontend error report payload."""
+    error: str = Field(..., description="Error message", min_length=1, max_length=2000)
+    component: Optional[str] = Field(None, description="Component name", max_length=200)
+    stack: Optional[str] = Field(None, description="Stack trace", max_length=5000)
+    url: Optional[str] = Field(None, description="Page URL", max_length=500)
+    user_agent: Optional[str] = Field(None, description="Browser user agent", max_length=500)
+
+
+@app.post("/errors/frontend")
+async def report_frontend_error(report: FrontendErrorReport):
+    """
+    Receive and log frontend error reports.
+    Provides a structured way to capture UI crashes.
+    """
+    logger.error(
+        "Frontend error: component=%s error=%s url=%s",
+        report.component or "unknown",
+        report.error[:500],
+        report.url or "unknown",
+    )
+    if report.stack:
+        logger.debug("Frontend stack trace: %s", report.stack[:2000])
+    return {"received": True}
 
 
 # Include API routes

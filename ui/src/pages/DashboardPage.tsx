@@ -1,9 +1,12 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef, lazy, Suspense } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { useVirtualizer } from '@tanstack/react-virtual';
+import { useVisibilityAwareInterval } from '../hooks/useVisibilityAwareInterval';
 import { getBackendStatus, getPositions, getRunnerStatus, startRunner, stopRunner, getDashboardAnalyticsBundle, getTradingPreferences, getScreenerAssets, getSafetyStatus, runPanicStop, getSafetyPreflight } from '../api/backend';
 import { StatusResponse, Position, RunnerState, RunnerStatus, PortfolioAnalytics, PortfolioSummaryResponse, BrokerAccountResponse, TradingPreferences } from '../api/types';
-import EquityCurveChart from '../components/EquityCurveChart';
-import PnLChart from '../components/PnLChart';
+
+const EquityCurveChart = lazy(() => import('../components/EquityCurveChart'));
+const PnLChart = lazy(() => import('../components/PnLChart'));
 import HelpTooltip from '../components/HelpTooltip';
 import PageHeader from '../components/PageHeader';
 import GuidedFlowStrip from '../components/GuidedFlowStrip';
@@ -46,6 +49,8 @@ function DashboardPage() {
   });
   const [killSwitchActive, setKillSwitchActive] = useState(false);
   const [blockedReason, setBlockedReason] = useState<string>('');
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const positionsScrollRef = useRef<HTMLDivElement>(null);
 
   const refreshSafetyPreflight = useCallback(async () => {
     try {
@@ -119,10 +124,15 @@ function DashboardPage() {
   }, []);
 
   const loadData = useCallback(async () => {
+    // Cancel any in-flight request from a previous call
+    abortControllerRef.current?.abort();
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
     try {
       setLoading(true);
       setError(null);
-      
+
       // Fetch status, positions, runner state, and analytics in parallel
       const [statusData, positionsData, runnerData, dashboardBundle, prefsData, safety] = await Promise.all([
         getBackendStatus(),
@@ -133,6 +143,9 @@ function DashboardPage() {
         getSafetyStatus().catch(() => ({ kill_switch_active: false, last_broker_sync_at: null })),
       ]);
       
+      // Skip state updates if this request was superseded or component unmounted
+      if (controller.signal.aborted) return;
+
       setStatus(statusData);
       setPositions(positionsData.positions);
       setPositionsAsOf(positionsData.as_of || null);
@@ -167,36 +180,23 @@ function DashboardPage() {
       void refreshKnownEtfSymbols();
       void refreshSafetyPreflight();
     } catch (err) {
+      if (controller.signal.aborted) return;
       setError(err instanceof Error ? err.message : 'Failed to load data');
     } finally {
-      setLoading(false);
+      if (!controller.signal.aborted) setLoading(false);
     }
   }, [analyticsDays, refreshKnownEtfSymbols, refreshSafetyPreflight]);
 
   useEffect(() => {
     void loadData();
+    return () => {
+      abortControllerRef.current?.abort();
+    };
   }, [loadData]);
 
-  useEffect(() => {
-    const interval = setInterval(() => {
-      void loadRunnerStatus();
-    }, 5000);
-    return () => clearInterval(interval);
-  }, [loadRunnerStatus]);
-
-  useEffect(() => {
-    const interval = setInterval(() => {
-      void refreshSafetyPreflight();
-    }, 30000);
-    return () => clearInterval(interval);
-  }, [refreshSafetyPreflight]);
-
-  useEffect(() => {
-    const interval = setInterval(() => {
-      void refreshPortfolioData();
-    }, 10000);
-    return () => clearInterval(interval);
-  }, [refreshPortfolioData]);
+  useVisibilityAwareInterval(loadRunnerStatus, 5000);
+  useVisibilityAwareInterval(refreshSafetyPreflight, 30000);
+  useVisibilityAwareInterval(refreshPortfolioData, 10000);
 
   const handleStartRunner = async () => {
     try {
@@ -254,6 +254,12 @@ function DashboardPage() {
   const totalPnlPercent = totalCost > 0 ? (totalPnl / totalCost) * 100 : 0;
   const classifySymbol = (symbol: string): 'stock' | 'etf' => (knownEtfSymbols.has(symbol.toUpperCase()) ? 'etf' : 'stock');
   const filteredPositions = positions.filter((pos) => (holdingFilter === 'all' ? true : classifySymbol(pos.symbol) === holdingFilter));
+  const positionRowVirtualizer = useVirtualizer({
+    count: filteredPositions.length,
+    getScrollElement: () => positionsScrollRef.current,
+    estimateSize: () => 48,
+    overscan: 15,
+  });
   const equityCurve = analytics
     ? analytics.equity_curve.map((point) => ({
         timestamp: point.timestamp,
@@ -516,15 +522,19 @@ function DashboardPage() {
                 </div>
               </div>
               <div className="grid grid-cols-1 gap-6">
-                <EquityCurveChart data={equityCurve} initialCapital={initialCapital} />
+                <Suspense fallback={<div className="h-[300px] bg-gray-800 rounded-lg border border-gray-700 animate-pulse" />}>
+                  <EquityCurveChart data={equityCurve} initialCapital={initialCapital} />
+                </Suspense>
                 {analytics && (
-                  <PnLChart
-                    data={analytics.equity_curve.map(point => ({
-                      timestamp: point.timestamp,
-                      pnl: point.trade_pnl,
-                      cumulative_pnl: point.cumulative_pnl
-                    }))}
-                  />
+                  <Suspense fallback={<div className="h-[300px] bg-gray-800 rounded-lg border border-gray-700 animate-pulse" />}>
+                    <PnLChart
+                      data={analytics.equity_curve.map(point => ({
+                        timestamp: point.timestamp,
+                        pnl: point.trade_pnl,
+                        cumulative_pnl: point.cumulative_pnl
+                      }))}
+                    />
+                  </Suspense>
                 )}
               </div>
             </div>
@@ -599,10 +609,10 @@ function DashboardPage() {
             {filteredPositions.length === 0 ? (
               <p className="text-gray-400 text-sm">No positions</p>
             ) : (
-              <div className="overflow-x-auto">
+              <div ref={positionsScrollRef} className="overflow-x-auto max-h-[480px] overflow-y-auto">
                 <table className="w-full">
                   <thead>
-                    <tr className="text-left text-gray-400 text-sm border-b border-gray-700">
+                    <tr className="text-left text-gray-400 text-sm border-b border-gray-700 sticky top-0 bg-gray-800 z-10">
                       <th className="pb-2">Symbol</th>
                       <th className="pb-2">Type</th>
                       <th className="pb-2">Quantity</th>
@@ -614,33 +624,47 @@ function DashboardPage() {
                       <th className="pb-2">P&L %</th>
                     </tr>
                   </thead>
-                  <tbody>
-                    {filteredPositions.map((pos) => {
+                  <tbody style={{ height: `${positionRowVirtualizer.getTotalSize()}px`, position: 'relative' }}>
+                    {positionRowVirtualizer.getVirtualItems().map((virtualRow) => {
+                      const pos = filteredPositions[virtualRow.index];
                       const type = classifySymbol(pos.symbol);
                       const weightPct = totalValue > 0 ? (pos.market_value / totalValue) * 100 : 0;
                       return (
-                      <tr key={pos.symbol} className="text-white border-b border-gray-700/50">
-                        <td className="py-3 font-medium">{pos.symbol}</td>
-                        <td className="py-3 uppercase text-xs text-gray-300">{type}</td>
-                        <td className="py-3">{pos.quantity}</td>
-                        <td className="py-3">${pos.avg_entry_price.toFixed(2)}</td>
-                        <td className="py-3">
-                          {pos.current_price_available === false ? (
-                            <span className="text-amber-300">N/A</span>
-                          ) : (
-                            `$${pos.current_price.toFixed(2)}`
-                          )}
-                        </td>
-                        <td className="py-3">${pos.market_value.toLocaleString(undefined, { maximumFractionDigits: 2 })}</td>
-                        <td className="py-3">{weightPct.toFixed(2)}%</td>
-                        <td className={`py-3 ${pos.unrealized_pnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                          {pos.unrealized_pnl >= 0 ? '+' : ''}${pos.unrealized_pnl.toFixed(2)}
-                        </td>
-                        <td className={`py-3 ${pos.unrealized_pnl_percent >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                          {pos.unrealized_pnl_percent >= 0 ? '+' : ''}{pos.unrealized_pnl_percent.toFixed(2)}%
-                        </td>
-                      </tr>
-                    )})}
+                        <tr
+                          key={pos.symbol}
+                          className="text-white border-b border-gray-700/50"
+                          style={{
+                            position: 'absolute',
+                            top: 0,
+                            left: 0,
+                            width: '100%',
+                            height: `${virtualRow.size}px`,
+                            transform: `translateY(${virtualRow.start}px)`,
+                            display: 'table-row',
+                          }}
+                        >
+                          <td className="py-3 font-medium">{pos.symbol}</td>
+                          <td className="py-3 uppercase text-xs text-gray-300">{type}</td>
+                          <td className="py-3">{pos.quantity}</td>
+                          <td className="py-3">${pos.avg_entry_price.toFixed(2)}</td>
+                          <td className="py-3">
+                            {pos.current_price_available === false ? (
+                              <span className="text-amber-300">N/A</span>
+                            ) : (
+                              `$${pos.current_price.toFixed(2)}`
+                            )}
+                          </td>
+                          <td className="py-3">${pos.market_value.toLocaleString(undefined, { maximumFractionDigits: 2 })}</td>
+                          <td className="py-3">{weightPct.toFixed(2)}%</td>
+                          <td className={`py-3 ${pos.unrealized_pnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                            {pos.unrealized_pnl >= 0 ? '+' : ''}${pos.unrealized_pnl.toFixed(2)}
+                          </td>
+                          <td className={`py-3 ${pos.unrealized_pnl_percent >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                            {pos.unrealized_pnl_percent >= 0 ? '+' : ''}{pos.unrealized_pnl_percent.toFixed(2)}%
+                          </td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>

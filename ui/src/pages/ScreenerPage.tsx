@@ -289,6 +289,7 @@ const ScreenerPage: React.FC = () => {
   const [prefsLoaded, setPrefsLoaded] = useState(false);
   const chartSectionRef = useRef<HTMLDivElement | null>(null);
   const optimizeRequestIdRef = useRef(0);
+  const abortControllerRef = useRef<AbortController | null>(null);
   const chartRequestIdRef = useRef(0);
   const chartCacheRef = useRef(
     new Map<string, { points: ChartPoint[]; indicators: Record<string, number | boolean | null>; fetchedAt: number }>()
@@ -417,6 +418,10 @@ const ScreenerPage: React.FC = () => {
   };
 
   const fetchAssets = useCallback(async () => {
+    abortControllerRef.current?.abort();
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
     setLoading(true);
     setError(null);
     try {
@@ -428,12 +433,13 @@ const ScreenerPage: React.FC = () => {
         dataSource = `${appliedUniverseQuery.asset_type}_preset:${appliedUniverseQuery.preset}:${appliedUniverseQuery.preset_universe_mode}`;
       }
       url = `${url}&page=${currentPage}&page_size=${pageSize}&min_dollar_volume=${appliedUniverseQuery.min_dollar_volume}&max_spread_bps=${appliedUniverseQuery.max_spread_bps}&max_sector_weight_pct=${appliedUniverseQuery.max_sector_weight_pct}&auto_regime_adjust=${appliedUniverseQuery.auto_regime_adjust}`;
-      const response = await authFetch(url);
+      const response = await authFetch(url, { signal: controller.signal });
       if (!response.ok) {
         const body = await response.json().catch(() => null);
         throw new Error(body?.detail || body?.message || `Failed to fetch assets (${response.status})`);
       }
       const data = await response.json();
+      if (controller.signal.aborted) return;
       setAssets(data.assets);
       setTotalAssetCount(data.total_count ?? data.assets?.length ?? 0);
       setTotalPages(data.total_pages ?? 1);
@@ -457,9 +463,10 @@ const ScreenerPage: React.FC = () => {
         setChartData([]);
       }
     } catch (err) {
+      if (controller.signal.aborted) return;
       setError(err instanceof Error ? err.message : 'An error occurred');
     } finally {
-      setLoading(false);
+      if (!controller.signal.aborted) setLoading(false);
     }
   }, [appliedUniverseQuery, currentPage, pageSize]);
 
@@ -869,6 +876,9 @@ const ScreenerPage: React.FC = () => {
   useEffect(() => {
     if (!prefsLoaded) return;
     void fetchAssets();
+    return () => {
+      abortControllerRef.current?.abort();
+    };
   }, [prefsLoaded, fetchAssets]);
 
   useEffect(() => {

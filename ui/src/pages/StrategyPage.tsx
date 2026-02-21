@@ -225,6 +225,51 @@ function isOptimizerStatusTransientError(error: unknown): boolean {
   return false;
 }
 
+function isOptimizerTransientUiError(message: string | null | undefined): boolean {
+  const normalized = String(message || '').toLowerCase();
+  if (!normalized) return false;
+  return (
+    normalized.includes('status temporarily unavailable')
+    || normalized.includes('status check failed')
+    || normalized.includes('reconnecting optimizer status')
+  );
+}
+
+function mergeOptimizerStatusFromHealth(
+  previous: StrategyOptimizationJobStatus | null,
+  healthRow: OptimizerHealthActiveJob,
+  strategyId: string,
+): StrategyOptimizationJobStatus {
+  const normalizedStatusRaw = String(healthRow.status || previous?.status || 'running').toLowerCase();
+  const normalizedStatus = (
+    normalizedStatusRaw === 'queued'
+    || normalizedStatusRaw === 'running'
+    || normalizedStatusRaw === 'completed'
+    || normalizedStatusRaw === 'failed'
+    || normalizedStatusRaw === 'canceled'
+  )
+    ? normalizedStatusRaw
+    : 'running';
+  return {
+    job_id: String(healthRow.job_id || previous?.job_id || ''),
+    strategy_id: strategyId,
+    status: normalizedStatus as StrategyOptimizationJobStatus['status'],
+    progress_pct: Number(healthRow.progress_pct ?? previous?.progress_pct ?? 0),
+    completed_iterations: Number(previous?.completed_iterations ?? 0),
+    total_iterations: Number(previous?.total_iterations ?? 0),
+    elapsed_seconds: Number(healthRow.elapsed_seconds ?? previous?.elapsed_seconds ?? 0),
+    eta_seconds: previous?.eta_seconds ?? null,
+    avg_seconds_per_iteration: previous?.avg_seconds_per_iteration ?? null,
+    message: String(healthRow.message || previous?.message || ''),
+    cancel_requested: Boolean(healthRow.cancel_requested),
+    error: normalizedStatus === 'failed' ? (previous?.error || 'Optimization failed') : null,
+    created_at: String(healthRow.created_at || previous?.created_at || new Date().toISOString()),
+    started_at: healthRow.started_at || previous?.started_at || null,
+    completed_at: previous?.completed_at || null,
+    result: previous?.result || null,
+  };
+}
+
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, fallback: T): Promise<T> {
   return new Promise((resolve) => {
     const timer = setTimeout(() => resolve(fallback), timeoutMs);
@@ -654,6 +699,10 @@ function StrategyPage() {
     applySymbols: boolean;
     strategyId: string;
     expectedConfigVersion: number;
+    recommendedParameters: Record<string, number>;
+    recommendedSymbols: string[];
+    sourceLabel: string;
+    sourceRunId?: string | null;
     parameterChanges: Array<{ name: string; from: number; to: number }>;
     symbolsAdded: string[];
     symbolsRemoved: string[];
@@ -689,6 +738,7 @@ function StrategyPage() {
   const [workspaceUniverseLoading, setWorkspaceUniverseLoading] = useState(false);
   const [prefillMessage, setPrefillMessage] = useState<string>('');
   const [prefillLoading, setPrefillLoading] = useState(false);
+  const abortControllerRef = useRef<AbortController | null>(null);
   const workspaceUniverseCacheRef = useRef<{ key: string; symbols: string[] } | null>(null);
   const runnerSummaryRequestIdRef = useRef(0);
 
@@ -706,6 +756,9 @@ function StrategyPage() {
     loadStrategies();
     loadRunnerStatus(true);
     loadSettingsSummary();
+    return () => {
+      abortControllerRef.current?.abort();
+    };
   }, []);
   /* eslint-enable react-hooks/exhaustive-deps */
 
@@ -785,11 +838,16 @@ function StrategyPage() {
   }, []);
 
   const loadStrategies = async () => {
+    abortControllerRef.current?.abort();
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
     try {
       setLoading(true);
       setError(null);
 
       const response = await getStrategies();
+      if (controller.signal.aborted) return;
       setStrategies(response.strategies);
       void loadRunnerInputSummary(response.strategies);
       const stillSelected = selectedStrategy
@@ -813,9 +871,10 @@ function StrategyPage() {
         }
       }
     } catch (err) {
+      if (controller.signal.aborted) return;
       setError(err instanceof Error ? err.message : 'Failed to load strategies');
     } finally {
-      setLoading(false);
+      if (!controller.signal.aborted) setLoading(false);
     }
   };
 
@@ -1077,9 +1136,15 @@ function StrategyPage() {
           setBacktestResult(status.result.best_result);
           setBacktestCompletedAt(status.completed_at || new Date().toISOString());
         }
-        if (status.status === 'failed') {
-          setOptimizerError(status.error || status.message || 'Optimization failed');
-        }
+        setOptimizerError((prev) => {
+          if (status.status === 'failed') {
+            return status.error || status.message || 'Optimization failed';
+          }
+          if (status.status === 'completed' || status.status === 'canceled') {
+            return null;
+          }
+          return isOptimizerTransientUiError(prev) ? null : prev;
+        });
         if (!isTerminal) {
           timer = setTimeout(() => {
             void poll();
@@ -1102,6 +1167,22 @@ function StrategyPage() {
             ? `Status temporarily unavailable (${message}). Retrying...`
             : `Status check failed (${message}). Retrying...`,
         );
+        if (transient) {
+          try {
+            const health = await getOptimizerHealth();
+            if (!cancelled) {
+              const matchingHealthRow = (health.active_jobs || []).find(
+                (job) => String(job.job_id || '') === optimizerJobId
+                  && String(job.strategy_id || '') === String(selectedStrategy.id),
+              );
+              if (matchingHealthRow) {
+                setOptimizerJobStatus((prev) => mergeOptimizerStatusFromHealth(prev, matchingHealthRow, selectedStrategy.id));
+              }
+            }
+          } catch {
+            // Ignore fallback failures; next poll cycle continues automatically.
+          }
+        }
         setOptimizerLoading(true);
         timer = setTimeout(() => {
           void poll();
@@ -1151,6 +1232,8 @@ function StrategyPage() {
       }
       if (status.status === 'failed') {
         setOptimizerError(status.error || status.message || 'Optimization failed');
+      } else {
+        setOptimizerError((prev) => (isOptimizerTransientUiError(prev) ? null : prev));
       }
       if (isTerminal) {
         clearPersistedOptimizerJobId(strategyId);
@@ -1203,11 +1286,12 @@ function StrategyPage() {
             delete next[strategyId];
             return;
           }
+          const preferredRun = strategyRuns.find((run) => String(run.status || '').toLowerCase() === 'completed') || strategyRuns[0];
           const selectedRunId = next[strategyId];
           if (selectedRunId && strategyRuns.some((run) => run.run_id === selectedRunId)) {
             return;
           }
-          next[strategyId] = strategyRuns[0].run_id;
+          next[strategyId] = preferredRun.run_id;
         });
         Object.keys(next).forEach((strategyId) => {
           if (!strategyScope.includes(strategyId)) {
@@ -1920,14 +2004,14 @@ function StrategyPage() {
       setOptimizerApplyMessage({ type: 'error', text: 'Strategy config is not loaded yet. Refresh and retry.' });
       return;
     }
-    if (!optimizerResult) {
-      setOptimizerApplyMessage({ type: 'error', text: 'No optimizer result available yet. Run optimizer first.' });
+    if (!activeOptimizerRecommendation) {
+      setOptimizerApplyMessage({ type: 'error', text: 'No optimizer recommendation available yet. Run optimizer first or pick a completed history run.' });
       return;
     }
-    if (optimizerResult.strategy_id !== selectedStrategy.id) {
+    if (activeOptimizerRecommendation.strategyId !== selectedStrategy.id) {
       setOptimizerApplyMessage({
         type: 'error',
-        text: 'Selected strategy does not match this optimizer result. Re-run optimizer for the selected strategy.',
+        text: 'Selected strategy does not match this optimizer recommendation. Re-run optimizer for the selected strategy.',
       });
       return;
     }
@@ -1935,7 +2019,7 @@ function StrategyPage() {
       acc[param.name] = Number(param.value);
       return acc;
     }, {} as Record<string, number>);
-    const parameterChanges = Object.entries(optimizerResult.recommended_parameters || {})
+    const parameterChanges = Object.entries(activeOptimizerRecommendation.recommendedParameters || {})
       .map(([name, rawTo]) => {
         const to = Number(rawTo);
         const from = Number(savedParamMap[name] ?? to);
@@ -1945,7 +2029,7 @@ function StrategyPage() {
       .sort((left, right) => left.name.localeCompare(right.name));
 
     const currentSymbols = normalizeSymbols((strategyConfig.symbols || []).join(', '));
-    const recommendedSymbols = normalizeSymbols((optimizerResult.recommended_symbols || []).join(', '));
+    const recommendedSymbols = normalizeSymbols((activeOptimizerRecommendation.recommendedSymbols || []).join(', '));
     const currentSymbolSet = new Set(currentSymbols);
     const recommendedSymbolSet = new Set(recommendedSymbols);
     const symbolsAdded = recommendedSymbols.filter((symbol) => !currentSymbolSet.has(symbol));
@@ -1966,6 +2050,10 @@ function StrategyPage() {
       applySymbols,
       strategyId: selectedStrategy.id,
       expectedConfigVersion: Math.max(1, Number(strategyConfig.config_version || 1)),
+      recommendedParameters: activeOptimizerRecommendation.recommendedParameters,
+      recommendedSymbols,
+      sourceLabel: activeOptimizerRecommendation.sourceLabel,
+      sourceRunId: activeOptimizerRecommendation.sourceRunId ?? null,
       parameterChanges,
       symbolsAdded,
       symbolsRemoved,
@@ -1978,12 +2066,12 @@ function StrategyPage() {
 
   const handleConfirmApplyOptimization = async () => {
     if (!pendingOptimizerApply) return;
-    if (!selectedStrategy || !strategyConfig || !optimizerResult) {
+    if (!selectedStrategy || !strategyConfig) {
       setOptimizerApplyMessage({ type: 'error', text: 'Optimizer apply context is stale. Refresh and retry.' });
       setPendingOptimizerApply(null);
       return;
     }
-    if (selectedStrategy.id !== pendingOptimizerApply.strategyId || optimizerResult.strategy_id !== pendingOptimizerApply.strategyId) {
+    if (selectedStrategy.id !== pendingOptimizerApply.strategyId) {
       setOptimizerApplyMessage({
         type: 'error',
         text: 'Selected strategy changed before apply. Re-open optimizer output and retry.',
@@ -2002,16 +2090,16 @@ function StrategyPage() {
         symbols?: string[];
         expected_config_version?: number;
       } = {
-        parameters: optimizerResult.recommended_parameters,
+        parameters: pendingOptimizerApply.recommendedParameters,
         expected_config_version: pendingOptimizerApply.expectedConfigVersion,
       };
       if (pendingOptimizerApply.applySymbols) {
-        payload.symbols = optimizerResult.recommended_symbols;
+        payload.symbols = pendingOptimizerApply.recommendedSymbols;
       }
       await updateStrategyConfig(selectedStrategy.id, payload);
       await loadStrategyConfig(selectedStrategy.id);
       if (pendingOptimizerApply.applySymbols) {
-        setConfigSymbols(optimizerResult.recommended_symbols.join(', '));
+        setConfigSymbols(pendingOptimizerApply.recommendedSymbols.join(', '));
         setAnalysisUniverseMode('strategy_symbols');
       }
       setPendingOptimizerApply(null);
@@ -2217,6 +2305,63 @@ function StrategyPage() {
       };
     })
     .filter((row) => row.strategy !== null);
+  const selectedStrategyHistoryRun = selectedStrategy
+    ? (compareRows.find((row) => row.strategyId === selectedStrategy.id)?.selectedRun || null)
+    : null;
+  const historyRecommendation = useMemo(() => {
+    if (!selectedStrategy || !selectedStrategyHistoryRun) return null;
+    if (String(selectedStrategyHistoryRun.status || '').toLowerCase() !== 'completed') return null;
+    const recommendedParameters = Object.entries(selectedStrategyHistoryRun.recommended_parameters || {}).reduce((acc, [name, value]) => {
+      const numeric = Number(value);
+      if (Number.isFinite(numeric)) {
+        acc[name] = numeric;
+      }
+      return acc;
+    }, {} as Record<string, number>);
+    const recommendedSymbols = normalizeSymbols((selectedStrategyHistoryRun.recommended_symbols || []).join(', '));
+    if (Object.keys(recommendedParameters).length === 0 && recommendedSymbols.length === 0) {
+      return null;
+    }
+    const metricsSummary = (selectedStrategyHistoryRun.metrics_summary || {}) as Record<string, unknown>;
+    const requestSummary = (selectedStrategyHistoryRun.request_summary || {}) as Record<string, unknown>;
+    return {
+      strategyId: selectedStrategy.id,
+      recommendedParameters,
+      recommendedSymbols,
+      sourceLabel: `History ${selectedStrategyHistoryRun.run_id.slice(0, 12)}...`,
+      sourceRunId: selectedStrategyHistoryRun.run_id,
+      createdAt: selectedStrategyHistoryRun.created_at,
+      objective: readHistoryText(requestSummary, 'objective', 'balanced'),
+      evaluatedIterations: readHistoryOptionalNumber(metricsSummary, 'evaluated_iterations'),
+      requestedIterations: readHistoryOptionalNumber(metricsSummary, 'requested_iterations'),
+      score: readHistoryOptionalNumber(metricsSummary, 'score'),
+      totalReturn: readHistoryOptionalNumber(metricsSummary, 'total_return'),
+      sharpe: readHistoryOptionalNumber(metricsSummary, 'sharpe_ratio'),
+      totalTrades: readHistoryOptionalNumber(metricsSummary, 'total_trades'),
+    };
+  }, [selectedStrategy, selectedStrategyHistoryRun]);
+  const activeOptimizerRecommendation = useMemo(() => {
+    if (selectedStrategy && optimizerResult && optimizerResult.strategy_id === selectedStrategy.id) {
+      const recommendedParameters = Object.entries(optimizerResult.recommended_parameters || {}).reduce((acc, [name, value]) => {
+        const numeric = Number(value);
+        if (Number.isFinite(numeric)) {
+          acc[name] = numeric;
+        }
+        return acc;
+      }, {} as Record<string, number>);
+      return {
+        strategyId: selectedStrategy.id,
+        recommendedParameters,
+        recommendedSymbols: normalizeSymbols((optimizerResult.recommended_symbols || []).join(', ')),
+        sourceLabel: 'Current optimizer output',
+        sourceRunId: null as string | null,
+      };
+    }
+    if (optimizerLoading) {
+      return null;
+    }
+    return historyRecommendation;
+  }, [selectedStrategy, optimizerResult, historyRecommendation, optimizerLoading]);
   const isDenseMode = densityMode === 'dense';
   const compareMetricRows = useMemo(() => (
     compareRows.map((row) => {
@@ -3576,6 +3721,111 @@ function StrategyPage() {
                         )}
                       </div>
                     )}
+                    {!optimizerResult && !optimizerLoading && historyRecommendation && (
+                      <div className="space-y-3 rounded border border-indigo-700/60 bg-indigo-950/20 p-3">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <p className="text-xs font-semibold text-indigo-100">Restored Last Completed Optimization</p>
+                          <span className="rounded bg-indigo-900/60 px-2 py-1 text-[11px] text-indigo-200">
+                            {historyRecommendation.sourceLabel}
+                          </span>
+                        </div>
+                        <p className="text-[11px] text-indigo-200/90">
+                          Completed at {formatLocalDateTime(historyRecommendation.createdAt)}.
+                          {' '}
+                          These recommendations are loaded from persisted optimizer history for this strategy.
+                        </p>
+                        <div className="grid grid-cols-2 md:grid-cols-5 gap-2 text-xs">
+                          <div className="rounded bg-gray-800 px-3 py-2">
+                            <div className="text-gray-400">Score</div>
+                            <div className="font-semibold text-white">
+                              {historyRecommendation.score == null ? 'n/a' : historyRecommendation.score.toFixed(3)}
+                            </div>
+                          </div>
+                          <div className="rounded bg-gray-800 px-3 py-2">
+                            <div className="text-gray-400">Return</div>
+                            <div className={`font-semibold ${
+                              (historyRecommendation.totalReturn ?? 0) >= 0 ? 'text-green-400' : 'text-red-400'
+                            }`}>
+                              {historyRecommendation.totalReturn == null ? 'n/a' : `${historyRecommendation.totalReturn.toFixed(2)}%`}
+                            </div>
+                          </div>
+                          <div className="rounded bg-gray-800 px-3 py-2">
+                            <div className="text-gray-400">Sharpe</div>
+                            <div className="font-semibold text-white">
+                              {historyRecommendation.sharpe == null ? 'n/a' : historyRecommendation.sharpe.toFixed(2)}
+                            </div>
+                          </div>
+                          <div className="rounded bg-gray-800 px-3 py-2">
+                            <div className="text-gray-400">Trades</div>
+                            <div className="font-semibold text-white">
+                              {historyRecommendation.totalTrades == null ? 'n/a' : Math.round(historyRecommendation.totalTrades)}
+                            </div>
+                          </div>
+                          <div className="rounded bg-gray-800 px-3 py-2">
+                            <div className="text-gray-400">Universe</div>
+                            <div className="font-semibold text-white">{historyRecommendation.recommendedSymbols.length} symbols</div>
+                          </div>
+                        </div>
+                        <p className="text-xs text-indigo-100">
+                          Objective: {historyRecommendation.objective.replace(/_/g, ' ')}.
+                          {' '}
+                          Evaluated {historyRecommendation.evaluatedIterations ?? 'n/a'}
+                          /
+                          {historyRecommendation.requestedIterations ?? 'n/a'}
+                          {' '}candidates.
+                        </p>
+                        <div className="max-h-40 overflow-auto rounded border border-gray-700">
+                          <table className="w-full text-xs text-gray-300">
+                            <thead className="bg-gray-900 text-gray-400">
+                              <tr>
+                                <th className="text-left px-2 py-1">Parameter</th>
+                                <th className="text-right px-2 py-1">Recommended</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {Object.entries(historyRecommendation.recommendedParameters).map(([name, value]) => (
+                                <tr key={`restored-opt-param-${name}`} className="border-t border-gray-800">
+                                  <td className="px-2 py-1">{name}</td>
+                                  <td className="px-2 py-1 text-right font-mono">{Number(value).toFixed(4)}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                        <p className="text-xs text-gray-400">
+                          Symbols: {historyRecommendation.recommendedSymbols.join(', ')}
+                        </p>
+                        <div className="flex flex-wrap gap-2">
+                          <button
+                            onClick={() => handleApplyOptimization(false)}
+                            disabled={optimizerApplyLoading}
+                            className="px-3 py-2 rounded text-xs font-medium bg-blue-600 hover:bg-blue-700 text-white"
+                          >
+                            {optimizerApplyLoading ? 'Applying...' : 'Apply Parameters'}
+                          </button>
+                          <button
+                            onClick={() => handleApplyOptimization(true)}
+                            disabled={optimizerApplyLoading}
+                            className="px-3 py-2 rounded text-xs font-medium bg-green-600 hover:bg-green-700 text-white"
+                          >
+                            {optimizerApplyLoading ? 'Applying...' : 'Apply Parameters + Symbols'}
+                          </button>
+                        </div>
+                        {optimizerApplyMessage && (
+                          <p
+                            className={`text-xs ${
+                              optimizerApplyMessage.type === 'success'
+                                ? 'text-emerald-300'
+                                : optimizerApplyMessage.type === 'error'
+                                  ? 'text-red-300'
+                                  : 'text-blue-200'
+                            }`}
+                          >
+                            {optimizerApplyMessage.text}
+                          </p>
+                        )}
+                      </div>
+                    )}
                   </div>
                   <div className="mb-4 rounded border border-gray-700 bg-gray-900/40 p-4">
                     <div className="flex items-center justify-between gap-3 mb-3">
@@ -4136,6 +4386,14 @@ function StrategyPage() {
                 <div className="text-gray-300">
                   Strategy ID: <span className="font-mono">{pendingOptimizerApply.strategyId}</span>
                 </div>
+                <div className="text-gray-300">
+                  Source: <span className="font-semibold">{pendingOptimizerApply.sourceLabel}</span>
+                </div>
+                {pendingOptimizerApply.sourceRunId && (
+                  <div className="text-gray-300">
+                    Run ID: <span className="font-mono">{pendingOptimizerApply.sourceRunId}</span>
+                  </div>
+                )}
                 <div className="text-gray-300">
                   Expected Config Version: <span className="font-semibold">{pendingOptimizerApply.expectedConfigVersion}</span>
                 </div>

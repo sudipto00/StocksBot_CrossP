@@ -1,7 +1,18 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { NavLink, useNavigate } from 'react-router-dom';
 import { getSystemHealthSnapshot } from '../api/backend';
 import { RunnerStatus } from '../api/types';
+
+// Map route paths to their lazy import functions for prefetching on hover
+const routePrefetchMap: Record<string, () => Promise<unknown>> = {
+  '/': () => import('../pages/DashboardPage'),
+  '/dashboard': () => import('../pages/DashboardPage'),
+  '/screener': () => import('../pages/ScreenerPage'),
+  '/strategy': () => import('../pages/StrategyPage'),
+  '/audit': () => import('../pages/AuditPage'),
+  '/settings': () => import('../pages/SettingsPage'),
+  '/help': () => import('../pages/HelpPage'),
+};
 
 /**
  * Sidebar navigation component.
@@ -22,6 +33,16 @@ function Sidebar() {
         ? 'bg-blue-600 text-white'
         : 'text-gray-300 hover:bg-gray-700 hover:text-white'
     }`;
+
+  const prefetchedRef = useRef(new Set<string>());
+  const prefetchRoute = useCallback((path: string) => {
+    if (prefetchedRef.current.has(path)) return;
+    const loader = routePrefetchMap[path];
+    if (loader) {
+      prefetchedRef.current.add(path);
+      void loader();
+    }
+  }, []);
 
   const healthColor =
     runnerLabel === RunnerStatus.RUNNING
@@ -80,34 +101,34 @@ function Sidebar() {
       {/* Navigation */}
       <nav className="flex-1 p-4 space-y-2">
         <p className="px-2 text-[11px] uppercase tracking-wide text-gray-500">Workspace</p>
-        <NavLink to="/" className={navLinkClass} end>
+        <NavLink to="/" className={navLinkClass} end onMouseEnter={() => prefetchRoute('/')}>
           <span className="mr-3">📊</span>
           Dashboard
         </NavLink>
 
-        <NavLink to="/screener" className={navLinkClass}>
+        <NavLink to="/screener" className={navLinkClass} onMouseEnter={() => prefetchRoute('/screener')}>
           <span className="mr-3">🔍</span>
           Screener
         </NavLink>
 
-        <NavLink to="/strategy" className={navLinkClass}>
+        <NavLink to="/strategy" className={navLinkClass} onMouseEnter={() => prefetchRoute('/strategy')}>
           <span className="mr-3">⚙️</span>
           Strategy
         </NavLink>
 
         <p className="px-2 pt-3 text-[11px] uppercase tracking-wide text-gray-500">Operations</p>
-        
-        <NavLink to="/audit" className={navLinkClass}>
+
+        <NavLink to="/audit" className={navLinkClass} onMouseEnter={() => prefetchRoute('/audit')}>
           <span className="mr-3">📋</span>
           Audit
         </NavLink>
-        
-        <NavLink to="/settings" className={navLinkClass}>
+
+        <NavLink to="/settings" className={navLinkClass} onMouseEnter={() => prefetchRoute('/settings')}>
           <span className="mr-3">🔧</span>
           Settings
         </NavLink>
 
-        <NavLink to="/help" className={navLinkClass}>
+        <NavLink to="/help" className={navLinkClass} onMouseEnter={() => prefetchRoute('/help')}>
           <span className="mr-3">❓</span>
           Help
         </NavLink>

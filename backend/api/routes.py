@@ -18,7 +18,7 @@ import signal
 import subprocess
 import sys
 from pathlib import Path
-from fastapi import APIRouter, HTTPException, Depends, Query, Header, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, HTTPException, Depends, Query, Header, WebSocket, WebSocketDisconnect, Request
 from typing import List, Optional, Dict, Any
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
@@ -113,6 +113,7 @@ from .models import (
     TradingPreferencesResponse,
 )
 from .runner_manager import runner_manager
+from .middleware import limiter
 from services.strategy_analytics import StrategyAnalyticsService
 from services.strategy_optimizer import (
     StrategyOptimizerService,
@@ -3036,7 +3037,7 @@ def stop_summary_scheduler() -> bool:
         return True
 
 
-@router.get("/config", response_model=ConfigResponse)
+@router.get("/config", response_model=ConfigResponse, tags=["Config"])
 async def get_config(db: Session = Depends(get_db)):
     """
     Get current configuration.
@@ -3048,7 +3049,7 @@ async def get_config(db: Session = Depends(get_db)):
     return config
 
 
-@router.post("/config", response_model=ConfigResponse)
+@router.post("/config", response_model=ConfigResponse, tags=["Config"])
 async def update_config(
     request: ConfigUpdateRequest,
     db: Session = Depends(get_db),
@@ -3126,7 +3127,7 @@ async def update_config(
     return config
 
 
-@router.get("/broker/credentials/status", response_model=BrokerCredentialsStatusResponse)
+@router.get("/broker/credentials/status", response_model=BrokerCredentialsStatusResponse, tags=["Broker"])
 async def get_broker_credentials_status():
     """
     Get status of runtime broker credentials loaded from desktop keychain.
@@ -3147,18 +3148,19 @@ async def get_broker_credentials_status():
     )
 
 
-@router.post("/broker/credentials", response_model=BrokerCredentialsStatusResponse)
-async def set_broker_credentials(request: BrokerCredentialsRequest):
+@router.post("/broker/credentials", response_model=BrokerCredentialsStatusResponse, tags=["Broker"])
+@limiter.limit("10/minute")
+async def set_broker_credentials(request: Request, cred_request: BrokerCredentialsRequest):
     """
     Set runtime Alpaca credentials from desktop keychain flow.
     Credentials are held in-memory only and never persisted to DB.
     """
-    mode = request.mode.strip().lower()
+    mode = cred_request.mode.strip().lower()
     if mode not in ("paper", "live"):
         raise HTTPException(status_code=400, detail="Mode must be 'paper' or 'live'")
 
-    api_key = request.api_key.strip()
-    secret_key = request.secret_key.strip()
+    api_key = cred_request.api_key.strip()
+    secret_key = cred_request.secret_key.strip()
     if len(api_key) < 8 or len(secret_key) < 8:
         raise HTTPException(status_code=400, detail="API key and secret key appear too short")
     if len(api_key) > 512 or len(secret_key) > 512:
@@ -3174,7 +3176,7 @@ async def set_broker_credentials(request: BrokerCredentialsRequest):
     return await get_broker_credentials_status()
 
 
-@router.get("/broker/account", response_model=BrokerAccountResponse)
+@router.get("/broker/account", response_model=BrokerAccountResponse, tags=["Broker"])
 async def get_broker_account(db: Session = Depends(get_db)):
     """
     Get active broker account balances (cash/equity/buying power).
@@ -3254,7 +3256,7 @@ async def get_broker_account(db: Session = Depends(get_db)):
 # Positions Endpoints
 # ============================================================================
 
-@router.get("/positions", response_model=PositionsResponse)
+@router.get("/positions", response_model=PositionsResponse, tags=["Positions"])
 async def get_positions(db: Session = Depends(get_db)):
     """
     Get current positions from broker, with local fallback if broker is unavailable.
@@ -3359,7 +3361,7 @@ async def get_positions(db: Session = Depends(get_db)):
 # Orders Endpoints
 # ============================================================================
 
-@router.get("/orders", response_model=OrdersResponse)
+@router.get("/orders", response_model=OrdersResponse, tags=["Orders"])
 async def get_orders(db: Session = Depends(get_db)):
     """
     Get recent orders from local storage and enrich with broker state when available.
@@ -3399,9 +3401,11 @@ async def get_orders(db: Session = Depends(get_db)):
     return OrdersResponse(orders=orders, total_count=len(orders))
 
 
-@router.post("/orders", response_model=Order)
+@router.post("/orders", response_model=Order, tags=["Orders"])
+@limiter.limit("30/minute")
 async def create_order(
-    request: OrderRequest,
+    request: Request,
+    order_request: OrderRequest,
     execution_service: OrderExecutionService = Depends(get_order_execution_service)
 ):
     """
@@ -3432,17 +3436,17 @@ async def create_order(
         except Exception:
             pass
 
-        block_reason = _execution_block_reason(request.symbol, execution_service.broker)
+        block_reason = _execution_block_reason(order_request.symbol, execution_service.broker)
         if block_reason:
             raise HTTPException(status_code=409, detail=block_reason)
 
         # Execute order
         order = execution_service.submit_order(
-            symbol=request.symbol,
-            side=request.side.value,
-            order_type=request.type.value,
-            quantity=request.quantity,
-            price=request.price
+            symbol=order_request.symbol,
+            side=order_request.side.value,
+            order_type=order_request.type.value,
+            quantity=order_request.quantity,
+            price=order_request.price
         )
         
         # Map to response model
@@ -3472,7 +3476,7 @@ async def create_order(
 # Notifications Endpoints
 # ============================================================================
 
-@router.post("/notifications", response_model=NotificationResponse)
+@router.post("/notifications", response_model=NotificationResponse, tags=["Notifications"])
 async def request_notification(request: NotificationRequest, db: Session = Depends(get_db)):
     """
     Request a notification to be sent to the user.
@@ -3533,14 +3537,14 @@ async def request_notification(request: NotificationRequest, db: Session = Depen
     return NotificationResponse(success=True, message=delivery_result)
 
 
-@router.get("/notifications/summary/preferences", response_model=SummaryNotificationPreferencesResponse)
+@router.get("/notifications/summary/preferences", response_model=SummaryNotificationPreferencesResponse, tags=["Notifications"])
 async def get_summary_notification_preferences(db: Session = Depends(get_db)):
     """Get daily/weekly summary notification preferences."""
     storage = StorageService(db)
     return _load_summary_notification_preferences(storage)
 
 
-@router.post("/notifications/summary/preferences", response_model=SummaryNotificationPreferencesResponse)
+@router.post("/notifications/summary/preferences", response_model=SummaryNotificationPreferencesResponse, tags=["Notifications"])
 async def update_summary_notification_preferences(
     request: SummaryNotificationPreferencesRequest,
     db: Session = Depends(get_db),
@@ -3577,7 +3581,7 @@ async def update_summary_notification_preferences(
     return current
 
 
-@router.post("/notifications/summary/send-now", response_model=NotificationResponse)
+@router.post("/notifications/summary/send-now", response_model=NotificationResponse, tags=["Notifications"])
 async def send_summary_notification_now(db: Session = Depends(get_db)):
     """
     Generate and deliver a summary notification immediately.
@@ -3617,7 +3621,7 @@ async def send_summary_notification_now(db: Session = Depends(get_db)):
 # Strategy Endpoints
 # ============================================================================
 
-@router.get("/strategies", response_model=StrategiesResponse)
+@router.get("/strategies", response_model=StrategiesResponse, tags=["Strategies"])
 async def get_strategies(db: Session = Depends(get_db)):
     """
     Get all strategies from database.
@@ -3643,7 +3647,7 @@ async def get_strategies(db: Session = Depends(get_db)):
     )
 
 
-@router.post("/strategies", response_model=Strategy)
+@router.post("/strategies", response_model=Strategy, tags=["Strategies"])
 async def create_strategy(request: StrategyCreateRequest, db: Session = Depends(get_db)):
     """
     Create a new strategy and persist to database.
@@ -3679,7 +3683,7 @@ async def create_strategy(request: StrategyCreateRequest, db: Session = Depends(
     )
 
 
-@router.get("/strategies/{strategy_id}", response_model=Strategy)
+@router.get("/strategies/{strategy_id}", response_model=Strategy, tags=["Strategies"])
 async def get_strategy(strategy_id: str, db: Session = Depends(get_db)):
     """
     Get a specific strategy by ID from database.
@@ -3706,7 +3710,7 @@ async def get_strategy(strategy_id: str, db: Session = Depends(get_db)):
     )
 
 
-@router.put("/strategies/{strategy_id}", response_model=Strategy)
+@router.put("/strategies/{strategy_id}", response_model=Strategy, tags=["Strategies"])
 async def update_strategy(strategy_id: str, request: StrategyUpdateRequest, db: Session = Depends(get_db)):
     """
     Update a strategy in the database.
@@ -3764,7 +3768,7 @@ async def update_strategy(strategy_id: str, request: StrategyUpdateRequest, db: 
     )
 
 
-@router.delete("/strategies/{strategy_id}")
+@router.delete("/strategies/{strategy_id}", tags=["Strategies"])
 async def delete_strategy(strategy_id: str, db: Session = Depends(get_db)):
     """
     Delete a strategy from the database.
@@ -3806,7 +3810,7 @@ async def delete_strategy(strategy_id: str, db: Session = Depends(get_db)):
 # Audit Log Endpoints
 # ============================================================================
 
-@router.get("/audit/logs", response_model=AuditLogsResponse)
+@router.get("/audit/logs", response_model=AuditLogsResponse, tags=["Audit"])
 async def get_audit_logs(
     limit: int = Query(default=100, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
@@ -3841,7 +3845,7 @@ async def get_audit_logs(
     )
 
 
-@router.get("/audit/trades", response_model=TradeHistoryResponse)
+@router.get("/audit/trades", response_model=TradeHistoryResponse, tags=["Audit"])
 async def get_audit_trades(
     limit: int = Query(default=1000, ge=1, le=10000),
     offset: int = Query(default=0, ge=0),
@@ -3881,7 +3885,7 @@ async def get_audit_trades(
 # Strategy Runner Endpoints
 # ============================================================================
 
-@router.get("/runner/status", response_model=RunnerStatusResponse)
+@router.get("/runner/status", response_model=RunnerStatusResponse, tags=["Runner"])
 async def get_runner_status():
     """
     Get strategy runner status.
@@ -3891,7 +3895,7 @@ async def get_runner_status():
     return RunnerStatusResponse(**status)
 
 
-@router.get("/runner/preflight")
+@router.get("/runner/preflight", tags=["Runner"])
 async def get_runner_preflight(db: Session = Depends(get_db)):
     """
     Validate active strategies against live execution constraints before runner start.
@@ -4080,7 +4084,7 @@ async def get_runner_preflight(db: Session = Depends(get_db)):
     }
 
 
-@router.get("/maintenance/storage")
+@router.get("/maintenance/storage", tags=["Maintenance"])
 async def get_storage_settings():
     """Get configured log/audit storage paths and a quick file inventory."""
     config = _get_config_snapshot()
@@ -4110,16 +4114,19 @@ async def get_storage_settings():
     }
 
 
-@router.post("/maintenance/cleanup")
-async def run_maintenance_cleanup(db: Session = Depends(get_db)):
+@router.post("/maintenance/cleanup", tags=["Maintenance"])
+@limiter.limit("5/minute")
+async def run_maintenance_cleanup(request: Request, db: Session = Depends(get_db)):
     """Run immediate retention cleanup based on configured periods."""
     storage = StorageService(db)
     result = _run_housekeeping(storage, force=True)
     return {"success": True, **result}
 
 
-@router.post("/maintenance/reset-audit-data")
+@router.post("/maintenance/reset-audit-data", tags=["Maintenance"])
+@limiter.limit("3/minute")
 async def reset_audit_data(
+    request: Request,
     clear_event_logs: bool = Query(default=True),
     clear_trade_history: bool = Query(default=True),
     clear_log_files: bool = Query(default=True),
@@ -4175,7 +4182,7 @@ async def reset_audit_data(
     }
 
 
-@router.get("/safety/status")
+@router.get("/safety/status", tags=["Safety"])
 async def get_safety_status(db: Session = Depends(get_db)):
     """Get trading safety controls status."""
     storage = StorageService(db)
@@ -4187,7 +4194,7 @@ async def get_safety_status(db: Session = Depends(get_db)):
     }
 
 
-@router.get("/safety/preflight")
+@router.get("/safety/preflight", tags=["Safety"])
 async def safety_preflight(symbol: str, db: Session = Depends(get_db)):
     """Return execution block reason for a candidate symbol."""
     storage = StorageService(db)
@@ -4209,8 +4216,10 @@ async def safety_preflight(symbol: str, db: Session = Depends(get_db)):
     return {"allowed": reason is None, "reason": reason or ""}
 
 
-@router.post("/safety/kill-switch")
+@router.post("/safety/kill-switch", tags=["Safety"])
+@limiter.limit("10/minute")
 async def set_safety_kill_switch(
+    request: Request,
     active: bool,
     db: Session = Depends(get_db),
     x_idempotency_key: Optional[str] = Header(default=None),
@@ -4232,8 +4241,10 @@ async def set_safety_kill_switch(
     return payload
 
 
-@router.post("/safety/panic-stop", response_model=RunnerActionResponse)
+@router.post("/safety/panic-stop", response_model=RunnerActionResponse, tags=["Safety"])
+@limiter.limit("5/minute")
 async def panic_stop(
+    request: Request,
     db: Session = Depends(get_db),
     x_idempotency_key: Optional[str] = Header(default=None),
 ):
@@ -4263,7 +4274,7 @@ async def panic_stop(
     return RunnerActionResponse(**payload)
 
 
-@router.post("/reconciliation/run")
+@router.post("/reconciliation/run", tags=["Runner"])
 async def run_reconciliation(db: Session = Depends(get_db)):
     """Run manual reconciliation against broker state."""
     storage = StorageService(db)
@@ -4272,7 +4283,7 @@ async def run_reconciliation(db: Session = Depends(get_db)):
     return {"success": True, **result}
 
 
-@router.post("/auth/ws-ticket", response_model=WebSocketAuthTicketResponse)
+@router.post("/auth/ws-ticket", response_model=WebSocketAuthTicketResponse, tags=["Runner"])
 async def create_ws_auth_ticket():
     """Issue one-time websocket auth ticket for browser clients."""
     if not _is_api_auth_required():
@@ -4327,9 +4338,11 @@ async def ws_system_health(websocket: WebSocket):
         return
 
 
-@router.post("/runner/start", response_model=RunnerActionResponse)
+@router.post("/runner/start", response_model=RunnerActionResponse, tags=["Runner"])
+@limiter.limit("10/minute")
 async def start_runner(
-    request: Optional[RunnerStartRequest] = None,
+    request: Request,
+    start_request: Optional[RunnerStartRequest] = None,
     db: Session = Depends(get_db),
     x_idempotency_key: Optional[str] = Header(default=None),
 ):
@@ -4382,8 +4395,8 @@ async def start_runner(
             ),
         )
     symbol_universe_overrides: Dict[str, List[str]] = {}
-    if request is not None and bool(request.use_workspace_universe):
-        target_strategy_id = str(request.target_strategy_id or "").strip()
+    if start_request is not None and bool(start_request.use_workspace_universe):
+        target_strategy_id = str(start_request.target_strategy_id or "").strip()
         if not target_strategy_id:
             raise HTTPException(
                 status_code=400,
@@ -4417,17 +4430,17 @@ async def start_runner(
             end_date=today,
             initial_capital=synthetic_initial_capital,
             use_workspace_universe=True,
-            asset_type=request.asset_type,
-            screener_mode=request.screener_mode,
-            stock_preset=request.stock_preset,
-            etf_preset=request.etf_preset,
-            screener_limit=request.screener_limit,
-            seed_only=request.seed_only,
-            preset_universe_mode=request.preset_universe_mode,
-            min_dollar_volume=request.min_dollar_volume,
-            max_spread_bps=request.max_spread_bps,
-            max_sector_weight_pct=request.max_sector_weight_pct,
-            auto_regime_adjust=request.auto_regime_adjust,
+            asset_type=start_request.asset_type,
+            screener_mode=start_request.screener_mode,
+            stock_preset=start_request.stock_preset,
+            etf_preset=start_request.etf_preset,
+            screener_limit=start_request.screener_limit,
+            seed_only=start_request.seed_only,
+            preset_universe_mode=start_request.preset_universe_mode,
+            min_dollar_volume=start_request.min_dollar_volume,
+            max_spread_bps=start_request.max_spread_bps,
+            max_sector_weight_pct=start_request.max_sector_weight_pct,
+            auto_regime_adjust=start_request.auto_regime_adjust,
         )
         screener = MarketScreener(
             alpaca_client=alpaca_creds,
@@ -4465,8 +4478,10 @@ async def start_runner(
     return RunnerActionResponse(**result)
 
 
-@router.post("/runner/stop", response_model=RunnerActionResponse)
+@router.post("/runner/stop", response_model=RunnerActionResponse, tags=["Runner"])
+@limiter.limit("10/minute")
 async def stop_runner(
+    request: Request,
     db: Session = Depends(get_db),
     x_idempotency_key: Optional[str] = Header(default=None),
 ):
@@ -4483,8 +4498,9 @@ async def stop_runner(
     return RunnerActionResponse(**result)
 
 
-@router.post("/portfolio/selloff", response_model=RunnerActionResponse)
-async def selloff_all_positions(x_idempotency_key: Optional[str] = Header(default=None)):
+@router.post("/portfolio/selloff", response_model=RunnerActionResponse, tags=["Safety"])
+@limiter.limit("5/minute")
+async def selloff_all_positions(request: Request, x_idempotency_key: Optional[str] = Header(default=None)):
     """
     Explicitly liquidate all open positions.
     This is opt-in and not triggered automatically on strategy switches.
@@ -4529,7 +4545,7 @@ async def selloff_all_positions(x_idempotency_key: Optional[str] = Header(defaul
 # Portfolio Analytics Endpoints
 # ============================================================================
 
-@router.get("/analytics/portfolio")
+@router.get("/analytics/portfolio", tags=["Analytics"])
 async def get_portfolio_analytics(
     days: Optional[int] = Query(default=None, ge=1, le=3650),
     db: Session = Depends(get_db)
@@ -4677,7 +4693,7 @@ async def get_portfolio_analytics(
     return payload
 
 
-@router.get("/analytics/summary")
+@router.get("/analytics/summary", tags=["Analytics"])
 async def get_portfolio_summary(db: Session = Depends(get_db)):
     """
     Get portfolio summary statistics.
@@ -4735,7 +4751,7 @@ async def get_portfolio_summary(db: Session = Depends(get_db)):
     return payload
 
 
-@router.get("/analytics/dashboard")
+@router.get("/analytics/dashboard", tags=["Analytics"])
 async def get_dashboard_analytics_bundle(
     days: Optional[int] = Query(default=None, ge=1, le=3650),
     db: Session = Depends(get_db),
@@ -5400,7 +5416,7 @@ def _compute_strategy_optimization_response(
     return response
 
 
-@router.get("/strategies/{strategy_id}/config", response_model=StrategyConfigResponse)
+@router.get("/strategies/{strategy_id}/config", response_model=StrategyConfigResponse, tags=["Strategies"])
 async def get_strategy_config(strategy_id: str, db: Session = Depends(get_db)):
     """
     Get detailed configuration for a specific strategy.
@@ -5452,7 +5468,7 @@ async def get_strategy_config(strategy_id: str, db: Session = Depends(get_db)):
     )
 
 
-@router.put("/strategies/{strategy_id}/config", response_model=StrategyConfigResponse)
+@router.put("/strategies/{strategy_id}/config", response_model=StrategyConfigResponse, tags=["Strategies"])
 async def update_strategy_config(
     strategy_id: str,
     request: StrategyConfigUpdateRequest,
@@ -5564,7 +5580,7 @@ async def update_strategy_config(
 # Strategy Metrics Endpoints
 # ============================================================================
 
-@router.get("/strategies/{strategy_id}/metrics", response_model=StrategyMetricsResponse)
+@router.get("/strategies/{strategy_id}/metrics", response_model=StrategyMetricsResponse, tags=["Analytics"])
 async def get_strategy_metrics(strategy_id: str, db: Session = Depends(get_db)):
     """
     Get real-time performance metrics for a strategy.
@@ -5602,7 +5618,7 @@ async def get_strategy_metrics(strategy_id: str, db: Session = Depends(get_db)):
 # Strategy Backtesting Endpoints
 # ============================================================================
 
-@router.post("/strategies/{strategy_id}/backtest", response_model=BacktestResponse)
+@router.post("/strategies/{strategy_id}/backtest", response_model=BacktestResponse, tags=["Backtesting"])
 async def run_strategy_backtest(
     strategy_id: str,
     request: BacktestRequest,
@@ -5687,7 +5703,7 @@ async def run_strategy_backtest(
     return _to_backtest_response(result)
 
 
-@router.post("/strategies/{strategy_id}/optimize", response_model=StrategyOptimizationResponse)
+@router.post("/strategies/{strategy_id}/optimize", response_model=StrategyOptimizationResponse, tags=["Backtesting"])
 async def optimize_strategy_configuration(
     strategy_id: str,
     request: StrategyOptimizationRequest,
@@ -5949,7 +5965,7 @@ def _run_optimizer_job(job_id: str) -> None:
         db.close()
 
 
-@router.post("/strategies/{strategy_id}/optimize/start", response_model=StrategyOptimizationJobStartResponse)
+@router.post("/strategies/{strategy_id}/optimize/start", response_model=StrategyOptimizationJobStartResponse, tags=["Backtesting"])
 async def start_strategy_optimization_job(
     strategy_id: str,
     request: StrategyOptimizationRequest,
@@ -6015,7 +6031,7 @@ async def start_strategy_optimization_job(
     )
 
 
-@router.get("/strategies/{strategy_id}/optimize/{job_id}", response_model=StrategyOptimizationJobStatusResponse)
+@router.get("/strategies/{strategy_id}/optimize/{job_id}", response_model=StrategyOptimizationJobStatusResponse, tags=["Backtesting"])
 async def get_strategy_optimization_job_status(strategy_id: str, job_id: str):
     """Fetch current async optimizer job status."""
     row = _optimizer_get_job(job_id)
@@ -6024,7 +6040,7 @@ async def get_strategy_optimization_job_status(strategy_id: str, job_id: str):
     return _optimizer_progress_snapshot(row)
 
 
-@router.post("/strategies/{strategy_id}/optimize/{job_id}/cancel", response_model=StrategyOptimizationJobCancelResponse)
+@router.post("/strategies/{strategy_id}/optimize/{job_id}/cancel", response_model=StrategyOptimizationJobCancelResponse, tags=["Backtesting"])
 async def cancel_strategy_optimization_job(
     strategy_id: str,
     job_id: str,
@@ -6059,7 +6075,7 @@ async def cancel_strategy_optimization_job(
     )
 
 
-@router.get("/optimizer/jobs")
+@router.get("/optimizer/jobs", tags=["Optimizer"])
 async def list_optimizer_jobs(
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
@@ -6131,7 +6147,7 @@ async def list_optimizer_jobs(
     }
 
 
-@router.get("/optimizer/health")
+@router.get("/optimizer/health", tags=["Optimizer"])
 async def optimizer_health_snapshot(db: Session = Depends(get_db)):
     """
     Operational snapshot for optimizer subsystem health and queue pressure.
@@ -6259,19 +6275,19 @@ def admin_cancel_all_optimizer_jobs(*, force: bool = False) -> Dict[str, Any]:
     }
 
 
-@router.post("/optimizer/cancel-all")
+@router.post("/optimizer/cancel-all", tags=["Optimizer"])
 async def cancel_all_optimizer_jobs(force: bool = Query(default=False)):
     """Request cancellation for all queued/running async optimizer jobs."""
     return admin_cancel_all_optimizer_jobs(force=bool(force))
 
 
-@router.post("/optimizer/admin/cancel-active")
+@router.post("/optimizer/admin/cancel-active", tags=["Optimizer"])
 async def admin_cancel_active_optimizer_jobs(force: bool = Query(default=True)):
     """Admin endpoint: cancel all queued/running optimizer jobs (with optional hard force)."""
     return admin_cancel_all_optimizer_jobs(force=bool(force))
 
 
-@router.delete("/optimizer/jobs")
+@router.delete("/optimizer/jobs", tags=["Optimizer"])
 async def purge_optimizer_jobs(
     statuses: Optional[str] = Query(default="canceled,failed,completed", description="Comma-separated statuses to delete"),
     strategy_id: Optional[int] = Query(default=None, ge=1),
@@ -6361,7 +6377,7 @@ def _read_optimization_history(
     )
 
 
-@router.get("/strategies/{strategy_id}/optimization-history", response_model=StrategyOptimizationHistoryResponse)
+@router.get("/strategies/{strategy_id}/optimization-history", response_model=StrategyOptimizationHistoryResponse, tags=["Backtesting"])
 async def get_strategy_optimization_history(
     strategy_id: str,
     limit: int = Query(default=20, ge=1, le=100),
@@ -6384,7 +6400,7 @@ async def get_strategy_optimization_history(
     )
 
 
-@router.get("/optimizer/history", response_model=StrategyOptimizationHistoryResponse)
+@router.get("/optimizer/history", response_model=StrategyOptimizationHistoryResponse, tags=["Optimizer"])
 async def get_optimizer_history(
     strategy_ids: Optional[str] = Query(default=None, description="Comma-separated strategy IDs"),
     limit_per_strategy: int = Query(default=10, ge=1, le=100),
@@ -6409,7 +6425,7 @@ async def get_optimizer_history(
 # Parameter Tuning Endpoints
 # ============================================================================
 
-@router.post("/strategies/{strategy_id}/tune", response_model=ParameterTuneResponse)
+@router.post("/strategies/{strategy_id}/tune", response_model=ParameterTuneResponse, tags=["Backtesting"])
 async def tune_strategy_parameter(
     strategy_id: str,
     request: ParameterTuneRequest,
@@ -6644,7 +6660,7 @@ def _paginate_assets(assets_raw: List[dict], page: int, page_size: int) -> tuple
     return assets, total_count, total_pages
 
 
-@router.get("/screener/stocks", response_model=ScreenerResponse)
+@router.get("/screener/stocks", response_model=ScreenerResponse, tags=["Screener"])
 async def get_active_stocks(
     limit: int = Query(default=50, ge=10, le=200),
     page: int = Query(default=1, ge=1),
@@ -6682,7 +6698,7 @@ async def get_active_stocks(
     )
 
 
-@router.get("/screener/etfs", response_model=ScreenerResponse)
+@router.get("/screener/etfs", response_model=ScreenerResponse, tags=["Screener"])
 async def get_active_etfs(
     limit: int = Query(default=50, ge=10, le=200),
     page: int = Query(default=1, ge=1),
@@ -6720,7 +6736,7 @@ async def get_active_etfs(
     )
 
 
-@router.get("/screener/all", response_model=ScreenerResponse)
+@router.get("/screener/all", response_model=ScreenerResponse, tags=["Screener"])
 async def get_screener_results(
     asset_type: Optional[AssetType] = None,
     limit: Optional[int] = Query(default=None, ge=10, le=200),
@@ -6892,7 +6908,7 @@ async def get_screener_results(
     )
 
 
-@router.get("/screener/preset", response_model=ScreenerResponse)
+@router.get("/screener/preset", response_model=ScreenerResponse, tags=["Screener"])
 async def get_screener_preset(
     asset_type: AssetType,
     preset: ScreenerPreset,
@@ -7050,7 +7066,7 @@ async def get_screener_preset(
 # Risk Profile Endpoints
 # ============================================================================
 
-@router.get("/risk-profiles", response_model=RiskProfilesResponse)
+@router.get("/risk-profiles", response_model=RiskProfilesResponse, tags=["Preferences"])
 async def get_risk_profiles():
     """
     Get all available risk profiles with their configurations.
@@ -7080,7 +7096,7 @@ async def get_risk_profiles():
 # Trading Preferences Endpoints
 # ============================================================================
 
-@router.get("/preferences", response_model=TradingPreferencesResponse)
+@router.get("/preferences", response_model=TradingPreferencesResponse, tags=["Preferences"])
 async def get_trading_preferences(db: Session = Depends(get_db)):
     """
     Get current trading preferences.
@@ -7092,7 +7108,7 @@ async def get_trading_preferences(db: Session = Depends(get_db)):
     return _load_trading_preferences(storage)
 
 
-@router.post("/preferences", response_model=TradingPreferencesResponse)
+@router.post("/preferences", response_model=TradingPreferencesResponse, tags=["Preferences"])
 async def update_trading_preferences(request: TradingPreferencesRequest, db: Session = Depends(get_db)):
     """
     Update trading preferences.
@@ -7169,7 +7185,7 @@ async def update_trading_preferences(request: TradingPreferencesRequest, db: Ses
     return current
 
 
-@router.get("/preferences/recommendation")
+@router.get("/preferences/recommendation", tags=["Preferences"])
 async def get_preference_recommendation(
     equity: Optional[float] = Query(default=None, ge=100, le=100_000_000),
     weekly_budget: Optional[float] = Query(default=None, ge=50, le=5_000_000),
@@ -7378,7 +7394,7 @@ async def get_preference_recommendation(
     return response_payload
 
 
-@router.get("/screener/chart/{symbol}", response_model=SymbolChartResponse)
+@router.get("/screener/chart/{symbol}", response_model=SymbolChartResponse, tags=["Screener"])
 async def get_symbol_chart(
     symbol: str,
     days: int = Query(default=320, ge=30, le=1000),
@@ -7427,7 +7443,7 @@ async def get_symbol_chart(
 # Budget Tracking Endpoints
 # ============================================================================
 
-@router.get("/budget/status", response_model=BudgetStatus)
+@router.get("/budget/status", response_model=BudgetStatus, tags=["Budget"])
 async def get_budget_status(db: Session = Depends(get_db)):
     """
     Get current weekly budget status.
@@ -7443,7 +7459,7 @@ async def get_budget_status(db: Session = Depends(get_db)):
     return BudgetStatus(**status)
 
 
-@router.post("/budget/update", response_model=BudgetStatus)
+@router.post("/budget/update", response_model=BudgetStatus, tags=["Budget"])
 async def update_weekly_budget(request: BudgetUpdateRequest, db: Session = Depends(get_db)):
     """
     Update the weekly budget amount.

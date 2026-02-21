@@ -3,6 +3,7 @@ import { Component, lazy, Suspense, useEffect, useRef } from 'react';
 import type { ErrorInfo, ReactNode } from 'react';
 import Sidebar from './components/Sidebar';
 import AppTopBar from './components/AppTopBar';
+import { useVisibilityAwareInterval } from './hooks/useVisibilityAwareInterval';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import {
@@ -20,6 +21,7 @@ import {
 } from './api/backend';
 import { AuditEventType, StrategyStatus } from './api/types';
 import { showSuccessNotification } from './utils/notifications';
+import { reportErrorObject, installGlobalErrorHandler } from './api/errorReporter';
 import GlobalJobTray from './components/GlobalJobTray';
 
 const DashboardPage = lazy(() => import('./pages/DashboardPage'));
@@ -94,6 +96,7 @@ class PageErrorBoundary extends Component<PageErrorBoundaryProps, PageErrorBound
 
   componentDidCatch(error: Error, info: ErrorInfo) {
     console.error('[PageErrorBoundary] Caught render error:', error, info.componentStack);
+    reportErrorObject(error, 'PageErrorBoundary');
   }
 
   componentDidUpdate(prevProps: PageErrorBoundaryProps) {
@@ -114,6 +117,11 @@ function App() {
   const seenFilledEventIdsRef = useRef<Set<string>>(new Set());
   const trayFailureCountRef = useRef(0);
   const trayLastSuccessMsRef = useRef<number | null>(null);
+
+  // Install global error handler once on mount
+  useEffect(() => {
+    installGlobalErrorHandler();
+  }, []);
 
   useEffect(() => {
     const isTauriRuntime = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in (window as unknown as Record<string, unknown>);
@@ -170,31 +178,28 @@ function App() {
     };
   }, []);
 
-  useEffect(() => {
-    const pollFilledEvents = async () => {
-      try {
-        const response = await getAuditLogs(50, AuditEventType.ORDER_FILLED);
-        const logs = response.logs || [];
-        logs
-          .slice()
-          .reverse()
-          .forEach((log) => {
-            if (seenFilledEventIdsRef.current.has(log.id)) return;
-            seenFilledEventIdsRef.current.add(log.id);
-            const details = log.details || {};
-            const symbol = String(details.symbol || '');
-            const quantity = Number(details.quantity || 0);
-            const price = Number(details.price || 0);
-            showSuccessNotification('Trade Filled', `${symbol} ${quantity} @ $${price.toFixed(2)}`);
-          });
-      } catch {
-        // Silent retry on next interval.
-      }
-    };
-    const interval = setInterval(pollFilledEvents, 10000);
-    void pollFilledEvents();
-    return () => clearInterval(interval);
-  }, []);
+  const pollFilledEvents = useRef(async () => {
+    try {
+      const response = await getAuditLogs(50, AuditEventType.ORDER_FILLED);
+      const logs = response.logs || [];
+      logs
+        .slice()
+        .reverse()
+        .forEach((log) => {
+          if (seenFilledEventIdsRef.current.has(log.id)) return;
+          seenFilledEventIdsRef.current.add(log.id);
+          const details = log.details || {};
+          const symbol = String(details.symbol || '');
+          const quantity = Number(details.quantity || 0);
+          const price = Number(details.price || 0);
+          showSuccessNotification('Trade Filled', `${symbol} ${quantity} @ $${price.toFixed(2)}`);
+        });
+    } catch {
+      // Silent retry on next interval.
+    }
+  });
+  useEffect(() => { void pollFilledEvents.current(); }, []);
+  useVisibilityAwareInterval(() => pollFilledEvents.current(), 10000);
 
   useEffect(() => {
     const isTauriRuntime = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in (window as unknown as Record<string, unknown>);
@@ -372,7 +377,22 @@ function App() {
         <Sidebar />
         <main className="flex-1 overflow-auto">
           <AppTopBar />
-          <Suspense fallback={<div className="p-6 text-gray-400">Loading page...</div>}>
+          <Suspense fallback={
+            <div className="p-8 space-y-6 animate-pulse">
+              <div className="h-8 w-48 bg-gray-700 rounded" />
+              <div className="h-4 w-72 bg-gray-800 rounded" />
+              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
+                {[...Array(4)].map((_, i) => (
+                  <div key={i} className="bg-gray-800 rounded-lg p-5 border border-gray-700">
+                    <div className="h-3 w-20 bg-gray-700 rounded mb-3" />
+                    <div className="h-7 w-28 bg-gray-700 rounded" />
+                  </div>
+                ))}
+              </div>
+              <div className="bg-gray-800 rounded-lg p-6 border border-gray-700 h-64" />
+              <div className="bg-gray-800 rounded-lg p-6 border border-gray-700 h-48" />
+            </div>
+          }>
             <PageErrorBoundary>
               <Routes>
                 <Route path="/" element={<DashboardPage />} />
