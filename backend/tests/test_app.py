@@ -56,7 +56,7 @@ def test_status():
     response = client.get("/status")
     assert response.status_code == 200
     data = response.json()
-    assert data["status"] == "running"
+    assert data["status"] in {"healthy", "degraded", "unhealthy"}
     assert data["service"] == "StocksBot Backend"
     assert "version" in data
 

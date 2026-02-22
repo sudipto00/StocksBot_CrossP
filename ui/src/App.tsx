@@ -10,6 +10,7 @@ import {
   createWebSocketAuthTicket,
   getApiAuthKey,
   getAuditLogs,
+  getBrokerAccount,
   getOptimizerHealth,
   getPositions,
   getStrategies,
@@ -20,7 +21,7 @@ import {
   stopRunner,
 } from './api/backend';
 import { AuditEventType, StrategyStatus } from './api/types';
-import { showSuccessNotification } from './utils/notifications';
+import { showSuccessNotification, showErrorNotification } from './utils/notifications';
 import { reportErrorObject, installGlobalErrorHandler } from './api/errorReporter';
 import GlobalJobTray from './components/GlobalJobTray';
 
@@ -117,6 +118,7 @@ function App() {
   const seenFilledEventIdsRef = useRef<Set<string>>(new Set());
   const trayFailureCountRef = useRef(0);
   const trayLastSuccessMsRef = useRef<number | null>(null);
+  const lastCrashNotifiedRef = useRef<string | null>(null);
 
   // Install global error handler once on mount
   useEffect(() => {
@@ -218,6 +220,10 @@ function App() {
       optimizer_queue_depth?: number;
       optimizer_stalled_jobs?: number;
       last_update?: string;
+      equity?: number;
+      cash?: number;
+      daily_pnl?: number;
+      daily_pnl_pct?: number;
     }) => {
       try {
         await invoke('update_tray_summary', { payload });
@@ -228,12 +234,13 @@ function App() {
 
     const syncTraySummary = async () => {
       try {
-        const [health, prefs, positionsRes, strategiesRes, optimizerHealth] = await Promise.all([
+        const [health, prefs, positionsRes, strategiesRes, optimizerHealth, brokerAccount] = await Promise.all([
           getSystemHealthSnapshot(),
           getTradingPreferences(),
           getPositions(),
           getStrategies(),
           getOptimizerHealth().catch(() => null),
+          getBrokerAccount().catch(() => null),
         ]);
         const active = (strategiesRes.strategies || []).filter((s) => s.status === StrategyStatus.ACTIVE);
         const activeLabel = active.length ? active.map((s) => s.name).join(', ') : 'No active strategy';
@@ -268,7 +275,24 @@ function App() {
           optimizer_queue_depth: Number(optimizerHealth?.queue_depth || 0),
           optimizer_stalled_jobs: stalledJobs.length,
           last_update: new Date().toLocaleTimeString(),
+          equity: brokerAccount?.equity,
+          cash: brokerAccount?.cash,
+          daily_pnl: positionsRes.total_pnl,
+          daily_pnl_pct: positionsRes.total_pnl_percent,
         });
+
+        // Runner crash notification
+        const crashAt = health.runner_crash_detected_at;
+        if (crashAt && crashAt !== lastCrashNotifiedRef.current) {
+          const crashTs = new Date(crashAt).getTime();
+          if (Number.isFinite(crashTs) && (Date.now() - crashTs) < 120_000) {
+            lastCrashNotifiedRef.current = crashAt;
+            void showErrorNotification(
+              'Runner Crashed',
+              'The strategy runner crashed unexpectedly. Auto-restart was attempted.',
+            );
+          }
+        }
       } catch {
         trayFailureCountRef.current += 1;
         const secondsDown = trayLastSuccessMsRef.current
@@ -310,12 +334,22 @@ function App() {
       // No-op if event channel unavailable.
     });
 
-    const interval = setInterval(() => {
-      void syncTraySummary();
-    }, 15000);
+    // Use setTimeout chain instead of setInterval to avoid browser throttling
+    // when the Tauri window is hidden. The tray MUST keep updating even when
+    // the window is not visible — it's the only UI surface the user sees.
+    let traySyncStopped = false;
+    const scheduleTraySync = () => {
+      if (traySyncStopped) return;
+      setTimeout(async () => {
+        if (traySyncStopped) return;
+        await syncTraySummary();
+        scheduleTraySync();
+      }, 15000);
+    };
     void syncTraySummary();
+    scheduleTraySync();
     return () => {
-      clearInterval(interval);
+      traySyncStopped = true;
       if (unlistenTrayToggle) {
         unlistenTrayToggle();
       }

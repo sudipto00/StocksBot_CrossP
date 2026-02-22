@@ -73,11 +73,10 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
-        # Exclude unnecessary packages to reduce size
+        # Exclude unnecessary GUI/plotting packages to reduce size
+        # Note: pandas and numpy are required by alpaca-py — do NOT exclude
         'tkinter',
         'matplotlib',
-        'pandas',
-        'numpy',
         'scipy',
         'PIL',
         'PyQt5',
@@ -107,11 +106,11 @@ exe = EXE(
     name='stocksbot-backend',
     debug=False,
     bootloader_ignore_signals=False,
-    strip=False,  # Set to True for smaller size (removes debug symbols)
-    upx=True,     # Compress with UPX if available
+    strip=False,  # Do NOT strip — corrupts native libs (zlib/SSL) on macOS
+    upx=False,    # Do NOT UPX-compress — corrupts native .dylib files
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=True,  # Set to False to hide console window on Windows
+    console=True,   # Must be True on macOS; Tauri hides stdio anyway
     disable_windowed_traceback=False,
     target_arch=None,
     codesign_identity=None,

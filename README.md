@@ -69,6 +69,7 @@ npm run tauri:dev
 - Save Alpaca Paper and/or Live credentials to Keychain
 - Load keys from Keychain
 - Pick Paper or Live mode
+- Keep Backend Hot Reload OFF for long-running optimizer stability (enable only for backend dev)
 - Save settings
 
 ## Backend Sidecar Behavior

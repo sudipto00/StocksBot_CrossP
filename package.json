@@ -9,6 +9,8 @@
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
     "backend:dev": "cd backend && python app.py",
+    "build:backend": "cd backend && pyinstaller build-backend.spec --noconfirm",
+    "release": "npm run build:backend && npm run tauri:build",
     "install:all": "cd ui && npm install && cd ../backend && pip install -r requirements.txt"
   },
   "repository": {

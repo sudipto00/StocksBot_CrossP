@@ -2,7 +2,9 @@
 Strategy Runner Manager - Singleton instance for managing strategy runner lifecycle.
 """
 from typing import Optional, Dict, Any
+import logging
 import threading
+import time
 import math
 import re
 from sqlalchemy.orm import Session
@@ -15,6 +17,8 @@ from services.budget_tracker import get_budget_tracker
 from storage.database import SessionLocal
 from storage.service import StorageService
 import json
+
+logger = logging.getLogger(__name__)
 
 
 class RunnerManager:
@@ -40,9 +44,16 @@ class RunnerManager:
         """Initialize the runner manager (only once)."""
         if self._initialized:
             return
-        
+
         self.runner: Optional[StrategyRunner] = None
         self._initialized = True
+
+        # ── Watchdog state ──────────────────────────────────────────
+        self._watchdog_thread: Optional[threading.Thread] = None
+        self._watchdog_stop = threading.Event()
+        self._crash_detected_at: Optional[str] = None
+        self._auto_restart_count: int = 0
+        self._auto_restart_timestamps: list[float] = []
 
     @staticmethod
     def _runner_thread_alive(runner: StrategyRunner) -> bool:
@@ -74,6 +85,84 @@ class RunnerManager:
             runner._persist_runtime_state()  # noqa: SLF001
         except Exception:
             pass
+
+    def _start_watchdog(self) -> None:
+        """Start the background watchdog thread that monitors runner liveness."""
+        self._watchdog_stop.clear()
+        if self._watchdog_thread is not None and self._watchdog_thread.is_alive():
+            return  # Already running
+
+        def _watchdog_loop() -> None:
+            logger.info("Runner watchdog started")
+            while not self._watchdog_stop.wait(timeout=30.0):
+                with self._lock:
+                    if self.runner is None:
+                        continue
+                    if self.runner.status not in (
+                        StrategyStatus.RUNNING,
+                        StrategyStatus.SLEEPING,
+                        StrategyStatus.PAUSED,
+                    ):
+                        continue
+                    if self._runner_thread_alive(self.runner):
+                        continue
+
+                    # Runner thread has died while status indicates it should be active
+                    from datetime import datetime, timezone
+
+                    crash_time = datetime.now(timezone.utc).isoformat()
+                    last_error = str(self.runner.last_poll_error or "unknown cause")
+                    logger.warning(
+                        "Watchdog detected runner crash at %s (last error: %s)",
+                        crash_time,
+                        last_error[:200],
+                    )
+                    self._crash_detected_at = crash_time
+                    self._normalize_stale_runner_state(self.runner)
+
+                    # Auto-restart logic: max 2 restarts per hour
+                    now = time.monotonic()
+                    self._auto_restart_timestamps = [
+                        ts for ts in self._auto_restart_timestamps if now - ts < 3600
+                    ]
+                    if len(self._auto_restart_timestamps) < 2:
+                        logger.info("Watchdog attempting auto-restart of runner")
+                        try:
+                            session = SessionLocal()
+                            try:
+                                storage = StorageService(session)
+                                storage.create_audit_log(
+                                    event_type="runner_started",
+                                    description="Runner auto-restarted by watchdog after crash",
+                                    details={"crash_time": crash_time, "last_error": last_error[:200]},
+                                )
+                            finally:
+                                session.close()
+                            # Reset runner so start_runner() rebuilds it cleanly
+                            self.runner = None
+                        except Exception:
+                            logger.exception("Watchdog: failed to log auto-restart audit event")
+                        self._auto_restart_count += 1
+                        self._auto_restart_timestamps.append(now)
+                    else:
+                        logger.warning(
+                            "Watchdog: auto-restart limit reached (2/hour). Manual restart required."
+                        )
+            logger.info("Runner watchdog stopped")
+
+        self._watchdog_thread = threading.Thread(
+            target=_watchdog_loop,
+            name="runner-watchdog",
+            daemon=True,
+        )
+        self._watchdog_thread.start()
+
+    def _stop_watchdog(self) -> None:
+        """Signal the watchdog thread to stop."""
+        self._watchdog_stop.set()
+        if self._watchdog_thread is not None:
+            self._watchdog_thread.join(timeout=5.0)
+            self._watchdog_thread = None
 
     @staticmethod
     def _load_persisted_runtime_state() -> Dict[str, Any]:
@@ -332,8 +421,10 @@ class RunnerManager:
             
             # Start runner
             success = runner.start()
-            
+
             if success:
+                self._crash_detected_at = None
+                self._start_watchdog()
                 override_message = ""
                 if symbol_universe_override:
                     override_message = f" using workspace universe override ({len(symbol_universe_override)} symbols)"
@@ -497,9 +588,12 @@ class RunnerManager:
                 if owns_session:
                     session.close()
             
+            # Stop watchdog before stopping runner
+            self._stop_watchdog()
+
             # Stop runner
             success = self.runner.stop()
-            
+
             if success:
                 return {
                     "success": True,
@@ -578,11 +672,15 @@ class RunnerManager:
                     "resume_count": int(persisted.get("resume_count", 0)),
                     "market_session_open": persisted.get("market_session_open"),
                     "last_state_persisted_at": persisted.get("persisted_at"),
+                    "runner_crash_detected_at": self._crash_detected_at,
+                    "auto_restart_count": self._auto_restart_count,
                 }
 
             self._normalize_stale_runner_state(self.runner)
             status = self.runner.get_status()
             status["runner_thread_alive"] = self._runner_thread_alive(self.runner)
+            status["runner_crash_detected_at"] = self._crash_detected_at
+            status["auto_restart_count"] = self._auto_restart_count
             return status
 
 

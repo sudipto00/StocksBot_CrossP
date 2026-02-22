@@ -23,7 +23,7 @@ from typing import List, Optional, Dict, Any
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
 
-from storage.database import SessionLocal, get_db
+from storage.database import SessionLocal, get_db, backup_sqlite_database, check_integrity
 from storage.service import StorageService
 from storage.models import (
     AuditLog as DBAuditLog,
@@ -41,6 +41,7 @@ from services.order_execution import (
     set_global_trading_enabled,
 )
 from config.settings import get_settings, has_alpaca_credentials
+from config.paths import default_log_directory, default_audit_export_directory
 from services.logging_service import configure_file_logging, cleanup_old_files
 from services.notification_delivery import NotificationDeliveryService
 from services.budget_tracker import get_budget_tracker
@@ -354,7 +355,7 @@ def get_order_execution_service(
 # Configuration Endpoints
 # ============================================================================
 
-# In-memory config store (TODO: Replace with persistent storage)
+# In-memory runtime snapshot backed by persistent config storage.
 _config = ConfigResponse(
     environment="development",
     trading_enabled=False,
@@ -364,8 +365,9 @@ _config = ConfigResponse(
     tick_interval_seconds=60.0,
     streaming_enabled=False,
     strict_alpaca_data=True,
-    log_directory="./logs",
-    audit_export_directory="./audit_exports",
+    backend_reload_enabled=False,
+    log_directory=default_log_directory(),
+    audit_export_directory=default_audit_export_directory(),
     log_retention_days=30,
     audit_retention_days=90,
     broker="paper",
@@ -655,6 +657,12 @@ def _portfolio_summary_cache_set(
 
 
 def _optimizer_use_subprocess_workers() -> bool:
+    # PyInstaller frozen binaries cannot use subprocess workers because
+    # sys.executable is the bundled binary itself — launching it with
+    # `-m api.optimizer_worker` just re-runs app.py, starting the full
+    # server + dispatcher and causing a recursive fork bomb.
+    if getattr(sys, "frozen", False):
+        return False
     mode = str(os.getenv("STOCKSBOT_OPTIMIZER_WORKER_MODE", "process")).strip().lower()
     if mode in {"thread", "inline"}:
         return False
@@ -3041,7 +3049,6 @@ def stop_summary_scheduler() -> bool:
 async def get_config(db: Session = Depends(get_db)):
     """
     Get current configuration.
-    TODO: Load from persistent storage.
     """
     storage = StorageService(db)
     config = _load_runtime_config(storage)
@@ -3057,7 +3064,6 @@ async def update_config(
 ):
     """
     Update configuration.
-    TODO: Persist to storage and validate changes.
     """
     cached = _idempotency_cache_get("/config", x_idempotency_key)
     if cached is not None:
@@ -3094,6 +3100,8 @@ async def update_config(
         runner_manager.set_streaming_enabled(config.streaming_enabled)
     if request.strict_alpaca_data is not None:
         config.strict_alpaca_data = bool(request.strict_alpaca_data)
+    if request.backend_reload_enabled is not None:
+        config.backend_reload_enabled = bool(request.backend_reload_enabled)
     if request.log_directory is not None:
         candidate = request.log_directory.strip()
         if not candidate:
@@ -4121,6 +4129,24 @@ async def run_maintenance_cleanup(request: Request, db: Session = Depends(get_db
     storage = StorageService(db)
     result = _run_housekeeping(storage, force=True)
     return {"success": True, **result}
+
+
+@router.post("/maintenance/backup", tags=["Maintenance"])
+@limiter.limit("3/minute")
+async def trigger_manual_backup(request: Request):
+    """Create a manual database backup and return the backup file path."""
+    try:
+        backup_path = backup_sqlite_database()
+        return {"success": True, "backup_path": backup_path}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/maintenance/integrity", tags=["Maintenance"])
+async def run_integrity_check():
+    """Run SQLite PRAGMA integrity_check and return the result."""
+    ok, result = check_integrity()
+    return {"ok": ok, "result": result}
 
 
 @router.post("/maintenance/reset-audit-data", tags=["Maintenance"])

@@ -67,6 +67,7 @@ export interface ConfigResponse {
   tick_interval_seconds: number;
   streaming_enabled: boolean;
   strict_alpaca_data: boolean;
+  backend_reload_enabled: boolean;
   log_directory: string;
   audit_export_directory: string;
   log_retention_days: number;
@@ -138,6 +139,7 @@ export interface ConfigUpdateRequest {
   tick_interval_seconds?: number;
   streaming_enabled?: boolean;
   strict_alpaca_data?: boolean;
+  backend_reload_enabled?: boolean;
   log_directory?: string;
   audit_export_directory?: string;
   log_retention_days?: number;
@@ -335,6 +337,8 @@ export interface RunnerStatusResponse {
   resume_count?: number;
   market_session_open?: boolean | null;
   last_state_persisted_at?: string | null;
+  runner_crash_detected_at?: string | null;
+  auto_restart_count?: number;
 }
 
 export interface RunnerActionResponse {
@@ -379,6 +383,7 @@ export interface SystemHealthSnapshot {
   market_session_open?: boolean | null;
   kill_switch_active?: boolean;
   last_broker_sync_at?: string | null;
+  runner_crash_detected_at?: string | null;
 }
 
 export interface SafetyStatusResponse {

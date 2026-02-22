@@ -97,9 +97,116 @@ function buildAuthHeaders(existing?: HeadersInit): Headers {
   return headers;
 }
 
-async function authFetch(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
+/** Default timeouts in milliseconds. */
+const DEFAULT_READ_TIMEOUT_MS = 15_000;
+const DEFAULT_WRITE_TIMEOUT_MS = 30_000;
+
+/** HTTP status codes that are safe to retry (server-side transient errors). */
+const RETRYABLE_STATUS_CODES = new Set([502, 503, 504]);
+
+/** Maximum retries for idempotent (GET) requests. */
+const MAX_GET_RETRIES = 2;
+
+interface AuthFetchOptions extends RequestInit {
+  /** Override the default timeout in milliseconds. */
+  timeoutMs?: number;
+  /** Override the default retry count. Set to 0 to disable retries. */
+  maxRetries?: number;
+}
+
+/**
+ * Resilient fetch wrapper with auth headers, timeouts, and retry logic.
+ * - GET requests: 15s timeout, up to 2 retries with exponential backoff
+ * - Mutation requests (POST/PUT/DELETE): 30s timeout, NO retries (safety for trading ops)
+ */
+async function authFetch(input: RequestInfo | URL, init: AuthFetchOptions = {}): Promise<Response> {
   const headers = buildAuthHeaders(init.headers);
-  return window.fetch(input, { ...init, headers });
+  const method = (init.method || 'GET').toUpperCase();
+  const isMutation = method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS';
+  const timeoutMs = init.timeoutMs ?? (isMutation ? DEFAULT_WRITE_TIMEOUT_MS : DEFAULT_READ_TIMEOUT_MS);
+  const maxRetries = init.maxRetries ?? (isMutation ? 0 : MAX_GET_RETRIES);
+
+  let lastError: Error | null = null;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+
+    // Merge caller's signal with our timeout signal
+    if (init.signal) {
+      init.signal.addEventListener('abort', () => controller.abort());
+    }
+
+    try {
+      const response = await window.fetch(input, {
+        ...init,
+        headers,
+        signal: controller.signal,
+      });
+
+      // Don't retry on non-retryable status codes
+      if (!RETRYABLE_STATUS_CODES.has(response.status) || attempt >= maxRetries) {
+        return response;
+      }
+
+      // Retryable server error — wait and try again
+      lastError = new Error(`Backend returned ${response.status}`);
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+
+      // Don't retry if the caller explicitly aborted
+      if (init.signal?.aborted) {
+        throw lastError;
+      }
+
+      // AbortError from our timeout is retryable; other errors might be too
+      if (attempt >= maxRetries) {
+        throw lastError;
+      }
+    } finally {
+      window.clearTimeout(timer);
+    }
+
+    // Exponential backoff with jitter: ~1s, ~2s
+    const baseDelay = 1000 * Math.pow(2, attempt);
+    const jitter = Math.random() * 500;
+    await new Promise((resolve) => setTimeout(resolve, baseDelay + jitter));
+  }
+
+  throw lastError ?? new Error('Request failed');
+}
+
+async function buildBackendError(response: Response): Promise<string> {
+  const prefix = `Backend returned ${response.status}`;
+  try {
+    const contentType = response.headers.get('content-type') || '';
+    if (contentType.includes('application/json')) {
+      const payload = await response.json();
+      const detail = payload?.detail;
+      if (typeof detail === 'string' && detail.trim()) {
+        return `${prefix}: ${detail.trim()}`;
+      }
+      if (Array.isArray(detail) && detail.length > 0) {
+        const flattened = detail
+          .map((item) => (typeof item?.msg === 'string' ? item.msg : JSON.stringify(item)))
+          .join('; ')
+          .trim();
+        if (flattened) {
+          return `${prefix}: ${flattened}`;
+        }
+      }
+      if (typeof payload?.message === 'string' && payload.message.trim()) {
+        return `${prefix}: ${payload.message.trim()}`;
+      }
+    } else {
+      const text = (await response.text()).trim();
+      if (text) {
+        return `${prefix}: ${text.slice(0, 240)}`;
+      }
+    }
+  } catch {
+    // Fall through to status-only error.
+  }
+  return prefix;
 }
 
 export function getApiAuthKey(): string {
@@ -157,7 +264,7 @@ export async function updateConfig(config: ConfigUpdateRequest): Promise<ConfigR
   });
   
   if (!response.ok) {
-    throw new Error(`Backend returned ${response.status}`);
+    throw new Error(await buildBackendError(response));
   }
   
   return response.json();
@@ -178,7 +285,7 @@ export async function setBrokerCredentials(
   });
 
   if (!response.ok) {
-    throw new Error(`Backend returned ${response.status}`);
+    throw new Error(await buildBackendError(response));
   }
 
   return response.json();
@@ -191,7 +298,7 @@ export async function getBrokerCredentialsStatus(): Promise<BrokerCredentialsSta
   const response = await authFetch(`${BACKEND_URL}/broker/credentials/status`);
 
   if (!response.ok) {
-    throw new Error(`Backend returned ${response.status}`);
+    throw new Error(await buildBackendError(response));
   }
 
   return response.json();
@@ -552,6 +659,7 @@ export async function getSystemHealthSnapshot(): Promise<SystemHealthSnapshot> {
     market_session_open: typeof runner.market_session_open === 'boolean' ? runner.market_session_open : null,
     last_broker_sync_at: safety.last_broker_sync_at || null,
     kill_switch_active: Boolean(safety.kill_switch_active),
+    runner_crash_detected_at: runner.runner_crash_detected_at || null,
   };
 }
 
@@ -904,21 +1012,9 @@ export async function getStrategyOptimizationStatus(
   strategyId: string,
   jobId: string
 ): Promise<StrategyOptimizationJobStatus> {
-  const controller = new AbortController();
-  const timer = window.setTimeout(() => controller.abort(), 25000);
-  let response: Response;
-  try {
-    response = await authFetch(`${BACKEND_URL}/strategies/${strategyId}/optimize/${jobId}`, {
-      signal: controller.signal,
-    });
-  } catch (err) {
-    if (err instanceof DOMException && err.name === 'AbortError') {
-      throw new Error('Optimizer status request timed out');
-    }
-    throw err;
-  } finally {
-    window.clearTimeout(timer);
-  }
+  const response = await authFetch(`${BACKEND_URL}/strategies/${strategyId}/optimize/${jobId}`, {
+    timeoutMs: 25_000,
+  });
   if (!response.ok) {
     const body = await response.json().catch(() => null);
     throw new Error(body?.detail || `Backend returned ${response.status}`);

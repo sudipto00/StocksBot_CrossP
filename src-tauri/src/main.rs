@@ -4,10 +4,12 @@
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tauri::menu::{MenuBuilder, MenuItem, MenuItemBuilder, PredefinedMenuItem};
+use tauri::image::Image;
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_notification::{NotificationExt, PermissionState};
@@ -38,11 +40,17 @@ struct TraySummaryPayload {
     optimizer_queue_depth: Option<u64>,
     optimizer_stalled_jobs: Option<u64>,
     last_update: Option<String>,
+    // Financial summary
+    equity: Option<f64>,
+    cash: Option<f64>,
+    daily_pnl: Option<f64>,
+    daily_pnl_pct: Option<f64>,
 }
 
 struct TrayState {
     runner_item: Mutex<Option<MenuItem<tauri::Wry>>>,
     broker_item: Mutex<Option<MenuItem<tauri::Wry>>>,
+    account_item: Mutex<Option<MenuItem<tauri::Wry>>>,
     summary_item: Mutex<Option<MenuItem<tauri::Wry>>>,
     toggle_runner_item: Mutex<Option<MenuItem<tauri::Wry>>>,
     runner_running: Mutex<bool>,
@@ -51,12 +59,18 @@ struct TrayState {
 
 struct SidecarState {
     process: Mutex<Option<Child>>,
+    /// Signal the watchdog thread to stop.
+    watchdog_stop: Arc<AtomicBool>,
+    /// How many times the watchdog has auto-restarted the sidecar.
+    restart_count: AtomicU32,
 }
 
 impl Default for SidecarState {
     fn default() -> Self {
         Self {
             process: Mutex::new(None),
+            watchdog_stop: Arc::new(AtomicBool::new(false)),
+            restart_count: AtomicU32::new(0),
         }
     }
 }
@@ -66,6 +80,7 @@ impl Default for TrayState {
         Self {
             runner_item: Mutex::new(None),
             broker_item: Mutex::new(None),
+            account_item: Mutex::new(None),
             summary_item: Mutex::new(None),
             toggle_runner_item: Mutex::new(None),
             runner_running: Mutex::new(false),
@@ -157,6 +172,33 @@ fn update_tray_status_ui(app: &AppHandle, payload: &TraySummaryPayload) -> Resul
                 ));
             }
         }
+        if let Ok(guard) = state.account_item.lock() {
+            if let Some(item) = &*guard {
+                let equity_str = match payload.equity {
+                    Some(v) => format!("${:.2}", v),
+                    None => "N/A".to_string(),
+                };
+                let cash_str = match payload.cash {
+                    Some(v) => format!("${:.2}", v),
+                    None => "N/A".to_string(),
+                };
+                let pnl_str = match (payload.daily_pnl, payload.daily_pnl_pct) {
+                    (Some(pnl), Some(pct)) => {
+                        let sign = if pnl >= 0.0 { "+" } else { "" };
+                        format!("{}${:.2} ({}{}%)", sign, pnl.abs(), sign, format!("{:.2}", pct))
+                    }
+                    (Some(pnl), None) => {
+                        let sign = if pnl >= 0.0 { "+" } else { "-" };
+                        format!("{}${:.2}", sign, pnl.abs())
+                    }
+                    _ => "N/A".to_string(),
+                };
+                let _ = item.set_text(format!(
+                    "Equity: {} | Cash: {} | Day P&L: {}",
+                    equity_str, cash_str, pnl_str
+                ));
+            }
+        }
         if let Ok(guard) = state.summary_item.lock() {
             if let Some(item) = &*guard {
                 let _ = item.set_text(format!(
@@ -185,31 +227,165 @@ fn update_tray_status_ui(app: &AppHandle, payload: &TraySummaryPayload) -> Resul
     }
 
     if let Some(tray) = app.tray_by_id(TRAY_ID) {
+        let equity_tip = match payload.equity {
+            Some(v) => format!("${:.0}", v),
+            None => "N/A".to_string(),
+        };
         let _ = tray.set_tooltip(Some(format!(
-            "StocksBot | Runner {} | Broker {} | Errors {} | Positions {} | Jobs {}/{}{} | {}",
+            "StocksBot | Equity {} | Runner {} | Broker {} | Positions {} | {}",
+            equity_tip,
             runner,
             broker,
-            poll_errors,
             open_positions,
-            active_jobs,
-            queue_depth,
-            if stalled_jobs > 0 {
-                format!(" | Stalled {}", stalled_jobs)
-            } else {
-                "".to_string()
-            },
             last_update
         )));
     }
     Ok(())
 }
 
-fn is_backend_reachable() -> bool {
-    let addr: SocketAddr = match "127.0.0.1:8000".parse() {
+const BACKEND_URL: &str = "http://127.0.0.1:8000";
+const BACKEND_ADDR: &str = "127.0.0.1:8000";
+
+/// Quick TCP-level reachability check (used before HTTP is available).
+fn is_backend_tcp_reachable() -> bool {
+    let addr: SocketAddr = match BACKEND_ADDR.parse() {
         Ok(parsed) => parsed,
         Err(_) => return false,
     };
     TcpStream::connect_timeout(&addr, Duration::from_millis(350)).is_ok()
+}
+
+/// Full HTTP health check — confirms the backend is responding to requests.
+fn is_backend_healthy() -> bool {
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(2))
+        .timeout(Duration::from_secs(5))
+        .build();
+    match agent.get(&format!("{}/status", BACKEND_URL)).call() {
+        Ok(resp) => resp.status() == 200,
+        Err(_) => false,
+    }
+}
+
+/// Wait for the backend to become healthy after launch.
+/// Polls up to `max_attempts` times with `interval` between each attempt.
+fn wait_for_backend_ready(max_attempts: u32, interval: Duration) -> bool {
+    for attempt in 1..=max_attempts {
+        if is_backend_healthy() {
+            println!("Backend healthy after {} attempt(s)", attempt);
+            return true;
+        }
+        std::thread::sleep(interval);
+    }
+    // Final attempt — maybe it just needs one more second
+    is_backend_healthy()
+}
+
+/// Background watchdog that monitors backend health and auto-restarts on failure.
+/// Runs in a dedicated thread. Emits `backend-health` events to the frontend.
+fn start_backend_watchdog(app_handle: AppHandle) {
+    let stop_flag = {
+        let state = app_handle.state::<SidecarState>();
+        state.watchdog_stop.clone()
+    };
+
+    std::thread::Builder::new()
+        .name("backend-watchdog".into())
+        .spawn(move || {
+            let mut consecutive_failures: u32 = 0;
+            let max_failures_before_restart: u32 = 3;
+            let max_auto_restarts_per_session: u32 = 5;
+
+            // Give the backend time to fully boot before first check
+            std::thread::sleep(Duration::from_secs(15));
+
+            loop {
+                if stop_flag.load(Ordering::Relaxed) {
+                    println!("Backend watchdog stopping");
+                    break;
+                }
+
+                if is_backend_healthy() {
+                    if consecutive_failures > 0 {
+                        println!("Backend recovered after {} failure(s)", consecutive_failures);
+                        let _ = app_handle.emit("backend-health", "healthy");
+                    }
+                    consecutive_failures = 0;
+                } else {
+                    consecutive_failures += 1;
+                    println!(
+                        "Backend health check failed ({}/{})",
+                        consecutive_failures, max_failures_before_restart
+                    );
+
+                    if consecutive_failures >= max_failures_before_restart {
+                        let _ = app_handle.emit("backend-health", "unhealthy");
+
+                        let restart_count = {
+                            let state = app_handle.state::<SidecarState>();
+                            state.restart_count.load(Ordering::Relaxed)
+                        };
+
+                        if restart_count < max_auto_restarts_per_session {
+                            println!("Attempting backend auto-restart #{}", restart_count + 1);
+
+                            // Kill stale process if it exists
+                            if let Some(state) = app_handle.try_state::<SidecarState>() {
+                                if let Ok(mut guard) = state.process.lock() {
+                                    if let Some(mut child) = guard.take() {
+                                        // Check if process is still alive
+                                        match child.try_wait() {
+                                            Ok(Some(_)) => {
+                                                // Already exited
+                                            }
+                                            _ => {
+                                                let _ = child.kill();
+                                                let _ = child.wait();
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Attempt re-launch
+                            if let Some(child) = launch_backend_sidecar(&app_handle) {
+                                if let Some(state) = app_handle.try_state::<SidecarState>() {
+                                    if let Ok(mut guard) = state.process.lock() {
+                                        *guard = Some(child);
+                                    }
+                                    state.restart_count.fetch_add(1, Ordering::Relaxed);
+                                }
+
+                                // Wait for the restarted backend to come up
+                                if wait_for_backend_ready(60, Duration::from_millis(500)) {
+                                    println!("Backend restarted successfully");
+                                    let _ = app_handle.emit("backend-health", "restarted");
+                                    consecutive_failures = 0;
+                                } else {
+                                    println!("Backend restart: process launched but not healthy yet");
+                                }
+                            } else {
+                                println!("Backend restart failed: could not find binary or script");
+                            }
+                        } else {
+                            println!(
+                                "Backend auto-restart limit reached ({}/{}). Manual restart required.",
+                                restart_count, max_auto_restarts_per_session
+                            );
+                        }
+                    }
+                }
+
+                // Poll every 10 seconds
+                for _ in 0..10 {
+                    if stop_flag.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+            }
+        })
+        .expect("Failed to spawn backend watchdog thread");
 }
 
 fn find_backend_script(app: &AppHandle) -> Option<PathBuf> {
@@ -219,6 +395,8 @@ fn find_backend_script(app: &AppHandle) -> Option<PathBuf> {
         candidates.push(cwd.join("backend/app.py"));
     }
     if let Ok(resource_dir) = app.path().resource_dir() {
+        // Tauri bundles `../backend/app.py` as `_up_/backend/app.py`
+        candidates.push(resource_dir.join("_up_/backend/app.py"));
         candidates.push(resource_dir.join("backend/app.py"));
         candidates.push(resource_dir.join("app.py"));
     }
@@ -230,10 +408,57 @@ fn find_backend_script(app: &AppHandle) -> Option<PathBuf> {
     None
 }
 
+fn find_backend_binary(app: &AppHandle) -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join("../backend/dist/stocksbot-backend"));
+        candidates.push(cwd.join("../backend/dist/stocksbot-backend.exe"));
+        candidates.push(cwd.join("backend/dist/stocksbot-backend"));
+        candidates.push(cwd.join("backend/dist/stocksbot-backend.exe"));
+    }
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        // Tauri bundles `../backend/dist/stocksbot-backend` as `_up_/backend/dist/stocksbot-backend`
+        candidates.push(resource_dir.join("_up_/backend/dist/stocksbot-backend"));
+        candidates.push(resource_dir.join("_up_/backend/dist/stocksbot-backend.exe"));
+        candidates.push(resource_dir.join("backend/dist/stocksbot-backend"));
+        candidates.push(resource_dir.join("backend/dist/stocksbot-backend.exe"));
+        candidates.push(resource_dir.join("stocksbot-backend"));
+        candidates.push(resource_dir.join("stocksbot-backend.exe"));
+    }
+    for candidate in candidates {
+        if candidate.exists() && candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 fn launch_backend_sidecar(app: &AppHandle) -> Option<Child> {
-    if is_backend_reachable() {
-        println!("Backend already reachable at 127.0.0.1:8000; skipping sidecar launch.");
+    if is_backend_tcp_reachable() {
+        println!("Backend already reachable at {}; skipping sidecar launch.", BACKEND_ADDR);
         return None;
+    }
+    if let Some(binary) = find_backend_binary(app) {
+        let mut cmd = Command::new(&binary);
+        if let Some(parent) = binary.parent() {
+            cmd.current_dir(parent);
+        }
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::null());
+        cmd.stderr(Stdio::null());
+        match cmd.spawn() {
+            Ok(child) => {
+                println!("Launched backend sidecar binary {}", binary.display());
+                return Some(child);
+            }
+            Err(e) => {
+                println!(
+                    "Failed to launch backend sidecar binary {}: {}",
+                    binary.display(),
+                    e
+                );
+            }
+        }
     }
     let script = match find_backend_script(app) {
         Some(path) => path,
@@ -467,6 +692,25 @@ fn update_tray_summary(app: tauri::AppHandle, payload: TraySummaryPayload) -> Re
     update_tray_status_ui(&app, &payload)
 }
 
+#[derive(Debug, Serialize)]
+struct BackendHealthStatus {
+    healthy: bool,
+    restart_count: u32,
+}
+
+#[tauri::command]
+fn check_backend_health(app: tauri::AppHandle) -> Result<BackendHealthStatus, String> {
+    let healthy = is_backend_healthy();
+    let restart_count = app
+        .try_state::<SidecarState>()
+        .map(|s| s.restart_count.load(Ordering::Relaxed))
+        .unwrap_or(0);
+    Ok(BackendHealthStatus {
+        healthy,
+        restart_count,
+    })
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
@@ -474,17 +718,30 @@ fn main() {
         .setup(|app| {
             println!("StocksBot is starting...");
             app.manage(SidecarState::default());
-            if let Some(child) = launch_backend_sidecar(&app.handle().clone()) {
+
+            let app_handle = app.handle().clone();
+            if let Some(child) = launch_backend_sidecar(&app_handle) {
                 let sidecar_state = app.state::<SidecarState>();
-                match sidecar_state.process.lock() {
-                    Ok(mut guard) => {
-                        *guard = Some(child);
-                    }
-                    Err(_) => {}
-                };
+                if let Ok(mut guard) = sidecar_state.process.lock() {
+                    *guard = Some(child);
+                }
+
+                // Wait for the backend to become fully healthy (up to 30s)
+                // PyInstaller one-file binaries need ~16s to extract + boot
+                println!("Waiting for backend to become healthy...");
+                if wait_for_backend_ready(60, Duration::from_millis(500)) {
+                    println!("Backend is healthy and ready");
+                } else {
+                    println!("Warning: backend launched but not responding to health checks yet");
+                }
+            } else if is_backend_healthy() {
+                println!("External backend already healthy at {}", BACKEND_ADDR);
             } else {
-                println!("Note: if backend is not running, start it manually: cd backend && python app.py");
+                println!("Note: backend is not running. Start it manually: cd backend && python app.py");
             }
+
+            // Start the background watchdog to monitor backend health
+            start_backend_watchdog(app_handle.clone());
 
             app.manage(TrayState::default());
 
@@ -493,6 +750,10 @@ fn main() {
                 .build(app)
                 .map_err(|e| e.to_string())?;
             let broker_item = MenuItemBuilder::new("Broker: Unknown | Poll Errors: 0 | Open Positions: 0")
+                .enabled(false)
+                .build(app)
+                .map_err(|e| e.to_string())?;
+            let account_item = MenuItemBuilder::new("Equity: N/A | Cash: N/A | Day P&L: N/A")
                 .enabled(false)
                 .build(app)
                 .map_err(|e| e.to_string())?;
@@ -518,6 +779,7 @@ fn main() {
                 .items(&[
                     &runner_item,
                     &broker_item,
+                    &account_item,
                     &summary_item,
                     &separator_a,
                     &show_item,
@@ -536,6 +798,9 @@ fn main() {
             if let Ok(mut guard) = tray_state.broker_item.lock() {
                 *guard = Some(broker_item.clone());
             }
+            if let Ok(mut guard) = tray_state.account_item.lock() {
+                *guard = Some(account_item.clone());
+            }
             if let Ok(mut guard) = tray_state.summary_item.lock() {
                 *guard = Some(summary_item.clone());
             }
@@ -543,10 +808,13 @@ fn main() {
                 *guard = Some(toggle_runner_item.clone());
             }
 
+            let tray_icon_image = Image::from_bytes(include_bytes!("../icons/tray-icon.png"))
+                .map_err(|e| e.to_string())?;
+
             TrayIconBuilder::with_id(TRAY_ID)
+                .icon(tray_icon_image)
+                .icon_as_template(false)
                 .menu(&tray_menu)
-                // On macOS, tooltip/notifications are unreliable as a primary status surface.
-                // Always open tray menu on left click so summary rows are visible consistently.
                 .show_menu_on_left_click(true)
                 .tooltip("StocksBot running in background")
                 .on_menu_event(|app, event| {
@@ -581,12 +849,17 @@ fn main() {
             get_alpaca_credentials,
             get_alpaca_credentials_status,
             clear_alpaca_credentials,
-            update_tray_summary
+            update_tray_summary,
+            check_backend_health
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| {
             if matches!(event, tauri::RunEvent::Exit) {
+                // Signal watchdog to stop before killing the sidecar
+                if let Some(state) = app.try_state::<SidecarState>() {
+                    state.watchdog_stop.store(true, Ordering::Relaxed);
+                }
                 stop_backend_sidecar(app);
             }
         });

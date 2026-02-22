@@ -10,8 +10,12 @@ Production features:
 - Graceful shutdown with in-flight request draining
 """
 import asyncio
+import json
+import multiprocessing
+import os
 import secrets
 import signal
+import sys
 import threading
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
@@ -28,7 +32,6 @@ from api.routes import (
     stop_summary_scheduler,
     start_optimizer_dispatcher,
     stop_optimizer_dispatcher,
-    admin_cancel_all_optimizer_jobs,
 )
 from api.middleware import (
     correlation_id_middleware,
@@ -38,7 +41,7 @@ from api.middleware import (
 )
 from api.health import build_health_response, mark_startup
 from config.settings import get_settings
-from storage.database import init_db, ensure_optimization_runs_schema
+from storage.database import init_db, check_integrity, backup_sqlite_database
 
 logger = logging.getLogger(__name__)
 SENSITIVE_KEYS = {"api_key", "secret_key", "password", "token", "authorization"}
@@ -57,6 +60,48 @@ _shutdown_event = threading.Event()
 _SHUTDOWN_TIMEOUT_SECONDS = 10
 
 
+def _parse_bool_like(value: str | None) -> bool | None:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return None
+    if raw in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if raw in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    return None
+
+
+def _resolve_backend_reload_enabled() -> bool:
+    """
+    Resolve backend auto-reload mode.
+    Precedence:
+      1. STOCKSBOT_BACKEND_RELOAD env var
+      2. persisted runtime config (`backend_reload_enabled`)
+      3. safe default (False)
+    """
+    env_value = _parse_bool_like(os.getenv("STOCKSBOT_BACKEND_RELOAD"))
+    if env_value is not None:
+        return env_value
+
+    try:
+        from storage.database import SessionLocal
+        from storage.models import Config as DBConfig
+        db = SessionLocal()
+        try:
+            row = db.query(DBConfig).filter(DBConfig.key == "runtime_config").first()
+            if not row or not row.value:
+                return False
+            payload = json.loads(row.value)
+            raw = payload.get("backend_reload_enabled")
+            if isinstance(raw, bool):
+                return raw
+            return bool(_parse_bool_like(str(raw)))
+        finally:
+            db.close()
+    except Exception:
+        return False
+
+
 def _is_shutting_down() -> bool:
     return _shutdown_event.is_set()
 
@@ -72,11 +117,24 @@ async def _lifespan(_app: FastAPI):
     # ── Database init ────────────────────────────────────────────────────
     try:
         init_db()
-        ensure_optimization_runs_schema()
         logger.info("Database initialized successfully")
     except (RuntimeError, ValueError, TypeError):
         logger.exception("Failed to initialize database schema")
         raise
+
+    # ── Database integrity check + backup ────────────────────────────────
+    try:
+        ok, result = check_integrity()
+        if not ok:
+            logger.critical("Database integrity check failed: %s — continuing anyway", result)
+    except Exception:
+        logger.exception("Database integrity check could not run")
+
+    try:
+        backup_path = backup_sqlite_database()
+        logger.info("Startup database backup created: %s", backup_path)
+    except Exception:
+        logger.warning("Database backup on startup failed (non-blocking)", exc_info=True)
 
     # ── Startup validation ───────────────────────────────────────────────
     if settings.environment == "production" and not settings.api_auth_key:
@@ -106,14 +164,11 @@ async def _lifespan(_app: FastAPI):
         logger.info("Initiating graceful shutdown...")
         _shutdown_event.set()
 
-        # 1. Stop accepting new optimizer jobs and cancel running ones
-        try:
-            cancel_result = admin_cancel_all_optimizer_jobs(force=True)
-            cancelled_count = cancel_result.get("requested_count", 0)
-            if cancelled_count > 0:
-                logger.info("Cancelled %d active optimizer job(s)", cancelled_count)
-        except Exception:
-            logger.exception("Error cancelling optimizer jobs during shutdown")
+        # 1. Do NOT cancel optimizer jobs on shutdown — they are persisted in the
+        # database and the dispatcher will auto-recover them (requeue orphaned
+        # "running" jobs) when the backend restarts.  Force-cancelling here was
+        # destroying long-running optimizer work on every watchdog restart, reload,
+        # or normal app quit + reopen cycle.
 
         # 2. Stop the strategy runner gracefully
         try:
@@ -131,7 +186,7 @@ async def _lifespan(_app: FastAPI):
         except Exception:
             logger.exception("Error stopping strategy runner during shutdown")
 
-        # 3. Stop optimizer dispatcher
+        # 3. Stop optimizer dispatcher (workers will be orphaned but auto-recovered on restart)
         try:
             optimizer_stopped = stop_optimizer_dispatcher()
             if optimizer_stopped:
@@ -348,9 +403,26 @@ app.include_router(api_router)
 
 
 if __name__ == "__main__":
-    uvicorn.run(
-        "app:app",
-        host="127.0.0.1",
-        port=8000,
-        reload=True
-    )
+    multiprocessing.freeze_support()
+
+    # Detect if running as a PyInstaller frozen binary
+    is_frozen = getattr(sys, "frozen", False)
+
+    if is_frozen:
+        # Frozen binary: pass app object directly, disable reload
+        logger.info("Backend bootstrap: frozen binary mode (reload disabled)")
+        uvicorn.run(
+            app,
+            host="127.0.0.1",
+            port=8000,
+            reload=False,
+        )
+    else:
+        reload_enabled = _resolve_backend_reload_enabled()
+        logger.info("Backend bootstrap: uvicorn reload=%s", reload_enabled)
+        uvicorn.run(
+            "app:app",
+            host="127.0.0.1",
+            port=8000,
+            reload=reload_enabled,
+        )

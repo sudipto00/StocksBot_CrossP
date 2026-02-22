@@ -67,7 +67,7 @@ sleep 5
 # Test 4: Check if backend is responding
 echo ""
 echo "Test 4: Backend health check"
-if curl -s http://127.0.0.1:8000/status | grep -q "ok"; then
+if curl -s http://127.0.0.1:8000/status | grep -q '"service":"StocksBot Backend"'; then
     echo "✅ Backend is responding correctly"
 else
     echo "⚠️  Backend not responding (may take longer to start)"
@@ -99,7 +99,7 @@ echo "1. [ ] App launches without errors"
 echo "2. [ ] Settings page accessible"
 echo "3. [ ] Can save credentials to Keychain"
 echo "4. [ ] Can load credentials from Keychain"
-echo "5. [ ] Backend status shows 'running'"
+echo "5. [ ] Backend status shows healthy/degraded (reachable)"
 echo "6. [ ] Can create strategies"
 echo "7. [ ] Can start/stop runner"
 echo "8. [ ] Dashboard displays data"

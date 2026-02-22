@@ -7,6 +7,7 @@ from datetime import datetime
 from enum import Enum
 import re
 from pydantic import BaseModel, Field, field_validator
+from config.paths import default_log_directory, default_audit_export_directory
 
 
 # ============================================================================
@@ -67,8 +68,12 @@ class ConfigResponse(BaseModel):
         default=True,
         description="When true and broker is alpaca, fail instead of using fallback market data",
     )
-    log_directory: str = Field(default="./logs", description="Directory for backend log files")
-    audit_export_directory: str = Field(default="./audit_exports", description="Directory for audit export artifacts")
+    backend_reload_enabled: bool = Field(
+        default=False,
+        description="Enable backend file-watcher auto-reload (dev-only; requires backend restart)",
+    )
+    log_directory: str = Field(default=default_log_directory(), description="Directory for backend log files")
+    audit_export_directory: str = Field(default=default_audit_export_directory(), description="Directory for audit export artifacts")
     log_retention_days: int = Field(default=30, description="Retention period for log files")
     audit_retention_days: int = Field(default=90, description="Retention period for audit logs/files")
     broker: str = Field(default="paper", description="Broker name")
@@ -154,6 +159,10 @@ class ConfigUpdateRequest(BaseModel):
     strict_alpaca_data: Optional[bool] = Field(
         None,
         description="Require real Alpaca-backed data when broker is alpaca",
+    )
+    backend_reload_enabled: Optional[bool] = Field(
+        None,
+        description="Enable backend file-watcher auto-reload (dev-only; requires backend restart)",
     )
     log_directory: Optional[str] = Field(None, description="Directory for backend log files")
     audit_export_directory: Optional[str] = Field(None, description="Directory for audit exports")

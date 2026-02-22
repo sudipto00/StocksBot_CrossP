@@ -5,7 +5,7 @@ Uses SQLAlchemy with SQLite for development and supports Postgres for production
 Production features:
 - Connection pool configuration
 - Automated SQLite backup
-- Schema self-heal (to be migrated to Alembic-only in future)
+- Alembic-first schema upgrades with create_all fallback
 """
 import logging
 import os
@@ -16,11 +16,13 @@ from typing import Generator
 from sqlalchemy import create_engine, inspect, text, event
 from sqlalchemy.orm import sessionmaker, Session, declarative_base
 
+from config.paths import default_database_url
+
 logger = logging.getLogger(__name__)
 
 # Database URL configuration
-# Default to SQLite for development
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./stocksbot.db")
+# Default to app-data SQLite location for standalone runtime.
+DATABASE_URL = os.getenv("DATABASE_URL", default_database_url())
 
 # Create database engine
 # For SQLite, enable check_same_thread=False for FastAPI compatibility
@@ -85,13 +87,45 @@ def get_db() -> Generator[Session, None, None]:
 
 def init_db() -> None:
     """
-    Initialize database by creating all tables.
-    This should be called on application startup.
-
-    Note: In production, use Alembic migrations instead.
+    Initialize or migrate the database schema.
+    Prefer Alembic upgrades; fallback to create_all for local recovery.
     """
-    from storage import models  # Import to register models
+    migrated = run_alembic_upgrade_head()
+    if migrated:
+        return
+    logger.warning("Falling back to SQLAlchemy create_all because Alembic upgrade was unavailable")
+    from storage import models  # noqa: F401  # Import to register models
     Base.metadata.create_all(bind=engine)
+
+
+def run_alembic_upgrade_head() -> bool:
+    """
+    Attempt Alembic `upgrade head`.
+    Returns True when migrations were applied successfully.
+    """
+    backend_dir = Path(__file__).resolve().parent.parent
+    alembic_ini = backend_dir / "alembic.ini"
+    script_location = backend_dir / "alembic"
+    if not alembic_ini.exists() or not script_location.exists():
+        logger.warning("Alembic assets not found, skipping migration upgrade")
+        return False
+    try:
+        from alembic import command
+        from alembic.config import Config
+    except Exception:
+        logger.exception("Alembic is not available in runtime environment")
+        return False
+
+    config = Config(str(alembic_ini))
+    config.set_main_option("script_location", str(script_location))
+    config.set_main_option("sqlalchemy.url", DATABASE_URL)
+    try:
+        command.upgrade(config, "head")
+        logger.info("Applied Alembic migrations to head")
+        return True
+    except Exception:
+        logger.exception("Alembic migration upgrade failed")
+        return False
 
 
 def check_db_connection() -> bool:
@@ -107,7 +141,7 @@ def check_db_connection() -> bool:
         return False
 
 
-def backup_sqlite_database(backup_dir: str = "./backups") -> str:
+def backup_sqlite_database(backup_dir: str | None = None) -> str:
     """
     Create a timestamped backup of the SQLite database file.
 
@@ -131,7 +165,11 @@ def backup_sqlite_database(backup_dir: str = "./backups") -> str:
     if not db_path.exists():
         raise RuntimeError(f"Database file not found: {db_path}")
 
-    backup_path = Path(backup_dir).resolve()
+    if backup_dir is None:
+        from config.paths import resolve_app_data_dir
+        backup_path = (resolve_app_data_dir() / "backups").resolve()
+    else:
+        backup_path = Path(backup_dir).resolve()
     backup_path.mkdir(parents=True, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -166,6 +204,27 @@ def backup_sqlite_database(backup_dir: str = "./backups") -> str:
             pass
 
     return str(backup_file)
+
+
+def check_integrity() -> tuple[bool, str]:
+    """
+    Run SQLite PRAGMA integrity_check.
+    Returns (ok, result_text).
+    """
+    if not DATABASE_URL.startswith("sqlite"):
+        return True, "not sqlite"
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(text("PRAGMA integrity_check")).scalar()
+            ok = str(result).strip().lower() == "ok"
+            if ok:
+                logger.info("Database integrity check passed")
+            else:
+                logger.critical("Database integrity check FAILED: %s", result)
+            return ok, str(result)
+    except Exception as exc:
+        logger.critical("Database integrity check error: %s", exc)
+        return False, str(exc)
 
 
 def ensure_optimization_runs_schema() -> None:

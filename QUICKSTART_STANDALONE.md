@@ -104,7 +104,7 @@ After installing, verify:
 - [ ] Settings page loads
 - [ ] Can save Alpaca credentials to Keychain
 - [ ] Can load credentials from Keychain
-- [ ] Backend status shows "running" (green)
+- [ ] Backend status is reachable (healthy/degraded)
 - [ ] Can create a new strategy
 - [ ] Can start/stop the runner
 - [ ] Dashboard shows positions/orders

@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { invoke } from '@tauri-apps/api/core';
-import { showSuccessNotification, showErrorNotification } from '../utils/notifications';
+import { showSuccessNotification, showErrorNotification, showWarningNotification } from '../utils/notifications';
 import {
   getConfig,
   updateConfig,
@@ -76,9 +76,10 @@ function SettingsPage() {
   const [tickIntervalSeconds, setTickIntervalSeconds] = useState(60);
   const [streamingEnabled, setStreamingEnabled] = useState(false);
   const [strictAlpacaData, setStrictAlpacaData] = useState(true);
+  const [backendReloadEnabled, setBackendReloadEnabled] = useState(false);
   const [broker, setBroker] = useState("paper");
-  const [logDirectory, setLogDirectory] = useState('./logs');
-  const [auditExportDirectory, setAuditExportDirectory] = useState('./audit_exports');
+  const [logDirectory, setLogDirectory] = useState('');
+  const [auditExportDirectory, setAuditExportDirectory] = useState('');
   const [logRetentionDays, setLogRetentionDays] = useState(30);
   const [auditRetentionDays, setAuditRetentionDays] = useState(90);
   const [storageInfo, setStorageInfo] = useState<MaintenanceStorageResponse | null>(null);
@@ -174,9 +175,10 @@ function SettingsPage() {
       setTickIntervalSeconds(config.tick_interval_seconds || 60);
       setStreamingEnabled(Boolean(config.streaming_enabled));
       setStrictAlpacaData(config.strict_alpaca_data !== false);
+      setBackendReloadEnabled(Boolean(config.backend_reload_enabled));
       setBroker(config.broker);
-      setLogDirectory(config.log_directory || './logs');
-      setAuditExportDirectory(config.audit_export_directory || './audit_exports');
+      setLogDirectory(config.log_directory || '');
+      setAuditExportDirectory(config.audit_export_directory || '');
       setLogRetentionDays(config.log_retention_days || 30);
       setAuditRetentionDays(config.audit_retention_days || 90);
       setLoading(false);
@@ -243,6 +245,7 @@ function SettingsPage() {
         tick_interval_seconds: tickIntervalSeconds,
         streaming_enabled: streamingEnabled,
         strict_alpaca_data: strictAlpacaData,
+        backend_reload_enabled: backendReloadEnabled,
         log_directory: logDirectory.trim(),
         audit_export_directory: auditExportDirectory.trim(),
         log_retention_days: logRetentionDays,
@@ -265,6 +268,7 @@ function SettingsPage() {
         verifiedConfig.tick_interval_seconds === tickIntervalSeconds &&
         Boolean(verifiedConfig.streaming_enabled) === streamingEnabled &&
         Boolean(verifiedConfig.strict_alpaca_data) === strictAlpacaData &&
+        Boolean(verifiedConfig.backend_reload_enabled) === backendReloadEnabled &&
         (verifiedConfig.log_directory || '').trim() === logDirectory.trim() &&
         (verifiedConfig.audit_export_directory || '').trim() === auditExportDirectory.trim() &&
         verifiedConfig.log_retention_days === logRetentionDays &&
@@ -342,38 +346,52 @@ function SettingsPage() {
 
     try {
       setCredentialSaving(true);
-      await invoke('save_alpaca_credentials', {
-        mode: credentialMode,
-        apiKey,
-        secretKey,
-      });
+      try {
+        await invoke('save_alpaca_credentials', {
+          mode: credentialMode,
+          apiKey,
+          secretKey,
+        });
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : 'Unknown keychain error';
+        await showErrorNotification(
+          'Credentials Error',
+          `Failed to store ${credentialMode} credentials in Keychain (${reason})`
+        );
+        return;
+      }
 
-      const runtimeStatus = await setBrokerCredentials({
-        mode: credentialMode,
-        api_key: apiKey,
-        secret_key: secretKey,
-      });
-      setRuntimeCredentialStatus(runtimeStatus);
+      try {
+        const runtimeStatus = await setBrokerCredentials({
+          mode: credentialMode,
+          api_key: apiKey,
+          secret_key: secretKey,
+        });
+        setRuntimeCredentialStatus(runtimeStatus);
 
-      const nextPaperTrading = credentialMode === 'paper';
-      setPaperTrading(nextPaperTrading);
-      setBroker('alpaca');
-      await updateConfig({
-        paper_trading: nextPaperTrading,
-        broker: 'alpaca',
-      });
-      setRuntimeCredentialStatus(await getBrokerCredentialsStatus());
-      await loadKeychainStatus();
+        const nextPaperTrading = credentialMode === 'paper';
+        setPaperTrading(nextPaperTrading);
+        setBroker('alpaca');
+        await updateConfig({
+          paper_trading: nextPaperTrading,
+          broker: 'alpaca',
+        });
+        setRuntimeCredentialStatus(await getBrokerCredentialsStatus());
+        await loadKeychainStatus();
 
-      await showSuccessNotification(
-        'Credentials Saved',
-        `Stored ${credentialMode} credentials in Keychain and updated backend runtime broker`
-      );
-    } catch {
-      await showErrorNotification(
-        'Credentials Error',
-        'Failed to save credentials. Ensure desktop app mode is running with backend available.'
-      );
+        await showSuccessNotification(
+          'Credentials Saved',
+          `Stored ${credentialMode} credentials in Keychain and updated backend runtime broker`
+        );
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : 'Unknown backend error';
+        setError(`Keychain save succeeded but backend sync failed: ${reason}`);
+        await loadKeychainStatus();
+        await showWarningNotification(
+          'Keychain Saved, Backend Pending',
+          `Stored ${credentialMode} credentials in Keychain, but backend sync failed (${reason}). Keep backend running and click Load Keys from Keychain.`
+        );
+      }
     } finally {
       setCredentialSaving(false);
     }
@@ -588,6 +606,28 @@ function SettingsPage() {
               <p className="text-red-400 text-sm mt-1">{validationErrors.tickIntervalSeconds}</p>
             )}
           </div>
+          <div className="flex items-center justify-between rounded border border-gray-700 bg-gray-900/40 p-3">
+            <div className="pr-4">
+              <label className="text-white font-medium flex items-center gap-1">
+                Backend Hot Reload
+                <HelpTooltip text="Developer-only file watcher that restarts backend on code changes. Keep OFF for long-running optimizer jobs and standalone stability. Requires backend restart after changing." />
+              </label>
+              <p className="text-gray-400 text-sm">Default OFF. Turn ON only when actively developing backend code.</p>
+            </div>
+            <button
+              onClick={() => setBackendReloadEnabled(!backendReloadEnabled)}
+              className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                backendReloadEnabled ? 'bg-amber-600' : 'bg-gray-600'
+              }`}
+            >
+              <span
+                className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                  backendReloadEnabled ? 'translate-x-6' : 'translate-x-1'
+                }`}
+              />
+            </button>
+          </div>
+          <p className="text-amber-300 text-xs -mt-2">Applies on next backend start.</p>
           <div className="rounded-lg border border-blue-800 bg-blue-900/20 p-3 text-sm text-blue-100">
             Position sizing, daily loss caps, universe filters, and budget guardrails are managed in
             <span className="font-semibold"> Screener Workspace Controls</span> to avoid duplicate risk inputs.

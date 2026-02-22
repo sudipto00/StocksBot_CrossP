@@ -8,6 +8,7 @@ Supports Alpaca broker credentials and other app settings.
 from typing import Optional
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
+from .paths import default_database_url
 
 
 class Settings(BaseSettings):
@@ -39,7 +40,7 @@ class Settings(BaseSettings):
     
     # Database Configuration
     database_url: str = Field(
-        default="sqlite:///./stocksbot.db",
+        default=default_database_url(),
         alias="DATABASE_URL"
     )
     
@@ -50,6 +51,7 @@ class Settings(BaseSettings):
     # API authentication (optional for local desktop dev/test)
     api_auth_enabled: bool = Field(default=False, alias="STOCKSBOT_API_KEY_AUTH_ENABLED")
     api_auth_key: Optional[str] = Field(default=None, alias="STOCKSBOT_API_KEY")
+    backend_reload: bool = Field(default=False, alias="STOCKSBOT_BACKEND_RELOAD")
 
     # Notification delivery (email + sms)
     summary_notifications_enabled: bool = Field(default=True, alias="STOCKSBOT_SUMMARY_NOTIFICATIONS_ENABLED")
