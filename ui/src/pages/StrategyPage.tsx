@@ -4729,8 +4729,8 @@ function StrategyPage() {
               </button>
             </div>
 
-            <p className="text-yellow-400 text-xs mt-4">
-              ⚠️ Note: This is a stub implementation. Strategies won't actually execute trades yet.
+            <p className="text-blue-300 text-xs mt-4">
+              Strategies execute through the runner when trading is enabled and risk/safety checks pass.
             </p>
           </div>
         </div>

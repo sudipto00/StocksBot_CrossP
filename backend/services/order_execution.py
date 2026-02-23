@@ -11,6 +11,7 @@ import logging
 import threading
 import time
 import uuid
+import math
 from collections import deque
 
 from sqlalchemy.orm import Session
@@ -117,6 +118,15 @@ class OrderExecutionService:
             self.budget_tracker = get_budget_tracker()
         else:
             self.budget_tracker = None
+
+    @staticmethod
+    def _same_price(a: Optional[float], b: Optional[float]) -> bool:
+        """Compare optional prices for duplicate-order detection."""
+        if a is None and b is None:
+            return True
+        if a is None or b is None:
+            return False
+        return math.isclose(float(a), float(b), rel_tol=0.0, abs_tol=1e-9)
     
     def validate_order(
         self,
@@ -308,9 +318,14 @@ class OrderExecutionService:
         # for the same symbol + side + strategy.
         existing_open = self.storage.get_open_orders(limit=500)
         for existing_order in existing_open:
-            if (existing_order.symbol == symbol
-                    and existing_order.side.value == side
-                    and existing_order.strategy_id == strategy_id):
+            is_same_order_shape = (
+                existing_order.symbol == symbol
+                and existing_order.side.value == side
+                and existing_order.strategy_id == strategy_id
+                and existing_order.type.value == order_type
+                and self._same_price(existing_order.price, price)
+            )
+            if is_same_order_shape:
                 raise OrderValidationError(
                     f"Duplicate order: pending {side} order already exists for {symbol} "
                     f"(order #{existing_order.id})"

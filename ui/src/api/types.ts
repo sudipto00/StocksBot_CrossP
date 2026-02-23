@@ -111,6 +111,8 @@ export interface Order {
   status: OrderStatus;
   filled_quantity: number;
   avg_fill_price?: number;
+  attached_order_ids?: string[];
+  attached_order_warnings?: string[];
   created_at: string; // ISO datetime string
   updated_at: string; // ISO datetime string
 }
@@ -130,6 +132,9 @@ export interface OrderRequest {
   type: OrderType;
   quantity: number;
   price?: number;
+  take_profit_price?: number;
+  stop_loss_price?: number;
+  trailing_stop_percent?: number;
 }
 
 export interface ConfigUpdateRequest {

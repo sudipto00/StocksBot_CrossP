@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 _startup_time: float = time.monotonic()
 _startup_utc: str = datetime.now(timezone.utc).isoformat()
 
-_APP_VERSION = "1.0.6"
+_APP_VERSION = "1.0.7"
 
 
 def mark_startup() -> None:

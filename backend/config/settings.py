@@ -5,10 +5,34 @@ Loads configuration from environment variables and config files.
 Supports Alpaca broker credentials and other app settings.
 """
 
-from typing import Optional
+from typing import Optional, Tuple
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
-from .paths import default_database_url
+from .paths import default_database_url, resolve_app_data_dir
+
+
+def _resolve_env_file_candidates() -> Tuple[str, ...]:
+    """
+    Resolve dotenv lookup order.
+    1) Per-user app-data .env (recommended for bundled desktop releases)
+    2) Local working-directory .env (developer fallback)
+    """
+    candidates: list[str] = []
+    try:
+        app_env = str((resolve_app_data_dir() / ".env").resolve())
+        if app_env:
+            candidates.append(app_env)
+    except Exception:
+        pass
+    candidates.append(".env")
+    deduped: list[str] = []
+    for item in candidates:
+        if item not in deduped:
+            deduped.append(item)
+    return tuple(deduped)
+
+
+_ENV_FILE_CANDIDATES = _resolve_env_file_candidates()
 
 
 class Settings(BaseSettings):
@@ -76,7 +100,7 @@ class Settings(BaseSettings):
     twilio_timeout_seconds: int = Field(default=15, alias="STOCKSBOT_TWILIO_TIMEOUT_SECONDS")
     
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=_ENV_FILE_CANDIDATES,
         env_file_encoding="utf-8",
         case_sensitive=False,
     )

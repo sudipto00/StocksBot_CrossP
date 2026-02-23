@@ -143,14 +143,21 @@ These endpoints support `X-Idempotency-Key`:
 
 ### `GET /orders`
 
-- Currently returns development stub orders.
-- This endpoint is not yet wired to full broker/history retrieval.
+- Returns persisted local orders and enriches status/fills from broker when available.
+- Output is sorted by newest `updated_at` first.
 
 ### `POST /orders`
 
 - Real execution path.
 - Validates symbol/order params, broker connectivity, market-open state, kill switch, tradability, buying power, and balance-adjusted risk limits.
 - Supports order types: `market`, `limit`, `stop`, `stop_limit`.
+- Supports optional attached exits for buy entries:
+  - `take_profit_price` (sell limit)
+  - `stop_loss_price` (sell stop)
+  - `trailing_stop_percent` (sell stop price snapshot from entry/reference price)
+- Attached exits are best-effort and returned as metadata:
+  - `attached_order_ids`
+  - `attached_order_warnings`
 
 ### Notification endpoints
 
@@ -219,9 +226,11 @@ These endpoints support `X-Idempotency-Key`:
 {
   "symbol": "AAPL",
   "side": "buy",
-  "type": "stop_limit",
+  "type": "market",
   "quantity": 5,
-  "price": 185.0
+  "take_profit_price": 195.0,
+  "stop_loss_price": 185.0,
+  "trailing_stop_percent": 2.5
 }
 ```
 
@@ -232,12 +241,14 @@ Success response shape:
   "id": "123",
   "symbol": "AAPL",
   "side": "buy",
-  "type": "stop_limit",
+  "type": "market",
   "quantity": 5.0,
-  "price": 185.0,
-  "status": "submitted",
-  "filled_quantity": 0.0,
-  "avg_fill_price": null,
+  "price": null,
+  "status": "filled",
+  "filled_quantity": 5.0,
+  "avg_fill_price": 190.3,
+  "attached_order_ids": ["124", "125"],
+  "attached_order_warnings": [],
   "created_at": "2026-02-13T18:12:00.000000",
   "updated_at": "2026-02-13T18:12:00.000000"
 }

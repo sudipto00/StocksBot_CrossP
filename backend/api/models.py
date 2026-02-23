@@ -6,7 +6,7 @@ from typing import Optional, List, Dict, Any, Literal
 from datetime import datetime
 from enum import Enum
 import re
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from config.paths import default_log_directory, default_audit_export_directory
 
 
@@ -121,6 +121,14 @@ class Order(BaseModel):
     status: OrderStatus = Field(..., description="Order status")
     filled_quantity: float = Field(default=0.0, description="Filled quantity")
     avg_fill_price: Optional[float] = Field(None, description="Average fill price")
+    attached_order_ids: List[str] = Field(
+        default_factory=list,
+        description="Optional attached exit order IDs (take-profit/stop-loss) created with this request",
+    )
+    attached_order_warnings: List[str] = Field(
+        default_factory=list,
+        description="Warnings emitted while creating attached exit orders",
+    )
     created_at: datetime = Field(..., description="Order creation timestamp")
     updated_at: datetime = Field(..., description="Last update timestamp")
 
@@ -142,6 +150,22 @@ class OrderRequest(BaseModel):
     type: OrderType = Field(..., description="Order type")
     quantity: float = Field(..., description="Order quantity", gt=0)
     price: Optional[float] = Field(None, description="Limit/stop price", gt=0)
+    take_profit_price: Optional[float] = Field(
+        None,
+        description="Optional take-profit limit price for attached exit order (buy entries only)",
+        gt=0,
+    )
+    stop_loss_price: Optional[float] = Field(
+        None,
+        description="Optional stop-loss stop price for attached exit order (buy entries only)",
+        gt=0,
+    )
+    trailing_stop_percent: Optional[float] = Field(
+        None,
+        description="Optional trailing stop percent converted to a stop price snapshot (buy entries only)",
+        gt=0,
+        le=30,
+    )
 
     @field_validator("symbol")
     @classmethod
@@ -150,6 +174,23 @@ class OrderRequest(BaseModel):
         if not re.match(r"^[A-Z][A-Z0-9.\-]{0,9}$", symbol):
             raise ValueError("Invalid symbol format")
         return symbol
+
+    @model_validator(mode="after")
+    def validate_attached_exits(self) -> "OrderRequest":
+        has_attached_exits = any([
+            self.take_profit_price is not None,
+            self.stop_loss_price is not None,
+            self.trailing_stop_percent is not None,
+        ])
+        if has_attached_exits and self.side != OrderSide.BUY:
+            raise ValueError("Attached exit orders are supported only for buy entries")
+        if (
+            self.take_profit_price is not None
+            and self.stop_loss_price is not None
+            and self.stop_loss_price >= self.take_profit_price
+        ):
+            raise ValueError("stop_loss_price must be below take_profit_price")
+        return self
 
 
 class ConfigUpdateRequest(BaseModel):

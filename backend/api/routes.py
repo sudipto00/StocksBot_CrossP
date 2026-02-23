@@ -2653,6 +2653,101 @@ def _api_order_from_broker_row(raw: Dict[str, Any]) -> Optional[Order]:
     )
 
 
+def _submit_attached_exit_orders(
+    *,
+    order_request: OrderRequest,
+    primary_order: Any,
+    execution_service: OrderExecutionService,
+) -> tuple[List[str], List[str]]:
+    """
+    Optionally submit attached exit orders for a filled buy entry.
+
+    Attached exits are best-effort:
+    - primary order success is never rolled back if attached legs fail
+    - warnings are surfaced in API response payload
+    """
+    attached_ids: List[str] = []
+    warnings: List[str] = []
+    requested_any_exit = any([
+        order_request.take_profit_price is not None,
+        order_request.stop_loss_price is not None,
+        order_request.trailing_stop_percent is not None,
+    ])
+    if not requested_any_exit:
+        return attached_ids, warnings
+
+    if order_request.side != OrderSide.BUY:
+        warnings.append("Attached exits are supported only for buy entries; ignoring exit fields.")
+        return attached_ids, warnings
+
+    status_value = str(getattr(getattr(primary_order, "status", None), "value", "")).strip().lower()
+    if status_value not in {"filled", "partially_filled"}:
+        warnings.append(
+            "Primary order is not filled yet; attached exits were not submitted. "
+            "Retry exits after fill confirmation."
+        )
+        return attached_ids, warnings
+
+    exit_quantity = _safe_float(getattr(primary_order, "filled_quantity", 0.0), 0.0)
+    if exit_quantity <= 0:
+        exit_quantity = _safe_float(getattr(primary_order, "quantity", 0.0), 0.0)
+    if exit_quantity <= 0:
+        warnings.append("Unable to resolve fill quantity for attached exits.")
+        return attached_ids, warnings
+
+    def _submit_leg(*, order_type: str, leg_price: float, label: str) -> None:
+        try:
+            attached = execution_service.submit_order(
+                symbol=order_request.symbol,
+                side=OrderSide.SELL.value,
+                order_type=order_type,
+                quantity=exit_quantity,
+                price=leg_price,
+                strategy_id=getattr(primary_order, "strategy_id", None),
+            )
+            attached_ids.append(str(attached.id))
+        except (OrderValidationError, BrokerError, RuntimeError, ValueError, TypeError) as exc:
+            warnings.append(f"{label} leg failed: {exc}")
+
+    if order_request.take_profit_price is not None:
+        _submit_leg(
+            order_type=OrderType.LIMIT.value,
+            leg_price=float(order_request.take_profit_price),
+            label="take_profit",
+        )
+
+    if order_request.stop_loss_price is not None:
+        _submit_leg(
+            order_type=OrderType.STOP.value,
+            leg_price=float(order_request.stop_loss_price),
+            label="stop_loss",
+        )
+
+    if order_request.trailing_stop_percent is not None:
+        base_price = _safe_float(getattr(primary_order, "avg_fill_price", None), 0.0)
+        if base_price <= 0:
+            try:
+                market_data = execution_service.broker.get_market_data(order_request.symbol)
+                base_price = _safe_float(market_data.get("price"), 0.0)
+            except (RuntimeError, ValueError, TypeError):
+                base_price = 0.0
+        if base_price <= 0:
+            warnings.append("trailing_stop leg failed: unable to resolve reference price")
+        else:
+            trail_pct = float(order_request.trailing_stop_percent)
+            stop_price = round(base_price * (1.0 - (trail_pct / 100.0)), 4)
+            if stop_price <= 0:
+                warnings.append("trailing_stop leg failed: computed stop price is not positive")
+            else:
+                _submit_leg(
+                    order_type=OrderType.STOP.value,
+                    leg_price=stop_price,
+                    label=f"trailing_stop({trail_pct:.2f}%)",
+                )
+
+    return attached_ids, warnings
+
+
 def _load_summary_notification_preferences(storage: StorageService) -> SummaryNotificationPreferencesResponse:
     """Load summary notification preferences from DB config."""
     config_entry = storage.config.get_by_key(_SUMMARY_NOTIFICATION_PREFERENCES_KEY)
@@ -3615,6 +3710,31 @@ async def create_order(
             quantity=order_request.quantity,
             price=order_request.price
         )
+        attached_order_ids, attached_order_warnings = _submit_attached_exit_orders(
+            order_request=order_request,
+            primary_order=order,
+            execution_service=execution_service,
+        )
+
+        if attached_order_ids or attached_order_warnings:
+            try:
+                execution_service.storage.create_audit_log(
+                    event_type="order_created",
+                    description=f"Attached exit processing for order {order.id}",
+                    details={
+                        "order_id": order.id,
+                        "symbol": order.symbol,
+                        "attached_order_ids": attached_order_ids,
+                        "attached_order_warnings": attached_order_warnings,
+                        "take_profit_price": order_request.take_profit_price,
+                        "stop_loss_price": order_request.stop_loss_price,
+                        "trailing_stop_percent": order_request.trailing_stop_percent,
+                    },
+                    order_id=order.id,
+                    strategy_id=order.strategy_id,
+                )
+            except (RuntimeError, ValueError, TypeError):
+                logger.exception("Failed to write attached-exit audit log for order %s", order.id)
         
         # Map to response model
         return Order(
@@ -3627,6 +3747,8 @@ async def create_order(
             status=_to_order_status(order.status.value),
             filled_quantity=order.filled_quantity or 0.0,
             avg_fill_price=order.avg_fill_price,
+            attached_order_ids=attached_order_ids,
+            attached_order_warnings=attached_order_warnings,
             created_at=_ensure_utc_datetime(order.created_at),
             updated_at=_ensure_utc_datetime(order.updated_at),
         )

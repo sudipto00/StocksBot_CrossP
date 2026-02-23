@@ -603,6 +603,46 @@ def test_api_create_limit_order_without_price():
     assert "Price required for limit orders" in response.json()["detail"]
 
 
+def test_api_create_market_order_with_attached_exits():
+    """POST /orders supports optional attached take-profit and stop-loss legs."""
+    order_data = {
+        "symbol": "AAPL",
+        "side": "buy",
+        "type": "market",
+        "quantity": 2,
+        "take_profit_price": 110.0,
+        "stop_loss_price": 95.0,
+    }
+
+    response = client.post("/orders", json=order_data)
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "filled"
+    assert isinstance(data.get("attached_order_ids"), list)
+    assert len(data.get("attached_order_ids", [])) == 2
+    assert data.get("attached_order_warnings") == []
+
+    orders = client.get("/orders")
+    assert orders.status_code == 200
+    by_id = {str(row["id"]): row for row in orders.json().get("orders", [])}
+    for attached_id in data["attached_order_ids"]:
+        assert str(attached_id) in by_id
+        assert by_id[str(attached_id)]["symbol"] == "AAPL"
+        assert by_id[str(attached_id)]["side"] == "sell"
+
+
+def test_api_rejects_attached_exits_for_sell_orders():
+    """Attached exit fields are valid only for buy entries."""
+    response = client.post("/orders", json={
+        "symbol": "AAPL",
+        "side": "sell",
+        "type": "market",
+        "quantity": 1,
+        "take_profit_price": 105.0,
+    })
+    assert response.status_code == 422
+
+
 def test_api_orders_persist_to_database():
     """Test that orders persist to database."""
     # Create an order

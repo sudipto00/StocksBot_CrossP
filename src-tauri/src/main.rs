@@ -123,12 +123,17 @@ fn hide_main_window(app: &AppHandle) {
 
 fn update_tray_status_ui(app: &AppHandle, payload: &TraySummaryPayload) -> Result<(), String> {
     let runner = sanitize_short(payload.runner_status.clone(), "unknown", 24).to_uppercase();
-    let broker = if payload.broker_connected.unwrap_or(false) {
-        "Connected".to_string()
-    } else {
-        "Degraded".to_string()
-    };
     let poll_errors = payload.poll_errors.unwrap_or(0);
+    let broker_connected = payload.broker_connected.unwrap_or(false);
+    let broker = if broker_connected {
+        if poll_errors > 0 {
+            "Connected (degraded)".to_string()
+        } else {
+            "Connected".to_string()
+        }
+    } else {
+        "Disconnected".to_string()
+    };
     let open_positions = payload.open_positions.unwrap_or(0);
     let strategy = sanitize_short(payload.active_strategy.clone(), "None", 36);
     let universe = sanitize_short(payload.universe.clone(), "N/A", 28);
@@ -136,9 +141,32 @@ fn update_tray_status_ui(app: &AppHandle, payload: &TraySummaryPayload) -> Resul
     let queue_depth = payload.optimizer_queue_depth.unwrap_or(0);
     let stalled_jobs = payload.optimizer_stalled_jobs.unwrap_or(0);
     let last_update = sanitize_short(payload.last_update.clone(), "-", 24);
+    let runner_indicator = match runner.as_str() {
+        "RUNNING" => "🟢",
+        "SLEEPING" => "🟡",
+        "ERROR" | "BACKEND DOWN" => "🔴",
+        _ => "⚪",
+    };
+    let broker_indicator = if broker_connected {
+        if poll_errors > 0 {
+            "🟡"
+        } else {
+            "🟢"
+        }
+    } else {
+        "🔴"
+    };
+    let pnl_indicator = match payload.daily_pnl {
+        Some(v) if v > 0.0 => "🟢",
+        Some(v) if v < 0.0 => "🔴",
+        Some(_) => "🟡",
+        None => "⚪",
+    };
     let snapshot = format!(
-        "Runner: {} | Broker: {} | Poll Errors: {} | Open Positions: {} | Jobs: {} active / {} queued{} | Strategy: {} | Universe: {} | Updated: {}",
+        "{} Runner: {} | {} Broker: {} | Poll Errors: {} | Open Positions: {} | Jobs: {} active / {} queued{} | Strategy: {} | Universe: {} | Updated: {}",
+        runner_indicator,
         runner,
+        broker_indicator,
         broker,
         poll_errors,
         open_positions,
@@ -155,19 +183,20 @@ fn update_tray_status_ui(app: &AppHandle, payload: &TraySummaryPayload) -> Resul
     );
 
     if let Some(state) = app.try_state::<TrayState>() {
-        let is_running = runner == "RUNNING";
+        let is_running = runner == "RUNNING" || runner == "SLEEPING";
         if let Ok(mut guard) = state.runner_running.lock() {
             *guard = is_running;
         }
         if let Ok(guard) = state.runner_item.lock() {
             if let Some(item) = &*guard {
-                let _ = item.set_text(format!("Runner: {}", runner));
+                let _ = item.set_text(format!("{} Runner: {}", runner_indicator, runner));
             }
         }
         if let Ok(guard) = state.broker_item.lock() {
             if let Some(item) = &*guard {
                 let _ = item.set_text(format!(
-                    "Broker: {} | Poll Errors: {} | Open Positions: {}",
+                    "{} Broker: {} | Poll Errors: {} | Open Positions: {}",
+                    broker_indicator,
                     broker, poll_errors, open_positions
                 ));
             }
@@ -194,15 +223,16 @@ fn update_tray_status_ui(app: &AppHandle, payload: &TraySummaryPayload) -> Resul
                     _ => "N/A".to_string(),
                 };
                 let _ = item.set_text(format!(
-                    "Equity: {} | Cash: {} | Day P&L: {}",
-                    equity_str, cash_str, pnl_str
+                    "{} Equity: {} | Cash: {} | Day P&L: {}",
+                    pnl_indicator, equity_str, cash_str, pnl_str
                 ));
             }
         }
         if let Ok(guard) = state.summary_item.lock() {
             if let Some(item) = &*guard {
                 let _ = item.set_text(format!(
-                    "Strategy: {} | Universe: {} | Jobs: {}/{}{}",
+                    "{} Strategy: {} | Universe: {} | Jobs: {}/{}{}",
+                    runner_indicator,
                     strategy,
                     universe,
                     active_jobs,
@@ -232,10 +262,13 @@ fn update_tray_status_ui(app: &AppHandle, payload: &TraySummaryPayload) -> Resul
             None => "N/A".to_string(),
         };
         let _ = tray.set_tooltip(Some(format!(
-            "Sudipta's Stocks Bot | Equity {} | Runner {} | Broker {} | Positions {} | {}",
-            equity_tip,
+            "Sudipta's Stocks Bot | {} Runner {} | {} Broker {} | {} Day P&L | Equity {} | Pos {} | {}",
+            runner_indicator,
             runner,
+            broker_indicator,
             broker,
+            pnl_indicator,
+            equity_tip,
             open_positions,
             last_update
         )));

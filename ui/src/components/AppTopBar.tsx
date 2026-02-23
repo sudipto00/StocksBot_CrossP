@@ -154,10 +154,10 @@ function AppTopBar() {
             {formatNextOpen(nextMarketOpenAt) ? (
               <>
                 {' '}
-                Next market open: <span className="font-semibold">{formatNextOpen(nextMarketOpenAt)}</span>.
+                Auto-resume at <span className="font-semibold">{formatNextOpen(nextMarketOpenAt)}</span>.
               </>
             ) : (
-              ' Waiting for market open.'
+              ' Auto-resume will occur at the next market open.'
             )}
           </div>
         </div>

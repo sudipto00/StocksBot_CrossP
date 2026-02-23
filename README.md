@@ -83,7 +83,12 @@ Production packaging keeps the same sidecar pattern (desktop app + backend proce
 - Desktop app stores Alpaca credentials in Keychain service `com.stocksbot.alpaca`
 - Backend uses runtime credentials pushed from desktop flow first
 - Backend falls back to env vars (`ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, `ALPACA_PAPER`) when runtime creds are unavailable
+- Backend dotenv lookup order:
+  - `~/Library/Application Support/com.stocksbot.app/.env` (macOS app-data; recommended for bundled release)
+  - local `backend/.env` (development fallback)
 - Paper/Live mode is controlled by app settings (`paper_trading`)
+- Automatic startup keychain hydration is disabled by default (to avoid repeated prompts in unsigned/personal builds).
+  - Optional: set `VITE_STOCKSBOT_AUTO_KEYCHAIN_HYDRATE=true` in frontend env to re-enable one-shot startup hydration.
 
 ## Optional API-Key Authentication
 

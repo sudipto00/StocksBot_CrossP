@@ -404,10 +404,6 @@ function DashboardPage() {
   const prefsSummary = tradingPrefs
     ? `${tradingPrefs.asset_type.toUpperCase()} | ${tradingPrefs.screener_mode === 'most_active' ? `Most Active (${tradingPrefs.screener_limit})` : `Preset ${tradingPrefs.asset_type === 'etf' ? tradingPrefs.etf_preset : tradingPrefs.stock_preset}`}${presetSeedCoverageSummary}`
     : 'Settings unavailable';
-  const nextMarketOpenLabel = runnerState?.next_market_open_at
-    ? formatDateTime(runnerState.next_market_open_at)
-    : '';
-
   return (
     <div className="p-8">
       <PageHeader
@@ -439,22 +435,6 @@ function DashboardPage() {
           <span className="font-semibold">Open Holdings {positions.length}</span>
         </p>
       </div>
-      {runnerState?.status === RunnerStatus.SLEEPING && (
-        <div className="mb-4 rounded-lg border border-amber-700 bg-amber-900/20 px-4 py-3">
-          <p className="text-sm text-amber-100">
-            Runner is in off-hours sleep mode.
-            {nextMarketOpenLabel ? (
-              <>
-                {' '}
-                Auto-resume at <span className="font-semibold">{nextMarketOpenLabel}</span>.
-              </>
-            ) : (
-              ' Auto-resume will occur at the next market open.'
-            )}
-          </p>
-        </div>
-      )}
-
       {loading && (
         <div className="space-y-6">
           <SkeletonStatGrid count={4} />

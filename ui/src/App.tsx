@@ -34,6 +34,11 @@ const SettingsPage = lazy(() => import('./pages/SettingsPage'));
 const ScreenerPage = lazy(() => import('./pages/ScreenerPage'));
 const HelpPage = lazy(() => import('./pages/HelpPage'));
 const BACKEND_URL = (import.meta as { env?: { VITE_BACKEND_URL?: string } }).env?.VITE_BACKEND_URL || 'http://127.0.0.1:8000';
+const AUTO_KEYCHAIN_HYDRATE = (() => {
+  const raw = (import.meta as { env?: { VITE_STOCKSBOT_AUTO_KEYCHAIN_HYDRATE?: string } }).env?.VITE_STOCKSBOT_AUTO_KEYCHAIN_HYDRATE;
+  const normalized = String(raw || '').trim().toLowerCase();
+  return normalized === '1' || normalized === 'true' || normalized === 'yes' || normalized === 'on';
+})();
 
 interface KeychainCredentialStatus {
   paper_available: boolean;
@@ -129,11 +134,9 @@ function App() {
 
   useEffect(() => {
     const isTauriRuntime = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in (window as unknown as Record<string, unknown>);
-    if (!isTauriRuntime) {
+    if (!isTauriRuntime || !AUTO_KEYCHAIN_HYDRATE) {
       return;
     }
-    let cancelled = false;
-    let retryTimer: number | null = null;
     const hydrateRuntimeCredentials = async (): Promise<boolean> => {
       try {
         const keychainStatus = await invoke<KeychainCredentialStatus>('get_alpaca_credentials_status').catch(() => null);
@@ -162,24 +165,8 @@ function App() {
         return false;
       }
     };
-    const runHydrationWithRetry = async (attempt = 0) => {
-      if (cancelled) return;
-      const ok = await hydrateRuntimeCredentials();
-      if (ok || cancelled) return;
-      const delayMs = Math.min(30_000, 1_000 * (attempt + 1));
-      retryTimer = window.setTimeout(() => {
-        void runHydrationWithRetry(attempt + 1);
-      }, delayMs);
-    };
-    void runHydrationWithRetry(0);
-    const interval = window.setInterval(() => {
-      void hydrateRuntimeCredentials();
-    }, 120_000);
-    return () => {
-      cancelled = true;
-      if (retryTimer) window.clearTimeout(retryTimer);
-      window.clearInterval(interval);
-    };
+    // One-shot hydration only (no periodic keychain reads).
+    void hydrateRuntimeCredentials();
   }, []);
 
   const pollFilledEvents = useRef(async () => {

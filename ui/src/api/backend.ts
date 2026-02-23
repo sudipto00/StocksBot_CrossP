@@ -8,6 +8,7 @@ import {
   ConfigResponse,
   PositionsResponse,
   OrdersResponse,
+  Order,
   OrderRequest,
   ConfigUpdateRequest,
   BrokerCredentialsRequest,
@@ -345,9 +346,10 @@ export async function getOrders(): Promise<OrdersResponse> {
 }
 
 /**
- * Create a new order (placeholder).
+ * Create a new order.
+ * Supports optional attached exits (take-profit, stop-loss, trailing-stop snapshot).
  */
-export async function createOrder(order: OrderRequest): Promise<{ message: string }> {
+export async function createOrder(order: OrderRequest): Promise<Order> {
   const response = await authFetch(`${BACKEND_URL}/orders`, {
     method: 'POST',
     headers: {
@@ -357,7 +359,7 @@ export async function createOrder(order: OrderRequest): Promise<{ message: strin
   });
   
   if (!response.ok) {
-    throw new Error(`Backend returned ${response.status}`);
+    throw new Error(await buildBackendError(response));
   }
   
   return response.json();
