@@ -39,6 +39,7 @@ import {
   BacktestResult,
   BacktestDiagnostics,
   BacktestLiveParityReport,
+  BacktestUniverseContext,
   StrategyOptimizationResult,
   StrategyOptimizationJobStatus,
   StrategyOptimizationHistoryItem,
@@ -51,10 +52,13 @@ import {
   BudgetStatus,
   ConfigResponse,
   BrokerAccountResponse,
+  PresetSeedCoverage,
 } from '../api/types';
 import HelpTooltip from '../components/HelpTooltip';
 import PageHeader from '../components/PageHeader';
 import GuidedFlowStrip from '../components/GuidedFlowStrip';
+import ConfirmDialog from '../components/ConfirmDialog';
+import { useToast } from '../components/Toast';
 
 const SYMBOL_RE = /^[A-Z][A-Z0-9.-]{0,9}$/;
 const STRATEGY_LIMITS = {
@@ -151,6 +155,46 @@ function formatDurationSeconds(seconds: number | null | undefined): string {
   if (h > 0) return `${h}h ${m}m ${s}s`;
   if (m > 0) return `${m}m ${s}s`;
   return `${s}s`;
+}
+
+function extractPresetSeedCoverage(raw: unknown): PresetSeedCoverage | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const candidate = raw as Partial<PresetSeedCoverage>;
+  const seedTotal = Number(candidate.seed_total);
+  const seedAvailable = Number(candidate.seed_available);
+  const seedMissing = Number(candidate.seed_missing);
+  if (!Number.isFinite(seedTotal) || !Number.isFinite(seedAvailable) || !Number.isFinite(seedMissing)) {
+    return null;
+  }
+  return {
+    seed_total: Math.max(0, Math.round(seedTotal)),
+    seed_live_available: Number.isFinite(Number(candidate.seed_live_available))
+      ? Math.max(0, Math.round(Number(candidate.seed_live_available)))
+      : undefined,
+    seed_fallback_available: Number.isFinite(Number(candidate.seed_fallback_available))
+      ? Math.max(0, Math.round(Number(candidate.seed_fallback_available)))
+      : undefined,
+    seed_available: Math.max(0, Math.round(seedAvailable)),
+    seed_missing: Math.max(0, Math.round(seedMissing)),
+    seed_missing_symbols: Array.isArray(candidate.seed_missing_symbols)
+      ? candidate.seed_missing_symbols
+          .map((symbol) => String(symbol || '').trim().toUpperCase())
+          .filter(Boolean)
+          .slice(0, 20)
+      : undefined,
+    backfill_added: Number.isFinite(Number(candidate.backfill_added))
+      ? Math.max(0, Math.round(Number(candidate.backfill_added)))
+      : undefined,
+    returned_count: Number.isFinite(Number(candidate.returned_count))
+      ? Math.max(0, Math.round(Number(candidate.returned_count)))
+      : undefined,
+  };
+}
+
+function formatPresetSeedCoverage(coverage: PresetSeedCoverage | null | undefined): string {
+  if (!coverage || coverage.seed_total <= 0) return 'n/a';
+  const missingPart = coverage.seed_missing > 0 ? ` (${coverage.seed_missing} missing)` : '';
+  return `${coverage.seed_available}/${coverage.seed_total}${missingPart}`;
 }
 
 function safeNumber(value: unknown, fallback = 0): number {
@@ -636,6 +680,9 @@ function summarizeGuardrails(liveParity: BacktestLiveParityReport): string {
  * Manage trading strategies - start, stop, configure, backtest, and tune.
  */
 function StrategyPage() {
+  const { addToast } = useToast();
+  const [selloffConfirmOpen, setSelloffConfirmOpen] = useState(false);
+  const [deleteConfirmStrategy, setDeleteConfirmStrategy] = useState<Strategy | null>(null);
   const [loading, setLoading] = useState(true);
   const [strategies, setStrategies] = useState<Strategy[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -727,6 +774,8 @@ function StrategyPage() {
   const backtestContributionTotal = Math.max(0, Number(backtestDiagnostics?.capital_contributions_total ?? 0));
   const backtestContributionEvents = Math.max(0, Math.round(Number(backtestDiagnostics?.contribution_events ?? 0)));
   const backtestLiveParity: BacktestLiveParityReport | null = backtestDiagnostics?.live_parity || null;
+  const backtestUniverseCtx: BacktestUniverseContext | null =
+    (backtestDiagnostics as unknown as { universe_context?: BacktestUniverseContext })?.universe_context ?? null;
   const topBacktestBlockers = (backtestDiagnostics?.top_blockers || []).filter((item) => item.count > 0);
   const [settingsSummary, setSettingsSummary] = useState<string>('Loading trading preferences...');
   const [cleanupLoading, setCleanupLoading] = useState(false);
@@ -735,11 +784,12 @@ function StrategyPage() {
   const [workspaceLastAppliedAt, setWorkspaceLastAppliedAt] = useState<string | null>(null);
   const [workspaceSnapshot, setWorkspaceSnapshot] = useState<WorkspaceSnapshot | null>(null);
   const [workspaceUniverseSymbols, setWorkspaceUniverseSymbols] = useState<string[]>([]);
+  const [workspacePresetSeedCoverage, setWorkspacePresetSeedCoverage] = useState<PresetSeedCoverage | null>(null);
   const [workspaceUniverseLoading, setWorkspaceUniverseLoading] = useState(false);
   const [prefillMessage, setPrefillMessage] = useState<string>('');
   const [prefillLoading, setPrefillLoading] = useState(false);
   const abortControllerRef = useRef<AbortController | null>(null);
-  const workspaceUniverseCacheRef = useRef<{ key: string; symbols: string[] } | null>(null);
+  const workspaceUniverseCacheRef = useRef<{ key: string; symbols: string[]; presetSeedCoverage: PresetSeedCoverage | null } | null>(null);
   const runnerSummaryRequestIdRef = useRef(0);
 
   const refreshRunnerPreflight = useCallback(async () => {
@@ -966,12 +1016,14 @@ function StrategyPage() {
   const refreshWorkspaceUniverseSymbols = useCallback(async (prefsOverride?: TradingPreferences | null) => {
     if (!analysisUsesWorkspaceUniverse) {
       setWorkspaceUniverseSymbols([]);
+      setWorkspacePresetSeedCoverage(null);
       setWorkspaceUniverseLoading(false);
       return;
     }
     const prefs = prefsOverride ?? await withTimeout(getTradingPreferences(), 2500, null);
     if (!prefs) {
       setWorkspaceUniverseSymbols([]);
+      setWorkspacePresetSeedCoverage(null);
       setWorkspaceUniverseLoading(false);
       return;
     }
@@ -979,6 +1031,7 @@ function StrategyPage() {
     const cached = workspaceUniverseCacheRef.current;
     if (cached && cached.key === resolved.cacheKey) {
       setWorkspaceUniverseSymbols(cached.symbols);
+      setWorkspacePresetSeedCoverage(cached.presetSeedCoverage);
       setWorkspaceUniverseLoading(false);
       return;
     }
@@ -991,10 +1044,13 @@ function StrategyPage() {
     if (response && Array.isArray(response.assets)) {
       const symbols = normalizeSymbols((response.assets || []).map((asset) => asset.symbol).join(', '))
         .slice(0, STRATEGY_LIMITS.maxSymbols);
-      workspaceUniverseCacheRef.current = { key: resolved.cacheKey, symbols };
+      const presetSeedCoverage = extractPresetSeedCoverage(response.applied_guardrails?.preset_seed_coverage);
+      workspaceUniverseCacheRef.current = { key: resolved.cacheKey, symbols, presetSeedCoverage };
       setWorkspaceUniverseSymbols(symbols);
+      setWorkspacePresetSeedCoverage(presetSeedCoverage);
     } else {
       setWorkspaceUniverseSymbols([]);
+      setWorkspacePresetSeedCoverage(null);
     }
     setWorkspaceUniverseLoading(false);
   }, [analysisUsesWorkspaceUniverse, resolveWorkspaceUniverseInputs]);
@@ -1049,6 +1105,7 @@ function StrategyPage() {
 
       if (!analysisUsesWorkspaceUniverse) {
         setWorkspaceUniverseSymbols([]);
+        setWorkspacePresetSeedCoverage(null);
         setWorkspaceUniverseLoading(false);
       }
 
@@ -1082,6 +1139,7 @@ function StrategyPage() {
       return;
     }
     setWorkspaceUniverseSymbols([]);
+    setWorkspacePresetSeedCoverage(null);
     setWorkspaceUniverseLoading(false);
   }, [
     analysisUsesWorkspaceUniverse,
@@ -1494,13 +1552,17 @@ function StrategyPage() {
 
   const handleSelloff = async () => {
     try {
+      setSelloffConfirmOpen(false);
       const result = await selloffPortfolio();
       if (result.success) {
+        addToast('success', 'Selloff Complete', result.message);
         await showSuccessNotification('Selloff Complete', result.message);
       } else {
+        addToast('error', 'Selloff Failed', result.message);
         await showErrorNotification('Selloff Failed', result.message);
       }
     } catch {
+      addToast('error', 'Selloff Error', 'Failed to liquidate positions');
       await showErrorNotification('Selloff Error', 'Failed to liquidate positions');
     }
   };
@@ -1627,12 +1689,13 @@ function StrategyPage() {
 
   const handleDelete = async (strategy: Strategy) => {
     try {
+      setDeleteConfirmStrategy(null);
       setDeletingStrategyId(strategy.id);
-      // Ensure strategy is not active before delete.
       if (strategy.status === StrategyStatus.ACTIVE) {
         await updateStrategy(strategy.id, { status: StrategyStatus.STOPPED });
       }
       await deleteStrategy(strategy.id);
+      addToast('success', 'Strategy Deleted', `Strategy "${strategy.name}" deleted`);
       await showSuccessNotification('Strategy Deleted', `Strategy "${strategy.name}" deleted`);
       clearPersistedOptimizerJobId(strategy.id);
       if (selectedStrategy?.id === strategy.id) {
@@ -1645,6 +1708,7 @@ function StrategyPage() {
       await loadRunnerStatus(false);
       await loadRunnerInputSummary();
     } catch (err) {
+      addToast('error', 'Delete Failed', err instanceof Error ? err.message : 'Failed to delete strategy');
       await showErrorNotification('Delete Error', err instanceof Error ? err.message : 'Failed to delete strategy');
     } finally {
       setDeletingStrategyId(null);
@@ -2185,6 +2249,7 @@ function StrategyPage() {
         maxSectorWeightPct: useSnapshot?.max_sector_weight_pct,
         autoRegimeAdjust: useSnapshot?.auto_regime_adjust,
       });
+      const presetSeedCoverage = extractPresetSeedCoverage(response.applied_guardrails?.preset_seed_coverage);
       const symbols = normalizeSymbols((response.assets || []).map((asset) => asset.symbol).join(', '))
         .slice(0, STRATEGY_LIMITS.maxSymbols);
       if (symbols.length > 0) {
@@ -2199,7 +2264,10 @@ function StrategyPage() {
             ? `Stocks Most Active (${prefs.screener_limit})`
             : `Stock Preset (${prefs.stock_preset}, ${presetUniverseLabel})`
           : `ETF Preset (${prefs.etf_preset}, ${presetUniverseLabel})`;
-        setPrefillMessage(`Prefilled ${symbols.length} symbols from ${sourceLabel}.`);
+        const coverageLabel = screenerMode === 'preset' && presetSeedCoverage
+          ? ` Seed coverage ${formatPresetSeedCoverage(presetSeedCoverage)}.`
+          : '';
+        setPrefillMessage(`Prefilled ${symbols.length} symbols from ${sourceLabel}.${coverageLabel}`);
       } else {
         setPrefillMessage('No symbols were returned from the current Screener selection.');
       }
@@ -2213,6 +2281,7 @@ function StrategyPage() {
   const selectedSymbolList = strategyConfig ? strategyConfig.symbols : normalizeSymbols(configSymbols);
   const selectedSymbolSet = new Set(selectedSymbolList.map((symbol) => symbol.trim().toUpperCase()).filter(Boolean));
   const workspaceSymbolSet = new Set(workspaceUniverseSymbols.map((symbol) => symbol.trim().toUpperCase()).filter(Boolean));
+  const workspacePresetSeedCoverageLabel = formatPresetSeedCoverage(workspacePresetSeedCoverage);
   const effectiveSymbolSet = analysisUsesWorkspaceUniverse ? workspaceSymbolSet : selectedSymbolSet;
   const savedParameterMap = strategyConfig
     ? strategyConfig.parameters.reduce((acc, param) => {
@@ -2533,7 +2602,7 @@ function StrategyPage() {
               {runnerLoading ? 'Stopping...' : 'Stop Runner'}
             </button>
             <button
-              onClick={handleSelloff}
+              onClick={() => setSelloffConfirmOpen(true)}
               className="px-4 py-2 rounded font-medium bg-orange-600 hover:bg-orange-700 text-white"
             >
               Sell Off All Holdings
@@ -2620,6 +2689,13 @@ function StrategyPage() {
               Workspace universe: <span className="font-semibold">{formatUniverseLabel(runnerInputSummary?.preferences ?? null)}</span>
             </div>
             <div className="rounded bg-blue-950/40 px-3 py-2">
+              Preset seed coverage: <span className="font-semibold">
+                {analysisUsesWorkspaceUniverse
+                  ? (workspaceUniverseLoading ? 'Loading...' : workspacePresetSeedCoverageLabel)
+                  : '-'}
+              </span>
+            </div>
+            <div className="rounded bg-blue-950/40 px-3 py-2">
               Asset type: <span className="font-semibold uppercase">{runnerInputSummary?.preferences?.asset_type ?? '-'}</span>
             </div>
             <div className="rounded bg-blue-950/40 px-3 py-2">
@@ -2697,7 +2773,14 @@ function StrategyPage() {
       )}
 
       {loading ? (
-        <div className="text-gray-400">Loading strategies...</div>
+        <div className="p-8 space-y-6 animate-pulse">
+          <div className="h-8 w-48 bg-gray-700 rounded" />
+          <div className="h-4 w-72 bg-gray-800 rounded" />
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            {[...Array(3)].map((_, i) => <div key={i} className="bg-gray-800 rounded-lg p-5 border border-gray-700 h-24" />)}
+          </div>
+          <div className="bg-gray-800 rounded-lg p-6 border border-gray-700 h-64" />
+        </div>
       ) : strategies.length === 0 ? (
         <div className="bg-gray-800 rounded-lg p-6 border border-gray-700">
           <h3 className="text-lg font-semibold text-white mb-4">Active Strategies</h3>
@@ -2843,6 +2926,11 @@ function StrategyPage() {
                       Screener limit: <span className="font-semibold">{currentPrefs?.screener_limit ?? '-'}</span>
                       <br />
                       Weekly budget: <span className="font-semibold">{formatCurrency(currentPrefs?.weekly_budget ?? 0)}</span>
+                    </div>
+                    <div className="rounded bg-cyan-950/40 px-3 py-2">
+                      Preset seed coverage: <span className="font-semibold">{workspacePresetSeedCoverageLabel}</span>
+                      <br />
+                      Missing symbols tracked: <span className="font-semibold">{workspacePresetSeedCoverage?.seed_missing_symbols?.length ?? 0}</span>
                     </div>
                     <div className="rounded bg-cyan-950/40 px-3 py-2">
                       Guardrail min $vol: <span className="font-semibold">{effectiveMinDollarVolume ? formatCurrency(effectiveMinDollarVolume) : 'N/A'}</span>
@@ -3124,7 +3212,7 @@ function StrategyPage() {
                           {selectedStrategy.status === StrategyStatus.ACTIVE ? 'Stop Strategy' : 'Start Strategy'}
                         </button>
                         <button
-                          onClick={() => handleDelete(selectedStrategy)}
+                          onClick={() => setDeleteConfirmStrategy(selectedStrategy)}
                           disabled={deletingStrategyId === selectedStrategy.id}
                           className="px-4 py-2 rounded font-medium bg-red-600 hover:bg-red-700 disabled:bg-gray-600 text-white"
                         >
@@ -4263,6 +4351,92 @@ function StrategyPage() {
                         </div>
                       )}
 
+                      {backtestUniverseCtx && backtestUniverseCtx.symbols_source === 'workspace_universe' && (
+                        <div className="bg-gray-900 rounded p-4">
+                          <div className="text-white font-medium mb-2">Universe Resolution</div>
+                          <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
+                            <div className="rounded bg-gray-800 px-3 py-2">
+                              <div className="text-gray-400">Data Source</div>
+                              <div className={`font-semibold ${backtestUniverseCtx.data_source === 'alpaca' ? 'text-green-400' : backtestUniverseCtx.data_source === 'fallback' ? 'text-amber-400' : 'text-yellow-400'}`}>
+                                {(backtestUniverseCtx.data_source || 'unknown').replace('_', ' ').replace(/\b\w/g, (c: string) => c.toUpperCase())}
+                                {backtestUniverseCtx.data_source !== 'alpaca' && backtestUniverseCtx.data_source && ' ⚠'}
+                              </div>
+                            </div>
+                            <div className="rounded bg-gray-800 px-3 py-2">
+                              <div className="text-gray-400">Asset Type / Mode</div>
+                              <div className="text-white font-semibold">
+                                {(backtestUniverseCtx.asset_type || 'n/a').toUpperCase()}
+                                {' / '}
+                                {(backtestUniverseCtx.screener_mode || 'n/a').replace('_', ' ').replace(/\b\w/g, (c: string) => c.toUpperCase())}
+                                {backtestUniverseCtx.screener_mode_auto_corrected && (
+                                  <span className="ml-1 text-amber-400">(auto-corrected)</span>
+                                )}
+                              </div>
+                              {backtestUniverseCtx.preset && (
+                                <div className="text-gray-500 mt-1">
+                                  Preset: {backtestUniverseCtx.preset.replace('_', ' ').replace(/\b\w/g, (c: string) => c.toUpperCase())}
+                                  {backtestUniverseCtx.preset_universe_mode && (
+                                    <> ({backtestUniverseCtx.preset_universe_mode.replace(/_/g, ' ')})</>
+                                  )}
+                                </div>
+                              )}
+                            </div>
+                            <div className="rounded bg-gray-800 px-3 py-2">
+                              <div className="text-gray-400">Symbols</div>
+                              <div className="text-white font-semibold">
+                                {backtestUniverseCtx.screener_limit ?? '?'} requested
+                                {' → '}
+                                {backtestUniverseCtx.symbols_selected ?? '?'} selected
+                              </div>
+                              {backtestUniverseCtx.asset_type_filtering && (
+                                backtestUniverseCtx.asset_type_filtering.filtered_out > 0 || backtestUniverseCtx.asset_type_filtering.backfilled > 0
+                              ) && (
+                                <div className="text-amber-400 mt-1">
+                                  {backtestUniverseCtx.asset_type_filtering.filtered_out > 0 && (
+                                    <>{backtestUniverseCtx.asset_type_filtering.filtered_out} removed (type mismatch)</>
+                                  )}
+                                  {backtestUniverseCtx.asset_type_filtering.filtered_out > 0 && backtestUniverseCtx.asset_type_filtering.backfilled > 0 && ', '}
+                                  {backtestUniverseCtx.asset_type_filtering.backfilled > 0 && (
+                                    <>{backtestUniverseCtx.asset_type_filtering.backfilled} backfilled</>
+                                  )}
+                                </div>
+                              )}
+                            </div>
+                            {backtestUniverseCtx.market_regime && (
+                              <div className="rounded bg-gray-800 px-3 py-2">
+                                <div className="text-gray-400">Market Regime</div>
+                                <div className="text-white font-semibold">
+                                  {backtestUniverseCtx.market_regime.replace(/_/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase())}
+                                </div>
+                              </div>
+                            )}
+                            {backtestUniverseCtx.preset_seed_coverage && (
+                              <div className="rounded bg-gray-800 px-3 py-2 md:col-span-2">
+                                <div className="text-gray-400">Seed Coverage</div>
+                                <div className="text-white font-semibold">
+                                  {backtestUniverseCtx.preset_seed_coverage.seed_available}/{backtestUniverseCtx.preset_seed_coverage.seed_total} seeds available
+                                  {backtestUniverseCtx.preset_seed_coverage.seed_missing > 0 && (
+                                    <span className="text-amber-400 ml-1">
+                                      ({backtestUniverseCtx.preset_seed_coverage.seed_missing} missing)
+                                    </span>
+                                  )}
+                                  {(backtestUniverseCtx.preset_seed_coverage.backfill_added ?? 0) > 0 && (
+                                    <span className="text-gray-400 ml-1">
+                                      + {backtestUniverseCtx.preset_seed_coverage.backfill_added} backfill
+                                    </span>
+                                  )}
+                                </div>
+                                {backtestUniverseCtx.preset_seed_coverage.seed_missing_symbols && backtestUniverseCtx.preset_seed_coverage.seed_missing_symbols.length > 0 && (
+                                  <div className="text-gray-500 mt-1 truncate">
+                                    Missing: {backtestUniverseCtx.preset_seed_coverage.seed_missing_symbols.join(', ')}
+                                  </div>
+                                )}
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      )}
+
                       {backtestDiagnostics?.advanced_metrics && (
                         <div className="bg-gray-900 rounded p-4">
                           <div className="text-white font-medium mb-2">Advanced Metrics</div>
@@ -4561,6 +4735,27 @@ function StrategyPage() {
           </div>
         </div>
       )}
+
+      <ConfirmDialog
+        open={selloffConfirmOpen}
+        title="Confirm Portfolio Selloff"
+        message="This will attempt to liquidate all open positions immediately. This action cannot be undone."
+        confirmLabel="Sell All Positions"
+        variant="danger"
+        onConfirm={handleSelloff}
+        onCancel={() => setSelloffConfirmOpen(false)}
+      />
+
+      <ConfirmDialog
+        open={deleteConfirmStrategy !== null}
+        title="Delete Strategy"
+        message={`Permanently delete strategy "${deleteConfirmStrategy?.name || ''}"? If active, it will be stopped first. This cannot be undone.`}
+        confirmLabel="Delete Strategy"
+        variant="danger"
+        loading={deletingStrategyId !== null}
+        onConfirm={() => deleteConfirmStrategy && handleDelete(deleteConfirmStrategy)}
+        onCancel={() => setDeleteConfirmStrategy(null)}
+      />
     </div>
   );
 }

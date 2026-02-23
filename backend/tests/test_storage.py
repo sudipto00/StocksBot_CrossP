@@ -5,6 +5,7 @@ Tests database models, repositories, and storage service.
 import pytest
 from datetime import datetime
 from sqlalchemy import create_engine
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
 from storage.database import Base
@@ -171,6 +172,25 @@ def test_get_order_by_id(order_repo):
     retrieved = order_repo.get_by_id(order.id)
     assert retrieved is not None
     assert retrieved.symbol == "MSFT"
+
+
+def test_order_external_id_is_unique(order_repo):
+    """Orders should not allow duplicate non-null broker external IDs."""
+    order_repo.create(
+        symbol="AAPL",
+        side=OrderSideEnum.BUY,
+        type=OrderTypeEnum.MARKET,
+        quantity=1.0,
+        external_id="alpaca-order-123",
+    )
+    with pytest.raises(IntegrityError):
+        order_repo.create(
+            symbol="MSFT",
+            side=OrderSideEnum.SELL,
+            type=OrderTypeEnum.MARKET,
+            quantity=1.0,
+            external_id="alpaca-order-123",
+        )
 
 
 def test_update_order_status(order_repo):

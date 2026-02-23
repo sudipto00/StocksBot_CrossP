@@ -1,11 +1,13 @@
 {
   "name": "stocksbot",
-  "version": "0.1.0",
+  "version": "1.0.6",
   "description": "Cross-platform StocksBot desktop application",
   "scripts": {
     "tauri": "tauri",
     "dev": "cd ui && npm run dev",
-    "build": "cd ui && npm run build",
+    "build": "npm run build:ui:metadata",
+    "build:ui:metadata": "node scripts/build-ui-with-metadata.mjs",
+    "version:set": "node scripts/set-version.mjs",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
     "backend:dev": "cd backend && python app.py",

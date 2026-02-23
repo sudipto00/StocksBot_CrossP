@@ -71,6 +71,7 @@ import {
   PresetUniverseModePreference,
   StockPresetPreference,
   EtfPresetPreference,
+  ScreenerAssetsResponse,
 } from './types';
 
 // Access environment variables via import.meta.env in Vite
@@ -1318,7 +1319,7 @@ export async function getScreenerAssets(
     maxSectorWeightPct?: number;
     autoRegimeAdjust?: boolean;
   } = {}
-): Promise<{ assets: Array<{ symbol: string }>; total_count?: number; total_pages?: number }> {
+): Promise<ScreenerAssetsResponse> {
   const normalizedAssetType: AssetTypePreference = assetType === 'etf' ? 'etf' : 'stock';
   const normalizedLimit = Math.max(10, Math.min(200, Math.round(limit || 50)));
   const mode = options.screenerMode;
@@ -1362,7 +1363,7 @@ export async function getScreenerAssets(
     baseParams.append('screener_mode', mode);
   }
 
-  const fetchPage = async (page: number): Promise<{ assets: Array<{ symbol: string }>; total_count: number; total_pages: number }> => {
+  const fetchPage = async (page: number): Promise<ScreenerAssetsResponse> => {
     const params = new URLSearchParams(baseParams);
     params.append('page', String(page));
     const response = await authFetch(`${endpoint}?${params.toString()}`);
@@ -1385,5 +1386,8 @@ export async function getScreenerAssets(
     assets: allAssets.slice(0, normalizedLimit),
     total_count: firstPage.total_count ?? allAssets.length,
     total_pages: totalPages,
+    market_regime: firstPage.market_regime,
+    data_source: firstPage.data_source,
+    applied_guardrails: firstPage.applied_guardrails,
   };
 }

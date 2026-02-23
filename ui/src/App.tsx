@@ -24,6 +24,8 @@ import { AuditEventType, StrategyStatus } from './api/types';
 import { showSuccessNotification, showErrorNotification } from './utils/notifications';
 import { reportErrorObject, installGlobalErrorHandler } from './api/errorReporter';
 import GlobalJobTray from './components/GlobalJobTray';
+import { ToastProvider } from './components/Toast';
+import ConnectionBanner from './components/ConnectionBanner';
 
 const DashboardPage = lazy(() => import('./pages/DashboardPage'));
 const StrategyPage = lazy(() => import('./pages/StrategyPage'));
@@ -406,7 +408,9 @@ function App() {
   }, []);
 
   return (
+    <ToastProvider>
     <BrowserRouter>
+      <ConnectionBanner />
       <div className="flex h-screen bg-gray-900">
         <Sidebar />
         <main className="flex-1 overflow-auto">
@@ -444,6 +448,7 @@ function App() {
         </main>
       </div>
     </BrowserRouter>
+    </ToastProvider>
   );
 }
 

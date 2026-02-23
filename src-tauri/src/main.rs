@@ -232,7 +232,7 @@ fn update_tray_status_ui(app: &AppHandle, payload: &TraySummaryPayload) -> Resul
             None => "N/A".to_string(),
         };
         let _ = tray.set_tooltip(Some(format!(
-            "StocksBot | Equity {} | Runner {} | Broker {} | Positions {} | {}",
+            "Sudipta's Stocks Bot | Equity {} | Runner {} | Broker {} | Positions {} | {}",
             equity_tip,
             runner,
             broker,
@@ -433,6 +433,28 @@ fn find_backend_binary(app: &AppHandle) -> Option<PathBuf> {
     None
 }
 
+fn apply_backend_storage_env(cmd: &mut Command, app: &AppHandle) {
+    match app.path().app_data_dir() {
+        Ok(app_data_dir) => {
+            if let Err(err) = std::fs::create_dir_all(&app_data_dir) {
+                println!(
+                    "Warning: failed to create app data directory {}: {}",
+                    app_data_dir.display(),
+                    err
+                );
+            }
+            cmd.env("STOCKSBOT_APP_DATA_DIR", &app_data_dir);
+            println!(
+                "Configured backend app data directory: {}",
+                app_data_dir.display()
+            );
+        }
+        Err(err) => {
+            println!("Warning: failed to resolve app data directory: {}", err);
+        }
+    }
+}
+
 fn launch_backend_sidecar(app: &AppHandle) -> Option<Child> {
     if is_backend_tcp_reachable() {
         println!("Backend already reachable at {}; skipping sidecar launch.", BACKEND_ADDR);
@@ -443,6 +465,7 @@ fn launch_backend_sidecar(app: &AppHandle) -> Option<Child> {
         if let Some(parent) = binary.parent() {
             cmd.current_dir(parent);
         }
+        apply_backend_storage_env(&mut cmd, app);
         cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::null());
         cmd.stderr(Stdio::null());
@@ -475,6 +498,7 @@ fn launch_backend_sidecar(app: &AppHandle) -> Option<Child> {
         if let Some(parent) = script.parent() {
             cmd.current_dir(parent);
         }
+        apply_backend_storage_env(&mut cmd, app);
         cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::null());
         cmd.stderr(Stdio::null());
@@ -516,7 +540,7 @@ fn stop_backend_sidecar(app: &AppHandle) {
 // TODO: Add custom commands for frontend-backend communication
 #[tauri::command]
 fn greet(name: &str) -> String {
-    format!("Hello, {}! Welcome to StocksBot", name)
+    format!("Hello, {}! Welcome to Sudipta's Stocks Bot", name)
 }
 
 // Command to show a system notification
@@ -716,7 +740,7 @@ fn main() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
-            println!("StocksBot is starting...");
+            println!("Sudipta's Stocks Bot is starting...");
             app.manage(SidecarState::default());
 
             let app_handle = app.handle().clone();
@@ -761,7 +785,7 @@ fn main() {
                 .enabled(false)
                 .build(app)
                 .map_err(|e| e.to_string())?;
-            let show_item = MenuItemBuilder::with_id(MENU_ID_SHOW, "Show StocksBot")
+            let show_item = MenuItemBuilder::with_id(MENU_ID_SHOW, "Show Sudipta's Stocks Bot")
                 .build(app)
                 .map_err(|e| e.to_string())?;
             let hide_item = MenuItemBuilder::with_id(MENU_ID_HIDE, "Hide Window")
@@ -816,7 +840,7 @@ fn main() {
                 .icon_as_template(false)
                 .menu(&tray_menu)
                 .show_menu_on_left_click(true)
-                .tooltip("StocksBot running in background")
+                .tooltip("Sudipta's Stocks Bot running in background")
                 .on_menu_event(|app, event| {
                     match event.id().as_ref() {
                         MENU_ID_SHOW => show_main_window(app),

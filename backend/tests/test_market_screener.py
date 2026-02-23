@@ -247,7 +247,7 @@ def test_get_preset_assets_seed_only_disables_backfill():
         seed_only=True,
     )
     symbols = {row["symbol"] for row in assets}
-    seed_symbols = {"SPY", "INTC", "PFE", "CSCO", "KO", "VTI", "XLF", "DIS"}
+    seed_symbols = {"SOFI", "INTC", "PFE", "CSCO", "KO", "HOOD", "SNAP", "DIS"}
     assert symbols
     assert symbols.issubset(seed_symbols)
     assert len(assets) <= len(seed_symbols)
@@ -263,7 +263,7 @@ def test_get_preset_assets_guardrail_only_ignores_seed_subset():
         preset_universe_mode="guardrail_only",
     )
     symbols = {row["symbol"] for row in assets}
-    seed_symbols = {"SPY", "INTC", "PFE", "CSCO", "KO", "VTI", "XLF", "DIS"}
+    seed_symbols = {"SOFI", "INTC", "PFE", "CSCO", "KO", "HOOD", "SNAP", "DIS"}
     assert symbols
     assert any(symbol not in seed_symbols for symbol in symbols)
 
@@ -303,3 +303,84 @@ def test_candidate_universe_tolerates_raw_alpaca_assets_with_new_enum_values():
     assert "SPY" not in symbol_set  # ETF filtered in stock mode
     assert "BTCUSD" not in symbol_set  # Non us_equity class ignored
     assert all(row["asset_type"] == "stock" for row in rows)
+
+
+def test_candidate_universe_us_equity_does_not_force_stock_for_etf_rows():
+    """Generic us_equity class should still allow ETF detection via known symbols/heuristics."""
+    screener = MarketScreener()
+
+    class DummyTradingClient:
+        def get_all_assets(self):
+            return [
+                {"symbol": "SPY", "tradable": True, "status": "active", "class": "us_equity", "name": "SPDR S&P 500 ETF Trust"},
+                {"symbol": "AAPL", "tradable": True, "status": "active", "class": "us_equity", "name": "Apple Inc"},
+            ]
+
+    screener._trading_client = DummyTradingClient()
+    etf_symbols, _ = screener._get_candidate_symbols_for_asset_class("etf", min_count=1)
+    stock_symbols, _ = screener._get_candidate_symbols_for_asset_class("stock", min_count=1)
+
+    assert "SPY" in set(etf_symbols)
+    assert "SPY" not in set(stock_symbols)
+    assert "AAPL" in set(stock_symbols)
+    assert "AAPL" not in set(etf_symbols)
+
+
+def test_candidate_universe_backfills_after_asset_type_post_filter_removal():
+    """When post-filter removes mismatched symbols, screener should backfill candidates."""
+    screener = MarketScreener()
+
+    class DummyTradingClient:
+        def get_all_assets(self):
+            return [
+                {"symbol": "SPY", "tradable": True, "status": "active", "asset_class": "us_equity", "name": "SPDR S&P 500 ETF Trust"},
+                {"symbol": "AAPL", "tradable": True, "status": "active", "asset_class": "us_equity", "name": "Apple Inc"},
+            ]
+
+    screener._trading_client = DummyTradingClient()
+    symbols, rows = screener._get_candidate_symbols_for_asset_class("stock", min_count=10)
+
+    assert "SPY" not in set(symbols)
+    assert len(symbols) >= 10
+    assert len(rows) >= 10
+    assert all(row.get("asset_type") == "stock" for row in rows)
+
+
+def test_candidate_universe_uses_asset_class_as_primary_etf_classifier():
+    """asset_class ETF hints should classify ETFs even when names/symbols are ambiguous."""
+    screener = MarketScreener()
+
+    class DummyTradingClient:
+        def get_all_assets(self):
+            return [
+                {"symbol": "ABCD", "tradable": True, "status": "active", "asset_class": "us_equity_etf", "name": "ABCD Portfolio"},
+                {"symbol": "AAPL", "tradable": True, "status": "active", "asset_class": "us_equity", "name": "Apple Inc"},
+            ]
+
+    screener._trading_client = DummyTradingClient()
+    etf_symbols, _ = screener._get_candidate_symbols_for_asset_class("etf", min_count=1)
+    stock_symbols, _ = screener._get_candidate_symbols_for_asset_class("stock", min_count=1)
+
+    assert "ABCD" in set(etf_symbols)
+    assert "ABCD" not in set(stock_symbols)
+
+
+def test_get_preset_assets_reports_seed_coverage_and_skips_synthetic_zero_rows(monkeypatch):
+    """Missing preset seeds should be reported, not emitted as synthetic zero-volume rows."""
+    screener = MarketScreener()
+    monkeypatch.setattr(screener, "get_active_stocks", lambda limit: [])
+    monkeypatch.setattr(screener, "_get_fallback_stocks", lambda limit: [])
+
+    assets = screener.get_preset_assets(
+        asset_type="stock",
+        preset="micro_budget",
+        limit=20,
+        seed_only=True,
+    )
+    metadata = screener.get_last_preset_metadata()
+
+    assert assets == []
+    assert metadata.get("seed_total") == 8
+    assert metadata.get("seed_available") == 0
+    assert metadata.get("seed_missing") == 8
+    assert len(metadata.get("seed_missing_symbols", [])) == 8

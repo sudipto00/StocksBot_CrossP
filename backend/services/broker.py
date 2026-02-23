@@ -112,17 +112,19 @@ class BrokerInterface(ABC):
         order_type: OrderType,
         quantity: float,
         price: Optional[float] = None,
+        client_order_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Submit an order to the broker.
-        
+
         Args:
             symbol: Stock symbol
             side: Buy or sell
             order_type: Market, limit, etc.
             quantity: Number of shares
             price: Limit price (for limit orders)
-            
+            client_order_id: Client-generated idempotency key
+
         Returns:
             Order confirmation dict
         """
@@ -331,10 +333,11 @@ class PaperBroker(BrokerInterface):
         order_type: OrderType,
         quantity: float,
         price: Optional[float] = None,
+        client_order_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Submit a paper order.
-        
+
         For market orders, immediately fill at the current simulated price.
         For limit orders, create pending order and fill later when simulated
         market price satisfies the limit criteria.

@@ -7,8 +7,8 @@ from __future__ import annotations
 
 import math
 import re
-from datetime import datetime
-from typing import Any, Dict, Mapping, Optional
+from datetime import datetime, timezone, timedelta
+from typing import Any, Dict, List, Mapping, Optional
 
 
 class RiskManager:
@@ -54,9 +54,15 @@ class RiskManager:
         self.max_consecutive_losses = max(1, int(max_consecutive_losses))
         self.max_drawdown_pct = max(1.0, min(50.0, float(max_drawdown_pct)))
 
-        # Track daily stats
+        # Track daily stats — reset at US market close (4 PM ET ≈ 21:00 UTC in EST)
         self.daily_pnl: float = 0.0
-        self.daily_reset_time = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        self._market_close_utc_hour = 21  # 4 PM ET in EST (covers both EST/EDT conservatively)
+        now_utc = datetime.now(timezone.utc)
+        self.daily_reset_time = now_utc.replace(
+            hour=self._market_close_utc_hour, minute=0, second=0, microsecond=0
+        )
+        if now_utc < self.daily_reset_time:
+            self.daily_reset_time -= timedelta(days=1)
 
         # Circuit breaker
         self.circuit_breaker_active = False
@@ -78,16 +84,18 @@ class RiskManager:
         quantity: float,
         price: float,
         current_positions: Dict[str, Any],
+        pending_orders: Optional[List[Dict[str, Any]]] = None,
     ) -> tuple[bool, Optional[str]]:
         """
         Validate an order against risk limits.
-        
+
         Args:
             symbol: Stock symbol
             quantity: Order quantity
             price: Order price
             current_positions: Current portfolio positions
-            
+            pending_orders: Open/pending orders not yet filled (used for exposure accounting)
+
         Returns:
             (is_valid, error_message)
         """
@@ -123,17 +131,34 @@ class RiskManager:
 
         positions = self._normalize_positions(current_positions)
         current_exposure = sum(max(0.0, float(pos.get("market_value", 0.0))) for pos in positions.values())
-        projected_exposure = current_exposure + order_value
+
+        # Account for pending buy orders not yet filled
+        pending_exposure = 0.0
+        pending_new_symbols: set[str] = set()
+        for porder in (pending_orders or []):
+            p_side = str(porder.get("side", "")).lower()
+            if p_side != "buy":
+                continue
+            p_qty = float(porder.get("quantity", 0) or 0)
+            p_price = float(porder.get("price", 0) or porder.get("avg_fill_price", 0) or px)
+            p_value = p_qty * p_price
+            pending_exposure += p_value
+            p_sym = str(porder.get("symbol", "")).strip().upper()
+            if p_sym and p_sym not in positions:
+                pending_new_symbols.add(p_sym)
+
+        projected_exposure = current_exposure + pending_exposure + order_value
         if projected_exposure > self.max_portfolio_exposure:
             return (
                 False,
-                f"Portfolio exposure limit exceeded: projected ${projected_exposure:.2f} > "
-                f"${self.max_portfolio_exposure:.2f}",
+                f"Portfolio exposure limit exceeded (including pending orders): "
+                f"projected ${projected_exposure:.2f} > ${self.max_portfolio_exposure:.2f}",
             )
 
-        is_new_symbol = normalized_symbol not in positions
-        if is_new_symbol and len(positions) >= self.max_open_positions:
-            return False, f"Max open positions reached ({self.max_open_positions})"
+        is_new_symbol = normalized_symbol not in positions and normalized_symbol not in pending_new_symbols
+        total_position_count = len(positions) + len(pending_new_symbols)
+        if is_new_symbol and total_position_count >= self.max_open_positions:
+            return False, f"Max open positions reached ({self.max_open_positions}) including pending orders"
 
         # Concentration checks are meaningful only once portfolio already has exposure.
         if current_exposure > 0:
@@ -262,13 +287,17 @@ class RiskManager:
         }
     
     def _reset_daily_stats_if_needed(self) -> None:
-        """Reset daily statistics if it's a new day."""
-        now = datetime.now()
-        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        
-        if today_start > self.daily_reset_time:
+        """Reset daily statistics after market session close (4 PM ET / 21:00 UTC)."""
+        now = datetime.now(timezone.utc)
+        today_market_close = now.replace(
+            hour=self._market_close_utc_hour, minute=0, second=0, microsecond=0
+        )
+        # Use yesterday's close as boundary if we haven't reached today's close yet
+        session_boundary = today_market_close if now >= today_market_close else today_market_close - timedelta(days=1)
+
+        if session_boundary > self.daily_reset_time:
             self.daily_pnl = 0.0
-            self.daily_reset_time = today_start
+            self.daily_reset_time = session_boundary
 
     def _normalize_positions(self, current_positions: Any) -> Dict[str, Dict[str, float]]:
         """

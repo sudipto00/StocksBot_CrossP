@@ -91,11 +91,11 @@ def init_db() -> None:
     Prefer Alembic upgrades; fallback to create_all for local recovery.
     """
     migrated = run_alembic_upgrade_head()
-    if migrated:
-        return
-    logger.warning("Falling back to SQLAlchemy create_all because Alembic upgrade was unavailable")
-    from storage import models  # noqa: F401  # Import to register models
-    Base.metadata.create_all(bind=engine)
+    if not migrated:
+        logger.warning("Falling back to SQLAlchemy create_all because Alembic upgrade was unavailable")
+        from storage import models  # noqa: F401  # Import to register models
+        Base.metadata.create_all(bind=engine)
+    ensure_orders_external_id_unique_index()
 
 
 def run_alembic_upgrade_head() -> bool:
@@ -225,6 +225,51 @@ def check_integrity() -> tuple[bool, str]:
     except Exception as exc:
         logger.critical("Database integrity check error: %s", exc)
         return False, str(exc)
+
+
+def ensure_orders_external_id_unique_index() -> None:
+    """
+    Best-effort uniqueness enforcement for orders.external_id.
+    Protects existing DBs that were created before uniqueness was added.
+    """
+    inspector = inspect(engine)
+    if not inspector.has_table("orders"):
+        return
+
+    indexes = inspector.get_indexes("orders")
+    has_unique_external_index = any(
+        index.get("name") == "ix_orders_external_id" and bool(index.get("unique"))
+        for index in indexes
+    )
+    if has_unique_external_index:
+        return
+
+    with engine.begin() as connection:
+        duplicate_rows = connection.execute(
+            text(
+                """
+                SELECT external_id, COUNT(*) AS cnt
+                FROM orders
+                WHERE external_id IS NOT NULL
+                GROUP BY external_id
+                HAVING COUNT(*) > 1
+                LIMIT 5
+                """
+            )
+        ).fetchall()
+        if duplicate_rows:
+            details = ", ".join(f"{row[0]}({row[1]})" for row in duplicate_rows)
+            logger.warning(
+                "Could not enforce unique orders.external_id due to duplicates: %s",
+                details,
+            )
+            return
+
+        connection.execute(text("DROP INDEX IF EXISTS ix_orders_external_id"))
+        connection.execute(
+            text("CREATE UNIQUE INDEX IF NOT EXISTS ix_orders_external_id ON orders (external_id)")
+        )
+        logger.info("Ensured unique index ix_orders_external_id on orders.external_id")
 
 
 def ensure_optimization_runs_schema() -> None:

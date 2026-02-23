@@ -99,7 +99,7 @@ class Order(Base):
     __tablename__ = "orders"
     
     id = Column(Integer, primary_key=True, index=True)
-    external_id = Column(String(100), nullable=True, index=True)  # Broker order ID
+    external_id = Column(String(100), nullable=True, index=True, unique=True)  # Broker order ID
     symbol = Column(String(20), nullable=False, index=True)
     side = Column(SQLEnum(OrderSideEnum), nullable=False)
     type = Column(SQLEnum(OrderTypeEnum), nullable=False)

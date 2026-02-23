@@ -77,6 +77,7 @@ export interface ConfigResponse {
 
 export interface Position {
   symbol: string;
+  asset_type?: 'stock' | 'etf';
   side: PositionSide;
   quantity: number;
   avg_entry_price: number;
@@ -625,6 +626,26 @@ export interface BacktestLiveParityReport {
   fees_paid_total: number;
 }
 
+export interface BacktestUniverseContext {
+  symbols_source?: string;
+  asset_type?: string;
+  screener_mode?: string;
+  screener_mode_auto_corrected?: boolean;
+  preset?: string | null;
+  preset_universe_mode?: string | null;
+  preset_seed_coverage?: PresetSeedCoverage | null;
+  screener_limit?: number;
+  asset_type_filtering?: {
+    filtered_out: number;
+    backfilled: number;
+    remaining: number;
+  };
+  guardrails?: Record<string, number | boolean>;
+  market_regime?: string;
+  data_source?: string;
+  symbols_selected?: number;
+}
+
 export interface BacktestDiagnostics {
   symbols_requested: number;
   symbols_with_data: number;
@@ -645,6 +666,7 @@ export interface BacktestDiagnostics {
   capital_base_for_return?: number;
   advanced_metrics?: BacktestAdvancedMetrics;
   live_parity?: BacktestLiveParityReport;
+  universe_context?: BacktestUniverseContext;
 }
 
 export interface BacktestResult {
@@ -940,6 +962,45 @@ export interface TradingPreferencesUpdateRequest {
   screener_mode?: ScreenerModePreference;
   stock_preset?: StockPresetPreference;
   etf_preset?: EtfPresetPreference;
+}
+
+export interface PresetSeedCoverage {
+  seed_total: number;
+  seed_live_available?: number;
+  seed_fallback_available?: number;
+  seed_available: number;
+  seed_missing: number;
+  seed_missing_symbols?: string[];
+  backfill_added?: number;
+  returned_count?: number;
+}
+
+export interface ScreenerAppliedGuardrails {
+  min_dollar_volume?: number;
+  max_spread_bps?: number;
+  max_sector_weight_pct?: number;
+  auto_regime_adjust?: boolean;
+  portfolio_adjusted?: boolean;
+  holdings_count?: number;
+  equity?: number;
+  buying_power?: number;
+  requested_screener_mode?: ScreenerModePreference | null;
+  resolved_screener_mode?: ScreenerModePreference | null;
+  screener_mode_auto_corrected?: boolean;
+  seed_only?: boolean;
+  preset_universe_mode?: PresetUniverseModePreference | null;
+  seed_only_relaxed_fallback_applied?: boolean;
+  preset_seed_coverage?: PresetSeedCoverage | null;
+  [key: string]: unknown;
+}
+
+export interface ScreenerAssetsResponse {
+  assets: Array<{ symbol: string }>;
+  total_count?: number;
+  total_pages?: number;
+  market_regime?: string;
+  data_source?: string;
+  applied_guardrails?: ScreenerAppliedGuardrails;
 }
 
 export interface BudgetStatus {

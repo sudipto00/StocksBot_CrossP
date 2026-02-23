@@ -628,6 +628,29 @@ def test_optimizer_worker_credential_env_roundtrip():
         api_routes._invalidate_broker_instance()
 
 
+def test_set_broker_credentials_does_not_invalidate_when_unchanged(monkeypatch):
+    """Posting identical credentials should not force broker disconnect/recreate."""
+    calls = {"count": 0}
+
+    def _count_invalidate() -> None:
+        calls["count"] += 1
+
+    monkeypatch.setattr(api_routes, "_invalidate_broker_instance", _count_invalidate)
+
+    payload = {
+        "mode": "paper",
+        "api_key": "paper_key_abcdefgh",
+        "secret_key": "paper_secret_abcdefgh",
+    }
+    first = client.post("/broker/credentials", json=payload)
+    assert first.status_code == 200
+    assert calls["count"] == 1
+
+    second = client.post("/broker/credentials", json=payload)
+    assert second.status_code == 200
+    assert calls["count"] == 1
+
+
 def test_optimize_strategy_async_job_cancel(monkeypatch):
     """Async optimizer cancel endpoint should mark running jobs for cancellation."""
     created = client.post(
@@ -2359,6 +2382,60 @@ def test_holdings_snapshot_uses_broker_truth_when_empty():
         db.close()
 
 
+def test_positions_endpoint_preserves_broker_asset_type(monkeypatch):
+    """`/positions` should return broker-provided asset_type when valid."""
+
+    class _DummyBroker:
+        def get_positions(self):
+            return [{
+                "symbol": "SPY",
+                "quantity": 1.0,
+                "side": "long",
+                "avg_entry_price": 500.0,
+                "current_price": 505.0,
+                "market_value": 505.0,
+                "cost_basis": 500.0,
+                "unrealized_pnl": 5.0,
+                "unrealized_pnl_percent": 1.0,
+                "asset_type": "etf",
+            }]
+
+    monkeypatch.setattr(api_routes, "get_broker", lambda: _DummyBroker())
+
+    response = client.get("/positions")
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload["positions"]) == 1
+    assert payload["positions"][0]["asset_type"] == "etf"
+
+
+def test_positions_endpoint_ignores_invalid_asset_type(monkeypatch):
+    """`/positions` should normalize unknown asset_type values to null."""
+
+    class _DummyBroker:
+        def get_positions(self):
+            return [{
+                "symbol": "AAPL",
+                "quantity": 1.0,
+                "side": "long",
+                "avg_entry_price": 180.0,
+                "current_price": 182.0,
+                "market_value": 182.0,
+                "cost_basis": 180.0,
+                "unrealized_pnl": 2.0,
+                "unrealized_pnl_percent": 1.1111,
+                "asset_type": "crypto",
+            }]
+
+    monkeypatch.setattr(api_routes, "get_broker", lambda: _DummyBroker())
+
+    response = client.get("/positions")
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload["positions"]) == 1
+    assert payload["positions"][0]["asset_type"] is None
+
+
 def test_capture_portfolio_snapshot_filters_micro_drift_between_polls():
     """Repeated API polls should not persist extra rows for tiny quote drift."""
     db = TestingSessionLocal()
@@ -2553,7 +2630,7 @@ def test_screener_preset_seed_only_returns_seed_symbols_only():
     assert response.status_code == 200
     data = response.json()
     assert data["asset_type"] == "stock"
-    seed_symbols = {"SPY", "INTC", "PFE", "CSCO", "KO", "VTI", "XLF", "DIS"}
+    seed_symbols = {"SOFI", "INTC", "PFE", "CSCO", "KO", "HOOD", "SNAP", "DIS"}
     returned_symbols = {row["symbol"] for row in data["assets"]}
     assert returned_symbols
     assert returned_symbols.issubset(seed_symbols)
@@ -2584,7 +2661,7 @@ def test_screener_all_preset_seed_only_uses_seed_universe():
     )
     assert response.status_code == 200
     data = response.json()
-    seed_symbols = {"SPY", "INTC", "PFE", "CSCO", "KO", "VTI", "XLF", "DIS"}
+    seed_symbols = {"SOFI", "INTC", "PFE", "CSCO", "KO", "HOOD", "SNAP", "DIS"}
     returned_symbols = {row["symbol"] for row in data["assets"]}
     assert returned_symbols
     assert returned_symbols.issubset(seed_symbols)
@@ -2638,6 +2715,101 @@ def test_screener_all_preset_guardrail_only_passes_mode():
     data = response.json()
     assert data.get("applied_guardrails", {}).get("preset_universe_mode") == "guardrail_only"
     assert data.get("applied_guardrails", {}).get("seed_only") is False
+
+
+def test_screener_all_rejects_explicit_invalid_etf_most_active_combo():
+    """Explicit asset_type=etf + screener_mode=most_active should fail fast."""
+    response = client.get(
+        "/screener/all",
+        params={
+            "asset_type": "etf",
+            "screener_mode": "most_active",
+            "limit": 20,
+        },
+    )
+    assert response.status_code == 400
+    assert "most_active" in response.json().get("detail", "")
+
+
+def test_preferences_reject_explicit_invalid_etf_most_active_combo():
+    """Preferences API should reject explicit invalid screener-mode combinations."""
+    response = client.post(
+        "/preferences",
+        json={
+            "asset_type": "etf",
+            "screener_mode": "most_active",
+            "weekly_budget": 200.0,
+        },
+    )
+    assert response.status_code == 400
+    assert "most_active" in response.json().get("detail", "")
+
+
+def test_preferences_auto_corrects_implicit_invalid_mode_for_etf():
+    """When screener_mode is omitted, ETF asset_type should resolve to preset mode."""
+    seed = client.post(
+        "/preferences",
+        json={
+            "asset_type": "stock",
+            "screener_mode": "most_active",
+            "weekly_budget": 200.0,
+        },
+    )
+    assert seed.status_code == 200
+
+    response = client.post(
+        "/preferences",
+        json={
+            "asset_type": "etf",
+        },
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["asset_type"] == "etf"
+    assert payload["screener_mode"] == "preset"
+
+
+def test_screener_preset_includes_seed_coverage_reporting():
+    """Preset responses should expose seed coverage diagnostics."""
+    response = client.get(
+        "/screener/preset",
+        params={
+            "asset_type": "stock",
+            "preset": "micro_budget",
+            "limit": 20,
+        },
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    guardrails = payload.get("applied_guardrails", {})
+    coverage = guardrails.get("preset_seed_coverage")
+    assert isinstance(coverage, dict)
+    assert int(coverage.get("seed_total", 0)) >= 1
+    assert int(coverage.get("seed_available", 0)) <= int(coverage.get("seed_total", 0))
+
+
+def test_strategy_create_infers_and_persists_asset_type():
+    """Mixed symbol strategies should persist explicit asset_type=both in config/reads."""
+    strategy_name = f"AssetType Infer Mix {int(time.time() * 1000)}"
+    created = client.post(
+        "/strategies",
+        json={
+            "name": strategy_name,
+            "symbols": ["AAPL", "SPY", "QQQ"],
+        },
+    )
+    assert created.status_code == 200
+    payload = created.json()
+    strategy_id = payload["id"]
+    assert payload["asset_type"] == "both"
+
+    fetched = client.get(f"/strategies/{strategy_id}")
+    assert fetched.status_code == 200
+    assert fetched.json()["asset_type"] == "both"
+
+    config = client.get(f"/strategies/{strategy_id}/config")
+    assert config.status_code == 200
+    assert config.json()["asset_type"] == "both"
 
 
 def test_runner_preflight_returns_strategy_readiness():

@@ -1,15 +1,18 @@
 import { useState, useEffect, useCallback, useRef, lazy, Suspense } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { useVirtualizer } from '@tanstack/react-virtual';
 import { useVisibilityAwareInterval } from '../hooks/useVisibilityAwareInterval';
 import { getBackendStatus, getPositions, getRunnerStatus, startRunner, stopRunner, getDashboardAnalyticsBundle, getTradingPreferences, getScreenerAssets, getSafetyStatus, runPanicStop, getSafetyPreflight } from '../api/backend';
-import { StatusResponse, Position, RunnerState, RunnerStatus, PortfolioAnalytics, PortfolioSummaryResponse, BrokerAccountResponse, TradingPreferences } from '../api/types';
+import { StatusResponse, Position, RunnerState, RunnerStatus, PortfolioAnalytics, PortfolioSummaryResponse, BrokerAccountResponse, TradingPreferences, PresetSeedCoverage } from '../api/types';
 
 const EquityCurveChart = lazy(() => import('../components/EquityCurveChart'));
 const PnLChart = lazy(() => import('../components/PnLChart'));
 import HelpTooltip from '../components/HelpTooltip';
 import PageHeader from '../components/PageHeader';
-import GuidedFlowStrip from '../components/GuidedFlowStrip';
+import OnboardingChecklist from '../components/OnboardingChecklist';
+import SectionErrorBoundary from '../components/SectionErrorBoundary';
+import ConfirmDialog from '../components/ConfirmDialog';
+import { SkeletonStatGrid, SkeletonChart, SkeletonTable } from '../components/Skeleton';
+import { useToast } from '../components/Toast';
 import { showErrorNotification, showSuccessNotification } from '../utils/notifications';
 import { formatDateTime } from '../utils/datetime';
 
@@ -17,8 +20,46 @@ import { formatDateTime } from '../utils/datetime';
  * Dashboard page component.
  * Shows backend status, current positions, portfolio summary, and runner controls.
  */
+function extractPresetSeedCoverage(raw: unknown): PresetSeedCoverage | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const candidate = raw as Partial<PresetSeedCoverage>;
+  const seedTotal = Number(candidate.seed_total);
+  const seedAvailable = Number(candidate.seed_available);
+  const seedMissing = Number(candidate.seed_missing);
+  if (!Number.isFinite(seedTotal) || !Number.isFinite(seedAvailable) || !Number.isFinite(seedMissing)) {
+    return null;
+  }
+  return {
+    seed_total: Math.max(0, Math.round(seedTotal)),
+    seed_live_available: Number.isFinite(Number(candidate.seed_live_available))
+      ? Math.max(0, Math.round(Number(candidate.seed_live_available)))
+      : undefined,
+    seed_fallback_available: Number.isFinite(Number(candidate.seed_fallback_available))
+      ? Math.max(0, Math.round(Number(candidate.seed_fallback_available)))
+      : undefined,
+    seed_available: Math.max(0, Math.round(seedAvailable)),
+    seed_missing: Math.max(0, Math.round(seedMissing)),
+    seed_missing_symbols: Array.isArray(candidate.seed_missing_symbols)
+      ? candidate.seed_missing_symbols
+          .map((symbol) => String(symbol || '').trim().toUpperCase())
+          .filter(Boolean)
+          .slice(0, 20)
+      : undefined,
+    backfill_added: Number.isFinite(Number(candidate.backfill_added))
+      ? Math.max(0, Math.round(Number(candidate.backfill_added)))
+      : undefined,
+    returned_count: Number.isFinite(Number(candidate.returned_count))
+      ? Math.max(0, Math.round(Number(candidate.returned_count)))
+      : undefined,
+  };
+}
+
 function DashboardPage() {
   const navigate = useNavigate();
+  const { addToast } = useToast();
+  const [panicConfirmOpen, setPanicConfirmOpen] = useState(false);
+  const prevPnlMapRef = useRef<Map<string, number>>(new Map());
+  const [flashMap, setFlashMap] = useState<Map<string, 'up' | 'down'>>(new Map());
   const [status, setStatus] = useState<StatusResponse | null>(null);
   const [positions, setPositions] = useState<Position[]>([]);
   const [positionsAsOf, setPositionsAsOf] = useState<string | null>(null);
@@ -34,6 +75,7 @@ function DashboardPage() {
   const [error, setError] = useState<string | null>(null);
   const [runnerLoading, setRunnerLoading] = useState(false);
   const [tradingPrefs, setTradingPrefs] = useState<TradingPreferences | null>(null);
+  const [presetSeedCoverage, setPresetSeedCoverage] = useState<PresetSeedCoverage | null>(null);
   const [holdingFilter, setHoldingFilter] = useState<'all' | 'stock' | 'etf'>('all');
   const [knownEtfSymbols, setKnownEtfSymbols] = useState<Set<string>>(() => {
     if (typeof window === 'undefined') return new Set();
@@ -95,6 +137,24 @@ function DashboardPage() {
         getPositions(),
         getDashboardAnalyticsBundle(analyticsDays === 'all' ? undefined : analyticsDays),
       ]);
+      // P&L flash detection
+      const newFlashes = new Map<string, 'up' | 'down'>();
+      for (const pos of positionsData.positions) {
+        const prev = prevPnlMapRef.current.get(pos.symbol);
+        if (prev !== undefined && prev !== pos.unrealized_pnl) {
+          newFlashes.set(pos.symbol, pos.unrealized_pnl > prev ? 'up' : 'down');
+        }
+      }
+      if (newFlashes.size > 0) {
+        setFlashMap(newFlashes);
+        setTimeout(() => setFlashMap(new Map()), 1200);
+      }
+      const nextPnlMap = new Map<string, number>();
+      for (const pos of positionsData.positions) {
+        nextPnlMap.set(pos.symbol, pos.unrealized_pnl);
+      }
+      prevPnlMapRef.current = nextPnlMap;
+
       setPositions(positionsData.positions);
       setPositionsAsOf(positionsData.as_of || null);
       setPositionsDataSource(positionsData.data_source || 'broker');
@@ -120,6 +180,29 @@ function DashboardPage() {
       }
     } catch (err) {
       console.error('Failed to refresh ETF universe cache:', err);
+    }
+  }, []);
+
+  const refreshPresetSeedCoverage = useCallback(async (prefs: TradingPreferences | null) => {
+    if (!prefs) {
+      setPresetSeedCoverage(null);
+      return;
+    }
+    const screenerMode = prefs.asset_type === 'stock' ? prefs.screener_mode : 'preset';
+    if (screenerMode !== 'preset') {
+      setPresetSeedCoverage(null);
+      return;
+    }
+    try {
+      const screener = await getScreenerAssets(prefs.asset_type, prefs.screener_limit, {
+        screenerMode,
+        stockPreset: prefs.stock_preset,
+        etfPreset: prefs.etf_preset,
+      });
+      setPresetSeedCoverage(extractPresetSeedCoverage(screener.applied_guardrails?.preset_seed_coverage));
+    } catch (err) {
+      console.error('Failed to load preset seed coverage for dashboard:', err);
+      setPresetSeedCoverage(null);
     }
   }, []);
 
@@ -176,6 +259,7 @@ function DashboardPage() {
       setSummary(dashboardBundle.summary);
       setBrokerAccount(dashboardBundle.broker_account);
       setTradingPrefs(prefsData);
+      void refreshPresetSeedCoverage(prefsData);
       setKillSwitchActive(Boolean(safety.kill_switch_active));
       void refreshKnownEtfSymbols();
       void refreshSafetyPreflight();
@@ -185,7 +269,7 @@ function DashboardPage() {
     } finally {
       if (!controller.signal.aborted) setLoading(false);
     }
-  }, [analyticsDays, refreshKnownEtfSymbols, refreshSafetyPreflight]);
+  }, [analyticsDays, refreshKnownEtfSymbols, refreshPresetSeedCoverage, refreshSafetyPreflight]);
 
   useEffect(() => {
     void loadData();
@@ -203,13 +287,15 @@ function DashboardPage() {
       setRunnerLoading(true);
       const response = await startRunner();
       if (response.success) {
-        // Reload runner status to get full state
         await loadRunnerStatus();
+        addToast('success', 'Runner Started', response.message || 'Strategy runner started successfully.');
         await showSuccessNotification('Runner Started', response.message || 'Strategy runner started successfully.');
       } else {
+        addToast('error', 'Runner Start Failed', response.message || 'Failed to start runner');
         await showErrorNotification('Runner Start Failed', response.message || 'Failed to start runner');
       }
     } catch (err) {
+      addToast('error', 'Runner Start Failed', err instanceof Error ? err.message : 'Failed to start runner');
       await showErrorNotification('Runner Start Failed', err instanceof Error ? err.message : 'Failed to start runner');
     } finally {
       setRunnerLoading(false);
@@ -221,13 +307,15 @@ function DashboardPage() {
       setRunnerLoading(true);
       const response = await stopRunner();
       if (response.success) {
-        // Reload runner status to get full state
         await loadRunnerStatus();
+        addToast('success', 'Runner Stopped', response.message || 'Strategy runner stopped.');
         await showSuccessNotification('Runner Stopped', response.message || 'Strategy runner stopped.');
       } else {
+        addToast('error', 'Runner Stop Failed', response.message || 'Failed to stop runner');
         await showErrorNotification('Runner Stop Failed', response.message || 'Failed to stop runner');
       }
     } catch (err) {
+      addToast('error', 'Runner Stop Failed', err instanceof Error ? err.message : 'Failed to stop runner');
       await showErrorNotification('Runner Stop Failed', err instanceof Error ? err.message : 'Failed to stop runner');
     } finally {
       setRunnerLoading(false);
@@ -237,11 +325,14 @@ function DashboardPage() {
   const handlePanicStop = async () => {
     try {
       setRunnerLoading(true);
+      setPanicConfirmOpen(false);
       await runPanicStop();
       setKillSwitchActive(true);
       await loadData();
+      addToast('warning', 'Panic Stop Complete', 'Kill switch enabled, runner stopped, and liquidation attempted.');
       await showSuccessNotification('Panic Stop Complete', 'Kill switch enabled, runner stopped, and liquidation attempted.');
     } catch (err) {
+      addToast('error', 'Panic Stop Failed', err instanceof Error ? err.message : 'Failed to run panic stop');
       await showErrorNotification('Panic Stop Failed', err instanceof Error ? err.message : 'Failed to run panic stop');
     } finally {
       setRunnerLoading(false);
@@ -252,14 +343,14 @@ function DashboardPage() {
   const totalPnl = positions.reduce((sum, pos) => sum + pos.unrealized_pnl, 0);
   const totalCost = positions.reduce((sum, pos) => sum + pos.cost_basis, 0);
   const totalPnlPercent = totalCost > 0 ? (totalPnl / totalCost) * 100 : 0;
-  const classifySymbol = (symbol: string): 'stock' | 'etf' => (knownEtfSymbols.has(symbol.toUpperCase()) ? 'etf' : 'stock');
-  const filteredPositions = positions.filter((pos) => (holdingFilter === 'all' ? true : classifySymbol(pos.symbol) === holdingFilter));
-  const positionRowVirtualizer = useVirtualizer({
-    count: filteredPositions.length,
-    getScrollElement: () => positionsScrollRef.current,
-    estimateSize: () => 48,
-    overscan: 15,
-  });
+  const formatQuantity = (value: number): string => value.toLocaleString(undefined, { maximumFractionDigits: 6 });
+  const classifyPosition = (position: Position): 'stock' | 'etf' => {
+    if (position.asset_type === 'stock' || position.asset_type === 'etf') {
+      return position.asset_type;
+    }
+    return knownEtfSymbols.has(position.symbol.toUpperCase()) ? 'etf' : 'stock';
+  };
+  const filteredPositions = positions.filter((pos) => (holdingFilter === 'all' ? true : classifyPosition(pos) === holdingFilter));
   const equityCurve = analytics
     ? analytics.equity_curve.map((point) => ({
         timestamp: point.timestamp,
@@ -307,8 +398,11 @@ function DashboardPage() {
       : runnerState?.status === RunnerStatus.STOPPED
       ? 'Runner is already stopped.'
       : '';
+  const presetSeedCoverageSummary = presetSeedCoverage && presetSeedCoverage.seed_total > 0
+    ? ` | Seeds ${presetSeedCoverage.seed_available}/${presetSeedCoverage.seed_total}`
+    : '';
   const prefsSummary = tradingPrefs
-    ? `${tradingPrefs.asset_type.toUpperCase()} | ${tradingPrefs.screener_mode === 'most_active' ? `Most Active (${tradingPrefs.screener_limit})` : `Preset ${tradingPrefs.asset_type === 'etf' ? tradingPrefs.etf_preset : tradingPrefs.stock_preset}`}`
+    ? `${tradingPrefs.asset_type.toUpperCase()} | ${tradingPrefs.screener_mode === 'most_active' ? `Most Active (${tradingPrefs.screener_limit})` : `Preset ${tradingPrefs.asset_type === 'etf' ? tradingPrefs.etf_preset : tradingPrefs.stock_preset}`}${presetSeedCoverageSummary}`
     : 'Settings unavailable';
   const nextMarketOpenLabel = runnerState?.next_market_open_at
     ? formatDateTime(runnerState.next_market_open_at)
@@ -331,7 +425,7 @@ function DashboardPage() {
           </button>
         )}
       />
-      <GuidedFlowStrip />
+      <OnboardingChecklist />
       <div className="mb-4 rounded-lg border border-emerald-700 bg-emerald-900/20 px-4 py-3">
         <p className="text-sm text-emerald-100">
           Active Trading Summary:
@@ -362,7 +456,12 @@ function DashboardPage() {
       )}
 
       {loading && (
-        <div className="text-gray-400">Loading dashboard data...</div>
+        <div className="space-y-6">
+          <SkeletonStatGrid count={4} />
+          <SkeletonChart height="h-48" />
+          <SkeletonChart />
+          <SkeletonTable rows={5} cols={9} />
+        </div>
       )}
 
       {error && (
@@ -379,6 +478,7 @@ function DashboardPage() {
 
       {!loading && !error && (
         <>
+          <SectionErrorBoundary name="Portfolio Summary">
           <div className="mb-6 grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
             <div className="bg-gray-800 rounded-lg p-5 border border-gray-700">
               <p className="text-gray-400 text-sm flex items-center gap-1">Total Value <HelpTooltip text="Current market value of open positions." /></p>
@@ -386,7 +486,7 @@ function DashboardPage() {
             </div>
             <div className="bg-gray-800 rounded-lg p-5 border border-gray-700">
               <p className="text-gray-400 text-sm flex items-center gap-1">Unrealized P&L <HelpTooltip text="Open-position profit/loss based on latest prices." /></p>
-              <p className={`text-2xl font-semibold ${totalPnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>  
+              <p className={`text-2xl font-semibold ${totalPnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
                 {totalPnl >= 0 ? '+' : ''}${totalPnl.toLocaleString()}
               </p>
               <p className="text-xs text-gray-500">{totalPnlPercent.toFixed(2)}%</p>
@@ -402,7 +502,9 @@ function DashboardPage() {
               </p>
             </div>
           </div>
+          </SectionErrorBoundary>
 
+          <SectionErrorBoundary name="Broker Account">
           <div className="mb-6 bg-gray-800 rounded-lg p-5 border border-gray-700">
             <div className="flex items-center justify-between gap-4">
               <h3 className="text-lg font-semibold text-white">Broker Account ({brokerAccount?.mode?.toUpperCase() || 'PAPER'})</h3>
@@ -428,7 +530,9 @@ function DashboardPage() {
               <p className="mt-3 text-xs text-amber-300">{brokerAccount.message}</p>
             )}
           </div>
+          </SectionErrorBoundary>
 
+          <SectionErrorBoundary name="Control & Performance">
           <div className="mb-8 grid grid-cols-1 xl:grid-cols-12 gap-6">
             <div className="xl:col-span-3 bg-gray-800 rounded-lg p-6 border border-gray-700">
               <h3 className="text-lg font-semibold text-white mb-4">Control & Risk</h3>
@@ -459,7 +563,7 @@ function DashboardPage() {
                   {stopBlockedReason && <p className="text-amber-300">Stop disabled when: {stopBlockedReason}</p>}
                 </div>
                 <button
-                  onClick={handlePanicStop}
+                  onClick={() => setPanicConfirmOpen(true)}
                   disabled={runnerLoading}
                   className="w-full bg-rose-700 hover:bg-rose-800 disabled:bg-gray-600 text-white px-3 py-2 rounded text-sm font-medium"
                 >
@@ -578,7 +682,9 @@ function DashboardPage() {
               </div>
             </div>
           </div>
+          </SectionErrorBoundary>
 
+          <SectionErrorBoundary name="Portfolio Holdings">
           <div className="bg-gray-800 rounded-lg p-6 border border-gray-700">
             <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
               <h3 className="text-lg font-semibold text-white">Current Portfolio Holdings</h3>
@@ -594,7 +700,7 @@ function DashboardPage() {
                 ))}
               </div>
             </div>
-            <p className="mb-3 text-xs text-gray-400">Shows current holdings with market value and portfolio weight. ETF filtering is based on current ETF universe classification.</p>
+            <p className="mb-3 text-xs text-gray-400">Shows current holdings with market value and portfolio weight. Type uses backend classification (Alpaca metadata when available), with ETF-universe fallback only when missing.</p>
             <p className="mb-3 text-xs text-gray-500">
               Data freshness: {positionsAsOf ? formatDateTime(positionsAsOf) : 'Not available'}
               {positionsDataSource ? ` (${positionsDataSource})` : ''}
@@ -610,56 +716,48 @@ function DashboardPage() {
               <p className="text-gray-400 text-sm">No positions</p>
             ) : (
               <div ref={positionsScrollRef} className="overflow-x-auto max-h-[480px] overflow-y-auto">
-                <table className="w-full">
+                <table className="w-full table-fixed text-sm">
                   <thead>
                     <tr className="text-left text-gray-400 text-sm border-b border-gray-700 sticky top-0 bg-gray-800 z-10">
-                      <th className="pb-2">Symbol</th>
-                      <th className="pb-2">Type</th>
-                      <th className="pb-2">Quantity</th>
-                      <th className="pb-2">Avg Price</th>
-                      <th className="pb-2">Current Price</th>
-                      <th className="pb-2">Market Value</th>
-                      <th className="pb-2">Weight</th>
-                      <th className="pb-2">P&L</th>
-                      <th className="pb-2">P&L %</th>
+                      <th className="pb-2 pr-2">Symbol</th>
+                      <th className="pb-2 pr-2">Type</th>
+                      <th className="pb-2 pr-2 text-right">Quantity</th>
+                      <th className="pb-2 pr-2 text-right">Avg Price</th>
+                      <th className="pb-2 pr-2 text-right">Current Price</th>
+                      <th className="pb-2 pr-2 text-right">Market Value</th>
+                      <th className="pb-2 pr-2 text-right">Weight</th>
+                      <th className="pb-2 pr-2 text-right">P&L</th>
+                      <th className="pb-2 text-right">P&L %</th>
                     </tr>
                   </thead>
-                  <tbody style={{ height: `${positionRowVirtualizer.getTotalSize()}px`, position: 'relative' }}>
-                    {positionRowVirtualizer.getVirtualItems().map((virtualRow) => {
-                      const pos = filteredPositions[virtualRow.index];
-                      const type = classifySymbol(pos.symbol);
+                  <tbody>
+                    {filteredPositions.map((pos) => {
+                      const type = classifyPosition(pos);
                       const weightPct = totalValue > 0 ? (pos.market_value / totalValue) * 100 : 0;
+                      const flash = flashMap.get(pos.symbol);
+                      const flashClass = flash === 'up' ? 'bg-green-900/30' : flash === 'down' ? 'bg-red-900/30' : '';
                       return (
                         <tr
                           key={pos.symbol}
-                          className="text-white border-b border-gray-700/50"
-                          style={{
-                            position: 'absolute',
-                            top: 0,
-                            left: 0,
-                            width: '100%',
-                            height: `${virtualRow.size}px`,
-                            transform: `translateY(${virtualRow.start}px)`,
-                            display: 'table-row',
-                          }}
+                          className={`text-white border-b border-gray-700/50 transition-colors duration-700 hover:bg-gray-700/30 ${flashClass}`}
                         >
-                          <td className="py-3 font-medium">{pos.symbol}</td>
-                          <td className="py-3 uppercase text-xs text-gray-300">{type}</td>
-                          <td className="py-3">{pos.quantity}</td>
-                          <td className="py-3">${pos.avg_entry_price.toFixed(2)}</td>
-                          <td className="py-3">
+                          <td className="py-3 pr-2 font-semibold tracking-wide">{pos.symbol}</td>
+                          <td className="py-3 pr-2 uppercase text-xs text-gray-300">{type}</td>
+                          <td className="py-3 pr-2 text-right font-mono tabular-nums">{formatQuantity(pos.quantity)}</td>
+                          <td className="py-3 pr-2 text-right font-mono tabular-nums">${pos.avg_entry_price.toFixed(2)}</td>
+                          <td className="py-3 pr-2 text-right font-mono tabular-nums">
                             {pos.current_price_available === false ? (
                               <span className="text-amber-300">N/A</span>
                             ) : (
                               `$${pos.current_price.toFixed(2)}`
                             )}
                           </td>
-                          <td className="py-3">${pos.market_value.toLocaleString(undefined, { maximumFractionDigits: 2 })}</td>
-                          <td className="py-3">{weightPct.toFixed(2)}%</td>
-                          <td className={`py-3 ${pos.unrealized_pnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                          <td className="py-3 pr-2 text-right font-mono tabular-nums">${pos.market_value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
+                          <td className="py-3 pr-2 text-right font-mono tabular-nums">{weightPct.toFixed(2)}%</td>
+                          <td className={`py-3 pr-2 text-right font-mono tabular-nums ${pos.unrealized_pnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
                             {pos.unrealized_pnl >= 0 ? '+' : ''}${pos.unrealized_pnl.toFixed(2)}
                           </td>
-                          <td className={`py-3 ${pos.unrealized_pnl_percent >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                          <td className={`py-3 text-right font-mono tabular-nums ${pos.unrealized_pnl_percent >= 0 ? 'text-green-400' : 'text-red-400'}`}>
                             {pos.unrealized_pnl_percent >= 0 ? '+' : ''}{pos.unrealized_pnl_percent.toFixed(2)}%
                           </td>
                         </tr>
@@ -670,8 +768,20 @@ function DashboardPage() {
               </div>
             )}
           </div>
+          </SectionErrorBoundary>
         </>
       )}
+
+      <ConfirmDialog
+        open={panicConfirmOpen}
+        title="Confirm Panic Stop"
+        message="This will immediately enable the kill switch, stop the strategy runner, and attempt to liquidate all open positions. This action cannot be undone."
+        confirmLabel="Execute Panic Stop"
+        variant="danger"
+        loading={runnerLoading}
+        onConfirm={handlePanicStop}
+        onCancel={() => setPanicConfirmOpen(false)}
+      />
     </div>
   );
 }

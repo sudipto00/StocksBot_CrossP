@@ -82,6 +82,10 @@ class ConfigResponse(BaseModel):
 class Position(BaseModel):
     """Position model."""
     symbol: str = Field(..., description="Stock symbol")
+    asset_type: Optional[Literal["stock", "etf"]] = Field(
+        default=None,
+        description="Asset type classification when available",
+    )
     side: PositionSide = Field(..., description="Position side (long/short)")
     quantity: float = Field(..., description="Number of shares")
     avg_entry_price: float = Field(..., description="Average entry price")
@@ -277,6 +281,10 @@ class Strategy(BaseModel):
     name: str = Field(..., description="Strategy name")
     description: Optional[str] = Field(None, description="Strategy description")
     status: StrategyStatus = Field(..., description="Strategy status")
+    asset_type: Literal["stock", "etf", "both"] = Field(
+        default="both",
+        description="Declared strategy asset type (stock/etf/both)",
+    )
     symbols: List[str] = Field(default_factory=list, description="Symbols to trade")
     created_at: datetime = Field(..., description="Creation timestamp")
     updated_at: datetime = Field(..., description="Last update timestamp")
@@ -286,6 +294,10 @@ class StrategyCreateRequest(BaseModel):
     """Strategy creation request."""
     name: str = Field(..., description="Strategy name", min_length=1, max_length=100)
     description: Optional[str] = Field(None, description="Strategy description", max_length=500)
+    asset_type: Optional[Literal["stock", "etf", "both"]] = Field(
+        default=None,
+        description="Optional explicit strategy asset type; defaults to inferred from symbols",
+    )
     symbols: List[str] = Field(default_factory=list, description="Symbols to trade")
 
     @field_validator("symbols")
@@ -304,6 +316,10 @@ class StrategyUpdateRequest(BaseModel):
     """Strategy update request."""
     name: Optional[str] = Field(None, description="Strategy name", min_length=1, max_length=100)
     description: Optional[str] = Field(None, description="Strategy description", max_length=500)
+    asset_type: Optional[Literal["stock", "etf", "both"]] = Field(
+        default=None,
+        description="Optional explicit strategy asset type override",
+    )
     symbols: Optional[List[str]] = Field(None, description="Symbols to trade")
     status: Optional[StrategyStatus] = Field(None, description="Strategy status")
 
@@ -480,6 +496,10 @@ class StrategyConfigResponse(BaseModel):
     strategy_id: str = Field(..., description="Strategy ID")
     name: str = Field(..., description="Strategy name")
     description: Optional[str] = Field(None, description="Strategy description")
+    asset_type: Literal["stock", "etf", "both"] = Field(
+        default="both",
+        description="Declared strategy asset type for symbol-universe rules",
+    )
     symbols: List[str] = Field(default_factory=list, description="Trading symbols")
     parameters: List[StrategyParameter] = Field(default_factory=list, description="Strategy parameters")
     enabled: bool = Field(default=True, description="Whether strategy is enabled")
@@ -488,6 +508,10 @@ class StrategyConfigResponse(BaseModel):
 
 class StrategyConfigUpdateRequest(BaseModel):
     """Request to update strategy configuration."""
+    asset_type: Optional[Literal["stock", "etf", "both"]] = Field(
+        default=None,
+        description="Optional strategy asset type override",
+    )
     symbols: Optional[List[str]] = Field(None, description="Trading symbols")
     parameters: Optional[Dict[str, float]] = Field(None, description="Parameter updates")
     enabled: Optional[bool] = Field(None, description="Enable/disable strategy")

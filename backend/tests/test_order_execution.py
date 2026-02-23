@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from datetime import datetime
+import uuid
 
 from app import app
 from storage.database import Base, get_db
@@ -335,6 +336,156 @@ def test_broker_error_marks_order_rejected(execution_service):
     orders = execution_service.storage.get_recent_orders(limit=10)
     assert len(orders) == 1
     assert orders[0].status.value == "rejected"
+
+
+def test_submit_order_normalizes_uuid_external_id(execution_service):
+    """UUID broker order IDs should be stored as strings to avoid sqlite binding errors."""
+    broker_uuid = uuid.uuid4()
+    execution_service.broker.submit_order = Mock(return_value={
+        "id": broker_uuid,
+        "status": "filled",
+        "filled_quantity": 1.0,
+        "avg_fill_price": 100.0,
+        "commission": 0.0,
+    })
+
+    order = execution_service.submit_order(
+        symbol="AAPL",
+        side="buy",
+        order_type="market",
+        quantity=1,
+    )
+    assert isinstance(order.external_id, str)
+    assert order.external_id == str(broker_uuid)
+
+
+def test_update_order_status_processes_only_fill_delta(execution_service):
+    """Repeated cumulative fill snapshots should process only the new delta."""
+    from storage.models import OrderStatusEnum
+
+    order = execution_service.storage.create_order(
+        symbol="AAPL",
+        side="buy",
+        order_type="limit",
+        quantity=10,
+        price=99.0,
+    )
+    order.status = OrderStatusEnum.OPEN
+    order.external_id = "ext-delta-1"
+    execution_service.storage.orders.update(order)
+
+    execution_service.broker.get_order = Mock(side_effect=[
+        {
+            "id": "ext-delta-1",
+            "status": "partially_filled",
+            "filled_quantity": 4.0,
+            "avg_fill_price": 100.0,
+            "commission": 2.0,
+        },
+        {
+            "id": "ext-delta-1",
+            "status": "partially_filled",
+            "filled_quantity": 4.0,
+            "avg_fill_price": 100.0,
+            "commission": 2.0,
+        },
+        {
+            "id": "ext-delta-1",
+            "status": "filled",
+            "filled_quantity": 10.0,
+            "avg_fill_price": 100.0,
+            "commission": 5.0,
+        },
+    ])
+
+    execution_service.update_order_status(order)
+    execution_service.update_order_status(order)
+    execution_service.update_order_status(order)
+
+    trades = execution_service.storage.get_recent_trades(limit=10)
+    quantities = sorted(float(t.quantity) for t in trades)
+    commissions = sorted(float(t.commission or 0.0) for t in trades)
+    assert quantities == [4.0, 6.0]
+    assert commissions == [2.0, 3.0]
+
+    final_order = execution_service.storage.orders.get_by_id(order.id)
+    assert final_order is not None
+    assert final_order.status.value == "filled"
+    assert float(final_order.filled_quantity or 0.0) == 10.0
+
+    position = execution_service.storage.get_position_by_symbol("AAPL")
+    assert position is not None
+    assert float(position.quantity) == 10.0
+    assert float(position.avg_entry_price) == pytest.approx(100.5, rel=1e-6)
+
+
+def test_update_order_status_rolls_back_on_fill_side_effect_error(execution_service):
+    """If fill side-effects fail, status/trade/position changes should roll back together."""
+    from storage.models import OrderStatusEnum
+
+    order = execution_service.storage.create_order(
+        symbol="MSFT",
+        side="buy",
+        order_type="limit",
+        quantity=5,
+        price=250.0,
+    )
+    order.status = OrderStatusEnum.OPEN
+    order.external_id = "ext-rollback-1"
+    execution_service.storage.orders.update(order)
+
+    execution_service.broker.get_order = Mock(return_value={
+        "id": "ext-rollback-1",
+        "status": "partially_filled",
+        "filled_quantity": 5.0,
+        "avg_fill_price": 250.0,
+        "commission": 1.0,
+    })
+    execution_service.storage.create_audit_log = Mock(side_effect=RuntimeError("audit write failed"))
+
+    execution_service.update_order_status(order)
+
+    reloaded_order = execution_service.storage.orders.get_by_id(order.id)
+    assert reloaded_order is not None
+    assert reloaded_order.status.value == "open"
+    assert float(reloaded_order.filled_quantity or 0.0) == 0.0
+    assert execution_service.storage.get_position_by_symbol("MSFT") is None
+    assert execution_service.storage.get_recent_trades(limit=10) == []
+
+
+def test_submit_order_reuses_existing_row_for_duplicate_broker_external_id(execution_service):
+    """If broker returns an already-seen external_id, do not process a duplicate fill again."""
+    duplicate_response = {
+        "id": "ext-duplicate-1",
+        "status": "filled",
+        "filled_quantity": 2.0,
+        "avg_fill_price": 100.0,
+        "commission": 0.0,
+    }
+    execution_service.broker.submit_order = Mock(return_value=duplicate_response)
+
+    first = execution_service.submit_order(
+        symbol="AAPL",
+        side="buy",
+        order_type="market",
+        quantity=2,
+    )
+    second = execution_service.submit_order(
+        symbol="AAPL",
+        side="buy",
+        order_type="market",
+        quantity=2,
+    )
+
+    assert second.id == first.id
+    trades = execution_service.storage.get_recent_trades(limit=10)
+    assert len(trades) == 1
+
+    orders = execution_service.storage.get_recent_orders(limit=10)
+    duplicate_rows = [o for o in orders if o.status.value == "rejected" and o.external_id is None]
+    live_rows = [o for o in orders if o.external_id == "ext-duplicate-1" and o.status.value == "filled"]
+    assert len(duplicate_rows) == 1
+    assert len(live_rows) == 1
 
 
 # ============================================================================

@@ -19,11 +19,11 @@ import subprocess
 import sys
 from pathlib import Path
 from fastapi import APIRouter, HTTPException, Depends, Query, Header, WebSocket, WebSocketDisconnect, Request
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Set
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
 
-from storage.database import SessionLocal, get_db, backup_sqlite_database, check_integrity
+from storage.database import DATABASE_URL, SessionLocal, get_db, backup_sqlite_database, check_integrity
 from storage.service import StorageService
 from storage.models import (
     AuditLog as DBAuditLog,
@@ -2387,6 +2387,153 @@ def _normalize_symbols(raw_symbols: List[str], max_symbols: int = 200) -> List[s
     return normalized_symbols
 
 
+_known_etf_symbols_cache: Optional[Set[str]] = None
+
+
+def _get_known_etf_symbols_for_strategy_inference() -> Set[str]:
+    """Load/cached known ETF symbols for strategy asset-type inference."""
+    global _known_etf_symbols_cache
+    if _known_etf_symbols_cache is None:
+        fallback_screener = MarketScreener(require_real_data=False)
+        _known_etf_symbols_cache = {
+            str(row.get("symbol", "")).strip().upper()
+            for row in fallback_screener._get_fallback_etfs(500)
+            if str(row.get("symbol", "")).strip()
+        }
+    return set(_known_etf_symbols_cache)
+
+
+def _infer_strategy_asset_type_from_symbols(symbols: List[str]) -> str:
+    """Infer strategy asset type from symbol composition when not explicitly set."""
+    normalized: List[str] = []
+    seen: Set[str] = set()
+    for raw_symbol in symbols or []:
+        symbol = str(raw_symbol).strip().upper()
+        if not symbol:
+            continue
+        if not re.match(r"^[A-Z][A-Z0-9.\-]{0,9}$", symbol):
+            continue
+        if symbol in seen:
+            continue
+        normalized.append(symbol)
+        seen.add(symbol)
+    if not normalized:
+        return "both"
+    known_etfs = _get_known_etf_symbols_for_strategy_inference()
+    etf_count = sum(1 for symbol in normalized if symbol in known_etfs)
+    stock_count = len(normalized) - etf_count
+    if etf_count > 0 and stock_count > 0:
+        return "both"
+    if etf_count > 0:
+        return "etf"
+    return "stock"
+
+
+def _strategy_config_asset_type(config: Any, symbols: List[str]) -> str:
+    """Resolve strategy config asset type with safe inference fallback."""
+    payload = _strategy_config_payload(config)
+    raw = str(payload.get("asset_type", "")).strip().lower()
+    if raw in {"stock", "etf", "both"}:
+        return raw
+    return _infer_strategy_asset_type_from_symbols(symbols)
+
+
+def _validate_asset_mode_combo(
+    asset_type: "AssetType",
+    screener_mode: "ScreenerMode",
+    *,
+    mode_explicit: bool,
+    context: str,
+) -> "ScreenerMode":
+    """
+    Validate asset_type+screener_mode pair.
+
+    - Explicit invalid combinations are rejected with HTTP 400.
+    - Implicit invalid combinations (from stored prefs) are corrected for safety.
+    """
+    if asset_type == AssetType.BOTH and screener_mode == ScreenerMode.PRESET:
+        raise HTTPException(status_code=400, detail=f"{context}: preset mode requires asset_type stock or etf")
+    if asset_type == AssetType.ETF and screener_mode == ScreenerMode.MOST_ACTIVE:
+        if mode_explicit:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{context}: screener_mode=most_active is available only for asset_type=stock",
+            )
+        return ScreenerMode.PRESET
+    if asset_type != AssetType.STOCK and screener_mode == ScreenerMode.MOST_ACTIVE:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{context}: screener_mode=most_active is available only for asset_type=stock",
+        )
+    return screener_mode
+
+
+def _filter_assets_to_asset_type_with_backfill(
+    screener: MarketScreener,
+    assets: List[Dict[str, Any]],
+    *,
+    asset_type: "AssetType",
+    target_count: int,
+) -> tuple[List[Dict[str, Any]], Dict[str, int]]:
+    """
+    Enforce asset type before optimization and backfill if filtering reduces count.
+    """
+    if asset_type not in (AssetType.STOCK, AssetType.ETF):
+        return list(assets), {
+            "filtered_out": 0,
+            "backfilled": 0,
+            "remaining": len(assets),
+        }
+
+    known_etfs = screener._get_known_etf_symbols()
+
+    def _matches(symbol: str, name: str) -> bool:
+        if asset_type == AssetType.STOCK:
+            return symbol not in known_etfs
+        return symbol in known_etfs or screener._is_probable_etf_asset(symbol, name)
+
+    filtered: List[Dict[str, Any]] = []
+    filtered_out = 0
+    seen: Set[str] = set()
+    for asset in assets:
+        symbol = str(asset.get("symbol", "")).strip().upper()
+        if not symbol or symbol in seen:
+            continue
+        name = str(asset.get("name", ""))
+        if not _matches(symbol, name):
+            filtered_out += 1
+            continue
+        filtered.append(dict(asset))
+        seen.add(symbol)
+
+    backfilled = 0
+    if len(filtered) < max(1, int(target_count)):
+        backfill_limit = max(200, int(target_count) * 3)
+        backfill_assets = (
+            screener.get_active_stocks(backfill_limit)
+            if asset_type == AssetType.STOCK
+            else screener.get_active_etfs(backfill_limit)
+        )
+        for asset in backfill_assets:
+            symbol = str(asset.get("symbol", "")).strip().upper()
+            if not symbol or symbol in seen:
+                continue
+            name = str(asset.get("name", ""))
+            if not _matches(symbol, name):
+                continue
+            filtered.append(dict(asset))
+            seen.add(symbol)
+            backfilled += 1
+            if len(filtered) >= int(target_count):
+                break
+
+    return filtered, {
+        "filtered_out": int(filtered_out),
+        "backfilled": int(backfilled),
+        "remaining": len(filtered),
+    }
+
+
 def _execution_block_reason(symbol: str, broker: BrokerInterface) -> Optional[str]:
     """Return first blocking safety reason for execution, if any."""
     config = _get_config_snapshot()
@@ -3176,10 +3323,15 @@ async def set_broker_credentials(request: Request, cred_request: BrokerCredentia
     if any(ch.isspace() for ch in api_key) or any(ch.isspace() for ch in secret_key):
         raise HTTPException(status_code=400, detail="API key and secret key cannot contain whitespace")
 
-    _set_runtime_credentials(mode, api_key, secret_key)
-
-    # Ensure broker instance is recreated with latest credentials.
-    _invalidate_broker_instance()
+    current = _get_runtime_credentials(mode)
+    unchanged = (
+        str(current.get("api_key") or "") == api_key
+        and str(current.get("secret_key") or "") == secret_key
+    )
+    if not unchanged:
+        _set_runtime_credentials(mode, api_key, secret_key)
+        # Recreate broker only when credentials actually changed.
+        _invalidate_broker_instance()
 
     return await get_broker_credentials_status()
 
@@ -3331,10 +3483,17 @@ async def get_positions(db: Session = Depends(get_db)):
         )
         side_raw = str(raw.get("side", "long")).lower()
         side = PositionSide.SHORT if side_raw == "short" else PositionSide.LONG
+        asset_type_raw = str(raw.get("asset_type", "")).strip().lower()
+        asset_type: Optional[str]
+        if asset_type_raw in {"stock", "etf"}:
+            asset_type = asset_type_raw
+        else:
+            asset_type = None
         valuation_source = str(raw.get("valuation_source", "broker_mark" if current_price_available else "cost_basis_fallback"))
         positions.append(
             Position(
                 symbol=str(raw.get("symbol", "")).upper(),
+                asset_type=asset_type,
                 side=side,
                 quantity=abs(qty),
                 avg_entry_price=avg_entry_price,
@@ -3639,12 +3798,16 @@ async def get_strategies(db: Session = Depends(get_db)):
 
     strategies = []
     for db_strat in db_strategies:
+        symbols = db_strat.config.get('symbols', []) if db_strat.config else []
+        normalized_symbols = _normalize_symbols(symbols if isinstance(symbols, list) else [])
+        resolved_asset_type = _strategy_config_asset_type(db_strat.config, normalized_symbols)
         strategies.append(Strategy(
             id=str(db_strat.id),
             name=db_strat.name,
             description=db_strat.description or "",
             status=StrategyStatus.ACTIVE if db_strat.is_active else StrategyStatus.STOPPED,
-            symbols=db_strat.config.get('symbols', []) if db_strat.config else [],
+            asset_type=resolved_asset_type,
+            symbols=normalized_symbols,
             created_at=_ensure_utc_datetime(db_strat.created_at),
             updated_at=_ensure_utc_datetime(db_strat.updated_at),
         ))
@@ -3666,18 +3829,29 @@ async def create_strategy(request: StrategyCreateRequest, db: Session = Depends(
     if existing:
         raise HTTPException(status_code=400, detail="Strategy with this name already exists")
     symbols = _normalize_symbols(request.symbols or [])
+    resolved_asset_type = (
+        str(request.asset_type).strip().lower()
+        if request.asset_type is not None
+        else _infer_strategy_asset_type_from_symbols(symbols)
+    )
+    if resolved_asset_type not in {"stock", "etf", "both"}:
+        raise HTTPException(status_code=400, detail="asset_type must be one of: stock, etf, both")
 
     db_strategy = storage.strategies.create(
         name=request.name,
         description=request.description or "",
         strategy_type="custom",
-        config={"symbols": symbols, _STRATEGY_CONFIG_VERSION_KEY: 1},
+        config={
+            "symbols": symbols,
+            "asset_type": resolved_asset_type,
+            _STRATEGY_CONFIG_VERSION_KEY: 1,
+        },
     )
 
     storage.create_audit_log(
         event_type="strategy_started",
         description=f"Strategy created: {request.name}",
-        details={"strategy_id": db_strategy.id, "symbols": symbols},
+        details={"strategy_id": db_strategy.id, "symbols": symbols, "asset_type": resolved_asset_type},
     )
 
     return Strategy(
@@ -3685,6 +3859,7 @@ async def create_strategy(request: StrategyCreateRequest, db: Session = Depends(
         name=db_strategy.name,
         description=db_strategy.description or "",
         status=StrategyStatus.STOPPED,
+        asset_type=resolved_asset_type,
         symbols=symbols,
         created_at=_ensure_utc_datetime(db_strategy.created_at),
         updated_at=_ensure_utc_datetime(db_strategy.updated_at),
@@ -3706,13 +3881,17 @@ async def get_strategy(strategy_id: str, db: Session = Depends(get_db)):
     db_strategy = storage.strategies.get_by_id(strategy_id_int)
     if not db_strategy:
         raise HTTPException(status_code=404, detail="Strategy not found")
+    symbols = db_strategy.config.get('symbols', []) if db_strategy.config else []
+    normalized_symbols = _normalize_symbols(symbols if isinstance(symbols, list) else [])
+    resolved_asset_type = _strategy_config_asset_type(db_strategy.config, normalized_symbols)
 
     return Strategy(
         id=str(db_strategy.id),
         name=db_strategy.name,
         description=db_strategy.description or "",
         status=StrategyStatus.ACTIVE if db_strategy.is_active else StrategyStatus.STOPPED,
-        symbols=db_strategy.config.get('symbols', []) if db_strategy.config else [],
+        asset_type=resolved_asset_type,
+        symbols=normalized_symbols,
         created_at=_ensure_utc_datetime(db_strategy.created_at),
         updated_at=_ensure_utc_datetime(db_strategy.updated_at),
     )
@@ -3738,23 +3917,56 @@ async def update_strategy(strategy_id: str, request: StrategyUpdateRequest, db: 
         db_strategy.name = request.name
     if request.description is not None:
         db_strategy.description = request.description
+    config_payload = _strategy_config_payload(db_strategy.config)
+    config_changed = False
     if request.symbols is not None:
-        symbols_changed = False
         current_symbols = _normalize_symbols(
-            db_strategy.config.get("symbols", [])
-            if isinstance(db_strategy.config, dict)
+            config_payload.get("symbols", [])
+            if isinstance(config_payload.get("symbols"), list)
             else []
         )
         next_symbols = _normalize_symbols(request.symbols)
         if current_symbols != next_symbols:
-            config_payload = _strategy_config_payload(db_strategy.config)
             config_payload["symbols"] = next_symbols
-            db_strategy.config = config_payload
-            _strategy_bump_config_version(db_strategy)
-            symbols_changed = True
-        if symbols_changed:
-            from sqlalchemy.orm.attributes import flag_modified
-            flag_modified(db_strategy, "config")
+            config_changed = True
+
+    if request.asset_type is not None:
+        next_asset_type = str(request.asset_type).strip().lower()
+        if next_asset_type not in {"stock", "etf", "both"}:
+            raise HTTPException(status_code=400, detail="asset_type must be one of: stock, etf, both")
+        # Cross-validate: if changing asset_type without updating symbols, ensure they match
+        if request.symbols is None and next_asset_type in {"stock", "etf"}:
+            existing_symbols = _normalize_symbols(
+                config_payload.get("symbols", [])
+                if isinstance(config_payload.get("symbols"), list)
+                else []
+            )
+            if existing_symbols:
+                inferred = _infer_strategy_asset_type_from_symbols(existing_symbols)
+                if inferred != next_asset_type and inferred != "both":
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"Cannot change asset_type to '{next_asset_type}' — existing symbols "
+                            f"are classified as '{inferred}'. Update symbols first or use asset_type='both'."
+                        ),
+                    )
+        if str(config_payload.get("asset_type", "")).strip().lower() != next_asset_type:
+            config_payload["asset_type"] = next_asset_type
+            config_changed = True
+    elif request.symbols is not None:
+        inferred_asset_type = _infer_strategy_asset_type_from_symbols(
+            config_payload.get("symbols", []) if isinstance(config_payload.get("symbols"), list) else []
+        )
+        if str(config_payload.get("asset_type", "")).strip().lower() != inferred_asset_type:
+            config_payload["asset_type"] = inferred_asset_type
+            config_changed = True
+
+    if config_changed:
+        db_strategy.config = config_payload
+        _strategy_bump_config_version(db_strategy)
+        from sqlalchemy.orm.attributes import flag_modified
+        flag_modified(db_strategy, "config")
     if request.status is not None:
         db_strategy.is_active = (request.status == StrategyStatus.ACTIVE)
         storage.create_audit_log(
@@ -3770,6 +3982,12 @@ async def update_strategy(strategy_id: str, request: StrategyUpdateRequest, db: 
         name=db_strategy.name,
         description=db_strategy.description or "",
         status=StrategyStatus.ACTIVE if db_strategy.is_active else StrategyStatus.STOPPED,
+        asset_type=_strategy_config_asset_type(
+            db_strategy.config,
+            _normalize_symbols(
+                db_strategy.config.get("symbols", []) if isinstance(db_strategy.config, dict) else []
+            ),
+        ),
         symbols=db_strategy.config.get('symbols', []) if db_strategy.config else [],
         created_at=_ensure_utc_datetime(db_strategy.created_at),
         updated_at=_ensure_utc_datetime(db_strategy.updated_at),
@@ -4098,6 +4316,9 @@ async def get_storage_settings():
     config = _get_config_snapshot()
     log_dir = Path(config.log_directory).expanduser().resolve()
     audit_dir = Path(config.audit_export_directory).expanduser().resolve()
+    db_path: Optional[str] = None
+    if str(DATABASE_URL).startswith("sqlite:///"):
+        db_path = str(Path(str(DATABASE_URL).replace("sqlite:///", "")).expanduser().resolve())
     log_files = []
     audit_files = []
     if log_dir.exists():
@@ -4113,6 +4334,8 @@ async def get_storage_settings():
             reverse=True,
         )[:50]
     return {
+        "database_url": DATABASE_URL,
+        "database_path": db_path,
         "log_directory": str(log_dir),
         "audit_export_directory": str(audit_dir),
         "log_retention_days": config.log_retention_days,
@@ -4285,16 +4508,26 @@ async def panic_stop(
     set_global_kill_switch(True)
     _save_kill_switch(storage, True)
     _ = runner_manager.stop_runner(db=db)
+
+    # Cancel all pending/open orders BEFORE liquidating positions
+    cancelled_orders = 0
+    try:
+        broker = get_broker()
+        cancelled_orders = broker.cancel_all_orders()
+        logger.info("Panic stop: cancelled %d open orders", cancelled_orders)
+    except Exception as exc:
+        logger.error("Panic stop: failed to cancel open orders: %s", exc)
+
     selloff = await selloff_all_positions()
     payload = {
         "success": True,
-        "message": f"Panic stop executed. {selloff.message}",
+        "message": f"Panic stop executed. Cancelled {cancelled_orders} pending orders. {selloff.message}",
         "status": "stopped",
     }
     storage.create_audit_log(
         event_type="error",
         description="Panic stop executed",
-        details={"selloff_message": selloff.message},
+        details={"selloff_message": selloff.message, "cancelled_orders": cancelled_orders},
     )
     _idempotency_cache_set("/safety/panic-stop", x_idempotency_key, payload)
     return RunnerActionResponse(**payload)
@@ -4473,7 +4706,7 @@ async def start_runner(
             require_real_data=require_real_data,
         )
         try:
-            workspace_symbols_override, _ = _resolve_workspace_universe_for_backtest(
+            workspace_symbols_override, _ws_ctx = _resolve_workspace_universe_for_backtest(
                 storage=storage,
                 screener=screener,
                 prefs=prefs,
@@ -4484,9 +4717,19 @@ async def start_runner(
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail=str(exc))
         if not workspace_symbols_override:
+            ctx_asset = _ws_ctx.get("asset_type", "unknown") if _ws_ctx else "unknown"
+            ctx_mode = _ws_ctx.get("screener_mode", "unknown") if _ws_ctx else "unknown"
+            ctx_preset = _ws_ctx.get("preset", "") if _ws_ctx else ""
+            ctx_source = _ws_ctx.get("data_source", "unknown") if _ws_ctx else "unknown"
             raise HTTPException(
                 status_code=400,
-                detail="Workspace universe resolution produced zero symbols. Adjust Screener settings or switch Runner Universe Source.",
+                detail=(
+                    f"Workspace universe resolution produced zero symbols "
+                    f"(asset_type={ctx_asset}, mode={ctx_mode}"
+                    f"{f', preset={ctx_preset}' if ctx_preset else ''}"
+                    f", data_source={ctx_source}). "
+                    f"Adjust Screener guardrails/preset or switch Runner Universe Source."
+                ),
             )
         symbol_universe_overrides[target_strategy_id] = workspace_symbols_override
     result = runner_manager.start_runner(
@@ -4878,12 +5121,23 @@ def _resolve_workspace_universe_for_backtest(
     """
     final_asset_type = _resolve_backtest_asset_type(request.asset_type, prefs)
     requested_mode = request.screener_mode
-    if final_asset_type == AssetType.ETF:
-        final_mode = ScreenerMode.PRESET
-    elif requested_mode in {"most_active", "preset"}:
-        final_mode = ScreenerMode(requested_mode)
+    if requested_mode in {"most_active", "preset"}:
+        mode_candidate = ScreenerMode(requested_mode)
+        mode_explicit = True
     else:
-        final_mode = prefs.screener_mode if prefs.screener_mode in (ScreenerMode.MOST_ACTIVE, ScreenerMode.PRESET) else ScreenerMode.MOST_ACTIVE
+        mode_candidate = (
+            prefs.screener_mode
+            if prefs.screener_mode in (ScreenerMode.MOST_ACTIVE, ScreenerMode.PRESET)
+            else ScreenerMode.MOST_ACTIVE
+        )
+        mode_explicit = False
+    final_mode = _validate_asset_mode_combo(
+        final_asset_type,
+        mode_candidate,
+        mode_explicit=mode_explicit,
+        context="workspace backtest universe",
+    )
+    mode_auto_corrected = (not mode_explicit) and (final_mode != mode_candidate)
 
     final_limit = (
         int(request.screener_limit)
@@ -4902,6 +5156,7 @@ def _resolve_workspace_universe_for_backtest(
 
     resolved_preset_universe_mode = "seed_guardrail_blend"
     resolved_preset_name: Optional[str] = None
+    preset_metadata: Dict[str, Any] = {}
 
     if final_mode == ScreenerMode.PRESET:
         if final_asset_type == AssetType.STOCK:
@@ -4938,6 +5193,7 @@ def _resolve_workspace_universe_for_backtest(
             seed_only=resolved_preset_universe_mode == "seed_only",
             preset_universe_mode=resolved_preset_universe_mode,
         )
+        preset_metadata = screener.get_last_preset_metadata()
     else:
         from services.market_screener import AssetType as ScreenerAssetType
 
@@ -4947,6 +5203,31 @@ def _resolve_workspace_universe_for_backtest(
         )
 
     regime = screener.detect_market_regime()
+    assets_pre_optimized, asset_type_filtering = _filter_assets_to_asset_type_with_backfill(
+        screener,
+        assets_raw,
+        asset_type=final_asset_type,
+        target_count=final_limit,
+    )
+    if int(asset_type_filtering.get("filtered_out", 0)) > 0:
+        logger.warning(
+            "Workspace universe pre-optimization asset_type filter removed=%d backfilled=%d for asset_type=%s",
+            int(asset_type_filtering.get("filtered_out", 0)),
+            int(asset_type_filtering.get("backfilled", 0)),
+            final_asset_type.value,
+        )
+    if int(asset_type_filtering.get("remaining", 0)) == 0:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Workspace universe produced zero symbols after asset-type filtering "
+                f"(asset_type={final_asset_type.value}, "
+                f"filtered_out={int(asset_type_filtering.get('filtered_out', 0))}, "
+                f"backfill_attempted={int(asset_type_filtering.get('backfilled', 0))}). "
+                f"Try widening guardrails or switching to a different preset/mode."
+            ),
+        )
+
     strategy_defaults = _adaptive_strategy_parameter_defaults(storage, max(1, final_limit))
     target_position_size = runner_manager._dynamic_position_size(
         requested_position_size=_safe_float(strategy_defaults.get("position_size", 1000.0), 1000.0),
@@ -4966,12 +5247,12 @@ def _resolve_workspace_universe_for_backtest(
     require_fractionable = _should_require_fractionable_symbols(final_asset_type, prefs, synthetic_account)
     enforce_execution_capabilities = bool(final_asset_type == AssetType.STOCK and require_fractionable)
     symbol_capabilities = (
-        _collect_symbol_capabilities(broker, assets_raw)
+        _collect_symbol_capabilities(broker, assets_pre_optimized)
         if enforce_execution_capabilities
         else {}
     )
     optimized = screener.optimize_assets(
-        assets_raw,
+        assets_pre_optimized,
         limit=final_limit,
         min_dollar_volume=min_dollar_volume,
         max_spread_bps=max_spread_bps,
@@ -4989,6 +5270,17 @@ def _resolve_workspace_universe_for_backtest(
         dca_tranches=dca_tranches,
     )
     symbols = _normalize_symbols([str(asset.get("symbol", "")).upper() for asset in optimized if asset.get("symbol")])
+    if not symbols:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"All {len(assets_pre_optimized)} candidate symbols were eliminated by guardrails "
+                f"(min_dollar_volume=${min_dollar_volume/1e6:.1f}M, max_spread={max_spread_bps}bps, "
+                f"max_sector_weight={max_sector_weight_pct}%). "
+                f"Relax guardrails or increase screener limit."
+            ),
+        )
+
     selected_capabilities = {
         symbol: {
             "tradable": bool((symbol_capabilities.get(symbol) or {}).get("tradable", True)),
@@ -5000,9 +5292,13 @@ def _resolve_workspace_universe_for_backtest(
         "symbols_source": "workspace_universe",
         "asset_type": final_asset_type.value,
         "screener_mode": final_mode.value,
+        "requested_screener_mode": str(requested_mode or ""),
+        "screener_mode_auto_corrected": mode_auto_corrected,
         "preset": resolved_preset_name,
         "preset_universe_mode": resolved_preset_universe_mode if final_mode == ScreenerMode.PRESET else None,
+        "preset_seed_coverage": preset_metadata or None,
         "screener_limit": final_limit,
+        "asset_type_filtering": asset_type_filtering,
         "guardrails": {
             "min_dollar_volume": min_dollar_volume,
             "max_spread_bps": max_spread_bps,
@@ -5076,6 +5372,7 @@ def _prepare_backtest_execution_context(
     selected_symbols = _normalize_symbols(selected_symbols)
     if not selected_symbols:
         raise HTTPException(status_code=400, detail="At least one valid symbol is required for backtest")
+    strategy_asset_type = _strategy_config_asset_type(db_strategy.config, selected_symbols)
 
     _bt_config = _get_config_snapshot()
     _bt_mode = "paper" if _bt_config.paper_trading else "live"
@@ -5113,6 +5410,8 @@ def _prepare_backtest_execution_context(
     universe_context: Dict[str, Any] = {
         "symbols_source": "strategy_symbols",
         "symbols_requested": len(selected_symbols),
+        "asset_type": strategy_asset_type,
+        "strategy_asset_type": strategy_asset_type,
     }
     live_parity_context: Dict[str, Any] = {
         "broker": broker_name or "unknown",
@@ -5138,9 +5437,19 @@ def _prepare_backtest_execution_context(
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail=str(exc))
         if not selected_symbols:
+            ctx_asset = universe_context.get("asset_type", "unknown")
+            ctx_mode = universe_context.get("screener_mode", "unknown")
+            ctx_preset = universe_context.get("preset", "")
+            ctx_source = universe_context.get("data_source", "unknown")
             raise HTTPException(
                 status_code=400,
-                detail="Workspace universe resolution produced zero symbols. Adjust guardrails/preset/universe mode.",
+                detail=(
+                    f"Workspace universe resolution produced zero symbols "
+                    f"(asset_type={ctx_asset}, mode={ctx_mode}"
+                    f"{f', preset={ctx_preset}' if ctx_preset else ''}"
+                    f", data_source={ctx_source}). "
+                    f"Adjust guardrails, preset, or universe mode."
+                ),
             )
     if not selected_symbols:
         raise HTTPException(status_code=400, detail="At least one valid symbol is required for backtest")
@@ -5149,7 +5458,14 @@ def _prepare_backtest_execution_context(
     symbol_capabilities: Dict[str, Dict[str, bool]] = {}
     filtered_out: List[Dict[str, str]] = []
     if emulate_live_trading:
-        asset_type_for_rules = _resolve_backtest_asset_type(request.asset_type, prefs)
+        if request.asset_type in {"stock", "etf"}:
+            asset_type_for_rules = AssetType(request.asset_type)
+        elif strategy_asset_type in {"stock", "etf", "both"}:
+            asset_type_for_rules = AssetType(strategy_asset_type)
+        elif prefs.asset_type in (AssetType.STOCK, AssetType.ETF, AssetType.BOTH):
+            asset_type_for_rules = prefs.asset_type
+        else:
+            asset_type_for_rules = AssetType.STOCK
         if request.use_workspace_universe and universe_context.get("asset_type") in {"stock", "etf"}:
             asset_type_for_rules = AssetType(str(universe_context["asset_type"]))
         synthetic_account = {
@@ -5176,9 +5492,14 @@ def _prepare_backtest_execution_context(
             enforced_symbols.append(symbol)
         selected_symbols = enforced_symbols
         if not selected_symbols:
+            filter_reasons = set(r["reason"] for r in filtered_out) if filtered_out else {"unknown"}
             raise HTTPException(
                 status_code=400,
-                detail="All candidate symbols were filtered by live execution rules (tradable/fractionable).",
+                detail=(
+                    f"All {len(filtered_out)} candidate symbols were filtered by live execution rules. "
+                    f"Reasons: {', '.join(sorted(filter_reasons))}. "
+                    f"Check broker symbol capabilities or disable live-equivalence mode."
+                ),
             )
     universe_context["symbols_selected"] = len(selected_symbols)
     if filtered_out:
@@ -5461,6 +5782,7 @@ async def get_strategy_config(strategy_id: str, db: Session = Depends(get_db)):
     
     symbols = db_strategy.config.get('symbols', []) if db_strategy.config else []
     normalized_symbols = _normalize_symbols(symbols if isinstance(symbols, list) else [])
+    resolved_asset_type = _strategy_config_asset_type(db_strategy.config, normalized_symbols)
     # Get parameters from config or use adaptive defaults
     config_params = db_strategy.config.get('parameters', {}) if db_strategy.config else {}
     adaptive_defaults = _adaptive_strategy_parameter_defaults(storage, symbol_count=len(normalized_symbols))
@@ -5487,6 +5809,7 @@ async def get_strategy_config(strategy_id: str, db: Session = Depends(get_db)):
         strategy_id=str(db_strategy.id),
         name=db_strategy.name,
         description=db_strategy.description or "",
+        asset_type=resolved_asset_type,
         symbols=normalized_symbols,
         parameters=parameters,
         enabled=db_strategy.is_enabled,
@@ -5534,6 +5857,22 @@ async def update_strategy_config(
         )
 
     config_changed = False
+    if request.asset_type is not None:
+        normalized_asset_type = str(request.asset_type).strip().lower()
+        if normalized_asset_type not in {"stock", "etf", "both"}:
+            raise HTTPException(status_code=400, detail="asset_type must be one of: stock, etf, both")
+        current_asset_type = _strategy_config_asset_type(
+            db_strategy.config,
+            _normalize_symbols(
+                db_strategy.config.get("symbols", [])
+                if isinstance(db_strategy.config.get("symbols"), list)
+                else []
+            ),
+        )
+        if normalized_asset_type != current_asset_type:
+            db_strategy.config["asset_type"] = normalized_asset_type
+            config_changed = True
+
     if request.symbols is not None:
         normalized_symbols = _normalize_symbols(request.symbols)
         current_symbols = _normalize_symbols(
@@ -5544,6 +5883,12 @@ async def update_strategy_config(
         if normalized_symbols != current_symbols:
             db_strategy.config['symbols'] = normalized_symbols
             config_changed = True
+        if request.asset_type is None:
+            inferred_asset_type = _infer_strategy_asset_type_from_symbols(normalized_symbols)
+            current_asset_type = _strategy_config_asset_type(db_strategy.config, current_symbols)
+            if inferred_asset_type != current_asset_type:
+                db_strategy.config["asset_type"] = inferred_asset_type
+                config_changed = True
 
     if request.parameters is not None:
         if 'parameters' not in db_strategy.config:
@@ -6799,7 +7144,14 @@ async def get_screener_results(
 
     # Use preferences if not overridden
     final_asset_type = asset_type or prefs.asset_type
-    final_mode = screener_mode or prefs.screener_mode
+    mode_candidate = screener_mode or prefs.screener_mode
+    final_mode = _validate_asset_mode_combo(
+        final_asset_type,
+        mode_candidate,
+        mode_explicit=screener_mode is not None,
+        context="/screener/all request",
+    )
+    mode_auto_corrected = (screener_mode is None) and (final_mode != mode_candidate)
     final_limit = (
         max(10, min(200, int(limit)))
         if limit is not None
@@ -6815,6 +7167,7 @@ async def get_screener_results(
     screener = _create_market_screener()
     
     resolved_preset_universe_mode = PresetUniverseMode.SEED_GUARDRAIL_BLEND
+    preset_metadata: Dict[str, Any] = {}
     try:
         if final_mode == ScreenerMode.PRESET and final_asset_type in (AssetType.STOCK, AssetType.ETF):
             if preset_universe_mode is not None:
@@ -6837,6 +7190,7 @@ async def get_screener_results(
                 seed_only=resolved_preset_universe_mode == PresetUniverseMode.SEED_ONLY,
                 preset_universe_mode=resolved_preset_universe_mode.value,
             )
+            preset_metadata = screener.get_last_preset_metadata()
         else:
             # Import AssetType from market_screener
             from services.market_screener import AssetType as ScreenerAssetType
@@ -6927,9 +7281,13 @@ async def get_screener_results(
             "require_fractionable": require_fractionable,
             "target_position_size": target_position_size,
             "dca_tranches": dca_tranches,
+            "requested_screener_mode": screener_mode.value if screener_mode is not None else None,
+            "resolved_screener_mode": final_mode.value,
+            "screener_mode_auto_corrected": mode_auto_corrected,
             "seed_only": resolved_preset_universe_mode == PresetUniverseMode.SEED_ONLY,
             "preset_universe_mode": resolved_preset_universe_mode.value,
             "seed_only_relaxed_fallback_applied": seed_only_relaxed_fallback_applied,
+            "preset_seed_coverage": preset_metadata or None,
         },
     )
 
@@ -6996,6 +7354,7 @@ async def get_screener_preset(
             seed_only=resolved_preset_universe_mode == PresetUniverseMode.SEED_ONLY,
             preset_universe_mode=resolved_preset_universe_mode.value,
         )
+        preset_metadata = screener.get_last_preset_metadata()
         regime = screener.detect_market_regime()
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -7084,6 +7443,7 @@ async def get_screener_preset(
             "seed_only": resolved_preset_universe_mode == PresetUniverseMode.SEED_ONLY,
             "preset_universe_mode": resolved_preset_universe_mode.value,
             "seed_only_relaxed_fallback_applied": seed_only_relaxed_fallback_applied,
+            "preset_seed_coverage": preset_metadata or None,
         },
     )
 
@@ -7195,13 +7555,14 @@ async def update_trading_preferences(request: TradingPreferencesRequest, db: Ses
         current.etf_preset = request.etf_preset
 
     # Conflict prevention and normalization.
+    current.screener_mode = _validate_asset_mode_combo(
+        current.asset_type,
+        current.screener_mode,
+        mode_explicit=request.screener_mode is not None,
+        context="preferences update",
+    )
     if current.asset_type == AssetType.ETF:
-        current.screener_mode = ScreenerMode.PRESET
         current.risk_profile = RiskProfile(current.etf_preset.value)
-    if current.asset_type == AssetType.BOTH and current.screener_mode == ScreenerMode.PRESET:
-        raise HTTPException(status_code=400, detail="Preset mode requires asset_type stock or etf")
-    if current.asset_type != AssetType.STOCK and current.screener_mode == ScreenerMode.MOST_ACTIVE:
-        raise HTTPException(status_code=400, detail="Most active mode is available only for stock asset_type")
     if current.asset_type == AssetType.STOCK and current.screener_mode == ScreenerMode.PRESET and current.stock_preset is None:
         raise HTTPException(status_code=400, detail="Stock preset is required for stock preset mode")
     current = _normalize_trading_preference_limits(current)

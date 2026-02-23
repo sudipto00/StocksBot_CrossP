@@ -228,6 +228,22 @@ class StrategyRunner:
                     if not self.broker.connect():
                         raise RuntimeError("Broker reconnect failed")
                     logger.info("Broker reconnected in strategy runner loop")
+                    # Force-poll open orders to catch fills missed during disconnect
+                    self._reconcile_open_orders()
+                    # Verify account isn't blocked/restricted after reconnect
+                    try:
+                        account = self.broker.get_account_info()
+                        if account.get("trading_blocked") or account.get("account_blocked"):
+                            logger.error(
+                                "Account blocked after reconnect (trading_blocked=%s, account_blocked=%s), activating circuit breaker",
+                                account.get("trading_blocked"), account.get("account_blocked"),
+                            )
+                            if self.risk_manager:
+                                self.risk_manager.activate_circuit_breaker(
+                                    "Account blocked/restricted by broker"
+                                )
+                    except Exception as exc:
+                        logger.warning("Failed to verify account status after reconnect: %s", exc)
 
                 self.market_session_open = bool(self.broker.is_market_open())
                 if not self.market_session_open:

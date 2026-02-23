@@ -60,6 +60,7 @@ class MarketScreener:
         self._data_client = None
         self._trading_client = None
         self._last_source = "fallback"
+        self._last_preset_metadata: Dict[str, Any] = {}
         runtime_api_key = None
         runtime_secret_key = None
         if isinstance(alpaca_client, dict):
@@ -247,6 +248,10 @@ class MarketScreener:
         """Return source used for latest screener pull."""
         return self._last_source
 
+    def get_last_preset_metadata(self) -> Dict[str, Any]:
+        """Return metadata from the latest preset-universe resolution."""
+        return dict(self._last_preset_metadata)
+
     def get_preset_assets(
         self,
         asset_type: str,
@@ -280,8 +285,8 @@ class MarketScreener:
             "weekly_optimized": ["NVDA", "TSLA", "AMD", "META", "AMZN", "AAPL", "MSFT", "GOOGL", "INTC", "CRM"],
             "three_to_five_weekly": ["AAPL", "MSFT", "AMZN", "GOOGL", "JPM", "V", "WMT", "KO", "PEP", "DIS"],
             "monthly_optimized": ["MSFT", "AAPL", "GOOGL", "JPM", "V", "WMT", "PEP", "KO", "CSCO", "ORCL"],
-            "small_budget_weekly": ["INTC", "PFE", "CSCO", "PYPL", "BABA", "NKE", "DIS", "KO", "XLF", "IWM"],
-            "micro_budget": ["SPY", "INTC", "PFE", "CSCO", "KO", "VTI", "XLF", "DIS"],
+            "small_budget_weekly": ["INTC", "PFE", "CSCO", "PYPL", "BABA", "NKE", "DIS", "KO", "F", "SNAP"],
+            "micro_budget": ["SOFI", "INTC", "PFE", "CSCO", "KO", "HOOD", "SNAP", "DIS"],
         }
         etf_presets = {
             "conservative": ["SPY", "VOO", "IVV", "AGG", "TLT", "XLP", "XLV", "VEA", "VTI", "DIA"],
@@ -294,7 +299,7 @@ class MarketScreener:
         active_universe_limit = max(200, min(800, limit * 8))
         all_assets = self.get_active_stocks(active_universe_limit) if asset_type == "stock" else self.get_active_etfs(active_universe_limit)
         by_symbol = {asset["symbol"]: asset for asset in all_assets}
-        fallback_seed_assets = self._get_fallback_stocks(400) + self._get_fallback_etfs(200)
+        fallback_seed_assets = self._get_fallback_stocks(400) if asset_type == "stock" else self._get_fallback_etfs(400)
         fallback_by_symbol = {asset["symbol"]: asset for asset in fallback_seed_assets}
 
         preset_map = stock_presets if asset_type == "stock" else etf_presets
@@ -313,24 +318,27 @@ class MarketScreener:
             )
 
         selected: List[Dict[str, Any]] = []
+        seed_live_count = 0
+        seed_fallback_count = 0
+        missing_seed_symbols: List[str] = []
         for symbol in symbols:
             live_row = by_symbol.get(symbol)
             if live_row:
-                selected.append(dict(live_row))
+                row = dict(live_row)
+                row["_preset_seed_symbol"] = True
+                row["_preset_seed_source"] = "live"
+                selected.append(row)
+                seed_live_count += 1
                 continue
             fallback_row = fallback_by_symbol.get(symbol)
             if fallback_row:
-                selected.append(dict(fallback_row))
+                row = dict(fallback_row)
+                row["_preset_seed_symbol"] = True
+                row["_preset_seed_source"] = "fallback"
+                selected.append(row)
+                seed_fallback_count += 1
                 continue
-            selected.append({
-                "symbol": symbol,
-                "name": symbol,
-                "asset_type": asset_type,
-                "volume": 0,
-                "price": 0.0,
-                "change_percent": 0.0,
-                "last_updated": datetime.now().isoformat(),
-            })
+            missing_seed_symbols.append(symbol)
         if normalized_mode == "guardrail_only":
             selected = list(all_assets)
         elif normalized_mode == "seed_guardrail_blend" and len(selected) < limit:
@@ -338,18 +346,41 @@ class MarketScreener:
             for asset in all_assets:
                 if asset["symbol"] in existing:
                     continue
-                selected.append(asset)
+                row = dict(asset)
+                row["_preset_seed_symbol"] = False
+                row["_preset_seed_source"] = "backfill"
+                selected.append(row)
                 if len(selected) >= limit:
                     break
 
-        return self._enrich_assets(selected[:limit])
+        enriched = self._enrich_assets(selected[:limit])
+        seed_available = seed_live_count + seed_fallback_count
+        self._last_preset_metadata = {
+            "asset_type": asset_type,
+            "preset": preset,
+            "preset_universe_mode": normalized_mode,
+            "seed_total": len(symbols),
+            "seed_live_available": seed_live_count,
+            "seed_fallback_available": seed_fallback_count,
+            "seed_available": seed_available,
+            "seed_missing": len(missing_seed_symbols),
+            "seed_missing_symbols": missing_seed_symbols[:50],
+            "backfill_added": len(
+                [row for row in enriched if str(row.get("_preset_seed_source", "")) == "backfill"]
+            ),
+            "returned_count": len(enriched),
+        }
+        return enriched
     
     def _fetch_active_from_data_client(self, asset_class: str, limit: int) -> List[Dict[str, Any]]:
         """Fetch active securities by ranking latest daily volume from Alpaca bars."""
         if not self._data_client or not StockBarsRequest or not TimeFrame:
             raise RuntimeError("Alpaca data client unavailable")
 
-        symbols, seed_asset_rows = self._get_candidate_symbols_for_asset_class(asset_class)
+        symbols, seed_asset_rows = self._get_candidate_symbols_for_asset_class(
+            asset_class,
+            min_count=max(200, limit * 3),
+        )
         if not symbols:
             raise RuntimeError("No active symbols available from Alpaca universe")
         by_symbol = {asset["symbol"]: asset for asset in seed_asset_rows}
@@ -377,7 +408,9 @@ class MarketScreener:
         for symbol in symbols:
             bars = bars_by_symbol.get(symbol, [])
             if not bars:
-                ranked_assets.append(by_symbol[symbol])
+                raw_row = dict(by_symbol[symbol])
+                raw_row.pop("_asset_class_etf", None)
+                ranked_assets.append(raw_row)
                 continue
             latest = bars[-1]
             previous = bars[-2] if len(bars) > 1 else None
@@ -427,7 +460,11 @@ class MarketScreener:
             return bool(value)
         return bool(default)
 
-    def _get_candidate_symbols_for_asset_class(self, asset_class: str) -> Tuple[List[str], List[Dict[str, Any]]]:
+    def _get_candidate_symbols_for_asset_class(
+        self,
+        asset_class: str,
+        min_count: int = 0,
+    ) -> Tuple[List[str], List[Dict[str, Any]]]:
         """Resolve candidate symbols using Alpaca tradable universe with fallback safety."""
         fallback_assets = (
             self._get_fallback_stocks(200)
@@ -436,6 +473,9 @@ class MarketScreener:
         )
         fallback_by_symbol = {asset["symbol"]: asset for asset in fallback_assets}
         fallback_symbols = [asset["symbol"] for asset in fallback_assets]
+        # Curated ETF set used for ETF/stock disambiguation when Alpaca asset_class is generic
+        # (e.g. us_equity, which contains both common stocks and ETFs).
+        known_etfs = self._get_known_etf_symbols()
 
         if not self._trading_client:
             return fallback_symbols, fallback_assets
@@ -460,11 +500,31 @@ class MarketScreener:
             status = str(self._asset_field(asset, "status", "")).lower()
             if status not in {"active", "assetstatus.active"}:
                 continue
+            # Skip halted or maintenance-mode symbols
+            if self._asset_bool(asset, "maintenance_mode", False):
+                continue
+            halted = str(self._asset_field(asset, "halted", "")).lower()
+            if halted in {"true", "1", "yes"}:
+                continue
             asset_class_name = str(self._asset_field(asset, "asset_class", "")).lower()
-            if asset_class_name and "us_equity" not in asset_class_name and "us-equity" not in asset_class_name:
+            asset_class_name_norm = asset_class_name.replace("-", "_").strip()
+            if asset_class_name_norm and "us_equity" not in asset_class_name_norm:
                 continue
             asset_name = str(self._asset_field(asset, "name", "") or "")
-            is_probable_etf = self._is_probable_etf_asset(symbol, asset_name)
+            # Primary classifier: explicit ETF signals in Alpaca asset_class.
+            is_etf_by_asset_class = ("etf" in asset_class_name_norm) or ("fund" in asset_class_name_norm)
+            # Do not treat generic us_equity as an explicit stock signal.
+            is_explicit_stock_by_asset_class = (
+                ("stock" in asset_class_name_norm or "common_stock" in asset_class_name_norm)
+                and not is_etf_by_asset_class
+            )
+            if is_etf_by_asset_class:
+                is_probable_etf = True
+            elif is_explicit_stock_by_asset_class:
+                is_probable_etf = False
+            else:
+                # Generic buckets (e.g. us_equity): infer using curated ETF list + heuristic.
+                is_probable_etf = symbol in known_etfs or self._is_probable_etf_asset(symbol, asset_name)
             if asset_class == "etf" and not is_probable_etf:
                 continue
             if asset_class == "stock" and is_probable_etf:
@@ -475,6 +535,7 @@ class MarketScreener:
                 "symbol": symbol,
                 "name": str(asset_name or (fallback_row or {}).get("name", symbol)),
                 "asset_type": asset_class,
+                "_asset_class_etf": bool(is_etf_by_asset_class),
                 "volume": int((fallback_row or {}).get("volume", 0)),
                 "price": float((fallback_row or {}).get("price", 0.0)),
                 "change_percent": float((fallback_row or {}).get("change_percent", 0.0)),
@@ -489,13 +550,94 @@ class MarketScreener:
                 raise RuntimeError(f"No Alpaca tradable symbols found for asset class {asset_class}")
             return fallback_symbols, fallback_assets
 
+        # Post-filter: cross-check against known ETF list to catch heuristic misses
+        filtered_rows: List[Dict[str, Any]] = []
+        removed_count = 0
+        pre_filter_count = len(candidate_rows)
+        for row in candidate_rows:
+            sym = row["symbol"]
+            if asset_class == "stock" and sym in known_etfs:
+                removed_count += 1
+                continue
+            if asset_class == "etf" and sym not in known_etfs:
+                # Keep if Alpaca asset_class or heuristic already flagged it as ETF (novel ETF not in fallback list)
+                name = str(row.get("name", ""))
+                if not bool(row.get("_asset_class_etf")) and not self._is_probable_etf_asset(sym, name):
+                    removed_count += 1
+                    continue
+            filtered_rows.append(row)
+        if removed_count > 0:
+            logger.info(
+                "Asset type post-filter removed %d symbols mismatched for asset_class=%s",
+                removed_count, asset_class,
+            )
+        candidate_rows = filtered_rows
+        if not candidate_rows:
+            if self.require_real_data:
+                raise RuntimeError(
+                    f"No Alpaca symbols remained after asset-type filtering for asset class {asset_class}"
+                )
+            return fallback_symbols, fallback_assets
+
+        # Backfill when post-filter removes symbols so downstream ranking still has enough candidates.
+        target_count = max(int(min_count or 0), min(pre_filter_count, 1500))
+        if len(candidate_rows) < target_count:
+            existing = {row["symbol"] for row in candidate_rows}
+            before_backfill = len(candidate_rows)
+            for fallback in fallback_assets:
+                symbol = str(fallback.get("symbol", "")).upper()
+                if not symbol or symbol in existing:
+                    continue
+                if asset_class == "stock" and symbol in known_etfs:
+                    continue
+                if asset_class == "etf" and symbol not in known_etfs and not self._is_probable_etf_asset(
+                    symbol,
+                    str(fallback.get("name", "")),
+                ):
+                    continue
+                candidate_rows.append(dict(fallback))
+                existing.add(symbol)
+                if len(candidate_rows) >= target_count:
+                    break
+            added_count = len(candidate_rows) - before_backfill
+            if added_count > 0:
+                logger.info(
+                    "Asset type post-filter backfill added %d symbols for asset_class=%s",
+                    added_count,
+                    asset_class,
+                )
+
+        for row in candidate_rows:
+            row.pop("_asset_class_etf", None)
         symbols = [row["symbol"] for row in candidate_rows]
         return symbols, candidate_rows
 
+    def _get_known_etf_symbols(self) -> set:
+        """Return a set of known ETF symbols from the curated fallback list."""
+        if not hasattr(self, "_known_etf_symbols_cache"):
+            self._known_etf_symbols_cache = {
+                asset["symbol"] for asset in self._get_fallback_etfs(500)
+            }
+        return self._known_etf_symbols_cache
+
     def _is_probable_etf_asset(self, symbol: str, name: str) -> bool:
-        """Heuristic ETF classifier for Alpaca asset metadata."""
-        text = f"{symbol} {name}".lower()
-        etf_terms = (" etf", "fund", "trust", "index", "ishares", "vanguard", "spdr", "invesco")
+        """Classify whether a symbol is an ETF using curated list + heuristic."""
+        upper_symbol = symbol.strip().upper()
+        # Fast path: check curated known ETF list first
+        if upper_symbol in self._get_known_etf_symbols():
+            return True
+        text = f" {symbol} {name} ".lower()
+        # Negative signals — strong indicators of individual stocks
+        stock_terms = (" inc.", " inc ", " corp.", " corp ", " co.", " co ", " ltd.", " ltd ",
+                       " plc ", " s.a.", " n.v.", " ag ", " se ", " technologies ",
+                       " pharmaceuticals ", " holdings inc", " group inc")
+        if any(term in text for term in stock_terms):
+            return False
+        # Positive signals — ETF naming patterns
+        etf_terms = (" etf", "fund", "trust", "index", "ishares", "vanguard", "spdr",
+                     "invesco", "proshares", "direxion", "wisdomtree", "schwab",
+                     "global x ", "first trust", "vaneck", "ark ", "graniteshares",
+                     "select sector", "ultra ", "leveraged")
         return any(term in text for term in etf_terms)
 
     def detect_market_regime(self) -> str:

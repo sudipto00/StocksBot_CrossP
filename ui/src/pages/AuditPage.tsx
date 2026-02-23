@@ -5,6 +5,9 @@ import { getAuditLogs, getAuditTrades, resetAuditData } from '../api/backend';
 import { AuditLog, AuditEventType, TradeHistoryItem } from '../api/types';
 import HelpTooltip from '../components/HelpTooltip';
 import PageHeader from '../components/PageHeader';
+import ConfirmDialog from '../components/ConfirmDialog';
+import { SkeletonPage } from '../components/Skeleton';
+import { useToast } from '../components/Toast';
 import { formatDateTime, parseTimestamp } from '../utils/datetime';
 
 type AuditView = 'events' | 'trades' | 'exports';
@@ -23,6 +26,7 @@ function toDateInputValue(date: Date): string {
  * View audit logs, complete trade history, and key system events.
  */
 function AuditPage() {
+  const { addToast } = useToast();
   const [loading, setLoading] = useState(true);
   const [logs, setLogs] = useState<AuditLog[]>([]);
   const [trades, setTrades] = useState<TradeHistoryItem[]>([]);
@@ -294,11 +298,13 @@ function AuditPage() {
       setSelectedLog(null);
       setResetConfirmOpen(false);
       await loadAuditData();
-      setResetSummary(
-        `Reset complete: removed ${result.audit_rows_deleted} event rows, ${result.trade_rows_deleted} trade rows, ${result.log_files_deleted} log files, and ${result.audit_files_deleted} audit export files.`
-      );
+      const msg = `Reset complete: removed ${result.audit_rows_deleted} event rows, ${result.trade_rows_deleted} trade rows, ${result.log_files_deleted} log files, and ${result.audit_files_deleted} audit export files.`;
+      setResetSummary(msg);
+      addToast('success', 'Audit Reset Complete', msg);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to reset audit data');
+      const msg = err instanceof Error ? err.message : 'Failed to reset audit data';
+      setError(msg);
+      addToast('error', 'Reset Failed', msg);
     } finally {
       setResetLoading(false);
     }
@@ -363,30 +369,17 @@ function AuditPage() {
         </div>
       )}
 
-      {resetConfirmOpen && (
-        <div className="mb-4 rounded border border-rose-800 bg-rose-900/20 px-4 py-3">
-          <p className="text-sm text-rose-100">
-            Confirm hard reset for testing. This permanently deletes audit event logs, trade history rows, backend log files, and audit export files.
-            Runner must be stopped.
-          </p>
-          <div className="mt-3 flex flex-wrap items-center gap-2">
-            <button
-              onClick={executeResetAuditData}
-              disabled={resetLoading}
-              className="bg-rose-700 hover:bg-rose-800 disabled:bg-gray-600 text-white px-3 py-1.5 rounded font-medium text-sm"
-            >
-              {resetLoading ? 'Resetting...' : 'Confirm Reset Now'}
-            </button>
-            <button
-              onClick={() => setResetConfirmOpen(false)}
-              disabled={resetLoading}
-              className="bg-gray-700 hover:bg-gray-600 disabled:bg-gray-600 text-gray-100 px-3 py-1.5 rounded font-medium text-sm"
-            >
-              Keep Existing Data
-            </button>
-          </div>
-        </div>
-      )}
+      <ConfirmDialog
+        open={resetConfirmOpen}
+        title="Reset All Audit Data"
+        message="This permanently deletes all audit event logs, trade history rows, backend log files, and audit export files. The runner must be stopped. This action cannot be undone."
+        confirmLabel="Reset Now"
+        cancelLabel="Keep Data"
+        variant="danger"
+        loading={resetLoading}
+        onConfirm={executeResetAuditData}
+        onCancel={() => setResetConfirmOpen(false)}
+      />
 
       <div className="mb-4 inline-flex rounded-lg border border-gray-700 bg-gray-800 p-1">
         {(['events', 'trades', 'exports'] as AuditView[]).map((tab) => (
@@ -492,7 +485,7 @@ function AuditPage() {
       )}
 
       {loading ? (
-        <div className="text-gray-400">Loading audit mode...</div>
+        <SkeletonPage />
       ) : (
         <div className="space-y-6">
           {view === 'events' && (

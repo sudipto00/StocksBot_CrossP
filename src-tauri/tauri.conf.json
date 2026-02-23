@@ -1,11 +1,11 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "StocksBot",
-  "version": "0.1.0",
+  "productName": "Sudipta's Stocks Bot",
+  "version": "1.0.6",
   "identifier": "com.stocksbot.app",
   "build": {
     "beforeDevCommand": "npm --prefix ui run dev",
-    "beforeBuildCommand": "npm run build:backend && npm --prefix ui run build",
+    "beforeBuildCommand": "npm run build:backend && npm run build:ui:metadata",
     "devUrl": "http://localhost:1420",
     "frontendDist": "../ui/dist"
   },
@@ -59,7 +59,7 @@
       {
         "fullscreen": false,
         "resizable": true,
-        "title": "StocksBot",
+        "title": "Sudipta's Stocks Bot",
         "width": 1200,
         "height": 800,
         "minWidth": 800,

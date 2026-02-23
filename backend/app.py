@@ -40,8 +40,9 @@ from api.middleware import (
     rate_limit_exceeded_handler,
 )
 from api.health import build_health_response, mark_startup
+from config.paths import resolve_app_data_dir
 from config.settings import get_settings
-from storage.database import init_db, check_integrity, backup_sqlite_database
+from storage.database import DATABASE_URL, init_db, check_integrity, backup_sqlite_database
 
 logger = logging.getLogger(__name__)
 SENSITIVE_KEYS = {"api_key", "secret_key", "password", "token", "authorization"}
@@ -113,6 +114,14 @@ async def _lifespan(_app: FastAPI):
     configure_structured_logging(settings.log_level)
     mark_startup()
     logger.info("StocksBot backend starting up (env=%s)", settings.environment)
+    try:
+        logger.info(
+            "Backend storage resolved (app_data_dir=%s, database_url=%s)",
+            resolve_app_data_dir(),
+            DATABASE_URL,
+        )
+    except Exception:
+        logger.exception("Failed to resolve backend storage paths")
 
     # ── Database init ────────────────────────────────────────────────────
     try:
@@ -210,7 +219,7 @@ async def _lifespan(_app: FastAPI):
 app = FastAPI(
     title="StocksBot API",
     description="Cross-platform StocksBot backend service",
-    version="0.1.0",
+    version="1.0.6",
     lifespan=_lifespan,
     openapi_tags=[
         {"name": "Config", "description": "Application configuration"},

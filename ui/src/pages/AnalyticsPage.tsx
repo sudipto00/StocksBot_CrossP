@@ -4,6 +4,7 @@ import { getPortfolioAnalytics, getPortfolioSummary } from '../api/backend';
 import { PortfolioAnalytics, PortfolioSummaryResponse } from '../api/types';
 import HelpTooltip from '../components/HelpTooltip';
 import PageHeader from '../components/PageHeader';
+import { SkeletonPage } from '../components/Skeleton';
 
 /**
  * Analytics page component.
@@ -81,7 +82,7 @@ function AnalyticsPage() {
       )}
 
       {loading ? (
-        <div className="text-gray-400">Loading analytics...</div>
+        <SkeletonPage />
       ) : !analytics || !summary ? (
         <div className="bg-gray-800 rounded-lg p-6 border border-gray-700">
           <div className="text-center py-12">

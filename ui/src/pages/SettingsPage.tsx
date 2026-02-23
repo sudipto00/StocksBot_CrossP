@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { invoke } from '@tauri-apps/api/core';
+import { getVersion as getAppVersion } from '@tauri-apps/api/app';
 import { showSuccessNotification, showErrorNotification, showWarningNotification } from '../utils/notifications';
 import {
   getConfig,
@@ -31,6 +32,9 @@ import {
 import HelpTooltip from '../components/HelpTooltip';
 import CollapsibleSection from '../components/CollapsibleSection';
 import PageHeader from '../components/PageHeader';
+import ConfirmDialog from '../components/ConfirmDialog';
+import { SkeletonPage } from '../components/Skeleton';
+import { useToast } from '../components/Toast';
 
 type CredentialMode = 'paper' | 'live';
 
@@ -53,6 +57,14 @@ const SETTINGS_LIMITS = {
 
 const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
 const PHONE_RE = /^\+?[1-9]\d{7,14}$/;
+const BUILD_ENV = (
+  import.meta as {
+    env?: {
+      VITE_BUILD_SHA?: string;
+      VITE_BUILD_DATE?: string;
+    };
+  }
+).env;
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
@@ -64,6 +76,9 @@ function clamp(value: number, min: number, max: number): number {
  */
 function SettingsPage() {
   const navigate = useNavigate();
+  const { addToast } = useToast();
+  const [panicConfirmOpen, setPanicConfirmOpen] = useState(false);
+  const [cleanupConfirmOpen, setCleanupConfirmOpen] = useState(false);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -108,6 +123,7 @@ function SettingsPage() {
   const [summaryRecipient, setSummaryRecipient] = useState('');
   const [killSwitchActive, setKillSwitchActive] = useState(false);
   const [panicLoading, setPanicLoading] = useState(false);
+  const [appVersion, setAppVersion] = useState('dev');
   const [saveVerificationMessage, setSaveVerificationMessage] = useState<string | null>(null);
   
   // Validation errors
@@ -288,10 +304,12 @@ function SettingsPage() {
       } catch {
         setStorageInfo(null);
       }
-      
+
+      addToast('success', 'Settings Saved', 'Your settings have been saved and verified.');
       await showSuccessNotification('Settings Saved', 'Your settings have been saved successfully');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to save settings');
+      addToast('error', 'Save Failed', err instanceof Error ? err.message : 'Failed to save settings');
       await showErrorNotification('Save Error', 'Failed to save settings');
     } finally {
       setSaving(false);
@@ -310,6 +328,26 @@ function SettingsPage() {
       setKeychainStatusError('Keychain status unavailable in browser/dev mode.');
       setKeychainStatusCheckedAt(new Date().toISOString());
     }
+  }, []);
+
+  useEffect(() => {
+    let mounted = true;
+    const loadAppVersion = async () => {
+      try {
+        const version = await getAppVersion();
+        if (mounted) {
+          setAppVersion(version);
+        }
+      } catch {
+        if (mounted) {
+          setAppVersion('dev');
+        }
+      }
+    };
+    void loadAppVersion();
+    return () => {
+      mounted = false;
+    };
   }, []);
 
   useEffect(() => {
@@ -379,6 +417,7 @@ function SettingsPage() {
         setRuntimeCredentialStatus(await getBrokerCredentialsStatus());
         await loadKeychainStatus();
 
+        addToast('success', 'Credentials Saved', `${credentialMode} credentials stored in Keychain and backend updated.`);
         await showSuccessNotification(
           'Credentials Saved',
           `Stored ${credentialMode} credentials in Keychain and updated backend runtime broker`
@@ -420,13 +459,14 @@ function SettingsPage() {
   const handleRunCleanupNow = async () => {
     try {
       setCleanupLoading(true);
+      setCleanupConfirmOpen(false);
       const result = await runMaintenanceCleanup();
-      await showSuccessNotification(
-        'Cleanup Complete',
-        `Deleted ${result.log_files_deleted} log files, ${result.audit_files_deleted} audit files, ${result.audit_rows_deleted} audit rows, and ${result.optimization_rows_deleted ?? 0} optimizer rows`
-      );
+      const msg = `Deleted ${result.log_files_deleted} log files, ${result.audit_files_deleted} audit files, ${result.audit_rows_deleted} audit rows, and ${result.optimization_rows_deleted ?? 0} optimizer rows`;
+      addToast('success', 'Cleanup Complete', msg);
+      await showSuccessNotification('Cleanup Complete', msg);
       setStorageInfo(await getMaintenanceStorage());
     } catch (err) {
+      addToast('error', 'Cleanup Failed', err instanceof Error ? err.message : 'Failed to run cleanup');
       await showErrorNotification('Cleanup Failed', err instanceof Error ? err.message : 'Failed to run cleanup');
     } finally {
       setCleanupLoading(false);
@@ -438,11 +478,10 @@ function SettingsPage() {
       const next = !killSwitchActive;
       const result = await setKillSwitch(next);
       setKillSwitchActive(result.kill_switch_active);
-      await showSuccessNotification(
-        'Safety Updated',
-        `Kill switch ${result.kill_switch_active ? 'enabled' : 'disabled'}`
-      );
+      addToast(result.kill_switch_active ? 'warning' : 'success', 'Safety Updated', `Kill switch ${result.kill_switch_active ? 'enabled' : 'disabled'}`);
+      await showSuccessNotification('Safety Updated', `Kill switch ${result.kill_switch_active ? 'enabled' : 'disabled'}`);
     } catch (err) {
+      addToast('error', 'Safety Update Failed', err instanceof Error ? err.message : 'Failed to update kill switch');
       await showErrorNotification('Safety Update Failed', err instanceof Error ? err.message : 'Failed to update kill switch');
     }
   };
@@ -450,10 +489,13 @@ function SettingsPage() {
   const handlePanicStop = async () => {
     try {
       setPanicLoading(true);
+      setPanicConfirmOpen(false);
       const result = await runPanicStop();
       setKillSwitchActive(true);
+      addToast('warning', 'Panic Stop Executed', result.message);
       await showSuccessNotification('Panic Stop Executed', result.message);
     } catch (err) {
+      addToast('error', 'Panic Stop Failed', err instanceof Error ? err.message : 'Failed to execute panic stop');
       await showErrorNotification('Panic Stop Failed', err instanceof Error ? err.message : 'Failed to execute panic stop');
     } finally {
       setPanicLoading(false);
@@ -469,12 +511,14 @@ function SettingsPage() {
   };
 
   if (loading) {
-    return (
-      <div className="p-8">
-        <div className="text-gray-400">Loading settings...</div>
-      </div>
-    );
+    return <SkeletonPage />;
   }
+
+  const buildSha = (BUILD_ENV?.VITE_BUILD_SHA || 'dev').trim() || 'dev';
+  const buildDateRaw = (BUILD_ENV?.VITE_BUILD_DATE || '').trim();
+  const buildDateDisplay = buildDateRaw
+    ? (Number.isNaN(Date.parse(buildDateRaw)) ? buildDateRaw : new Date(buildDateRaw).toLocaleString())
+    : 'dev';
 
   return (
     <div className="p-8">
@@ -866,7 +910,7 @@ function SettingsPage() {
 
           <div className="flex flex-wrap items-center gap-2">
             <button
-              onClick={handleRunCleanupNow}
+              onClick={() => setCleanupConfirmOpen(true)}
               disabled={cleanupLoading}
               className="bg-amber-600 hover:bg-amber-700 disabled:bg-gray-600 text-white px-4 py-2 rounded font-medium"
             >
@@ -930,7 +974,7 @@ function SettingsPage() {
           <div className="rounded border border-red-800 bg-red-900/20 p-3">
             <p className="text-sm text-red-200">Panic Stop immediately enables kill switch, stops runner, and triggers selloff.</p>
             <button
-              onClick={handlePanicStop}
+              onClick={() => setPanicConfirmOpen(true)}
               disabled={panicLoading}
               className="mt-2 bg-rose-700 hover:bg-rose-800 disabled:bg-gray-600 text-white px-4 py-2 rounded font-medium"
             >
@@ -1129,6 +1173,23 @@ function SettingsPage() {
         </div>
       </CollapsibleSection>
 
+      <CollapsibleSection title="Build Information" summary="Release version and traceability metadata" defaultOpen={false}>
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+          <div className="rounded border border-gray-700 bg-gray-800/40 p-3">
+            <p className="text-xs text-gray-400">App Version</p>
+            <p className="text-white font-medium">{appVersion}</p>
+          </div>
+          <div className="rounded border border-gray-700 bg-gray-800/40 p-3">
+            <p className="text-xs text-gray-400">Build SHA</p>
+            <p className="text-white font-medium font-mono">{buildSha}</p>
+          </div>
+          <div className="rounded border border-gray-700 bg-gray-800/40 p-3">
+            <p className="text-xs text-gray-400">Build Date</p>
+            <p className="text-white font-medium">{buildDateDisplay}</p>
+          </div>
+        </div>
+      </CollapsibleSection>
+
       <CollapsibleSection title="Feature Highlights" summary="Current and upcoming capabilities" defaultOpen={false}>
       <div className="bg-blue-900/20 border border-blue-700 rounded-lg p-6 mb-6">
         <h4 className="text-lg font-semibold text-blue-400 mb-2">Features Available</h4>
@@ -1155,6 +1216,28 @@ function SettingsPage() {
         </ul>
       </div>
       </CollapsibleSection>
+
+      <ConfirmDialog
+        open={panicConfirmOpen}
+        title="Confirm Panic Stop"
+        message="This will immediately enable the kill switch, stop the strategy runner, and attempt to liquidate all open positions. This action cannot be undone."
+        confirmLabel="Execute Panic Stop"
+        variant="danger"
+        loading={panicLoading}
+        onConfirm={handlePanicStop}
+        onCancel={() => setPanicConfirmOpen(false)}
+      />
+
+      <ConfirmDialog
+        open={cleanupConfirmOpen}
+        title="Confirm Cleanup"
+        message="This will permanently delete log files and audit records older than your configured retention periods. This cannot be undone."
+        confirmLabel="Run Cleanup"
+        variant="warning"
+        loading={cleanupLoading}
+        onConfirm={handleRunCleanupNow}
+        onCancel={() => setCleanupConfirmOpen(false)}
+      />
     </div>
   );
 }

@@ -35,7 +35,17 @@ class StorageService:
         self.audit_logs = AuditLogRepository(db)
         self.portfolio_snapshots = PortfolioSnapshotRepository(db)
         self.optimization_runs = OptimizationRunRepository(db)
-    
+
+    # Transaction helpers
+
+    def commit(self) -> None:
+        """Commit the current database transaction."""
+        self.db.commit()
+
+    def rollback(self) -> None:
+        """Rollback the current database transaction."""
+        self.db.rollback()
+
     # Position operations
     
     def get_open_positions(self) -> List[Position]:
@@ -47,48 +57,55 @@ class StorageService:
         return self.positions.get_by_symbol(symbol, is_open=True)
     
     def create_position(self, symbol: str, side: str, quantity: float,
-                       avg_entry_price: float) -> Position:
-        """Create a new position."""
-        cost_basis = quantity * avg_entry_price
+                       avg_entry_price: float, commission: float = 0.0,
+                       auto_commit: bool = True) -> Position:
+        """Create a new position, including commission in cost basis."""
+        cost_basis = quantity * avg_entry_price + commission
+        effective_avg = cost_basis / quantity if quantity > 0 else avg_entry_price
         return self.positions.create(
             symbol=symbol,
             side=PositionSideEnum(side),
             quantity=quantity,
-            avg_entry_price=avg_entry_price,
-            cost_basis=cost_basis
+            avg_entry_price=effective_avg,
+            cost_basis=cost_basis,
+            auto_commit=auto_commit,
         )
     
     def update_position_quantity(self, position: Position, quantity_delta: float,
-                                 price: float) -> Position:
+                                 price: float, commission: float = 0.0,
+                                 auto_commit: bool = True) -> Position:
         """
         Update position quantity and recalculate cost basis.
-        
+
         Args:
             position: Position to update
             quantity_delta: Change in quantity (positive for buy, negative for sell)
             price: Transaction price
-        
+            commission: Transaction commission to include in cost basis
+            auto_commit: Whether to auto-commit (False for transactional batching)
+
         Returns:
             Updated position
         """
         new_quantity = position.quantity + quantity_delta
-        
+
         if new_quantity == 0:
-            # Position closed
+            # Position closed — subtract commission from realized P&L
             if position.side == PositionSideEnum.LONG:
-                realized_pnl = quantity_delta * (price - position.avg_entry_price)
+                realized_pnl = quantity_delta * (price - position.avg_entry_price) - commission
             else:  # SHORT
-                realized_pnl = quantity_delta * (position.avg_entry_price - price)
-            
-            return self.positions.close_position(position, realized_pnl)
+                realized_pnl = quantity_delta * (position.avg_entry_price - price) - commission
+
+            return self.positions.close_position(position, realized_pnl, auto_commit=auto_commit)
         else:
             if abs(new_quantity) > abs(position.quantity):
-                total_cost = position.cost_basis + (abs(quantity_delta) * price)
+                # Adding to position — include commission in cost basis
+                total_cost = position.cost_basis + (abs(quantity_delta) * price) + commission
                 position.avg_entry_price = total_cost / abs(new_quantity)
-            
+
             position.quantity = new_quantity
             position.cost_basis = abs(new_quantity) * position.avg_entry_price
-            return self.positions.update(position)
+            return self.positions.update(position, auto_commit=auto_commit)
     
     # Order operations
     
@@ -115,12 +132,17 @@ class StorageService:
     
     def update_order_status(self, order_id: int, status: str,
                            filled_quantity: Optional[float] = None,
-                           avg_fill_price: Optional[float] = None) -> Optional[Order]:
+                           avg_fill_price: Optional[float] = None,
+                           auto_commit: bool = True) -> Optional[Order]:
         """Update order status."""
         order = self.orders.get_by_id(order_id)
         if order:
             return self.orders.update_status(
-                order, OrderStatusEnum(status), filled_quantity, avg_fill_price
+                order,
+                OrderStatusEnum(status),
+                filled_quantity,
+                avg_fill_price,
+                auto_commit=auto_commit,
             )
         return None
     
@@ -129,7 +151,8 @@ class StorageService:
     def record_trade(self, order_id: int, symbol: str, side: str,
                     quantity: float, price: float,
                     commission: float = 0.0, fees: float = 0.0,
-                    strategy_id: Optional[int] = None) -> Trade:
+                    strategy_id: Optional[int] = None,
+                    auto_commit: bool = True) -> Trade:
         """Record a trade execution."""
         return self.trades.create(
             order_id=order_id,
@@ -141,6 +164,7 @@ class StorageService:
             commission=commission,
             fees=fees,
             strategy_id=strategy_id,
+            auto_commit=auto_commit,
         )
     
     def get_recent_trades(self, limit: int = 100) -> List[Trade]:
@@ -197,7 +221,8 @@ class StorageService:
         details: Optional[Dict[str, Any]] = None,
         user_id: Optional[str] = None,
         strategy_id: Optional[int] = None,
-        order_id: Optional[int] = None
+        order_id: Optional[int] = None,
+        auto_commit: bool = True,
     ) -> AuditLog:
         """Create a new audit log entry."""
         return self.audit_logs.create(
@@ -206,7 +231,8 @@ class StorageService:
             details=details,
             user_id=user_id,
             strategy_id=strategy_id,
-            order_id=order_id
+            order_id=order_id,
+            auto_commit=auto_commit,
         )
     
     def get_audit_logs(

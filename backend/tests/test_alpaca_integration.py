@@ -8,6 +8,7 @@ without requiring real API credentials or making real API calls.
 import pytest
 from unittest.mock import Mock, MagicMock, patch
 from datetime import datetime
+import uuid
 
 from integrations.alpaca_broker import AlpacaBroker
 from services.broker import OrderSide, OrderType, OrderStatus
@@ -188,6 +189,15 @@ class TestAlpacaBrokerPositions:
         mock_client_instance = MagicMock()
         mock_client_instance.get_account.return_value = mock_account
         mock_client_instance.get_all_positions.return_value = [mock_position]
+        mock_client_instance.get_asset.return_value = Mock(
+            tradable=True,
+            fractionable=True,
+            shortable=True,
+            easy_to_borrow=True,
+            marginable=True,
+            asset_class="us_equity",
+            name="Apple Inc.",
+        )
         mock_trading_client.return_value = mock_client_instance
         alpaca_broker.connect()
         
@@ -203,7 +213,64 @@ class TestAlpacaBrokerPositions:
         assert pos["avg_entry_price"] == 150.00
         assert pos["current_price"] == 155.00
         assert pos["unrealized_pnl"] == 500.00
+        assert pos["asset_type"] == "stock"
         assert abs(pos["unrealized_pnl_percent"] - 3.33) < 0.01  # Allow for float precision
+
+    @patch('integrations.alpaca_broker.TradingClient')
+    @patch('integrations.alpaca_broker.StockHistoricalDataClient')
+    def test_get_positions_classifies_etf_from_asset_class(
+        self, mock_data_client, mock_trading_client, alpaca_broker, mock_position, mock_account
+    ):
+        """ETF asset_class should be surfaced as asset_type=etf."""
+        mock_position.symbol = "SPY"
+        mock_client_instance = MagicMock()
+        mock_client_instance.get_account.return_value = mock_account
+        mock_client_instance.get_all_positions.return_value = [mock_position]
+        mock_client_instance.get_asset.return_value = Mock(
+            tradable=True,
+            fractionable=True,
+            shortable=True,
+            easy_to_borrow=True,
+            marginable=True,
+            asset_class="us_equity_etf",
+            name="SPDR S&P 500 ETF Trust",
+        )
+        mock_trading_client.return_value = mock_client_instance
+        alpaca_broker.connect()
+
+        positions = alpaca_broker.get_positions()
+
+        assert len(positions) == 1
+        assert positions[0]["symbol"] == "SPY"
+        assert positions[0]["asset_type"] == "etf"
+
+    @patch('integrations.alpaca_broker.TradingClient')
+    @patch('integrations.alpaca_broker.StockHistoricalDataClient')
+    def test_get_positions_classifies_etf_from_heuristic_when_asset_class_is_generic(
+        self, mock_data_client, mock_trading_client, alpaca_broker, mock_position, mock_account
+    ):
+        """Generic us_equity should still classify ETFs using symbol/name fallback."""
+        mock_position.symbol = "QQQ"
+        mock_client_instance = MagicMock()
+        mock_client_instance.get_account.return_value = mock_account
+        mock_client_instance.get_all_positions.return_value = [mock_position]
+        mock_client_instance.get_asset.return_value = Mock(
+            tradable=True,
+            fractionable=True,
+            shortable=True,
+            easy_to_borrow=True,
+            marginable=True,
+            asset_class="us_equity",
+            name="Invesco QQQ Trust",
+        )
+        mock_trading_client.return_value = mock_client_instance
+        alpaca_broker.connect()
+
+        positions = alpaca_broker.get_positions()
+
+        assert len(positions) == 1
+        assert positions[0]["symbol"] == "QQQ"
+        assert positions[0]["asset_type"] == "etf"
     
     def test_get_positions_not_connected(self, alpaca_broker):
         """Test getting positions when not connected."""
@@ -240,6 +307,27 @@ class TestAlpacaBrokerOrders:
         assert result["type"] == "market"
         assert result["quantity"] == 100.0
         assert result["status"] == "filled"
+
+    @patch('integrations.alpaca_broker.TradingClient')
+    @patch('integrations.alpaca_broker.StockHistoricalDataClient')
+    def test_submit_order_normalizes_uuid_ids_to_strings(self, mock_data_client, mock_trading_client, alpaca_broker, mock_order, mock_account):
+        """Broker responses with UUID ids should be normalized to strings."""
+        mock_order.id = uuid.uuid4()
+        mock_order.client_order_id = uuid.uuid4()
+        mock_client_instance = MagicMock()
+        mock_client_instance.get_account.return_value = mock_account
+        mock_client_instance.submit_order.return_value = mock_order
+        mock_trading_client.return_value = mock_client_instance
+        alpaca_broker.connect()
+
+        result = alpaca_broker.submit_order(
+            symbol="AAPL",
+            side=OrderSide.BUY,
+            order_type=OrderType.MARKET,
+            quantity=1
+        )
+        assert isinstance(result["id"], str)
+        assert isinstance(result["client_order_id"], str)
     
     @patch('integrations.alpaca_broker.TradingClient')
     @patch('integrations.alpaca_broker.StockHistoricalDataClient')

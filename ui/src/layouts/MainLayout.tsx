@@ -14,7 +14,7 @@ function MainLayout({ children }: MainLayoutProps) {
       {/* TODO: Add sidebar navigation */}
       <aside className="w-64 bg-gray-800 border-r border-gray-700">
         <div className="p-4">
-          <h1 className="text-2xl font-bold text-white">StocksBot</h1>
+          <h1 className="text-2xl font-bold text-white">Sudipta's Stocks Bot</h1>
           <p className="text-sm text-gray-400 mt-1">Cross-Platform Trading</p>
         </div>
         <nav className="mt-8 px-4">

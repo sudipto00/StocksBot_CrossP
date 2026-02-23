@@ -11,7 +11,7 @@ function HomePage() {
     <div className="p-8">
       <div className="mb-8">
         <h2 className="text-3xl font-bold text-white mb-2">Dashboard</h2>
-        <p className="text-gray-400">Welcome to StocksBot</p>
+        <p className="text-gray-400">Welcome to Sudipta's Stocks Bot</p>
       </div>
 
       {/* Backend Status Card */}

@@ -21,7 +21,8 @@ class PositionRepository:
         self.db = db
     
     def create(self, symbol: str, side: PositionSideEnum, quantity: float,
-               avg_entry_price: float, cost_basis: float) -> Position:
+               avg_entry_price: float, cost_basis: float,
+               auto_commit: bool = True) -> Position:
         """Create a new position."""
         position = Position(
             symbol=symbol,
@@ -32,7 +33,10 @@ class PositionRepository:
             is_open=True
         )
         self.db.add(position)
-        self.db.commit()
+        if auto_commit:
+            self.db.commit()
+        else:
+            self.db.flush()
         self.db.refresh(position)
         return position
     
@@ -54,19 +58,23 @@ class PositionRepository:
         """Get all positions with pagination."""
         return self.db.query(Position).offset(offset).limit(limit).all()
     
-    def update(self, position: Position) -> Position:
+    def update(self, position: Position, auto_commit: bool = True) -> Position:
         """Update an existing position."""
         position.updated_at = datetime.now()
-        self.db.commit()
+        if auto_commit:
+            self.db.commit()
+        else:
+            self.db.flush()
         self.db.refresh(position)
         return position
-    
-    def close_position(self, position: Position, realized_pnl: float) -> Position:
+
+    def close_position(self, position: Position, realized_pnl: float,
+                       auto_commit: bool = True) -> Position:
         """Close a position."""
         position.is_open = False
         position.closed_at = datetime.now()
         position.realized_pnl = realized_pnl
-        return self.update(position)
+        return self.update(position, auto_commit=auto_commit)
     
     def delete(self, position_id: int) -> bool:
         """Delete a position (use with caution)."""
@@ -148,7 +156,8 @@ class OrderRepository:
     
     def update_status(self, order: Order, status: OrderStatusEnum,
                      filled_quantity: Optional[float] = None,
-                     avg_fill_price: Optional[float] = None) -> Order:
+                     avg_fill_price: Optional[float] = None,
+                     auto_commit: bool = True) -> Order:
         """Update order status and fill details."""
         order.status = status
         if filled_quantity is not None:
@@ -157,12 +166,15 @@ class OrderRepository:
             order.avg_fill_price = avg_fill_price
         if status == OrderStatusEnum.FILLED:
             order.filled_at = datetime.now()
-        return self.update(order)
+        return self.update(order, auto_commit=auto_commit)
     
-    def update(self, order: Order) -> Order:
+    def update(self, order: Order, auto_commit: bool = True) -> Order:
         """Update an existing order."""
         order.updated_at = datetime.now()
-        self.db.commit()
+        if auto_commit:
+            self.db.commit()
+        else:
+            self.db.flush()
         self.db.refresh(order)
         return order
 
@@ -178,7 +190,8 @@ class TradeRepository:
                commission: float = 0.0, fees: float = 0.0,
                external_id: Optional[str] = None,
                executed_at: Optional[datetime] = None,
-               strategy_id: Optional[int] = None) -> Trade:
+               strategy_id: Optional[int] = None,
+               auto_commit: bool = True) -> Trade:
         """Create a new trade."""
         trade = Trade(
             order_id=order_id,
@@ -194,7 +207,10 @@ class TradeRepository:
             strategy_id=strategy_id,
         )
         self.db.add(trade)
-        self.db.commit()
+        if auto_commit:
+            self.db.commit()
+        else:
+            self.db.flush()
         self.db.refresh(trade)
         return trade
     
@@ -365,7 +381,8 @@ class AuditLogRepository:
         details: Optional[Dict[str, Any]] = None,
         user_id: Optional[str] = None,
         strategy_id: Optional[int] = None,
-        order_id: Optional[int] = None
+        order_id: Optional[int] = None,
+        auto_commit: bool = True,
     ) -> AuditLog:
         """Create a new audit log entry."""
         audit_log = AuditLog(
@@ -377,7 +394,10 @@ class AuditLogRepository:
             order_id=order_id
         )
         self.db.add(audit_log)
-        self.db.commit()
+        if auto_commit:
+            self.db.commit()
+        else:
+            self.db.flush()
         self.db.refresh(audit_log)
         return audit_log
     

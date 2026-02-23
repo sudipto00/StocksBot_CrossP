@@ -33,6 +33,25 @@ from services.broker import BrokerInterface, OrderSide, OrderType, OrderStatus
 
 logger = logging.getLogger(__name__)
 
+_KNOWN_ETF_SYMBOLS = {
+    "SPY", "QQQ", "IWM", "VTI", "VOO", "IVV", "DIA", "AGG", "TLT", "XLF",
+    "XLK", "XLE", "XLI", "XLV", "XLP", "XLY", "XLC", "XLB", "XLU", "XLRE",
+    "VEA", "VWO", "EEM", "BND", "LQD", "HYG", "IYR", "VNQ", "SCHD", "VIG",
+    "RSP", "MTUM", "QUAL", "USMV", "GDX", "SLV", "GLD", "SMH", "SOXX", "ARKK",
+    "SCHA", "SCHB", "SCHF", "VT", "ACWI", "BIL", "SGOV", "MUB", "EMB", "PFF",
+    "GBTC", "ETHE", "BITO", "BIZD", "GLL", "VTWO",
+}
+_ETF_HINT_TERMS = (
+    " etf", "fund", "trust", "index", "ishares", "vanguard", "spdr",
+    "invesco", "proshares", "direxion", "wisdomtree", "schwab", "global x",
+    "first trust", "vaneck", "graniteshares", "exchange traded", "select sector",
+)
+_STOCK_HINT_TERMS = (
+    " inc.", " inc ", " corp.", " corp ", " co.", " co ", " ltd.", " ltd ",
+    " plc ", " s.a.", " n.v.", " ag ", " se ", " technologies ",
+    " pharmaceuticals ", " holdings inc", " group inc",
+)
+
 
 class AlpacaBroker(BrokerInterface):
     """
@@ -209,6 +228,8 @@ class AlpacaBroker(BrokerInterface):
                 "shortable": bool(getattr(asset, "shortable", False)),
                 "easy_to_borrow": bool(getattr(asset, "easy_to_borrow", False)),
                 "marginable": bool(getattr(asset, "marginable", False)),
+                "asset_class": str(getattr(asset, "asset_class", getattr(asset, "class", "")) or ""),
+                "name": str(getattr(asset, "name", "") or ""),
             }
         except (RuntimeError, APIError, OSError):
             payload = {
@@ -217,12 +238,42 @@ class AlpacaBroker(BrokerInterface):
                 "shortable": False,
                 "easy_to_borrow": False,
                 "marginable": False,
+                "asset_class": "",
+                "name": "",
             }
         self._asset_capabilities_cache[symbol] = {
             "data": payload,
             "expires_at": now + self._asset_capabilities_ttl,
         }
         return dict(payload)
+
+    def _is_probable_etf_asset(self, symbol: str, name: str) -> bool:
+        """Fallback ETF classifier when Alpaca asset_class is generic."""
+        normalized_symbol = str(symbol or "").strip().upper()
+        if normalized_symbol in _KNOWN_ETF_SYMBOLS:
+            return True
+        text = f" {normalized_symbol} {str(name or '')} ".lower()
+        if any(term in text for term in _STOCK_HINT_TERMS):
+            return False
+        return any(term in text for term in _ETF_HINT_TERMS)
+
+    def _resolve_asset_type(self, symbol: str, asset_meta: Dict[str, Any]) -> str:
+        """
+        Resolve stock/ETF type from Alpaca asset metadata.
+        - Primary: explicit asset_class signals.
+        - Fallback: known ETF set + name/symbol heuristic.
+        """
+        asset_class = str(asset_meta.get("asset_class", "")).strip().lower().replace("-", "_")
+        is_etf_by_asset_class = ("etf" in asset_class) or ("fund" in asset_class)
+        is_explicit_stock_by_asset_class = (
+            ("stock" in asset_class or "common_stock" in asset_class)
+            and not is_etf_by_asset_class
+        )
+        if is_etf_by_asset_class:
+            return "etf"
+        if is_explicit_stock_by_asset_class:
+            return "stock"
+        return "etf" if self._is_probable_etf_asset(symbol, str(asset_meta.get("name", ""))) else "stock"
 
     def get_next_market_open(self) -> Optional[datetime]:
         """Return next market-open timestamp from Alpaca clock when available."""
@@ -253,8 +304,10 @@ class AlpacaBroker(BrokerInterface):
         
         result = []
         for pos in positions:
+            symbol = str(pos.symbol).upper()
+            asset_meta = self._get_asset_capabilities(symbol)
             result.append({
-                "symbol": pos.symbol,
+                "symbol": symbol,
                 "quantity": float(pos.qty),
                 "side": "long" if float(pos.qty) > 0 else "short",
                 "avg_entry_price": float(pos.avg_entry_price),
@@ -263,6 +316,7 @@ class AlpacaBroker(BrokerInterface):
                 "cost_basis": float(pos.cost_basis),
                 "unrealized_pnl": float(pos.unrealized_pl),
                 "unrealized_pnl_percent": float(pos.unrealized_plpc) * 100,
+                "asset_type": self._resolve_asset_type(symbol, asset_meta),
             })
         
         return result
@@ -274,50 +328,55 @@ class AlpacaBroker(BrokerInterface):
         order_type: OrderType,
         quantity: float,
         price: Optional[float] = None,
+        client_order_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Submit an order to Alpaca.
-        
+
         Args:
             symbol: Stock symbol
             side: Buy or sell
             order_type: Market, limit, etc.
             quantity: Number of shares
             price: Limit/stop price for non-market orders
-            
+            client_order_id: Client-generated idempotency key
+
         Returns:
             Order confirmation dict
         """
         if not self.is_connected():
             raise RuntimeError("Not connected to Alpaca")
-        
+
         # Map our OrderSide to Alpaca's OrderSide
         alpaca_side = AlpacaOrderSide.BUY if side == OrderSide.BUY else AlpacaOrderSide.SELL
-        
+
+        # Common kwargs for idempotency
+        common_kwargs: Dict[str, Any] = {}
+        if client_order_id:
+            common_kwargs["client_order_id"] = client_order_id
+
         # Submit order based on type
         if order_type == OrderType.MARKET:
-            # Alpaca supports fractional shares for market orders on
-            # eligible symbols.  Pass qty with up to 9 decimal places
-            # so small-budget positions (e.g. 0.25 shares of a $400
-            # stock) are filled correctly.
             order_data = MarketOrderRequest(
                 symbol=symbol,
                 qty=round(quantity, 9),
                 side=alpaca_side,
-                time_in_force=TimeInForce.DAY
+                time_in_force=TimeInForce.DAY,
+                **common_kwargs,
             )
             order = self._trading_client.submit_order(order_data)
-        
+
         elif order_type == OrderType.LIMIT:
             if price is None:
                 raise ValueError("Price required for limit orders")
-            
+
             order_data = LimitOrderRequest(
                 symbol=symbol,
                 qty=quantity,
                 side=alpaca_side,
                 time_in_force=TimeInForce.DAY,
-                limit_price=price
+                limit_price=price,
+                **common_kwargs,
             )
             order = self._trading_client.submit_order(order_data)
 
@@ -331,14 +390,13 @@ class AlpacaBroker(BrokerInterface):
                 side=alpaca_side,
                 time_in_force=TimeInForce.DAY,
                 stop_price=price,
+                **common_kwargs,
             )
             order = self._trading_client.submit_order(order_data)
 
         elif order_type == OrderType.STOP_LIMIT:
             if price is None:
                 raise ValueError("Price required for stop_limit orders")
-            # Broker interface currently carries a single optional price field.
-            # Use it for both stop and limit legs for now.
             order_data = StopLimitOrderRequest(
                 symbol=symbol,
                 qty=quantity,
@@ -346,12 +404,13 @@ class AlpacaBroker(BrokerInterface):
                 time_in_force=TimeInForce.DAY,
                 stop_price=price,
                 limit_price=price,
+                **common_kwargs,
             )
             order = self._trading_client.submit_order(order_data)
-        
+
         else:
             raise ValueError(f"Unsupported order type: {order_type}")
-        
+
         return self._map_alpaca_order(order)
     
     def cancel_order(self, order_id: str) -> bool:
@@ -375,6 +434,19 @@ class AlpacaBroker(BrokerInterface):
             logger.error(f"Failed to cancel order {order_id}: {e}")
             return False
     
+    def cancel_all_orders(self) -> int:
+        """Cancel all open orders on the broker. Returns count cancelled (-1 if unknown)."""
+        if not self.is_connected():
+            raise RuntimeError("Not connected to Alpaca")
+        try:
+            cancel_responses = self._trading_client.cancel_orders()
+            count = len(cancel_responses) if cancel_responses else 0
+            logger.info("Cancelled all open orders (%d)", count)
+            return count
+        except Exception as e:
+            logger.error("Failed to cancel all orders: %s", e)
+            return 0
+
     def get_order(self, order_id: str) -> Dict[str, Any]:
         """
         Get order details.
@@ -598,8 +670,8 @@ class AlpacaBroker(BrokerInterface):
         normalized_price = normalized_limit_price if normalized_limit_price is not None else normalized_stop_price
             
         return {
-            "id": order.id,
-            "client_order_id": order.client_order_id,
+            "id": str(order.id),
+            "client_order_id": str(order.client_order_id) if order.client_order_id is not None else None,
             "symbol": order.symbol,
             "side": order.side.value,
             "type": order_type_value,
@@ -611,6 +683,7 @@ class AlpacaBroker(BrokerInterface):
             "status": self._map_from_alpaca_status(order.status),
             "created_at": order.created_at.isoformat(),
             "updated_at": order.updated_at.isoformat() if order.updated_at else order.created_at.isoformat(),
+            "commission": self._safe_optional_float(getattr(order, "commission", None)) or 0.0,
         }
 
     def _map_from_alpaca_order_type(self, alpaca_order_type: Any) -> str:

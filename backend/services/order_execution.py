@@ -10,13 +10,14 @@ from datetime import datetime
 import logging
 import threading
 import time
+import uuid
 from collections import deque
 
 from sqlalchemy.orm import Session
 
 from services.broker import BrokerInterface, OrderSide, OrderType, OrderStatus
 from storage.service import StorageService
-from storage.models import Order, Trade
+from storage.models import Order, OrderStatusEnum, Trade
 from services.budget_tracker import get_budget_tracker
 from config.risk_profiles import RiskProfile, validate_trade, get_position_size
 
@@ -302,7 +303,19 @@ class OrderExecutionService:
 
         # Validate order
         self.validate_order(symbol, side, order_type, quantity, price)
-        
+
+        # Duplicate order prevention: reject if an open order already exists
+        # for the same symbol + side + strategy.
+        existing_open = self.storage.get_open_orders(limit=500)
+        for existing_order in existing_open:
+            if (existing_order.symbol == symbol
+                    and existing_order.side.value == side
+                    and existing_order.strategy_id == strategy_id):
+                raise OrderValidationError(
+                    f"Duplicate order: pending {side} order already exists for {symbol} "
+                    f"(order #{existing_order.id})"
+                )
+
         # Create order in storage with PENDING status
         order = self.storage.create_order(
             symbol=symbol,
@@ -312,22 +325,45 @@ class OrderExecutionService:
             price=price,
             strategy_id=strategy_id
         )
-        
+
         try:
+            # Generate deterministic client_order_id for broker-side idempotency
+            ts_bucket = int(time.time() // 60)
+            idem_seed = f"{strategy_id or 'manual'}-{symbol}-{side}-{order_type}-{quantity}-{price or 'market'}-{ts_bucket}"
+            client_order_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, idem_seed))
+
             # Submit to broker
             broker_side = OrderSide.BUY if side == "buy" else OrderSide.SELL
             broker_type = OrderType[order_type.upper()]
-            
+
             broker_response = self.broker.submit_order(
                 symbol=symbol,
                 side=broker_side,
                 order_type=broker_type,
                 quantity=quantity,
-                price=price
+                price=price,
+                client_order_id=client_order_id,
             )
             
             # Update order with broker's external ID and status
-            order.external_id = broker_response.get("id")
+            raw_external_id = broker_response.get("id")
+            external_id = str(raw_external_id).strip() if raw_external_id is not None else None
+            if external_id == "":
+                external_id = None
+            if external_id:
+                existing_order = self.storage.orders.get_by_external_id(str(external_id))
+                if existing_order and existing_order.id != order.id:
+                    logger.warning(
+                        "Duplicate broker order detected for external_id=%s. "
+                        "Returning existing order #%s and rejecting duplicate local row #%s.",
+                        external_id,
+                        existing_order.id,
+                        order.id,
+                    )
+                    order.status = OrderStatusEnum.REJECTED
+                    self.storage.orders.update(order)
+                    return existing_order
+            order.external_id = external_id
             order.status = self._map_broker_status(broker_response.get("status"))
             
             # Update fill information if available
@@ -337,8 +373,9 @@ class OrderExecutionService:
             if filled_quantity > 0:
                 order.filled_quantity = filled_quantity
                 order.avg_fill_price = avg_fill_price
-            
-            order = self.storage.orders.update(order)
+
+            immediate_fill = order.status.value == "filled" and filled_quantity > 0
+            order = self.storage.orders.update(order, auto_commit=not immediate_fill)
             
             logger.info(
                 f"Order submitted: {order.id} (external: {order.external_id}), "
@@ -347,8 +384,9 @@ class OrderExecutionService:
             )
             
             # If order was filled immediately, process the fill
-            if order.status.value == "filled" and filled_quantity > 0:
-                self._process_fill(order, filled_quantity, avg_fill_price)
+            if immediate_fill:
+                commission = float(broker_response.get("commission", 0) or 0)
+                self._process_fill(order, filled_quantity, avg_fill_price, commission=commission)
                 
                 # Record trade in budget tracker if enabled
                 if self.enable_budget_tracking and self.budget_tracker and side == "buy":
@@ -377,8 +415,8 @@ class OrderExecutionService:
             return order
             
         except Exception as e:
+            self.storage.rollback()
             # Mark order as rejected
-            from storage.models import OrderStatusEnum
             order.status = OrderStatusEnum.REJECTED
             order = self.storage.orders.update(order)
             
@@ -415,35 +453,46 @@ class OrderExecutionService:
             # Get current status from broker
             broker_order = self.broker.get_order(order.external_id)
             broker_status = broker_order.get("status")
-            
+
             # Map broker status to our status
             new_status = self._map_broker_status(broker_status)
-            
-            # Check if order was filled
+
+            # Broker returns cumulative filled_quantity; calculate delta vs what
+            # we have already processed locally to avoid double-counting.
             filled_quantity = broker_order.get("filled_quantity", 0)
             avg_fill_price = broker_order.get("avg_fill_price")
-            
+            previously_processed = order.filled_quantity or 0.0
+            fill_delta = filled_quantity - previously_processed
+
+            should_process_fill = fill_delta > 0 and new_status.value in ("filled", "partially_filled")
+
             # Update order in storage
             if new_status != order.status or filled_quantity != order.filled_quantity:
                 order = self.storage.update_order_status(
                     order.id,
                     new_status.value,
                     filled_quantity=filled_quantity,
-                    avg_fill_price=avg_fill_price
+                    avg_fill_price=avg_fill_price,
+                    auto_commit=not should_process_fill,
                 )
-                
+
                 logger.info(
-                    f"Order {order.id} updated: {order.status.value}, "
-                    f"filled {filled_quantity}/{order.quantity}"
+                    f"Order {order.id} updated: {new_status.value}, "
+                    f"filled {filled_quantity}/{order.quantity} (delta: {fill_delta})"
                 )
-                
-                # If order was filled, create trade and update position
-                if new_status.value == "filled" and filled_quantity > 0:
-                    self._process_fill(order, filled_quantity, avg_fill_price)
+
+                # Process NEW fill quantity only (works for both partial and full fills)
+                if should_process_fill:
+                    commission = float(broker_order.get("commission", 0) or 0)
+                    # Prorate commission for partial fills
+                    if filled_quantity > 0 and fill_delta < filled_quantity:
+                        commission = commission * (fill_delta / filled_quantity)
+                    self._process_fill(order, fill_delta, avg_fill_price, commission=commission)
             
             return order
             
         except Exception as e:
+            self.storage.rollback()
             logger.error(f"Failed to update order {order.id} status: {e}")
             return order
     
@@ -451,99 +500,109 @@ class OrderExecutionService:
         self,
         order: Order,
         filled_quantity: float,
-        avg_fill_price: float
+        avg_fill_price: float,
+        commission: float = 0.0,
     ) -> None:
         """
-        Process order fill by creating trade and updating position.
-        
+        Process order fill atomically — trade + position + audit in one transaction.
+
+        All DB operations use auto_commit=False so they are flushed but not
+        committed individually. A single commit at the end ensures atomicity;
+        if any step fails the entire fill is rolled back.
+
         Args:
             order: Filled order
-            filled_quantity: Quantity filled
+            filled_quantity: Quantity filled (delta, not cumulative)
             avg_fill_price: Average fill price
+            commission: Commission charged by broker (prorated for partial fills)
         """
-        # Create trade record
-        trade = self.storage.record_trade(
-            order_id=order.id,
-            symbol=order.symbol,
-            side=order.side.value,
-            quantity=filled_quantity,
-            price=avg_fill_price,
-            commission=0.0,  # TODO: Get commission from broker
-            fees=0.0,
-            strategy_id=getattr(order, "strategy_id", None),
-        )
-        
-        logger.info(
-            f"Trade recorded: {trade.id}, {order.side.value} "
-            f"{filled_quantity} {order.symbol} @ ${avg_fill_price:.2f}"
-        )
-        
-        # Update or create position
-        position = self.storage.get_position_by_symbol(order.symbol)
-        
-        if position is None:
-            # Create new position
-            if order.side.value == "buy":
-                self.storage.create_position(
-                    symbol=order.symbol,
-                    side="long",
-                    quantity=filled_quantity,
-                    avg_entry_price=avg_fill_price
-                )
-                logger.info(
-                    f"Position opened: LONG {filled_quantity} {order.symbol} "
-                    f"@ ${avg_fill_price:.2f}"
-                )
-            else:  # sell - short position
-                self.storage.create_position(
-                    symbol=order.symbol,
-                    side="short",
-                    quantity=filled_quantity,
-                    avg_entry_price=avg_fill_price
-                )
-                logger.info(
-                    f"Position opened: SHORT {filled_quantity} {order.symbol} "
-                    f"@ ${avg_fill_price:.2f}"
-                )
-        else:
-            # Update existing position
-            if order.side.value == "buy":
-                quantity_delta = filled_quantity
-            else:  # sell
-                quantity_delta = -filled_quantity
-            
-            updated_position = self.storage.update_position_quantity(
-                position,
-                quantity_delta,
-                avg_fill_price
+        try:
+            # Create trade record (flush only — no commit yet)
+            trade = self.storage.record_trade(
+                order_id=order.id,
+                symbol=order.symbol,
+                side=order.side.value,
+                quantity=filled_quantity,
+                price=avg_fill_price,
+                commission=commission,
+                fees=0.0,
+                strategy_id=getattr(order, "strategy_id", None),
+                auto_commit=False,
             )
-            
-            if updated_position.is_open:
+
+            logger.info(
+                f"Trade recorded: {trade.id}, {order.side.value} "
+                f"{filled_quantity} {order.symbol} @ ${avg_fill_price:.2f}"
+            )
+
+            # Update or create position (flush only — no commit yet)
+            position = self.storage.get_position_by_symbol(order.symbol)
+
+            if position is None:
+                # Create new position
+                pos_side = "long" if order.side.value == "buy" else "short"
+                self.storage.create_position(
+                    symbol=order.symbol,
+                    side=pos_side,
+                    quantity=filled_quantity,
+                    avg_entry_price=avg_fill_price,
+                    commission=commission,
+                    auto_commit=False,
+                )
                 logger.info(
-                    f"Position updated: {updated_position.side.value.upper()} "
-                    f"{updated_position.quantity} {order.symbol} "
-                    f"@ ${updated_position.avg_entry_price:.2f}"
+                    f"Position opened: {pos_side.upper()} {filled_quantity} {order.symbol} "
+                    f"@ ${avg_fill_price:.2f}"
                 )
             else:
-                logger.info(
-                    f"Position closed: {order.symbol}, "
-                    f"P&L: ${updated_position.realized_pnl:.2f}"
+                # Update existing position
+                quantity_delta = filled_quantity if order.side.value == "buy" else -filled_quantity
+
+                updated_position = self.storage.update_position_quantity(
+                    position,
+                    quantity_delta,
+                    avg_fill_price,
+                    commission=commission,
+                    auto_commit=False,
                 )
-        
-        # Create audit log
-        self.storage.create_audit_log(
-            event_type="order_filled",
-            description=f"Order filled: {order.side.value} {filled_quantity} {order.symbol}",
-            details={
-                "order_id": order.id,
-                "trade_id": trade.id,
-                "symbol": order.symbol,
-                "side": order.side.value,
-                "quantity": filled_quantity,
-                "price": avg_fill_price
-            },
-            order_id=order.id
-        )
+
+                if updated_position.is_open:
+                    logger.info(
+                        f"Position updated: {updated_position.side.value.upper()} "
+                        f"{updated_position.quantity} {order.symbol} "
+                        f"@ ${updated_position.avg_entry_price:.2f}"
+                    )
+                else:
+                    logger.info(
+                        f"Position closed: {order.symbol}, "
+                        f"P&L: ${updated_position.realized_pnl:.2f}"
+                    )
+
+            # Create audit log (flush only — no commit yet)
+            self.storage.create_audit_log(
+                event_type="order_filled",
+                description=f"Order filled: {order.side.value} {filled_quantity} {order.symbol}",
+                details={
+                    "order_id": order.id,
+                    "trade_id": trade.id,
+                    "symbol": order.symbol,
+                    "side": order.side.value,
+                    "quantity": filled_quantity,
+                    "price": avg_fill_price,
+                    "commission": commission,
+                },
+                order_id=order.id,
+                auto_commit=False,
+            )
+
+            # Atomically commit trade + position + audit together
+            self.storage.commit()
+
+        except Exception as exc:
+            logger.error(
+                f"Fill processing failed for order {order.id}, rolling back: {exc}"
+            )
+            self.storage.rollback()
+            raise
     
     def _map_broker_status(self, broker_status: str) -> Any:
         """
