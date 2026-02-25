@@ -1,6 +1,6 @@
 [package]
 name = "stocksbot"
-version = "1.0.7"
+version = "1.0.8"
 description = "Cross-platform StocksBot desktop application"
 authors = ["StocksBot Team"]
 license = ""

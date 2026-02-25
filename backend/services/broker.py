@@ -1,11 +1,6 @@
 """
 Broker Service Interface.
 Abstract interface for broker integrations.
-
-TODO: Implement concrete broker implementations
-- Alpaca API integration
-- Interactive Brokers integration
-- Paper trading broker
 """
 
 from abc import ABC, abstractmethod
@@ -47,11 +42,7 @@ class BrokerInterface(ABC):
     All broker implementations must inherit from this interface.
     This ensures consistent API across different brokers.
     
-    TODO: Add more methods as needed
-    - Account info
-    - Margin requirements
-    - Watchlists
-    - Historical data
+    Extend with additional methods only when a concrete integration requires them.
     """
     
     @abstractmethod
@@ -157,12 +148,23 @@ class BrokerInterface(ABC):
         pass
     
     @abstractmethod
-    def get_orders(self, status: Optional[OrderStatus] = None) -> List[Dict[str, Any]]:
+    def get_orders(
+        self,
+        status: Optional[OrderStatus] = None,
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+        limit: Optional[int] = None,
+        symbols: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
         """
-        Get orders.
+        Get orders with optional filtering.
         
         Args:
             status: Filter by status (optional)
+            start: Optional start datetime (inclusive)
+            end: Optional end datetime (inclusive)
+            limit: Optional max rows to return
+            symbols: Optional list of symbols to include
             
         Returns:
             List of order dicts
@@ -297,7 +299,9 @@ class PaperBroker(BrokerInterface):
         Get paper account info.
         """
         positions_value = 0.0
-        for symbol, position in self.positions.items():
+        # Snapshot iteration because get_market_data can trigger pending-order fills
+        # that mutate self.positions.
+        for symbol, position in list(self.positions.items()):
             market_data = self.get_market_data(symbol)
             current_price = float(market_data.get("price", position.get("current_price", position.get("avg_entry_price", 0.0))))
             quantity = float(position.get("quantity", 0.0))
@@ -407,7 +411,14 @@ class PaperBroker(BrokerInterface):
             _ = self.get_market_data(str(order.get("symbol", "")))
         return order
     
-    def get_orders(self, status: Optional[OrderStatus] = None) -> List[Dict[str, Any]]:
+    def get_orders(
+        self,
+        status: Optional[OrderStatus] = None,
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+        limit: Optional[int] = None,
+        symbols: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
         """Get paper orders."""
         # Re-evaluate pending limit orders on each fetch.
         pending_symbols = {
@@ -418,9 +429,32 @@ class PaperBroker(BrokerInterface):
         for symbol in pending_symbols:
             _ = self.get_market_data(symbol)
 
+        rows = list(self.orders.values())
         if status:
-            return [o for o in self.orders.values() if o["status"] == status.value]
-        return list(self.orders.values())
+            rows = [row for row in rows if str(row.get("status")) == status.value]
+        if symbols:
+            symbol_set = {str(symbol or "").strip().upper() for symbol in symbols if str(symbol or "").strip()}
+            rows = [row for row in rows if str(row.get("symbol", "")).upper() in symbol_set]
+        if start or end:
+            def _in_range(row: Dict[str, Any]) -> bool:
+                created_at_raw = row.get("created_at")
+                if not created_at_raw:
+                    return True
+                try:
+                    created_at = datetime.fromisoformat(str(created_at_raw))
+                except (TypeError, ValueError):
+                    return True
+                if start and created_at < start:
+                    return False
+                if end and created_at > end:
+                    return False
+                return True
+            rows = [row for row in rows if _in_range(row)]
+
+        rows.sort(key=lambda row: str(row.get("created_at", "")), reverse=True)
+        if limit is not None and limit > 0:
+            rows = rows[:int(limit)]
+        return rows
     
     def get_market_data(self, symbol: str) -> Dict[str, Any]:
         """

@@ -5,6 +5,7 @@ and performance analysis.
 """
 from typing import List, Dict, Any, Optional, Callable
 from datetime import datetime, timedelta, timezone, date as date_type
+import hashlib
 import math
 import random as _random_mod
 from sqlalchemy.orm import Session
@@ -180,6 +181,21 @@ class StrategyAnalyticsService:
         max_position_size = max(1.0, float(request.max_position_size or params.get("position_size", 1000.0)))
         daily_risk_limit = max(1.0, float(request.risk_limit_daily or max(50.0, initial_capital * 0.05)))
         fee_bps = max(0.0, float(request.fee_bps or 0.0))
+        execution_latency_ms = max(0.0, float(getattr(request, "execution_latency_ms", 220.0) or 0.0))
+        queue_position_bps = max(0.0, float(getattr(request, "queue_position_bps", 6.0) or 0.0))
+        max_participation_rate = max(
+            0.001,
+            min(0.5, float(getattr(request, "max_participation_rate", 0.03) or 0.03)),
+        )
+        simulate_queue_position = bool(getattr(request, "simulate_queue_position", emulate_live_trading))
+        enforce_liquidity_limits = bool(getattr(request, "enforce_liquidity_limits", emulate_live_trading))
+        reconcile_fees_with_broker = bool(getattr(request, "reconcile_fees_with_broker", emulate_live_trading))
+        execution_seed = self._resolve_execution_seed(
+            request=request,
+            symbols=symbols,
+            params=params,
+        )
+        execution_rng = _random_mod.Random(execution_seed)
         # Monte Carlo price noise: per-bar multiplicative Gaussian noise.
         price_noise_bps = max(0.0, float(getattr(request, "price_noise_bps", 0.0) or 0.0))
         _price_noise_rng: Optional[_random_mod.Random] = None
@@ -200,6 +216,7 @@ class StrategyAnalyticsService:
             "symbols_requested": len(symbols),
             "symbols_with_data": 0,
             "symbols_without_data": [],
+            "symbol_data_errors": [],
             "trading_days_evaluated": 0,
             "bars_evaluated": 0,
             "entry_checks": 0,
@@ -215,6 +232,7 @@ class StrategyAnalyticsService:
                 "cash_insufficient": 0,
                 "not_tradable": 0,
                 "not_fractionable": 0,
+                "liquidity_no_fill": 0,
                 "daily_risk_limit": 0,
                 "risk_circuit_breaker": 0,
                 "risk_validation_failed": 0,
@@ -231,10 +249,33 @@ class StrategyAnalyticsService:
             "max_position_size_applied": max_position_size,
             "risk_limit_daily_applied": daily_risk_limit,
             "fee_bps_applied": fee_bps,
+            "execution_latency_ms": execution_latency_ms,
+            "queue_position_bps": queue_position_bps,
+            "max_participation_rate": max_participation_rate,
+            "simulate_queue_position": simulate_queue_position,
+            "enforce_liquidity_limits": enforce_liquidity_limits,
+            "reconcile_fees_with_broker": reconcile_fees_with_broker,
+            "execution_seed": execution_seed,
             "contribution_amount": contribution_amount,
             "contribution_frequency": contribution_frequency,
             "contribution_events": 0,
             "capital_contributions_total": 0.0,
+            "partial_entry_fills": 0,
+            "execution_summary": {
+                "fills": 0,
+                "entry_fills": 0,
+                "exit_fills": 0,
+                "liquidity_capped_fills": 0,
+                "effective_slippage_bps_sum": 0.0,
+                "effective_latency_ms_sum": 0.0,
+                "queue_penalty_bps_sum": 0.0,
+                "impact_bps_sum": 0.0,
+                "spread_bps_sum": 0.0,
+                "filled_notional_total": 0.0,
+                "entry_notional_total": 0.0,
+                "fees_total": 0.0,
+                "participation_rate_sum": 0.0,
+            },
         }
         if isinstance(request.universe_context, dict) and request.universe_context:
             diagnostics["universe_context"] = dict(request.universe_context)
@@ -261,15 +302,34 @@ class StrategyAnalyticsService:
         # Build date-keyed index per symbol for O(1) lookups.
         date_index_by_symbol: Dict[str, Dict[date_type, Dict[str, Any]]] = {}
         latest_price_by_symbol: Dict[str, float] = {}
+        latest_volume_by_symbol: Dict[str, float] = {}
         all_dates: set[date_type] = set()
         for symbol in symbols:
             _check_cancel()
-            cache_key = f"{symbol.upper()}:{lookback_days}"
+            cache_key = (
+                f"{symbol.upper()}:"
+                f"{start_dt.date().isoformat()}:"
+                f"{end_dt.date().isoformat()}:"
+                f"{lookback_days}"
+            )
             points = self._historical_bars_cache.get(cache_key)
             if points is None:
-                fetched = screener.get_symbol_chart(symbol, days=lookback_days)
-                points = [dict(point) for point in fetched if isinstance(point, dict)]
-                self._historical_bars_cache[cache_key] = points
+                try:
+                    fetched = screener.get_symbol_chart_window(
+                        symbol=symbol,
+                        days=lookback_days,
+                        start_date=(start_dt - timedelta(days=320)),
+                        end_date=end_dt,
+                    )
+                    points = [dict(point) for point in fetched if isinstance(point, dict)]
+                    self._historical_bars_cache[cache_key] = points
+                except RuntimeError as exc:
+                    diagnostics["symbols_without_data"].append(symbol)
+                    diagnostics["symbol_data_errors"].append({
+                        "symbol": symbol,
+                        "error": str(exc),
+                    })
+                    continue
             parsed = self._prepare_series(points, start_dt=start_dt, end_dt=end_dt)
             if not parsed:
                 diagnostics["symbols_without_data"].append(symbol)
@@ -307,6 +367,16 @@ class StrategyAnalyticsService:
                 fee_bps=fee_bps,
                 base_slippage_bps=_DEFAULT_SLIPPAGE_BPS,
                 total_fees_paid=0.0,
+                execution_latency_ms=execution_latency_ms,
+                queue_position_bps=queue_position_bps,
+                max_participation_rate=max_participation_rate,
+                simulate_queue_position=simulate_queue_position,
+                enforce_liquidity_limits=enforce_liquidity_limits,
+                reconcile_fees_with_broker=reconcile_fees_with_broker,
+            )
+            diagnostics["confidence"] = self._build_backtest_confidence_report(
+                diagnostics=diagnostics,
+                total_trades=0,
             )
             return BacktestResult(
                 strategy_id=request.strategy_id,
@@ -374,13 +444,19 @@ class StrategyAnalyticsService:
                 close = float(point["close"])
                 high = float(point["high"])
                 low = float(point["low"])
+                open_price = float(point.get("open", close) or close)
+                if open_price <= 0:
+                    open_price = close
+                daily_volume = max(0.0, float(point.get("volume", 0.0) or 0.0))
                 # Monte Carlo price noise: apply per-bar multiplicative jitter.
                 if _price_noise_rng is not None and price_noise_bps > 0 and close > 0:
                     noise_factor = 1.0 + _price_noise_rng.gauss(0.0, price_noise_bps / 10000.0)
                     close = close * noise_factor
                     high = max(close, high * noise_factor)
                     low = min(close, low * noise_factor)
+                    open_price = open_price * noise_factor
                 latest_price_by_symbol[symbol] = close
+                latest_volume_by_symbol[symbol] = daily_volume
 
                 capability = symbol_capabilities.get(symbol, {})
                 broker_tradable = bool(capability.get("tradable", True))
@@ -405,15 +481,30 @@ class StrategyAnalyticsService:
                                 position_size_cap=min(params["position_size"], max_position_size) / tranches_total,
                                 cash=cash,
                             )
-                            entry_slippage_bps = self._effective_slippage_bps(
-                                base_bps=slippage_bps,
-                                close=close,
+                            dca_fill = self._simulate_execution_fill(
+                                side="buy",
+                                order_style="dca_add",
+                                open_price=open_price,
                                 high=high,
                                 low=low,
+                                close=close,
+                                daily_volume=daily_volume,
+                                requested_notional=tranche_notional,
+                                requested_qty=None,
+                                fee_bps=fee_bps,
+                                base_slippage_bps=slippage_bps,
                                 emulate_live=emulate_live_trading,
+                                latency_ms=execution_latency_ms,
+                                queue_position_bps=queue_position_bps,
+                                max_participation_rate=max_participation_rate,
+                                simulate_queue_position=simulate_queue_position,
+                                enforce_liquidity_limits=enforce_liquidity_limits,
+                                allow_partial=True,
+                                rng=execution_rng,
+                                reconcile_fees_with_broker=reconcile_fees_with_broker,
                             )
-                            fill_price = close * (1.0 + entry_slippage_bps / 10000.0)
-                            add_qty = tranche_notional / fill_price if fill_price > 0 else 0.0
+                            fill_price = float(dca_fill.get("fill_price", close))
+                            add_qty = float(dca_fill.get("filled_qty", 0.0))
                             if emulate_live_trading and not fractionable:
                                 add_qty = float(math.floor(add_qty))
                             fill_cost = add_qty * fill_price
@@ -423,6 +514,7 @@ class StrategyAnalyticsService:
                                 quantity=add_qty,
                                 fee_bps=fee_bps,
                                 emulate_live=emulate_live_trading,
+                                reconcile_fees_with_broker=reconcile_fees_with_broker,
                             )
                             if add_qty > 0 and (fill_cost + fill_fees) <= cash:
                                 old_qty = float(position["qty"])
@@ -437,6 +529,11 @@ class StrategyAnalyticsService:
                                 position["dca_tranches_filled"] = tranches_filled + 1
                                 new_avg = new_cost / new_qty
                                 position["take_profit_price"] = new_avg * (1.0 + params["take_profit_pct"] / 100.0)
+                                self._record_execution_fill(
+                                    diagnostics=diagnostics,
+                                    fill=dict(dca_fill, fees=fill_fees, fill_notional=fill_cost, filled_qty=add_qty),
+                                    side="entry",
+                                )
 
                     # --- Dynamic ATR stop recalculation ---
                     current_atr_pct = self._compute_atr_pct(series_by_symbol[symbol], day)
@@ -458,58 +555,64 @@ class StrategyAnalyticsService:
                     # Time-based exit: force close after max_hold_days.
                     entry_date = datetime.fromisoformat(position["entry_date"]).date()
                     days_held = (day - entry_date).days
+                    exit_reference_price: Optional[float] = None
+                    exit_style = "time_exit"
                     if days_held >= max_hold_days:
-                        exit_slippage_bps = self._effective_slippage_bps(
-                            base_bps=slippage_bps,
-                            close=close,
-                            high=high,
-                            low=low,
-                            emulate_live=emulate_live_trading,
-                        )
-                        exit_price = close * (1.0 - exit_slippage_bps / 10000.0)
+                        exit_reference_price = close
+                        exit_style = "time_exit"
                         exit_reason = "time_exit"
                     elif low <= effective_stop:
                         # On gap-downs, the fill occurs at or below the low,
                         # not at the stop level.  Use the worse of the two.
-                        exit_slippage_bps = self._effective_slippage_bps(
-                            base_bps=slippage_bps,
-                            close=close,
-                            high=high,
-                            low=low,
-                            emulate_live=emulate_live_trading,
-                        )
                         raw_stop_fill = min(effective_stop, low)
-                        exit_price = raw_stop_fill * (1.0 - exit_slippage_bps / 10000.0)
+                        exit_reference_price = raw_stop_fill
+                        exit_style = "stop_exit"
                         exit_reason = "stop_exit"
                     elif high >= take_profit_price:
-                        # TP fills can also experience minor slippage.
-                        exit_slippage_bps = self._effective_slippage_bps(
-                            base_bps=slippage_bps,
-                            close=close,
-                            high=high,
-                            low=low,
-                            emulate_live=emulate_live_trading,
-                        )
-                        exit_price = take_profit_price * (1.0 - exit_slippage_bps / 10000.0)
+                        exit_reference_price = take_profit_price
+                        exit_style = "take_profit_exit"
                         exit_reason = "take_profit_exit"
 
-                    if exit_price is not None:
+                    if exit_reference_price is not None:
                         diagnostics["exit_reasons"][exit_reason] = diagnostics["exit_reasons"].get(exit_reason, 0) + 1
                         qty = float(position["qty"])
                         entry_price = float(position["entry_price"])
-                        exit_notional = qty * exit_price
-                        exit_fees = self._estimate_trade_fees(
+                        exit_fill = self._simulate_execution_fill(
                             side="sell",
-                            notional=exit_notional,
-                            quantity=qty,
+                            order_style=exit_style,
+                            open_price=open_price,
+                            high=high,
+                            low=low,
+                            close=close,
+                            daily_volume=daily_volume,
+                            requested_notional=None,
+                            requested_qty=qty,
                             fee_bps=fee_bps,
+                            base_slippage_bps=slippage_bps,
                             emulate_live=emulate_live_trading,
+                            latency_ms=execution_latency_ms,
+                            queue_position_bps=queue_position_bps,
+                            max_participation_rate=max_participation_rate,
+                            simulate_queue_position=simulate_queue_position,
+                            enforce_liquidity_limits=enforce_liquidity_limits,
+                            allow_partial=False,
+                            rng=execution_rng,
+                            reconcile_fees_with_broker=reconcile_fees_with_broker,
+                            reference_price_override=exit_reference_price,
                         )
+                        exit_price = float(exit_fill.get("fill_price", exit_reference_price))
+                        exit_notional = float(exit_fill.get("fill_notional", qty * exit_price))
+                        exit_fees = float(exit_fill.get("fees", 0.0))
                         cost_basis = float(position.get("total_cost", entry_price * qty))
                         pnl = (exit_notional - exit_fees) - cost_basis
                         cash += (exit_notional - exit_fees)
                         day_realized_pnl += pnl
                         risk_manager.record_trade_result(pnl)
+                        self._record_execution_fill(
+                            diagnostics=diagnostics,
+                            fill=exit_fill,
+                            side="exit",
+                        )
                         trades.append({
                             "id": trade_id,
                             "symbol": symbol,
@@ -577,19 +680,34 @@ class StrategyAnalyticsService:
                 if target_notional < 1.0:
                     diagnostics["blocked_reasons"]["risk_cap_too_low"] += 1
                     continue
-                # Apply entry slippage (buy slightly higher).
-                entry_slippage_bps = self._effective_slippage_bps(
-                    base_bps=slippage_bps,
-                    close=close,
+                entry_fill = self._simulate_execution_fill(
+                    side="buy",
+                    order_style="entry_market",
+                    open_price=open_price,
                     high=high,
                     low=low,
+                    close=close,
+                    daily_volume=daily_volume,
+                    requested_notional=target_notional,
+                    requested_qty=None,
+                    fee_bps=fee_bps,
+                    base_slippage_bps=slippage_bps,
                     emulate_live=emulate_live_trading,
+                    latency_ms=execution_latency_ms,
+                    queue_position_bps=queue_position_bps,
+                    max_participation_rate=max_participation_rate,
+                    simulate_queue_position=simulate_queue_position,
+                    enforce_liquidity_limits=enforce_liquidity_limits,
+                    allow_partial=True,
+                    rng=execution_rng,
+                    reconcile_fees_with_broker=reconcile_fees_with_broker,
                 )
-                fill_price = close * (1.0 + entry_slippage_bps / 10000.0)
-                qty = target_notional / fill_price if fill_price > 0 else 0.0
+                fill_price = float(entry_fill.get("fill_price", close))
+                qty = float(entry_fill.get("filled_qty", 0.0))
                 if emulate_live_trading and not fractionable:
                     qty = float(math.floor(qty))
                 if qty <= 0:
+                    diagnostics["blocked_reasons"]["liquidity_no_fill"] += 1
                     diagnostics["blocked_reasons"]["invalid_position_size"] += 1
                     continue
                 fill_notional = qty * fill_price
@@ -599,6 +717,7 @@ class StrategyAnalyticsService:
                     quantity=qty,
                     fee_bps=fee_bps,
                     emulate_live=emulate_live_trading,
+                    reconcile_fees_with_broker=reconcile_fees_with_broker,
                 )
                 if emulate_live_trading:
                     current_positions_for_risk = {
@@ -638,6 +757,14 @@ class StrategyAnalyticsService:
                     "total_cost": fill_notional + fill_fees,
                     "fees_paid": fill_fees,
                 }
+                requested_qty = float(entry_fill.get("requested_qty", 0.0))
+                if requested_qty > 0 and qty + 1e-9 < requested_qty:
+                    diagnostics["partial_entry_fills"] = int(diagnostics.get("partial_entry_fills", 0)) + 1
+                self._record_execution_fill(
+                    diagnostics=diagnostics,
+                    fill=dict(entry_fill, fees=fill_fees, fill_notional=fill_notional),
+                    side="entry",
+                )
                 diagnostics["entries_opened"] += 1
 
             market_value = sum(
@@ -657,21 +784,44 @@ class StrategyAnalyticsService:
             for symbol in sorted(list(open_positions.keys())):
                 pos = open_positions[symbol]
                 close = latest_price_by_symbol.get(symbol, float(pos["entry_price"]))
-                exit_price = close * (1.0 - slippage_bps / 10000.0)
                 qty = float(pos["qty"])
                 entry_price = float(pos["entry_price"])
-                exit_notional = qty * exit_price
-                exit_fees = self._estimate_trade_fees(
+                daily_volume = max(0.0, float(latest_volume_by_symbol.get(symbol, 0.0) or 0.0))
+                exit_fill = self._simulate_execution_fill(
                     side="sell",
-                    notional=exit_notional,
-                    quantity=qty,
+                    order_style="end_of_backtest",
+                    open_price=close,
+                    high=close,
+                    low=close,
+                    close=close,
+                    daily_volume=daily_volume,
+                    requested_notional=None,
+                    requested_qty=qty,
                     fee_bps=fee_bps,
+                    base_slippage_bps=slippage_bps,
                     emulate_live=emulate_live_trading,
+                    latency_ms=execution_latency_ms,
+                    queue_position_bps=queue_position_bps,
+                    max_participation_rate=max_participation_rate,
+                    simulate_queue_position=simulate_queue_position,
+                    enforce_liquidity_limits=enforce_liquidity_limits,
+                    allow_partial=False,
+                    rng=execution_rng,
+                    reconcile_fees_with_broker=reconcile_fees_with_broker,
+                    reference_price_override=close,
                 )
+                exit_price = float(exit_fill.get("fill_price", close))
+                exit_notional = float(exit_fill.get("fill_notional", qty * exit_price))
+                exit_fees = float(exit_fill.get("fees", 0.0))
                 cost_basis = float(pos.get("total_cost", entry_price * qty))
                 pnl = (exit_notional - exit_fees) - cost_basis
                 cash += (exit_notional - exit_fees)
                 risk_manager.record_trade_result(pnl)
+                self._record_execution_fill(
+                    diagnostics=diagnostics,
+                    fill=exit_fill,
+                    side="exit",
+                )
                 entry_date = datetime.fromisoformat(pos["entry_date"]).date()
                 days_held = (end_dt.date() - entry_date).days
                 diagnostics["exit_reasons"]["end_of_backtest"] += 1
@@ -739,6 +889,44 @@ class StrategyAnalyticsService:
                 }
                 for symbol, caps in symbol_capabilities.items()
             }
+        execution_summary = diagnostics.get("execution_summary")
+        if isinstance(execution_summary, dict):
+            fills_count = max(0, int(execution_summary.get("fills", 0)))
+            entry_fills = max(0, int(execution_summary.get("entry_fills", 0)))
+            exit_fills = max(0, int(execution_summary.get("exit_fills", 0)))
+            execution_summary["average_effective_slippage_bps"] = round(
+                float(execution_summary.get("effective_slippage_bps_sum", 0.0)) / max(1, fills_count),
+                4,
+            )
+            execution_summary["average_effective_latency_ms"] = round(
+                float(execution_summary.get("effective_latency_ms_sum", 0.0)) / max(1, fills_count),
+                4,
+            )
+            execution_summary["average_queue_penalty_bps"] = round(
+                float(execution_summary.get("queue_penalty_bps_sum", 0.0)) / max(1, fills_count),
+                4,
+            )
+            execution_summary["average_impact_bps"] = round(
+                float(execution_summary.get("impact_bps_sum", 0.0)) / max(1, fills_count),
+                4,
+            )
+            execution_summary["average_spread_bps"] = round(
+                float(execution_summary.get("spread_bps_sum", 0.0)) / max(1, fills_count),
+                4,
+            )
+            execution_summary["average_participation_rate"] = round(
+                float(execution_summary.get("participation_rate_sum", 0.0)) / max(1, fills_count),
+                6,
+            )
+            execution_summary["average_entry_notional"] = round(
+                float(execution_summary.get("entry_notional_total", 0.0)) / max(1, entry_fills),
+                4,
+            )
+            execution_summary["fees_total"] = round(float(execution_summary.get("fees_total", 0.0)), 4)
+            execution_summary["fill_split"] = {
+                "entry": entry_fills,
+                "exit": exit_fills,
+            }
         diagnostics["advanced_metrics"] = {
             "profit_factor": round(profit_factor, 3),
             "sortino_ratio": round(sortino_ratio, 3),
@@ -751,6 +939,10 @@ class StrategyAnalyticsService:
             "calmar_ratio": round(calmar_ratio, 3),
             "avg_hold_days": round(avg_hold_days, 1),
             "slippage_bps_applied": slippage_bps,
+            "execution_slippage_bps_effective_avg": round(
+                float((diagnostics.get("execution_summary") or {}).get("average_effective_slippage_bps", slippage_bps)),
+                4,
+            ),
             "fees_paid": round(total_fees_paid, 4),
         }
         diagnostics["live_parity"] = self._build_live_parity_report(
@@ -763,6 +955,16 @@ class StrategyAnalyticsService:
             fee_bps=fee_bps,
             base_slippage_bps=slippage_bps,
             total_fees_paid=total_fees_paid,
+            execution_latency_ms=execution_latency_ms,
+            queue_position_bps=queue_position_bps,
+            max_participation_rate=max_participation_rate,
+            simulate_queue_position=simulate_queue_position,
+            enforce_liquidity_limits=enforce_liquidity_limits,
+            reconcile_fees_with_broker=reconcile_fees_with_broker,
+        )
+        diagnostics["confidence"] = self._build_backtest_confidence_report(
+            diagnostics=diagnostics,
+            total_trades=total_trades,
         )
 
         return BacktestResult(
@@ -816,6 +1018,12 @@ class StrategyAnalyticsService:
         fee_bps: float,
         base_slippage_bps: float,
         total_fees_paid: float,
+        execution_latency_ms: float,
+        queue_position_bps: float,
+        max_participation_rate: float,
+        simulate_queue_position: bool,
+        enforce_liquidity_limits: bool,
+        reconcile_fees_with_broker: bool,
     ) -> Dict[str, Any]:
         """Build a compact diagnostics summary of live-equivalent constraints."""
         universe_context = diagnostics.get("universe_context")
@@ -835,6 +1043,15 @@ class StrategyAnalyticsService:
             symbols_selected_for_entries = universe_context.get("symbols_selected")
         if not isinstance(symbols_selected_for_entries, int):
             symbols_selected_for_entries = int(diagnostics.get("symbols_requested", 0))
+
+        symbols_requested_total = int(diagnostics.get("symbols_requested", 0))
+        raw_requested_from_context = universe_context.get("symbols_requested")
+        try:
+            parsed_requested = int(raw_requested_from_context)
+        except (TypeError, ValueError):
+            parsed_requested = None
+        if parsed_requested is not None and parsed_requested > 0:
+            symbols_requested_total = parsed_requested
 
         return {
             "emulate_live_trading": bool(emulate_live_trading),
@@ -864,7 +1081,7 @@ class StrategyAnalyticsService:
             ),
             "require_fractionable": bool(require_fractionable),
             "symbol_capabilities_enforced": bool(symbol_capabilities),
-            "symbols_requested": int(diagnostics.get("symbols_requested", 0)),
+            "symbols_requested": int(symbols_requested_total),
             "symbols_selected_for_entries": int(symbols_selected_for_entries),
             "symbols_with_data": int(diagnostics.get("symbols_with_data", 0)),
             "symbols_filtered_out_count": int(
@@ -879,6 +1096,121 @@ class StrategyAnalyticsService:
             ),
             "fee_bps_applied": round(float(fee_bps), 4),
             "fees_paid_total": round(float(total_fees_paid), 4),
+            "execution_fill_model": (
+                "intrabar_latency_queue_participation"
+                if emulate_live_trading
+                else "close_price_basic"
+            ),
+            "execution_latency_ms_applied": round(float(execution_latency_ms), 4),
+            "queue_position_bps_applied": round(float(queue_position_bps), 4),
+            "max_participation_rate_applied": round(float(max_participation_rate), 6),
+            "simulate_queue_position": bool(simulate_queue_position),
+            "enforce_liquidity_limits": bool(enforce_liquidity_limits),
+            "fee_reconciliation_mode": (
+                "broker_schedule_rounded"
+                if reconcile_fees_with_broker
+                else "approximate"
+            ),
+        }
+
+    def _build_backtest_confidence_report(
+        self,
+        *,
+        diagnostics: Dict[str, Any],
+        total_trades: int,
+    ) -> Dict[str, Any]:
+        """Estimate confidence that this run reflects live-executable conditions."""
+        live_parity = diagnostics.get("live_parity")
+        if not isinstance(live_parity, dict):
+            live_parity = {}
+        symbols_requested = max(
+            0,
+            int(live_parity.get("symbols_requested", diagnostics.get("symbols_requested", 0))),
+        )
+        symbols_with_data = max(0, int(diagnostics.get("symbols_with_data", 0)))
+        symbols_selected = max(0, int(live_parity.get("symbols_selected_for_entries", symbols_requested)))
+        symbols_filtered_out_count = max(0, int(live_parity.get("symbols_filtered_out_count", 0)))
+        coverage_denom = max(1, symbols_requested)
+        data_coverage_pct = (symbols_with_data / coverage_denom) * 100.0
+        executable_universe_pct = (symbols_selected / coverage_denom) * 100.0
+
+        blocked_reasons = diagnostics.get("blocked_reasons")
+        blocked_total = 0
+        if isinstance(blocked_reasons, dict):
+            blocked_total = int(sum(max(0, int(v or 0)) for v in blocked_reasons.values()))
+        entry_checks = max(0, int(diagnostics.get("entry_checks", 0)))
+        entry_signals = max(0, int(diagnostics.get("entry_signals", 0)))
+        entries_opened = max(0, int(diagnostics.get("entries_opened", 0)))
+        partial_entry_fills = max(0, int(diagnostics.get("partial_entry_fills", 0)))
+        signal_realization_pct = (entries_opened / max(1, entry_signals)) * 100.0 if entry_signals > 0 else 0.0
+        partial_fill_ratio = (partial_entry_fills / max(1, entries_opened)) if entries_opened > 0 else 0.0
+
+        strict_data_score = 1.0 if bool(live_parity.get("strict_real_data_required")) else 0.35
+        provider = str(live_parity.get("data_provider", "")).strip().lower()
+        provider_score = 1.0 if provider == "alpaca" else 0.1
+        capability_score = 1.0 if bool(live_parity.get("symbol_capabilities_enforced")) else 0.4
+        execution_model_name = str(live_parity.get("execution_fill_model", "")).strip().lower()
+        queue_sim_enabled = bool(live_parity.get("simulate_queue_position"))
+        liquidity_limits_enabled = bool(live_parity.get("enforce_liquidity_limits"))
+        fee_reconcile_mode = str(live_parity.get("fee_reconciliation_mode", "")).strip().lower()
+        execution_model_score = 1.0 if (
+            execution_model_name == "intrabar_latency_queue_participation"
+            and queue_sim_enabled
+            and liquidity_limits_enabled
+            and fee_reconcile_mode == "broker_schedule_rounded"
+        ) else 0.35
+        trades_score = min(1.0, max(0.0, float(total_trades) / 80.0))
+        blocker_penalty = min(1.0, float(blocked_total) / max(50.0, float(entry_checks) + 1.0))
+
+        overall_score = (
+            0.21 * strict_data_score
+            + 0.18 * provider_score
+            + 0.16 * capability_score
+            + 0.12 * execution_model_score
+            + 0.13 * min(1.0, data_coverage_pct / 100.0)
+            + 0.11 * min(1.0, executable_universe_pct / 100.0)
+            + 0.09 * trades_score
+        )
+        overall_score *= (1.0 - (0.18 * blocker_penalty))
+        overall_score *= (1.0 - (0.10 * min(1.0, partial_fill_ratio)))
+        overall_score_pct = max(0.0, min(100.0, overall_score * 100.0))
+        if overall_score_pct >= 80.0:
+            confidence_band = "high"
+        elif overall_score_pct >= 60.0:
+            confidence_band = "medium"
+        else:
+            confidence_band = "low"
+
+        notes: List[str] = []
+        if provider != "alpaca":
+            notes.append("Data provider fallback detected; live confidence reduced.")
+        if data_coverage_pct < 95.0:
+            notes.append("Some requested symbols lacked usable history in the selected window.")
+        if executable_universe_pct < 80.0:
+            notes.append("A material share of requested symbols was filtered out by live execution constraints.")
+        if bool(live_parity.get("emulate_live_trading")) and not bool(live_parity.get("symbol_capabilities_enforced")):
+            notes.append("Broker tradable/fractionable capability checks were not fully enforced.")
+        if bool(live_parity.get("emulate_live_trading")) and execution_model_name != "intrabar_latency_queue_participation":
+            notes.append("Execution simulator is not using intrabar latency/queue-participation model.")
+        if partial_entry_fills > 0:
+            notes.append("Entry liquidity caps caused partial fills; live execution sizing may be harder than requested.")
+        if total_trades < 20:
+            notes.append("Low executed trade count can make optimization rankings unstable.")
+
+        return {
+            "overall_confidence_score": round(overall_score_pct, 2),
+            "confidence_band": confidence_band,
+            "data_coverage_pct": round(data_coverage_pct, 2),
+            "executable_universe_pct": round(executable_universe_pct, 2),
+            "symbols_filtered_out_count": int(symbols_filtered_out_count),
+            "signal_realization_pct": round(signal_realization_pct, 2),
+            "entry_checks": int(entry_checks),
+            "entry_signals": int(entry_signals),
+            "entries_opened": int(entries_opened),
+            "partial_entry_fills": int(partial_entry_fills),
+            "total_trades": int(total_trades),
+            "blocked_events_total": int(blocked_total),
+            "notes": notes,
         }
 
     # ------------------------------------------------------------------
@@ -1051,18 +1383,26 @@ class StrategyAnalyticsService:
                 close = float(point.get("close", 0.0))
                 high = float(point.get("high", close))
                 low = float(point.get("low", close))
+                open_price = float(point.get("open", close))
+                volume = float(point.get("volume", 0.0) or 0.0)
             except (TypeError, ValueError):
                 continue
             if close <= 0:
                 continue
             if high < low:
                 high, low = low, high
+            if open_price <= 0:
+                open_price = close
+            if not math.isfinite(volume) or volume < 0:
+                volume = 0.0
             series.append({
                 "date": date_key,
                 "timestamp": ts,
+                "open": open_price,
                 "close": close,
                 "high": high,
                 "low": low,
+                "volume": max(0.0, volume),
                 "sma50": point.get("sma50"),
             })
         series.sort(key=lambda item: item["timestamp"])
@@ -1214,6 +1554,256 @@ class StrategyAnalyticsService:
             return "high_volatility_range"
         return "range_bound"
 
+    def _resolve_execution_seed(
+        self,
+        *,
+        request: BacktestRequest,
+        symbols: List[str],
+        params: Dict[str, float],
+    ) -> int:
+        """Resolve deterministic seed for execution-model randomness."""
+        explicit_seed = getattr(request, "execution_seed", None)
+        if explicit_seed is not None:
+            try:
+                parsed = int(explicit_seed)
+                if parsed >= 0:
+                    return parsed
+            except (TypeError, ValueError):
+                pass
+        digest_parts = [
+            str(request.strategy_id),
+            str(request.start_date),
+            str(request.end_date),
+            f"{float(request.initial_capital):.6f}",
+            ",".join(sorted(str(sym).upper() for sym in symbols)),
+            "|".join(f"{key}:{float(params[key]):.6f}" for key in sorted(params.keys())),
+            str(bool(request.emulate_live_trading)),
+        ]
+        digest = hashlib.sha256("::".join(digest_parts).encode("utf-8")).hexdigest()
+        return int(digest[:16], 16)
+
+    def _intrabar_reference_price(
+        self,
+        *,
+        side: str,
+        open_price: float,
+        high: float,
+        low: float,
+        close: float,
+        latency_ms: float,
+        emulate_live: bool,
+    ) -> float:
+        """
+        Approximate arrival price inside bar based on latency and side.
+
+        Uses a simple directional path approximation for OHLC bars:
+        - green bar: open -> low -> high -> close
+        - red/flat bar: open -> high -> low -> close
+        """
+        if close <= 0:
+            return max(0.01, close)
+        if not emulate_live:
+            return close
+        session_ms = 6.5 * 60.0 * 60.0 * 1000.0
+        progress = max(0.0, min(1.0, float(latency_ms) / max(1.0, session_ms)))
+        if close >= open_price:
+            path = [open_price, low, high, close]
+        else:
+            path = [open_price, high, low, close]
+        segments = max(1, len(path) - 1)
+        scaled = progress * segments
+        idx = min(segments - 1, int(math.floor(scaled)))
+        frac = scaled - float(idx)
+        start_price = float(path[idx])
+        end_price = float(path[idx + 1])
+        reference = start_price + ((end_price - start_price) * frac)
+        return max(0.01, min(high, max(low, reference)))
+
+    def _simulate_execution_fill(
+        self,
+        *,
+        side: str,
+        order_style: str,
+        open_price: float,
+        high: float,
+        low: float,
+        close: float,
+        daily_volume: float,
+        requested_notional: Optional[float],
+        requested_qty: Optional[float],
+        fee_bps: float,
+        base_slippage_bps: float,
+        emulate_live: bool,
+        latency_ms: float,
+        queue_position_bps: float,
+        max_participation_rate: float,
+        simulate_queue_position: bool,
+        enforce_liquidity_limits: bool,
+        allow_partial: bool,
+        rng: Optional[_random_mod.Random],
+        reconcile_fees_with_broker: bool,
+        reference_price_override: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Simulate fill price/size with latency, queue, spread, and liquidity caps."""
+        safe_close = max(0.01, float(close))
+        safe_high = max(safe_close, float(high))
+        safe_low = min(safe_close, float(low))
+        safe_open = max(0.01, float(open_price) if open_price > 0 else safe_close)
+        reference_price = (
+            max(0.01, float(reference_price_override))
+            if reference_price_override is not None
+            else self._intrabar_reference_price(
+                side=side,
+                open_price=safe_open,
+                high=safe_high,
+                low=safe_low,
+                close=safe_close,
+                latency_ms=latency_ms,
+                emulate_live=emulate_live,
+            )
+        )
+        requested_quantity = float(requested_qty) if requested_qty is not None else 0.0
+        if requested_quantity <= 0 and requested_notional is not None and reference_price > 0:
+            requested_quantity = float(requested_notional) / reference_price
+        requested_quantity = max(0.0, requested_quantity)
+        filled_quantity = requested_quantity
+        liquidity_limited = False
+        effective_latency_ms = float(latency_ms if emulate_live else 0.0)
+
+        max_rate = max(0.001, min(0.5, float(max_participation_rate)))
+        traded_volume = max(0.0, float(daily_volume))
+        participation_capacity = traded_volume * max_rate
+        overflow_participation = 0.0
+        if (
+            emulate_live
+            and enforce_liquidity_limits
+            and traded_volume > 0
+            and requested_quantity > participation_capacity
+        ):
+            liquidity_limited = True
+            if allow_partial:
+                filled_quantity = max(0.0, participation_capacity)
+            else:
+                filled_quantity = requested_quantity
+                overflow_participation = max(
+                    0.0,
+                    (requested_quantity - participation_capacity) / max(1.0, traded_volume),
+                )
+        participation_rate = (
+            min(1.0, filled_quantity / traded_volume)
+            if traded_volume > 0 and filled_quantity > 0
+            else 0.0
+        )
+
+        bar_range_bps = max(0.0, ((safe_high - safe_low) / safe_close) * 10000.0)
+        spread_bps = max(0.6, min(120.0, (bar_range_bps * 0.08) + 0.4))
+        impact_bps = max(
+            float(base_slippage_bps),
+            min(220.0, (bar_range_bps * 0.22) + (math.sqrt(max(0.0, participation_rate)) * 85.0)),
+        ) if emulate_live else max(0.0, float(base_slippage_bps))
+        style_penalty_bps = 0.0
+        style = str(order_style).strip().lower()
+        if emulate_live and style == "stop_exit":
+            style_penalty_bps = min(220.0, bar_range_bps * 0.30)
+        elif emulate_live and style == "take_profit_exit":
+            style_penalty_bps = min(80.0, bar_range_bps * 0.08)
+        if emulate_live and overflow_participation > 0:
+            style_penalty_bps += min(260.0, math.sqrt(overflow_participation) * 120.0)
+
+        queue_penalty_bps = 0.0
+        if emulate_live and simulate_queue_position:
+            latency_ratio = min(1.0, effective_latency_ms / (6.5 * 60.0 * 60.0 * 1000.0))
+            queue_scale = 0.5 + (2.5 * latency_ratio) + min(1.5, participation_rate * 100.0)
+            queue_penalty_bps = max(0.0, float(queue_position_bps)) * queue_scale
+
+        stochastic_bps = 0.0
+        if emulate_live and rng is not None:
+            stochastic_bps = rng.gauss(0.0, max(0.2, spread_bps * 0.15))
+
+        total_adverse_bps = max(
+            0.0,
+            (spread_bps * 0.5) + impact_bps + style_penalty_bps + queue_penalty_bps + max(0.0, stochastic_bps),
+        )
+        if not emulate_live:
+            total_adverse_bps = max(0.0, float(base_slippage_bps))
+
+        if filled_quantity <= 0:
+            return {
+                "requested_qty": requested_quantity,
+                "filled_qty": 0.0,
+                "fill_price": reference_price,
+                "fill_notional": 0.0,
+                "fees": 0.0,
+                "effective_slippage_bps": 0.0,
+                "spread_bps": spread_bps,
+                "impact_bps": impact_bps,
+                "queue_penalty_bps": queue_penalty_bps,
+                "latency_ms": effective_latency_ms,
+                "participation_rate": participation_rate,
+                "liquidity_limited": liquidity_limited,
+                "order_style": style,
+            }
+
+        side_key = side.strip().lower()
+        if side_key == "sell":
+            fill_price = reference_price * (1.0 - (total_adverse_bps / 10000.0))
+        else:
+            fill_price = reference_price * (1.0 + (total_adverse_bps / 10000.0))
+        fill_price = max(0.01, fill_price)
+        fill_notional = filled_quantity * fill_price
+        fees = self._estimate_trade_fees(
+            side=side_key,
+            notional=fill_notional,
+            quantity=filled_quantity,
+            fee_bps=fee_bps,
+            emulate_live=emulate_live,
+            reconcile_fees_with_broker=reconcile_fees_with_broker,
+        )
+        return {
+            "requested_qty": requested_quantity,
+            "filled_qty": filled_quantity,
+            "fill_price": fill_price,
+            "fill_notional": fill_notional,
+            "fees": fees,
+            "effective_slippage_bps": total_adverse_bps,
+            "spread_bps": spread_bps,
+            "impact_bps": impact_bps + style_penalty_bps,
+            "queue_penalty_bps": queue_penalty_bps,
+            "latency_ms": effective_latency_ms,
+            "participation_rate": participation_rate,
+            "liquidity_limited": liquidity_limited,
+            "order_style": style,
+        }
+
+    def _record_execution_fill(
+        self,
+        *,
+        diagnostics: Dict[str, Any],
+        fill: Dict[str, Any],
+        side: str,
+    ) -> None:
+        """Accumulate execution-model diagnostics from one fill."""
+        summary = diagnostics.get("execution_summary")
+        if not isinstance(summary, dict):
+            return
+        summary["fills"] = int(summary.get("fills", 0)) + 1
+        if side == "entry":
+            summary["entry_fills"] = int(summary.get("entry_fills", 0)) + 1
+        else:
+            summary["exit_fills"] = int(summary.get("exit_fills", 0)) + 1
+        if bool(fill.get("liquidity_limited")):
+            summary["liquidity_capped_fills"] = int(summary.get("liquidity_capped_fills", 0)) + 1
+        summary["effective_slippage_bps_sum"] = float(summary.get("effective_slippage_bps_sum", 0.0)) + float(fill.get("effective_slippage_bps", 0.0) or 0.0)
+        summary["effective_latency_ms_sum"] = float(summary.get("effective_latency_ms_sum", 0.0)) + float(fill.get("latency_ms", 0.0) or 0.0)
+        summary["queue_penalty_bps_sum"] = float(summary.get("queue_penalty_bps_sum", 0.0)) + float(fill.get("queue_penalty_bps", 0.0) or 0.0)
+        summary["impact_bps_sum"] = float(summary.get("impact_bps_sum", 0.0)) + float(fill.get("impact_bps", 0.0) or 0.0)
+        summary["spread_bps_sum"] = float(summary.get("spread_bps_sum", 0.0)) + float(fill.get("spread_bps", 0.0) or 0.0)
+        summary["filled_notional_total"] = float(summary.get("filled_notional_total", 0.0)) + float(fill.get("fill_notional", 0.0) or 0.0)
+        if side == "entry":
+            summary["entry_notional_total"] = float(summary.get("entry_notional_total", 0.0)) + float(fill.get("fill_notional", 0.0) or 0.0)
+        summary["fees_total"] = float(summary.get("fees_total", 0.0)) + float(fill.get("fees", 0.0) or 0.0)
+        summary["participation_rate_sum"] = float(summary.get("participation_rate_sum", 0.0)) + float(fill.get("participation_rate", 0.0) or 0.0)
+
     def _effective_slippage_bps(
         self,
         base_bps: float,
@@ -1242,12 +1832,14 @@ class StrategyAnalyticsService:
         quantity: float,
         fee_bps: float,
         emulate_live: bool,
+        reconcile_fees_with_broker: bool = True,
     ) -> float:
         """
         Estimate execution costs.
 
         - Optional generic fee bps on notional.
         - In live emulation mode, apply sell-side SEC/TAF style regulatory fees.
+        - When reconcile_fees_with_broker is enabled, apply broker-style cent rounding.
         """
         gross = max(0.0, float(notional))
         qty = max(0.0, float(quantity))
@@ -1256,8 +1848,13 @@ class StrategyAnalyticsService:
             # SEC fee approximation (sell-side only): ~$8 per $1M notional.
             sec_fee = gross * 0.000008
             # FINRA TAF approximation (sell-side only): $0.000166/share, capped.
-            taf_fee = min(8.30, qty * 0.000166)
+            taf_fee = min(8.30, max(0.01, qty * 0.000166))
+            if reconcile_fees_with_broker:
+                sec_fee = round(sec_fee + 1e-12, 2)
+                taf_fee = round(taf_fee + 1e-12, 2)
             total_fees += sec_fee + taf_fee
+        if reconcile_fees_with_broker:
+            total_fees = round(total_fees + 1e-12, 4)
         return max(0.0, total_fees)
 
     # ------------------------------------------------------------------

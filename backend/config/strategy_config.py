@@ -54,12 +54,19 @@ class BacktestRequest(BaseModel):
     contribution_frequency: str = "none"
     symbols: Optional[List[str]] = None
     parameters: Optional[Dict[str, float]] = None
-    emulate_live_trading: bool = False
+    emulate_live_trading: bool = True
     symbol_capabilities: Optional[Dict[str, Dict[str, bool]]] = None
     require_fractionable: bool = False
     max_position_size: Optional[float] = None
     risk_limit_daily: Optional[float] = None
     fee_bps: float = 1.0  # Generic per-side cost in bps; 0.0 for live-emulation with SEC/TAF
+    execution_latency_ms: float = 220.0  # Order->venue->fill latency model input
+    queue_position_bps: float = 6.0  # Queue-priority penalty in bps before fill
+    max_participation_rate: float = 0.03  # Max fraction of bar volume fillable per order
+    simulate_queue_position: bool = True  # Apply queue/latency fill model
+    enforce_liquidity_limits: bool = True  # Enforce participation caps (partial/no fill)
+    reconcile_fees_with_broker: bool = True  # Apply broker-style rounded fee schedule
+    execution_seed: Optional[int] = None  # Deterministic seed for execution model randomness
     price_noise_bps: float = 0.0  # Monte Carlo: per-bar multiplicative noise stdev in bps (0 = off)
     price_noise_seed: Optional[int] = None  # Deterministic seed for price noise RNG
     universe_context: Optional[Dict[str, Any]] = None

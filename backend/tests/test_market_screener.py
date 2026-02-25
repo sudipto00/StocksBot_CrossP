@@ -3,6 +3,7 @@ Tests for Market Screener Service.
 """
 
 import pytest
+from datetime import date
 from services.market_screener import MarketScreener, AssetType
 
 
@@ -384,3 +385,19 @@ def test_get_preset_assets_reports_seed_coverage_and_skips_synthetic_zero_rows(m
     assert metadata.get("seed_available") == 0
     assert metadata.get("seed_missing") == 8
     assert len(metadata.get("seed_missing_symbols", [])) == 8
+
+
+def test_coerce_datetime_supports_end_of_day_for_date_only_inputs():
+    """Date-only window bounds should include the full end day for bar requests."""
+    screener = MarketScreener()
+
+    end_from_string = screener._coerce_datetime("2026-02-03", end_of_day=True)
+    end_from_date = screener._coerce_datetime(date(2026, 2, 3), end_of_day=True)
+
+    assert end_from_string is not None
+    assert end_from_date is not None
+    assert end_from_string.hour == 23
+    assert end_from_string.minute == 59
+    assert end_from_string.second == 59
+    assert end_from_string.microsecond == 999999
+    assert end_from_date == end_from_string

@@ -736,3 +736,86 @@ def test_api_get_orders_returns_persisted_rows_not_stub_payload():
     ids = {str(item["id"]) for item in payload.get("orders", [])}
     assert created_id in ids
     assert "order-001" not in ids
+
+
+def test_safety_kill_switch_blocks_and_unblocks_order_submission():
+    """Kill switch endpoint should block orders until explicitly disabled."""
+    enable = client.post("/safety/kill-switch?active=true")
+    assert enable.status_code == 200
+    assert enable.json().get("kill_switch_active") is True
+
+    blocked = client.post("/orders", json={
+        "symbol": "AAPL",
+        "side": "buy",
+        "type": "market",
+        "quantity": 1,
+    })
+    assert blocked.status_code == 409
+    assert "kill switch is active" in str(blocked.json().get("detail", "")).lower()
+
+    status = client.get("/safety/status")
+    assert status.status_code == 200
+    assert status.json().get("kill_switch_active") is True
+
+    disable = client.post("/safety/kill-switch?active=false")
+    assert disable.status_code == 200
+    assert disable.json().get("kill_switch_active") is False
+
+    allowed = client.post("/orders", json={
+        "symbol": "AAPL",
+        "side": "buy",
+        "type": "market",
+        "quantity": 1,
+    })
+    assert allowed.status_code == 200
+
+
+def test_safety_preflight_reports_kill_switch_block_reason():
+    """Safety preflight should expose kill-switch block reason without execution."""
+    client.post("/safety/kill-switch?active=true")
+    response = client.get("/safety/preflight", params={"symbol": "AAPL"})
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload.get("allowed") is False
+    assert "kill switch is active" in str(payload.get("reason", "")).lower()
+    client.post("/safety/kill-switch?active=false")
+
+
+def test_oco_group_cancels_sibling_after_first_exit_fill(execution_service):
+    """When one OCO sibling fills, the other sibling should be cancelled."""
+    # Seed a position to attach exits against.
+    entry = execution_service.submit_order(
+        symbol="AAPL",
+        side="buy",
+        order_type="market",
+        quantity=1,
+    )
+    assert entry.status.value == "filled"
+
+    take_profit = execution_service.submit_order(
+        symbol="AAPL",
+        side="sell",
+        order_type="limit",
+        quantity=1,
+        price=95.0,  # market is ~100 so this will fill on next status reconciliation
+    )
+    stop_loss = execution_service.submit_order(
+        symbol="AAPL",
+        side="sell",
+        order_type="stop",
+        quantity=1,
+        price=90.0,
+    )
+    group_id = execution_service.register_oco_group(
+        parent_order_id=entry.id,
+        symbol="AAPL",
+        order_ids=[take_profit.id, stop_loss.id],
+    )
+    assert group_id is not None
+
+    updated_tp = execution_service.update_order_status(take_profit)
+    assert updated_tp.status.value in {"filled", "partially_filled"}
+
+    refreshed_sl = execution_service.storage.orders.get_by_id(stop_loss.id)
+    assert refreshed_sl is not None
+    assert refreshed_sl.status.value == "cancelled"

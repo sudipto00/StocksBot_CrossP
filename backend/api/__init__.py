@@ -1,15 +1,5 @@
+"""API package marker.
+
+Runtime route registration lives in `api.routes` and is mounted by `backend/app.py`.
+This module intentionally stays minimal for package compatibility.
 """
-API routes module.
-
-TODO: Implement API endpoints
-- Portfolio routes
-- Trading routes
-- Analytics routes
-- Settings routes
-"""
-
-from fastapi import APIRouter
-
-router = APIRouter()
-
-# TODO: Add route handlers here

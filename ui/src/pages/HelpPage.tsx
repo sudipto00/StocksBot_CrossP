@@ -1,5 +1,10 @@
 import { useEffect, useState } from 'react';
 import { useLocation } from 'react-router-dom';
+import {
+  STOCK_PRESET_PARAMETER_DEFAULTS,
+  ETF_PRESET_PARAMETER_DEFAULTS,
+  formatPresetDefaultsForHelp,
+} from '../constants/presetDefaults';
 
 /* ─────────────────────────────────────────────────────────────────────────────
    TABLE OF CONTENTS (navigation sections)
@@ -186,7 +191,7 @@ const presetSettingsRows = [
     goal: 'Higher activity, momentum-leaning weekly cadence.',
     riskProfile: 'Auto-Optimize target: aggressive.',
     screener: 'min_dollar_volume 20M, max_spread_bps 35, max_sector_weight_pct 40.',
-    strategy: 'position_size 1200; risk 1.5%; SL 2.0%; TP 5.0%; trail 2.5%; ATR 2.0; z-score -1.2; dip 1.5%; hold 10d; DCA 1; max_losses 3; max_DD 15%.',
+    strategy: formatPresetDefaultsForHelp(STOCK_PRESET_PARAMETER_DEFAULTS.weekly_optimized),
   },
   {
     sequence: '3) Stocks > 3-5 Trades/Week',
@@ -194,7 +199,7 @@ const presetSettingsRows = [
     goal: 'Balanced weekly turnover and diversification.',
     riskProfile: 'Auto-Optimize target: balanced.',
     screener: 'min_dollar_volume 12M, max_spread_bps 45, max_sector_weight_pct 45.',
-    strategy: 'position_size 1000; risk 1.2%; SL 2.5%; TP 6.0%; trail 2.8%; ATR 1.9; z-score -1.3; dip 2.0%; hold 7d; DCA 1; max_losses 3; max_DD 15%.',
+    strategy: formatPresetDefaultsForHelp(STOCK_PRESET_PARAMETER_DEFAULTS.three_to_five_weekly),
   },
   {
     sequence: '4) Stocks > Monthly Optimized',
@@ -202,7 +207,7 @@ const presetSettingsRows = [
     goal: 'Lower-turnover swing profile with longer hold window.',
     riskProfile: 'Auto-Optimize target: balanced.',
     screener: 'min_dollar_volume 8M, max_spread_bps 60, max_sector_weight_pct 50.',
-    strategy: 'position_size 900; risk 1.0%; SL 3.5%; TP 8.0%; trail 3.5%; ATR 2.2; z-score -1.5; dip 2.5%; hold 30d; DCA 1; max_losses 3; max_DD 15%.',
+    strategy: formatPresetDefaultsForHelp(STOCK_PRESET_PARAMETER_DEFAULTS.monthly_optimized),
   },
   {
     sequence: '5) Stocks > Small Budget Weekly',
@@ -210,7 +215,7 @@ const presetSettingsRows = [
     goal: 'Budget-sensitive weekly execution with tighter sizing.',
     riskProfile: 'Auto-Optimize target: conservative.',
     screener: 'min_dollar_volume 5M, max_spread_bps 80, max_sector_weight_pct 55.',
-    strategy: 'position_size 500; risk 0.8%; SL 2.0%; TP 5.0%; trail 2.5%; ATR 1.8; z-score -1.2; dip 1.5%; hold 10d; DCA 1; max_losses 3; max_DD 15%.',
+    strategy: formatPresetDefaultsForHelp(STOCK_PRESET_PARAMETER_DEFAULTS.small_budget_weekly),
   },
   {
     sequence: '6) Stocks > Micro Budget',
@@ -218,7 +223,7 @@ const presetSettingsRows = [
     goal: 'Micro account optimization with DCA, compounding, and strict risk controls.',
     riskProfile: 'Auto-Optimize target: micro_budget.',
     screener: 'min_dollar_volume 2M, max_spread_bps 150, max_sector_weight_pct 60.',
-    strategy: 'position_size 75; risk 0.5%; SL 1.5%; TP 4.0%; trail 2.0%; ATR 1.5; z-score -1.0; dip 1.2%; hold 7d; DCA 2; max_losses 2; max_DD 10%.',
+    strategy: formatPresetDefaultsForHelp(STOCK_PRESET_PARAMETER_DEFAULTS.micro_budget),
   },
   {
     sequence: '7) ETFs > Conservative',
@@ -226,7 +231,7 @@ const presetSettingsRows = [
     goal: 'Defensive ETF profile with stricter liquidity/sector limits.',
     riskProfile: 'Directly set to conservative.',
     screener: 'min_dollar_volume 15M, max_spread_bps 30, max_sector_weight_pct 35.',
-    strategy: 'position_size 1000; risk 0.8%; SL 2.0%; TP 5.0%; trail 2.5%; ATR 1.6; z-score -1.0; dip 1.2%; hold 12d; DCA 1; max_losses 3; max_DD 15%.',
+    strategy: formatPresetDefaultsForHelp(ETF_PRESET_PARAMETER_DEFAULTS.conservative),
   },
   {
     sequence: '8) ETFs > Balanced',
@@ -234,7 +239,7 @@ const presetSettingsRows = [
     goal: 'Moderate ETF mix balancing rotation and drawdown control.',
     riskProfile: 'Directly set to balanced.',
     screener: 'min_dollar_volume 10M, max_spread_bps 40, max_sector_weight_pct 40.',
-    strategy: 'position_size 1000; risk 1.0%; SL 2.5%; TP 6.0%; trail 2.8%; ATR 1.9; z-score -1.2; dip 1.5%; hold 10d; DCA 1; max_losses 3; max_DD 15%.',
+    strategy: formatPresetDefaultsForHelp(ETF_PRESET_PARAMETER_DEFAULTS.balanced),
   },
   {
     sequence: '9) ETFs > Aggressive',
@@ -242,7 +247,7 @@ const presetSettingsRows = [
     goal: 'Higher-beta ETF profile seeking larger moves.',
     riskProfile: 'Directly set to aggressive.',
     screener: 'min_dollar_volume 7M, max_spread_bps 55, max_sector_weight_pct 45.',
-    strategy: 'position_size 1300; risk 1.4%; SL 3.5%; TP 8.0%; trail 3.5%; ATR 2.0; z-score -1.5; dip 2.0%; hold 8d; DCA 1; max_losses 3; max_DD 15%.',
+    strategy: formatPresetDefaultsForHelp(ETF_PRESET_PARAMETER_DEFAULTS.aggressive),
   },
 ];
 

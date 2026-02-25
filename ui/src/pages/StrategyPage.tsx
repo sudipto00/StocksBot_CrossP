@@ -58,7 +58,10 @@ import HelpTooltip from '../components/HelpTooltip';
 import PageHeader from '../components/PageHeader';
 import GuidedFlowStrip from '../components/GuidedFlowStrip';
 import ConfirmDialog from '../components/ConfirmDialog';
-import { useToast } from '../components/Toast';
+import { useToast } from '../components/toastContext';
+import {
+  resolvePresetDefaultParameters,
+} from '../constants/presetDefaults';
 
 const SYMBOL_RE = /^[A-Z][A-Z0-9.-]{0,9}$/;
 const STRATEGY_LIMITS = {
@@ -105,6 +108,12 @@ interface RunnerInputSummary {
   inactiveSymbolsPreview: string[];
   openPositionCount: number;
   generatedAt: string;
+}
+
+interface RunnerLoadedStrategySnapshot {
+  name: string;
+  symbols: string[];
+  isRunning: boolean;
 }
 
 interface WorkspaceSnapshot {
@@ -248,6 +257,39 @@ function formatParameterPreview(parameters: Record<string, number> | null | unde
     .map(([name, value]) => `${name}=${Number(value).toFixed(3)}`)
     .join(', ');
   return entries.length > maxItems ? `${preview}, ...` : preview;
+}
+
+function normalizeParameterMap(source: Record<string, unknown> | null | undefined): Record<string, number> {
+  if (!source) return {};
+  return Object.entries(source).reduce((acc, [name, value]) => {
+    const numeric = Number(value);
+    if (Number.isFinite(numeric)) {
+      acc[name] = numeric;
+    }
+    return acc;
+  }, {} as Record<string, number>);
+}
+
+function computeParameterAdjustments(
+  executable: Record<string, number>,
+  raw: Record<string, number> | null | undefined,
+): Array<{ name: string; raw: number; executable: number }> {
+  if (!raw) return [];
+  return Object.entries(executable)
+    .map(([name, executableValue]) => {
+      const rawValue = Number(raw[name]);
+      return { name, raw: rawValue, executable: Number(executableValue) };
+    })
+    .filter((item) => Number.isFinite(item.raw) && Number.isFinite(item.executable) && Math.abs(item.raw - item.executable) > 0.000001)
+    .sort((left, right) => left.name.localeCompare(right.name));
+}
+
+function confidenceBandClass(band: string): string {
+  const normalized = String(band || '').trim().toLowerCase();
+  if (normalized === 'high') return 'text-emerald-300';
+  if (normalized === 'medium') return 'text-amber-300';
+  if (normalized === 'low') return 'text-red-300';
+  return 'text-gray-300';
 }
 
 function getErrorMessage(error: unknown): string {
@@ -694,6 +736,7 @@ function StrategyPage() {
   const [runnerLoading, setRunnerLoading] = useState(false);
   const [runnerBlockedReason, setRunnerBlockedReason] = useState('');
   const [killSwitchActive, setKillSwitchActive] = useState(false);
+  const [runnerLoadedStrategies, setRunnerLoadedStrategies] = useState<RunnerLoadedStrategySnapshot[]>([]);
 
   // Form state
   const [formName, setFormName] = useState('');
@@ -751,6 +794,7 @@ function StrategyPage() {
     sourceLabel: string;
     sourceRunId?: string | null;
     parameterChanges: Array<{ name: string; from: number; to: number }>;
+    adjustedParameters: Array<{ name: string; raw: number; executable: number }>;
     symbolsAdded: string[];
     symbolsRemoved: string[];
   } | null>(null);
@@ -774,6 +818,7 @@ function StrategyPage() {
   const backtestContributionTotal = Math.max(0, Number(backtestDiagnostics?.capital_contributions_total ?? 0));
   const backtestContributionEvents = Math.max(0, Math.round(Number(backtestDiagnostics?.contribution_events ?? 0)));
   const backtestLiveParity: BacktestLiveParityReport | null = backtestDiagnostics?.live_parity || null;
+  const backtestConfidence = ((backtestDiagnostics?.confidence || {}) as Record<string, unknown>);
   const backtestUniverseCtx: BacktestUniverseContext | null =
     (backtestDiagnostics as unknown as { universe_context?: BacktestUniverseContext })?.universe_context ?? null;
   const topBacktestBlockers = (backtestDiagnostics?.top_blockers || []).filter((item) => item.count > 0);
@@ -786,6 +831,7 @@ function StrategyPage() {
   const [workspaceUniverseSymbols, setWorkspaceUniverseSymbols] = useState<string[]>([]);
   const [workspacePresetSeedCoverage, setWorkspacePresetSeedCoverage] = useState<PresetSeedCoverage | null>(null);
   const [workspaceUniverseLoading, setWorkspaceUniverseLoading] = useState(false);
+  const [workspaceUniverseIssue, setWorkspaceUniverseIssue] = useState<string | null>(null);
   const [prefillMessage, setPrefillMessage] = useState<string>('');
   const [prefillLoading, setPrefillLoading] = useState(false);
   const abortControllerRef = useRef<AbortController | null>(null);
@@ -935,6 +981,25 @@ function StrategyPage() {
         getSafetyStatus().catch(() => ({ kill_switch_active: false, last_broker_sync_at: null })),
       ]);
       setRunnerStatus(status.status);
+      const loadedStrategies = Array.isArray(status.strategies)
+        ? status.strategies
+          .map((raw) => {
+            if (!raw || typeof raw !== 'object') return null;
+            const row = raw as Record<string, unknown>;
+            const name = String(row.name || '').trim();
+            if (!name) return null;
+            const symbols = Array.isArray(row.symbols)
+              ? normalizeSymbols((row.symbols as unknown[]).map((symbol) => String(symbol || '')).join(', '))
+              : [];
+            return {
+              name,
+              symbols,
+              isRunning: Boolean(row.is_running),
+            } as RunnerLoadedStrategySnapshot;
+          })
+          .filter((row): row is RunnerLoadedStrategySnapshot => row !== null)
+        : [];
+      setRunnerLoadedStrategies(loadedStrategies);
       setKillSwitchActive(Boolean(safety.kill_switch_active));
       if (includePreflight) {
         void refreshRunnerPreflight();
@@ -1013,18 +1078,34 @@ function StrategyPage() {
     };
   }, [workspaceSnapshot]);
 
+  const resolveStrategySymbolFallback = useCallback((): string[] => {
+    const draftSymbols = normalizeSymbols(configSymbols).slice(0, STRATEGY_LIMITS.maxSymbols);
+    if (draftSymbols.length > 0) {
+      return draftSymbols;
+    }
+    const strategySymbols = selectedStrategy?.symbols || [];
+    return normalizeSymbols(strategySymbols.join(', ')).slice(0, STRATEGY_LIMITS.maxSymbols);
+  }, [configSymbols, selectedStrategy]);
+
   const refreshWorkspaceUniverseSymbols = useCallback(async (prefsOverride?: TradingPreferences | null) => {
     if (!analysisUsesWorkspaceUniverse) {
       setWorkspaceUniverseSymbols([]);
       setWorkspacePresetSeedCoverage(null);
       setWorkspaceUniverseLoading(false);
+      setWorkspaceUniverseIssue(null);
       return;
     }
+    const fallbackSymbols = resolveStrategySymbolFallback();
     const prefs = prefsOverride ?? await withTimeout(getTradingPreferences(), 2500, null);
     if (!prefs) {
-      setWorkspaceUniverseSymbols([]);
+      setWorkspaceUniverseSymbols(fallbackSymbols);
       setWorkspacePresetSeedCoverage(null);
       setWorkspaceUniverseLoading(false);
+      setWorkspaceUniverseIssue(
+        fallbackSymbols.length > 0
+          ? 'Workspace universe preferences are unavailable right now. Using strategy symbols as fallback.'
+          : 'Workspace universe preferences are unavailable and no strategy symbols were found.'
+      );
       return;
     }
     const resolved = resolveWorkspaceUniverseInputs(prefs);
@@ -1033,27 +1114,54 @@ function StrategyPage() {
       setWorkspaceUniverseSymbols(cached.symbols);
       setWorkspacePresetSeedCoverage(cached.presetSeedCoverage);
       setWorkspaceUniverseLoading(false);
+      setWorkspaceUniverseIssue(null);
       return;
     }
     setWorkspaceUniverseLoading(true);
-    const response = await withTimeout(
-      getScreenerAssets(prefs.asset_type as AssetTypePreference, prefs.screener_limit, resolved.screenerOptions),
-      6000,
-      null,
-    );
-    if (response && Array.isArray(response.assets)) {
-      const symbols = normalizeSymbols((response.assets || []).map((asset) => asset.symbol).join(', '))
-        .slice(0, STRATEGY_LIMITS.maxSymbols);
-      const presetSeedCoverage = extractPresetSeedCoverage(response.applied_guardrails?.preset_seed_coverage);
-      workspaceUniverseCacheRef.current = { key: resolved.cacheKey, symbols, presetSeedCoverage };
-      setWorkspaceUniverseSymbols(symbols);
-      setWorkspacePresetSeedCoverage(presetSeedCoverage);
-    } else {
-      setWorkspaceUniverseSymbols([]);
+    try {
+      const response = await withTimeout(
+        getScreenerAssets(prefs.asset_type as AssetTypePreference, prefs.screener_limit, resolved.screenerOptions),
+        6000,
+        null,
+      );
+      if (response && Array.isArray(response.assets)) {
+        const symbols = normalizeSymbols((response.assets || []).map((asset) => asset.symbol).join(', '))
+          .slice(0, STRATEGY_LIMITS.maxSymbols);
+        const presetSeedCoverage = extractPresetSeedCoverage(response.applied_guardrails?.preset_seed_coverage);
+        if (symbols.length > 0) {
+          workspaceUniverseCacheRef.current = { key: resolved.cacheKey, symbols, presetSeedCoverage };
+          setWorkspaceUniverseSymbols(symbols);
+          setWorkspacePresetSeedCoverage(presetSeedCoverage);
+          setWorkspaceUniverseIssue(null);
+        } else {
+          setWorkspaceUniverseSymbols(fallbackSymbols);
+          setWorkspacePresetSeedCoverage(null);
+          setWorkspaceUniverseIssue(
+            fallbackSymbols.length > 0
+              ? 'Workspace universe resolved zero symbols. Using strategy symbols as fallback.'
+              : 'Workspace universe resolved zero symbols. Adjust Screener filters/preset.'
+          );
+        }
+      } else {
+        setWorkspaceUniverseSymbols(fallbackSymbols);
+        setWorkspacePresetSeedCoverage(null);
+        setWorkspaceUniverseIssue(
+          fallbackSymbols.length > 0
+            ? 'Workspace universe fetch timed out or failed. Using strategy symbols as fallback.'
+            : 'Workspace universe fetch timed out or failed.'
+        );
+      }
+    } catch {
+      setWorkspaceUniverseSymbols(fallbackSymbols);
       setWorkspacePresetSeedCoverage(null);
+      setWorkspaceUniverseIssue(
+        fallbackSymbols.length > 0
+          ? 'Workspace universe request failed. Using strategy symbols as fallback.'
+          : 'Workspace universe request failed.'
+      );
     }
     setWorkspaceUniverseLoading(false);
-  }, [analysisUsesWorkspaceUniverse, resolveWorkspaceUniverseInputs]);
+  }, [analysisUsesWorkspaceUniverse, resolveStrategySymbolFallback, resolveWorkspaceUniverseInputs]);
 
   const loadRunnerInputSummary = useCallback(async (strategySnapshot?: Strategy[]) => {
     try {
@@ -1141,6 +1249,7 @@ function StrategyPage() {
     setWorkspaceUniverseSymbols([]);
     setWorkspacePresetSeedCoverage(null);
     setWorkspaceUniverseLoading(false);
+    setWorkspaceUniverseIssue(null);
   }, [
     analysisUsesWorkspaceUniverse,
     refreshWorkspaceUniverseSymbols,
@@ -1795,6 +1904,31 @@ function StrategyPage() {
     }, {} as Record<string, number>);
   };
 
+  const buildWorkspacePresetParameterPayload = (): Record<string, number> => {
+    if (!strategyConfig) return {};
+    const presetDefaults = resolvePresetDefaultParameters(runnerInputSummary?.preferences ?? null);
+    if (!presetDefaults) {
+      return buildResolvedParameterPayload();
+    }
+    return strategyConfig.parameters.reduce((acc, param) => {
+      const presetValue = presetDefaults[param.name];
+      if (Number.isFinite(presetValue)) {
+        const bounded = Math.min(param.max_value, Math.max(param.min_value, Number(presetValue)));
+        acc[param.name] = bounded;
+      } else {
+        acc[param.name] = param.value;
+      }
+      return acc;
+    }, {} as Record<string, number>);
+  };
+
+  const buildAnalysisParameterPayload = (): Record<string, number> => {
+    if (analysisUsesWorkspaceUniverse) {
+      return buildWorkspacePresetParameterPayload();
+    }
+    return buildResolvedParameterPayload();
+  };
+
   const handleRunBacktest = async () => {
     if (!selectedStrategy || !strategyConfig) return;
 
@@ -1822,7 +1956,7 @@ function StrategyPage() {
         setBacktestError('At least one valid symbol is required');
         return;
       }
-      const parameters = buildResolvedParameterPayload();
+      const parameters = buildAnalysisParameterPayload();
       const workspacePresetUniverseMode = (
         workspaceSnapshot?.preset_universe_mode
         || (typeof workspaceSnapshot?.seed_only_preset === 'boolean'
@@ -1901,7 +2035,7 @@ function StrategyPage() {
         setOptimizerError('At least one valid symbol is required');
         return;
       }
-      const parameters = buildResolvedParameterPayload();
+      const parameters = buildAnalysisParameterPayload();
       const workspacePresetUniverseMode = (
         workspaceSnapshot?.preset_universe_mode
         || (typeof workspaceSnapshot?.seed_only_preset === 'boolean'
@@ -2119,6 +2253,7 @@ function StrategyPage() {
       sourceLabel: activeOptimizerRecommendation.sourceLabel,
       sourceRunId: activeOptimizerRecommendation.sourceRunId ?? null,
       parameterChanges,
+      adjustedParameters: activeOptimizerRecommendation.adjustedParameters || [],
       symbolsAdded,
       symbolsRemoved,
     });
@@ -2301,8 +2436,31 @@ function StrategyPage() {
     ? draftSymbols.join(',') !== savedSymbols.join(',')
     : false;
   const currentPrefs = runnerInputSummary?.preferences ?? null;
+  const workspaceAssetMismatch = Boolean(
+    analysisUsesWorkspaceUniverse
+    && selectedStrategy
+    && currentPrefs
+    && selectedStrategy.asset_type !== 'both'
+    && selectedStrategy.asset_type !== currentPrefs.asset_type
+  );
   const recommendation = runnerInputSummary?.recommendation ?? null;
   const budgetStatus = runnerInputSummary?.budgetStatus ?? null;
+  const effectiveAnalysisParameterMap = analysisUsesWorkspaceUniverse
+    ? buildWorkspacePresetParameterPayload()
+    : buildResolvedParameterPayload();
+  const analysisParameterSourceLabel = analysisUsesWorkspaceUniverse
+    ? 'Workspace preset baseline defaults (from current Settings/Workspace preset)'
+    : (hasUnsavedParamChanges ? 'Current strategy draft values (unsaved changes shown)' : 'Saved strategy parameters');
+  const analysisSymbolSourceLabel = analysisUsesWorkspaceUniverse
+    ? 'Workspace Universe'
+    : 'Strategy Symbols (Hardened)';
+  const effectiveAnalysisSymbolsPreview = Array.from(effectiveSymbolSet).slice(0, 18).join(', ');
+  const workspaceBaselineDiffCount = strategyConfig
+    ? strategyConfig.parameters.filter((param) => {
+      const effectiveValue = Number(effectiveAnalysisParameterMap[param.name]);
+      return Number.isFinite(effectiveValue) && Math.abs(effectiveValue - Number(param.value)) > 0.000001;
+    }).length
+    : 0;
   const effectiveMinDollarVolume = typeof workspaceSnapshot?.min_dollar_volume === 'number'
     ? workspaceSnapshot.min_dollar_volume
     : recommendation?.guardrails?.min_dollar_volume;
@@ -2329,14 +2487,14 @@ function StrategyPage() {
       : 'IDLE';
   const estimatedPositionSize = strategyConfig
     ? computeEstimatedDynamicPositionSize({
-      requestedPositionSize: savedParameterMap.position_size ?? 1000,
+      requestedPositionSize: effectiveAnalysisParameterMap.position_size ?? savedParameterMap.position_size ?? 1000,
       symbolCount: Math.max(1, effectiveSymbolSet.size || 1),
       existingPositionCount: runnerInputSummary?.openPositionCount ?? 0,
       remainingWeeklyBudget: budgetStatus?.remaining_budget ?? currentPrefs?.weekly_budget ?? 0,
       buyingPower: runnerInputSummary?.brokerAccount?.buying_power ?? 0,
       equity: runnerInputSummary?.brokerAccount?.equity ?? 0,
-      riskPerTradePct: savedParameterMap.risk_per_trade ?? 1,
-      stopLossPct: savedParameterMap.stop_loss_pct ?? 2,
+      riskPerTradePct: effectiveAnalysisParameterMap.risk_per_trade ?? savedParameterMap.risk_per_trade ?? 1,
+      stopLossPct: effectiveAnalysisParameterMap.stop_loss_pct ?? savedParameterMap.stop_loss_pct ?? 2,
     })
     : null;
   const optimizerActiveJobs = optimizerHealth?.active_jobs || [];
@@ -2380,13 +2538,13 @@ function StrategyPage() {
   const historyRecommendation = useMemo(() => {
     if (!selectedStrategy || !selectedStrategyHistoryRun) return null;
     if (String(selectedStrategyHistoryRun.status || '').toLowerCase() !== 'completed') return null;
-    const recommendedParameters = Object.entries(selectedStrategyHistoryRun.recommended_parameters || {}).reduce((acc, [name, value]) => {
-      const numeric = Number(value);
-      if (Number.isFinite(numeric)) {
-        acc[name] = numeric;
-      }
-      return acc;
-    }, {} as Record<string, number>);
+    const recommendedParameters = normalizeParameterMap(selectedStrategyHistoryRun.recommended_parameters as Record<string, unknown>);
+    const recommendedParametersRaw = normalizeParameterMap(
+      (selectedStrategyHistoryRun.recommended_parameters_raw
+        || selectedStrategyHistoryRun.result_payload?.recommended_parameters_raw
+        || selectedStrategyHistoryRun.recommended_parameters) as Record<string, unknown>,
+    );
+    const adjustedParameters = computeParameterAdjustments(recommendedParameters, recommendedParametersRaw);
     const recommendedSymbols = normalizeSymbols((selectedStrategyHistoryRun.recommended_symbols || []).join(', '));
     if (Object.keys(recommendedParameters).length === 0 && recommendedSymbols.length === 0) {
       return null;
@@ -2396,6 +2554,8 @@ function StrategyPage() {
     return {
       strategyId: selectedStrategy.id,
       recommendedParameters,
+      recommendedParametersRaw,
+      adjustedParameters,
       recommendedSymbols,
       sourceLabel: `History ${selectedStrategyHistoryRun.run_id.slice(0, 12)}...`,
       sourceRunId: selectedStrategyHistoryRun.run_id,
@@ -2411,16 +2571,15 @@ function StrategyPage() {
   }, [selectedStrategy, selectedStrategyHistoryRun]);
   const activeOptimizerRecommendation = useMemo(() => {
     if (selectedStrategy && optimizerResult && optimizerResult.strategy_id === selectedStrategy.id) {
-      const recommendedParameters = Object.entries(optimizerResult.recommended_parameters || {}).reduce((acc, [name, value]) => {
-        const numeric = Number(value);
-        if (Number.isFinite(numeric)) {
-          acc[name] = numeric;
-        }
-        return acc;
-      }, {} as Record<string, number>);
+      const recommendedParameters = normalizeParameterMap(optimizerResult.recommended_parameters as Record<string, unknown>);
+      const recommendedParametersRaw = normalizeParameterMap(
+        (optimizerResult.recommended_parameters_raw || optimizerResult.recommended_parameters) as Record<string, unknown>,
+      );
       return {
         strategyId: selectedStrategy.id,
         recommendedParameters,
+        recommendedParametersRaw,
+        adjustedParameters: computeParameterAdjustments(recommendedParameters, recommendedParametersRaw),
         recommendedSymbols: normalizeSymbols((optimizerResult.recommended_symbols || []).join(', ')),
         sourceLabel: 'Current optimizer output',
         sourceRunId: null as string | null,
@@ -2431,6 +2590,25 @@ function StrategyPage() {
     }
     return historyRecommendation;
   }, [selectedStrategy, optimizerResult, historyRecommendation, optimizerLoading]);
+  const optimizerAdjustedParameters = useMemo(() => {
+    if (!optimizerResult) return [] as Array<{ name: string; raw: number; executable: number }>;
+    const executable = normalizeParameterMap(optimizerResult.recommended_parameters as Record<string, unknown>);
+    const raw = normalizeParameterMap((optimizerResult.recommended_parameters_raw || optimizerResult.recommended_parameters) as Record<string, unknown>);
+    return computeParameterAdjustments(executable, raw);
+  }, [optimizerResult]);
+  const optimizerConfidence = useMemo(() => {
+    const payload = (optimizerResult?.confidence || {}) as Record<string, unknown>;
+    const score = readHistoryOptionalNumber(payload, 'overall_confidence_score');
+    const backtestScore = readHistoryOptionalNumber(payload, 'backtest_confidence_score');
+    const walkForwardPassRatePct = readHistoryOptionalNumber(payload, 'walk_forward_pass_rate_pct');
+    const band = readHistoryText(payload, 'confidence_band', '').trim().toLowerCase();
+    return {
+      score,
+      backtestScore,
+      walkForwardPassRatePct,
+      band,
+    };
+  }, [optimizerResult]);
   const isDenseMode = densityMode === 'dense';
   const compareMetricRows = useMemo(() => (
     compareRows.map((row) => {
@@ -2625,7 +2803,7 @@ function StrategyPage() {
         </div>
         <div className="mt-4 rounded-lg border border-blue-800 bg-blue-900/20 p-4">
           <div className="flex flex-wrap items-center justify-between gap-2">
-            <p className="text-sm font-semibold text-blue-100">Runner Input Summary (current snapshot)</p>
+            <p className="text-sm font-semibold text-blue-100">Global Runner Snapshot (all active strategies)</p>
             <button
               onClick={() => loadRunnerInputSummary()}
               disabled={runnerInputSummaryLoading}
@@ -2635,65 +2813,26 @@ function StrategyPage() {
             </button>
           </div>
           <p className="mt-1 text-xs text-blue-200">
-            Start Runner executes active strategy symbols and applies risk/execution controls shown here.
+            This section is global runner state. Strategy-specific analysis source/parameters are shown in Effective Runner Configuration for the selected strategy.
           </p>
-          <p className="mt-1 text-xs text-blue-200">
-            Workspace Universe mode resolves symbols from Screener for the selected strategy only at runner start.
-          </p>
-          <div className="mt-3 grid grid-cols-1 gap-2 md:grid-cols-3">
-            <label className="text-xs text-blue-100">
-              Runner Universe Source
-              <select
-                value={analysisUniverseMode}
-                onChange={(e) => setAnalysisUniverseMode(e.target.value as AnalysisUniverseMode)}
-                className="mt-1 w-full rounded border border-blue-800 bg-blue-950/50 px-3 py-2 text-blue-100"
-              >
-                <option value="strategy_symbols">Strategy Symbols (Hardened)</option>
-                <option value="workspace_universe">Workspace Universe (Selected Strategy Override)</option>
-              </select>
-            </label>
-            <div className="rounded bg-blue-950/40 px-3 py-2 text-xs text-blue-100">
-              <div className="text-blue-300">Current mode</div>
-              <div className="font-semibold">
-                {analysisUsesWorkspaceUniverse ? 'Workspace Universe override on runner start' : 'Strategy Symbols hardened universe'}
-              </div>
-            </div>
-            <div className="rounded bg-blue-950/40 px-3 py-2 text-xs text-blue-100">
-              <div className="text-blue-300">Backtest/Optimizer source</div>
-              <div className="font-semibold">
-                {analysisUsesWorkspaceUniverse ? 'Workspace Universe' : 'Strategy Symbols'}
-              </div>
-            </div>
-          </div>
           <div className="mt-3 grid grid-cols-1 gap-2 text-xs text-blue-100 md:grid-cols-3">
             <div className="rounded bg-blue-950/40 px-3 py-2">
-              Active strategies used: <span className="font-semibold">{runnerInputSummary?.activeStrategyCount ?? activeStrategyCount}</span>
+              Runner status: <span className="font-semibold uppercase">{runnerStatus}</span>
+            </div>
+            <div className="rounded bg-blue-950/40 px-3 py-2">
+              Runner-loaded strategies: <span className="font-semibold">{runnerLoadedStrategies.length}</span>
+            </div>
+            <div className="rounded bg-blue-950/40 px-3 py-2">
+              Active strategies in DB: <span className="font-semibold">{runnerInputSummary?.activeStrategyCount ?? activeStrategyCount}</span>
             </div>
             <div className="rounded bg-blue-950/40 px-3 py-2">
               Inactive strategies: <span className="font-semibold">{runnerInputSummary?.inactiveStrategyCount ?? 0}</span>
             </div>
             <div className="rounded bg-blue-950/40 px-3 py-2">
-              Unique symbols in scope: <span className="font-semibold">{runnerInputSummary?.activeSymbolCount ?? 0}</span>
-            </div>
-            <div className="rounded bg-blue-950/40 px-3 py-2">
-              Runner universe source: <span className="font-semibold">{analysisUsesWorkspaceUniverse ? 'Workspace Universe' : 'Strategy Symbols (Hardened)'}</span>
-            </div>
-            <div className="rounded bg-blue-950/40 px-3 py-2">
-              Workspace resolved symbols: <span className="font-semibold">
-                {analysisUsesWorkspaceUniverse
-                  ? (workspaceUniverseLoading ? 'Loading...' : workspaceUniverseSymbols.length)
-                  : '-'}
-              </span>
+              Unique active symbols: <span className="font-semibold">{runnerInputSummary?.activeSymbolCount ?? 0}</span>
             </div>
             <div className="rounded bg-blue-950/40 px-3 py-2">
               Workspace universe: <span className="font-semibold">{formatUniverseLabel(runnerInputSummary?.preferences ?? null)}</span>
-            </div>
-            <div className="rounded bg-blue-950/40 px-3 py-2">
-              Preset seed coverage: <span className="font-semibold">
-                {analysisUsesWorkspaceUniverse
-                  ? (workspaceUniverseLoading ? 'Loading...' : workspacePresetSeedCoverageLabel)
-                  : '-'}
-              </span>
             </div>
             <div className="rounded bg-blue-950/40 px-3 py-2">
               Asset type: <span className="font-semibold uppercase">{runnerInputSummary?.preferences?.asset_type ?? '-'}</span>
@@ -2702,7 +2841,7 @@ function StrategyPage() {
               Weekly budget: <span className="font-semibold">{formatCurrency(runnerInputSummary?.preferences?.weekly_budget ?? 0)}</span>
             </div>
             <div className="rounded bg-blue-950/40 px-3 py-2">
-              Max position: <span className="font-semibold">{formatCurrency(runnerInputSummary?.config?.max_position_size ?? 0)}</span>
+              Max position cap: <span className="font-semibold">{formatCurrency(runnerInputSummary?.config?.max_position_size ?? 0)}</span>
             </div>
             <div className="rounded bg-blue-950/40 px-3 py-2">
               Daily loss cap: <span className="font-semibold">{formatCurrency(runnerInputSummary?.config?.risk_limit_daily ?? 0)}</span>
@@ -2715,19 +2854,23 @@ function StrategyPage() {
             </div>
           </div>
           <p className="mt-2 text-xs text-blue-200">
-            Symbol sample:{' '}
+            Runner-loaded strategies:{' '}
             <span className="font-mono text-blue-100">
-              {analysisUsesWorkspaceUniverse
-                ? (workspaceUniverseLoading
-                  ? 'Resolving workspace symbols...'
-                  : (workspaceUniverseSymbols.length > 0
-                    ? workspaceUniverseSymbols.slice(0, 12).join(', ')
-                    : 'No workspace symbols found'))
-                : ((runnerInputSummary?.activeSymbolsPreview || []).length > 0
-                  ? (runnerInputSummary?.activeSymbolsPreview || []).join(', ')
-                  : (runnerInputSummary?.inactiveSymbolsPreview || []).length > 0
-                    ? `No active strategy symbols. Stopped-strategy sample: ${(runnerInputSummary?.inactiveSymbolsPreview || []).join(', ')}`
-                    : 'No strategy symbols found')}
+              {runnerLoadedStrategies.length > 0
+                ? runnerLoadedStrategies
+                  .map((strategy) => `${strategy.name}(${strategy.symbols.length})`)
+                  .join(', ')
+                : 'None loaded'}
+            </span>
+          </p>
+          <p className="mt-1 text-xs text-blue-200">
+            Active symbol sample:{' '}
+            <span className="font-mono text-blue-100">
+              {(runnerInputSummary?.activeSymbolsPreview || []).length > 0
+                ? (runnerInputSummary?.activeSymbolsPreview || []).join(', ')
+                : (runnerInputSummary?.inactiveSymbolsPreview || []).length > 0
+                  ? `No active strategy symbols. Stopped-strategy sample: ${(runnerInputSummary?.inactiveSymbolsPreview || []).join(', ')}`
+                  : 'No strategy symbols found'}
             </span>
           </p>
           <p className="mt-1 text-xs text-blue-200">
@@ -2896,6 +3039,48 @@ function StrategyPage() {
                     </p>
                   )}
 
+                  <div className="mt-3 rounded border border-cyan-800 bg-cyan-950/35 p-3">
+                    <p className="text-xs font-semibold text-cyan-100">Selected Strategy Analysis Source</p>
+                    <p className="mt-1 text-[11px] text-cyan-200">
+                      This setting switches with strategy selection and controls the exact symbols/parameters used by backtest and optimizer.
+                    </p>
+                    <div className="mt-2 grid grid-cols-1 gap-2 md:grid-cols-3">
+                      <label className="text-xs text-cyan-100">
+                        Runner Universe Source
+                        <select
+                          value={analysisUniverseMode}
+                          onChange={(e) => setAnalysisUniverseMode(e.target.value as AnalysisUniverseMode)}
+                          className="mt-1 w-full rounded border border-cyan-800 bg-cyan-950/50 px-3 py-2 text-cyan-100"
+                        >
+                          <option value="strategy_symbols">Strategy Symbols (Hardened)</option>
+                          <option value="workspace_universe">Workspace Universe (Selected Strategy Override)</option>
+                        </select>
+                      </label>
+                      <div className="rounded bg-cyan-950/45 px-3 py-2 text-xs text-cyan-100">
+                        <div className="text-cyan-300">Effective symbol source</div>
+                        <div className="font-semibold">{analysisSymbolSourceLabel}</div>
+                      </div>
+                      <div className="rounded bg-cyan-950/45 px-3 py-2 text-xs text-cyan-100">
+                        <div className="text-cyan-300">Effective parameter source</div>
+                        <div className="font-semibold">{analysisParameterSourceLabel}</div>
+                      </div>
+                    </div>
+                    <p className="mt-2 text-[11px] text-cyan-200">
+                      Start Runner applies this selected source on the next runner start. If runner is already active, restart it to apply source changes.
+                    </p>
+                    {analysisUsesWorkspaceUniverse && (
+                      <p className="mt-1 text-[11px] text-cyan-200">
+                        Workspace baseline currently differs from saved strategy values on {workspaceBaselineDiffCount} parameter(s). This is expected when optimized/hardened strategy values diverge from preset defaults.
+                      </p>
+                    )}
+                    {workspaceAssetMismatch && (
+                      <p className="mt-1 rounded bg-amber-900/60 px-2 py-1 text-[11px] text-amber-200">
+                        Strategy asset type ({selectedStrategy?.asset_type?.toUpperCase()}) differs from current workspace asset type ({currentPrefs?.asset_type?.toUpperCase()}).
+                        Workspace universe mode follows current workspace settings.
+                      </p>
+                    )}
+                  </div>
+
                   <div className="mt-3 grid grid-cols-1 gap-2 text-xs text-cyan-100 md:grid-cols-3">
                     <div className="rounded bg-cyan-950/40 px-3 py-2">
                       Strategy status: <span className="font-semibold uppercase">{selectedStrategy.status}</span>
@@ -2928,19 +3113,37 @@ function StrategyPage() {
                       Weekly budget: <span className="font-semibold">{formatCurrency(currentPrefs?.weekly_budget ?? 0)}</span>
                     </div>
                     <div className="rounded bg-cyan-950/40 px-3 py-2">
-                      Preset seed coverage: <span className="font-semibold">{workspacePresetSeedCoverageLabel}</span>
+                      Preset seed coverage: <span className="font-semibold">
+                        {analysisUsesWorkspaceUniverse ? workspacePresetSeedCoverageLabel : '-'}
+                      </span>
                       <br />
-                      Missing symbols tracked: <span className="font-semibold">{workspacePresetSeedCoverage?.seed_missing_symbols?.length ?? 0}</span>
+                      Missing symbols tracked: <span className="font-semibold">
+                        {analysisUsesWorkspaceUniverse ? (workspacePresetSeedCoverage?.seed_missing_symbols?.length ?? 0) : '-'}
+                      </span>
                     </div>
                     <div className="rounded bg-cyan-950/40 px-3 py-2">
-                      Guardrail min $vol: <span className="font-semibold">{effectiveMinDollarVolume ? formatCurrency(effectiveMinDollarVolume) : 'N/A'}</span>
+                      Guardrail min $vol: <span className="font-semibold">
+                        {analysisUsesWorkspaceUniverse
+                          ? (effectiveMinDollarVolume ? formatCurrency(effectiveMinDollarVolume) : 'N/A')
+                          : '-'}
+                      </span>
                       <br />
-                      Guardrail spread: <span className="font-semibold">{typeof effectiveMaxSpreadBps === 'number' ? `${effectiveMaxSpreadBps} bps` : 'N/A'}</span>
+                      Guardrail spread: <span className="font-semibold">
+                        {analysisUsesWorkspaceUniverse
+                          ? (typeof effectiveMaxSpreadBps === 'number' ? `${effectiveMaxSpreadBps} bps` : 'N/A')
+                          : '-'}
+                      </span>
                     </div>
                     <div className="rounded bg-cyan-950/40 px-3 py-2">
-                      Guardrail sector cap: <span className="font-semibold">{typeof effectiveMaxSectorWeightPct === 'number' ? `${effectiveMaxSectorWeightPct}%` : 'N/A'}</span>
+                      Guardrail sector cap: <span className="font-semibold">
+                        {analysisUsesWorkspaceUniverse
+                          ? (typeof effectiveMaxSectorWeightPct === 'number' ? `${effectiveMaxSectorWeightPct}%` : 'N/A')
+                          : '-'}
+                      </span>
                       <br />
-                      Auto regime adjust: <span className="font-semibold">{effectiveAutoRegimeAdjust ? 'On' : 'Off'}</span>
+                      Auto regime adjust: <span className="font-semibold">
+                        {analysisUsesWorkspaceUniverse ? (effectiveAutoRegimeAdjust ? 'On' : 'Off') : '-'}
+                      </span>
                     </div>
                     <div className="rounded bg-cyan-950/40 px-3 py-2">
                       Open positions: <span className="font-semibold">{runnerInputSummary?.openPositionCount ?? 0}</span>
@@ -2972,6 +3175,27 @@ function StrategyPage() {
                         : Array.from(effectiveSymbolSet).join(', ') || 'None'}
                     </span>
                   </div>
+                  {analysisUsesWorkspaceUniverse && workspaceUniverseIssue && (
+                    <p className="mt-2 rounded bg-amber-900/60 px-3 py-2 text-xs text-amber-200">
+                      {workspaceUniverseIssue}
+                    </p>
+                  )}
+                  <div className="mt-2 rounded bg-cyan-950/40 px-3 py-2 text-xs text-cyan-100">
+                    Backtest/Optimizer execution payload:
+                    {' '}
+                    <span className="font-semibold">{analysisSymbolSourceLabel}</span>
+                    {' | '}
+                    <span className="font-semibold">{analysisParameterSourceLabel}</span>
+                    {' | '}
+                    <span className="font-semibold">Symbols {effectiveSymbolSet.size}</span>
+                    {' | '}
+                    <span className="font-mono">{effectiveAnalysisSymbolsPreview || 'None'}</span>
+                    {' | '}
+                    <span className="font-mono">Params: {formatParameterPreview(effectiveAnalysisParameterMap, 5)}</span>
+                  </div>
+                  <p className="mt-1 text-[11px] text-cyan-200">
+                    Backtest/optimizer always use this exact selected strategy payload. Runner uses saved strategy parameters and applies Workspace Universe symbols only for the selected target strategy at runner start.
+                  </p>
 
                   {strategyConfig?.parameters && strategyConfig.parameters.length > 0 && (
                     <div className="mt-3 overflow-x-auto">
@@ -2980,13 +3204,13 @@ function StrategyPage() {
                           <tr>
                             <th className="text-left py-1 pr-2">Parameter</th>
                             <th className="text-right py-1 pr-2">Saved</th>
-                            <th className="text-right py-1">Current Draft</th>
+                            <th className="text-right py-1">Effective For Backtest/Optimizer</th>
                           </tr>
                         </thead>
                         <tbody>
                           {strategyConfig.parameters.map((param) => {
-                            const draftValue = Number.isFinite(parameterDrafts[param.name])
-                              ? Number(parameterDrafts[param.name])
+                            const draftValue = Number.isFinite(effectiveAnalysisParameterMap[param.name])
+                              ? Number(effectiveAnalysisParameterMap[param.name])
                               : param.value;
                             return (
                               <tr key={`runner-summary-${param.name}`} className="border-t border-cyan-900/70">
@@ -3381,8 +3605,11 @@ function StrategyPage() {
                       </div>
                     </div>
                     <p className="text-[11px] text-gray-400 mb-2">
-                      Backtest/optimizer symbol source is controlled from Runner Input Summary (Runner Universe Source).
+                      Backtest/optimizer symbol source is controlled from Effective Runner Configuration (Selected Strategy Analysis Source).
                     </p>
+                    <div className="mb-3 rounded border border-emerald-700/50 bg-emerald-950/20 px-3 py-2 text-[11px] text-emerald-100">
+                      Live-equivalent mode is locked on for this UI. Backtest and optimizer requests always send <span className="font-mono">emulate_live_trading=true</span>.
+                    </div>
                     <div className="grid grid-cols-1 md:grid-cols-5 gap-3 mb-3">
                       <label className="text-xs text-gray-300">
                         Iterations
@@ -3651,7 +3878,7 @@ function StrategyPage() {
                     )}
                     {optimizerResult && (
                       <div className="space-y-3">
-                        <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-xs">
+                        <div className="grid grid-cols-2 md:grid-cols-5 gap-2 text-xs">
                           <div className="rounded bg-gray-800 px-3 py-2">
                             <div className="text-gray-400">Best Sharpe</div>
                             <div className="font-semibold text-white">{optimizerResult.best_result.sharpe_ratio.toFixed(2)}</div>
@@ -3670,6 +3897,12 @@ function StrategyPage() {
                             <div className="text-gray-400">Universe</div>
                             <div className="font-semibold text-white">{optimizerResult.recommended_symbols.length} symbols</div>
                           </div>
+                          <div className="rounded bg-gray-800 px-3 py-2">
+                            <div className="text-gray-400">Confidence</div>
+                            <div className={`font-semibold ${confidenceBandClass(optimizerConfidence.band)}`}>
+                              {optimizerConfidence.score == null ? 'n/a' : `${optimizerConfidence.score.toFixed(1)} / 100`}
+                            </div>
+                          </div>
                         </div>
                         <p className="text-xs text-indigo-100">
                           Evaluated {optimizerResult.evaluated_iterations}/{optimizerResult.requested_iterations} candidates.
@@ -3687,6 +3920,22 @@ function StrategyPage() {
                             ? 'Selected candidate meets the minimum trades target.'
                             : 'Selected candidate is below minimum trades target. Increase date range or loosen entry filters.'}
                         </p>
+                        {optimizerConfidence.score != null && (
+                          <p className={`text-xs ${confidenceBandClass(optimizerConfidence.band)}`}>
+                            Confidence band: {optimizerConfidence.band || 'n/a'}.
+                            {' '}
+                            Backtest confidence {optimizerConfidence.backtestScore == null ? 'n/a' : optimizerConfidence.backtestScore.toFixed(1)}.
+                            {' '}
+                            Walk-forward pass rate {optimizerConfidence.walkForwardPassRatePct == null ? 'n/a' : `${optimizerConfidence.walkForwardPassRatePct.toFixed(1)}%`}.
+                          </p>
+                        )}
+                        {optimizerAdjustedParameters.length > 0 && (
+                          <p className="text-xs text-amber-300">
+                            Executable recommendation adjusted {optimizerAdjustedParameters.length} parameter(s) to runtime limits:
+                            {' '}
+                            {optimizerAdjustedParameters.map((item) => item.name).join(', ')}.
+                          </p>
+                        )}
                         <div className="max-h-40 overflow-auto rounded border border-gray-700">
                           <table className="w-full text-xs text-gray-300">
                             <thead className="bg-gray-900 text-gray-400">
@@ -3862,6 +4111,13 @@ function StrategyPage() {
                           {historyRecommendation.requestedIterations ?? 'n/a'}
                           {' '}candidates.
                         </p>
+                        {historyRecommendation.adjustedParameters.length > 0 && (
+                          <p className="text-xs text-amber-300">
+                            Executable recommendation adjusted {historyRecommendation.adjustedParameters.length} parameter(s) to runtime limits:
+                            {' '}
+                            {historyRecommendation.adjustedParameters.map((item) => item.name).join(', ')}.
+                          </p>
+                        )}
                         <div className="max-h-40 overflow-auto rounded border border-gray-700">
                           <table className="w-full text-xs text-gray-300">
                             <thead className="bg-gray-900 text-gray-400">
@@ -4209,7 +4465,7 @@ function StrategyPage() {
                       {backtestDiagnostics && (
                         <div className="bg-gray-900 rounded p-4">
                           <div className="text-white font-medium mb-2">Backtest Diagnostics</div>
-                          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs mb-3">
+                          <div className="grid grid-cols-2 md:grid-cols-5 gap-3 text-xs mb-3">
                             <div className="rounded bg-gray-800 px-3 py-2">
                               <div className="text-gray-400">Symbols With Data</div>
                               <div className="text-white font-semibold">
@@ -4227,6 +4483,15 @@ function StrategyPage() {
                             <div className="rounded bg-gray-800 px-3 py-2">
                               <div className="text-gray-400">Signals / Entries</div>
                               <div className="text-white font-semibold">{backtestDiagnostics.entry_signals} / {backtestDiagnostics.entries_opened}</div>
+                            </div>
+                            <div className="rounded bg-gray-800 px-3 py-2">
+                              <div className="text-gray-400">Confidence</div>
+                              <div className={`font-semibold ${confidenceBandClass(readHistoryText(backtestConfidence, 'confidence_band', ''))}`}>
+                                {(() => {
+                                  const score = readHistoryOptionalNumber(backtestConfidence, 'overall_confidence_score');
+                                  return score == null ? 'n/a' : `${score.toFixed(1)} / 100`;
+                                })()}
+                              </div>
                             </div>
                           </div>
 
@@ -4572,6 +4837,16 @@ function StrategyPage() {
                   Expected Config Version: <span className="font-semibold">{pendingOptimizerApply.expectedConfigVersion}</span>
                 </div>
               </div>
+              {pendingOptimizerApply.adjustedParameters.length > 0 && (
+                <div className="rounded border border-amber-700/60 bg-amber-950/20 p-3 text-amber-100">
+                  <div className="font-semibold">Runtime Limit Adjustments</div>
+                  <div className="mt-1">
+                    The applied parameters are executable values. Raw optimizer values were clamped for:
+                    {' '}
+                    {pendingOptimizerApply.adjustedParameters.map((item) => item.name).join(', ')}.
+                  </div>
+                </div>
+              )}
               <div className="rounded border border-gray-700 bg-gray-800/70 p-3">
                 <div className="mb-2 font-semibold text-gray-200">
                   Parameter Changes ({pendingOptimizerApply.parameterChanges.length})

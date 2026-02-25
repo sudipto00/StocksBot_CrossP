@@ -1,9 +1,4 @@
-"""
-Audit and compliance module.
+"""Audit package marker.
 
-TODO: Implement audit functionality
-- Trade logging
-- Compliance checks
-- Audit trail generation
-- Regulatory reporting
+Audit routes, persistence, and compliance-oriented records live in active backend modules.
 """

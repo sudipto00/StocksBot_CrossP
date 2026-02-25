@@ -7,7 +7,7 @@ import HelpTooltip from '../components/HelpTooltip';
 import PageHeader from '../components/PageHeader';
 import ConfirmDialog from '../components/ConfirmDialog';
 import { SkeletonPage } from '../components/Skeleton';
-import { useToast } from '../components/Toast';
+import { useToast } from '../components/toastContext';
 import { formatDateTime, parseTimestamp } from '../utils/datetime';
 
 type AuditView = 'events' | 'trades' | 'exports';

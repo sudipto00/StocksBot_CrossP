@@ -6,7 +6,7 @@ Supports both paper trading and live trading via API credentials.
 """
 
 from typing import Dict, List, Optional, Any, Callable
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import logging
 import threading
 
@@ -23,6 +23,7 @@ from alpaca.trading.enums import (
     OrderType as AlpacaOrderType,
     TimeInForce,
     OrderStatus as AlpacaOrderStatus,
+    QueryOrderStatus,
 )
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestQuoteRequest, StockBarsRequest
@@ -88,6 +89,13 @@ class AlpacaBroker(BrokerInterface):
         self._trade_stream_thread: Optional[threading.Thread] = None
         self._trade_stream_running = False
         self._trade_update_callback: Optional[Callable[[Dict[str, Any]], None]] = None
+        self._market_data_stream = None
+        self._market_data_stream_thread: Optional[threading.Thread] = None
+        self._market_data_stream_running = False
+        self._market_data_update_callback: Optional[Callable[[Dict[str, Any]], None]] = None
+        self._market_data_stream_symbols: List[str] = []
+        self._live_quote_cache: Dict[str, Dict[str, Any]] = {}
+        self._live_quote_cache_lock = threading.Lock()
         self._asset_capabilities_cache: Dict[str, Dict[str, Any]] = {}
         self._asset_capabilities_ttl = timedelta(minutes=15)
         self._last_connect_error: Optional[str] = None
@@ -136,10 +144,13 @@ class AlpacaBroker(BrokerInterface):
             True if disconnected successfully
         """
         self.stop_trade_update_stream()
+        self.stop_market_data_stream()
         self._connected = False
         self._trading_client = None
         self._data_client = None
         self._asset_capabilities_cache = {}
+        with self._live_quote_cache_lock:
+            self._live_quote_cache.clear()
         logger.info("Disconnected from Alpaca")
         return True
     
@@ -463,73 +474,299 @@ class AlpacaBroker(BrokerInterface):
         order = self._trading_client.get_order_by_id(order_id)
         return self._map_alpaca_order(order)
     
-    def get_orders(self, status: Optional[OrderStatus] = None) -> List[Dict[str, Any]]:
+    @staticmethod
+    def _to_utc_datetime(value: Optional[datetime]) -> Optional[datetime]:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+    def get_orders(
+        self,
+        status: Optional[OrderStatus] = None,
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+        limit: Optional[int] = None,
+        symbols: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
         """
-        Get orders.
-        
-        TODO: Add support for filtering by date range
-        TODO: Add support for pagination
+        Get orders with optional filtering and pagination.
         
         Args:
             status: Filter by status (optional)
+            start: Optional start datetime (inclusive)
+            end: Optional end datetime (inclusive)
+            limit: Optional max rows to return
+            symbols: Optional list of symbols to include
             
         Returns:
             List of order dicts
         """
         if not self.is_connected():
             raise RuntimeError("Not connected to Alpaca")
-        
-        # Build request filter
-        request = GetOrdersRequest()
-        if status:
-            # Map our status to Alpaca's status
-            alpaca_status = self._map_to_alpaca_status(status)
-            if alpaca_status:
-                request.status = alpaca_status
-        
-        orders = self._trading_client.get_orders(filter=request)
-        
-        return [self._map_alpaca_order(order) for order in orders]
+
+        parsed_start = self._to_utc_datetime(start)
+        parsed_end = self._to_utc_datetime(end)
+        target_limit = max(1, int(limit)) if limit is not None else 500
+        page_size = max(1, min(500, target_limit))
+
+        normalized_symbols = [
+            str(symbol or "").strip().upper()
+            for symbol in (symbols or [])
+            if str(symbol or "").strip()
+        ]
+        use_symbol_filter = len(normalized_symbols) > 0
+
+        collected: List[Dict[str, Any]] = []
+        next_until = parsed_end
+        seen_ids: set[str] = set()
+
+        while len(collected) < target_limit:
+            request = GetOrdersRequest(limit=page_size)
+            if status:
+                alpaca_status = self._map_to_alpaca_status(status)
+                if alpaca_status:
+                    request.status = alpaca_status
+            if parsed_start is not None:
+                request.after = parsed_start
+            if next_until is not None:
+                request.until = next_until
+            if use_symbol_filter:
+                request.symbols = list(normalized_symbols)
+
+            rows = self._trading_client.get_orders(filter=request)
+            if not rows:
+                break
+
+            all_mapped_rows = [self._map_alpaca_order(row) for row in rows]
+            mapped_rows = list(all_mapped_rows)
+            if status is not None:
+                mapped_rows = [
+                    row for row in mapped_rows
+                    if str(row.get("status", "")).strip().lower() == status.value
+                ]
+            if use_symbol_filter:
+                symbol_set = set(normalized_symbols)
+                mapped_rows = [
+                    row for row in mapped_rows
+                    if str(row.get("symbol", "")).upper() in symbol_set
+                ]
+            for row in mapped_rows:
+                row_id = str(row.get("id", "")).strip()
+                if not row_id or row_id in seen_ids:
+                    continue
+                seen_ids.add(row_id)
+                collected.append(row)
+                if len(collected) >= target_limit:
+                    break
+
+            oldest_created_at: Optional[datetime] = None
+            for mapped in all_mapped_rows:
+                created_raw = str(mapped.get("created_at", "")).strip()
+                if not created_raw:
+                    continue
+                candidate = created_raw
+                if candidate.endswith("Z"):
+                    candidate = f"{candidate[:-1]}+00:00"
+                try:
+                    created_at = datetime.fromisoformat(candidate)
+                except ValueError:
+                    continue
+                if created_at.tzinfo is None:
+                    created_at = created_at.replace(tzinfo=timezone.utc)
+                if oldest_created_at is None or created_at < oldest_created_at:
+                    oldest_created_at = created_at
+            if oldest_created_at is None:
+                break
+            # Cursor pagination: fetch older rows next loop.
+            next_until = oldest_created_at - timedelta(microseconds=1)
+            if parsed_start is not None and next_until < parsed_start:
+                break
+            if len(rows) < page_size:
+                break
+
+        collected.sort(key=lambda row: str(row.get("created_at", "")), reverse=True)
+        return collected[:target_limit]
     
-    def get_market_data(self, symbol: str) -> Dict[str, Any]:
+    def get_market_data(
+        self,
+        symbol: str,
+        include_bars: bool = False,
+        bars_timeframe: TimeFrame = TimeFrame.Minute,
+        bars_limit: int = 30,
+    ) -> Dict[str, Any]:
         """
         Get current market data for a symbol.
         
-        TODO: Add support for multiple symbols in one call
-        TODO: Add support for bars/candles data
-        TODO: Add support for real-time streaming data
-        
         Args:
             symbol: Stock symbol
+            include_bars: Include recent candle bars in response
+            bars_timeframe: Bar timeframe for candles
+            bars_limit: Number of bars to request
             
         Returns:
             Market data dict (price, volume, etc.)
         """
         if not self.is_connected():
             raise RuntimeError("Not connected to Alpaca")
-        
-        request = StockLatestQuoteRequest(symbol_or_symbols=symbol)
-        quotes = self._data_client.get_stock_latest_quote(request)
-        
-        if symbol not in quotes:
-            return {
-                "symbol": symbol,
-                "price": 0.0,
-                "error": "No quote data available"
-            }
-        
-        quote = quotes[symbol]
-        
-        return {
-            "symbol": symbol,
-            "price": float((float(quote.ask_price) + float(quote.bid_price)) / 2.0),
-            "ask_price": float(quote.ask_price),
-            "bid_price": float(quote.bid_price),
-            "ask_size": int(quote.ask_size),
-            "bid_size": int(quote.bid_size),
-            "volume": 0,
-            "timestamp": quote.timestamp.isoformat(),
-        }
+
+        normalized = str(symbol or "").strip().upper()
+        if not normalized:
+            return {"symbol": "", "price": 0.0, "error": "Invalid symbol"}
+
+        multi = self.get_market_data_multi(
+            symbols=[normalized],
+            include_bars=include_bars,
+            bars_timeframe=bars_timeframe,
+            bars_limit=bars_limit,
+        )
+        return multi.get(normalized, {"symbol": normalized, "price": 0.0, "error": "No quote data available"})
+
+    def get_market_data_multi(
+        self,
+        symbols: List[str],
+        include_bars: bool = False,
+        bars_timeframe: TimeFrame = TimeFrame.Minute,
+        bars_limit: int = 30,
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        Get current market data for multiple symbols in one request.
+        Optionally includes recent bars/candles for richer context.
+        """
+        if not self.is_connected():
+            raise RuntimeError("Not connected to Alpaca")
+
+        normalized_symbols = [
+            str(symbol or "").strip().upper()
+            for symbol in symbols
+            if str(symbol or "").strip()
+        ]
+        if not normalized_symbols:
+            return {}
+
+        quotes_map: Dict[str, Any] = {}
+        try:
+            request = StockLatestQuoteRequest(symbol_or_symbols=normalized_symbols)
+            quotes_map = self._data_client.get_stock_latest_quote(request) or {}
+        except (RuntimeError, APIError, OSError) as exc:
+            logger.warning("Failed to fetch latest quotes for %s: %s", normalized_symbols, exc)
+            quotes_map = {}
+
+        result: Dict[str, Dict[str, Any]] = {}
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        for symbol in normalized_symbols:
+            quote = quotes_map.get(symbol)
+            if quote is not None:
+                ask_price = self._safe_optional_float(getattr(quote, "ask_price", None)) or 0.0
+                bid_price = self._safe_optional_float(getattr(quote, "bid_price", None)) or 0.0
+                mid_price = float((ask_price + bid_price) / 2.0) if (ask_price > 0 and bid_price > 0) else max(ask_price, bid_price)
+                row = {
+                    "symbol": symbol,
+                    "price": mid_price,
+                    "ask_price": ask_price,
+                    "bid_price": bid_price,
+                    "ask_size": int(getattr(quote, "ask_size", 0) or 0),
+                    "bid_size": int(getattr(quote, "bid_size", 0) or 0),
+                    "volume": 0,
+                    "timestamp": getattr(quote, "timestamp", datetime.now(timezone.utc)).isoformat(),
+                    "data_source": "quote",
+                }
+            else:
+                # Fallback path: use live stream cache or latest bar close.
+                cached_quote = None
+                with self._live_quote_cache_lock:
+                    cached_quote = dict(self._live_quote_cache.get(symbol, {})) if symbol in self._live_quote_cache else None
+                if cached_quote:
+                    row = {
+                        "symbol": symbol,
+                        "price": float(cached_quote.get("price", 0.0) or 0.0),
+                        "ask_price": self._safe_optional_float(cached_quote.get("ask_price")) or 0.0,
+                        "bid_price": self._safe_optional_float(cached_quote.get("bid_price")) or 0.0,
+                        "ask_size": int(cached_quote.get("ask_size", 0) or 0),
+                        "bid_size": int(cached_quote.get("bid_size", 0) or 0),
+                        "volume": int(cached_quote.get("volume", 0) or 0),
+                        "timestamp": str(cached_quote.get("timestamp") or now_iso),
+                        "data_source": "stream_cache",
+                    }
+                else:
+                    row = {
+                        "symbol": symbol,
+                        "price": 0.0,
+                        "ask_price": 0.0,
+                        "bid_price": 0.0,
+                        "ask_size": 0,
+                        "bid_size": 0,
+                        "volume": 0,
+                        "timestamp": now_iso,
+                        "error": "No quote data available",
+                        "data_source": "unavailable",
+                    }
+                if include_bars:
+                    try:
+                        fallback_bars = self.get_historical_bars(
+                            symbol=symbol,
+                            start=datetime.now(timezone.utc) - timedelta(days=2),
+                            end=datetime.now(timezone.utc),
+                            limit=max(1, int(bars_limit)),
+                            timeframe=bars_timeframe,
+                        )
+                    except (RuntimeError, APIError, OSError):
+                        fallback_bars = []
+                    if fallback_bars:
+                        latest_close = self._safe_optional_float(fallback_bars[-1].get("close")) or 0.0
+                        if latest_close > 0 and float(row.get("price", 0.0) or 0.0) <= 0:
+                            row["price"] = latest_close
+                            row["data_source"] = "bars_fallback"
+                        row["bars"] = fallback_bars
+                result[symbol] = row
+                continue
+
+            result[symbol] = row
+
+        if include_bars:
+            start = datetime.now(timezone.utc) - timedelta(days=2)
+            end = datetime.now(timezone.utc)
+            request = StockBarsRequest(
+                symbol_or_symbols=normalized_symbols,
+                timeframe=bars_timeframe,
+                start=start,
+                end=end,
+                limit=max(1, int(bars_limit)),
+            )
+            try:
+                bars_response = self._data_client.get_stock_bars(request)
+                bars_data = bars_response.data if hasattr(bars_response, "data") else bars_response
+            except (RuntimeError, APIError, OSError) as exc:
+                logger.warning("Failed to fetch bars for %s: %s", normalized_symbols, exc)
+                bars_data = {}
+
+            for symbol in normalized_symbols:
+                raw_bars = bars_data.get(symbol, []) if isinstance(bars_data, dict) else []
+                bar_rows: List[Dict[str, Any]] = []
+                for bar in raw_bars:
+                    bar_rows.append({
+                        "timestamp": getattr(bar, "timestamp", None),
+                        "open": float(getattr(bar, "open", 0.0) or 0.0),
+                        "high": float(getattr(bar, "high", 0.0) or 0.0),
+                        "low": float(getattr(bar, "low", 0.0) or 0.0),
+                        "close": float(getattr(bar, "close", 0.0) or 0.0),
+                        "volume": int(getattr(bar, "volume", 0) or 0),
+                    })
+                if symbol in result:
+                    if bar_rows:
+                        result[symbol]["bars"] = bar_rows
+                    elif "bars" not in result[symbol]:
+                        result[symbol]["bars"] = []
+                    if (
+                        (self._safe_optional_float(result[symbol].get("price")) or 0.0) <= 0
+                        and len(bar_rows) > 0
+                    ):
+                        result[symbol]["price"] = float(bar_rows[-1]["close"] or 0.0)
+                        result[symbol]["data_source"] = "bars_fallback"
+
+        return result
 
     def get_historical_bars(
         self,
@@ -629,6 +866,94 @@ class AlpacaBroker(BrokerInterface):
         logger.info("Alpaca trade update stream started")
         return True
 
+    def start_market_data_stream(
+        self,
+        symbols: List[str],
+        on_update: Callable[[Dict[str, Any]], None],
+    ) -> bool:
+        """
+        Start Alpaca market-data websocket stream for quote updates.
+        Captures quotes into an in-memory cache and forwards updates to callback.
+        """
+        if not self.is_connected():
+            logger.warning("Cannot start market data stream: broker not connected")
+            return False
+        normalized_symbols = [
+            str(symbol or "").strip().upper()
+            for symbol in symbols
+            if str(symbol or "").strip()
+        ]
+        if not normalized_symbols:
+            logger.warning("Cannot start market data stream: no symbols provided")
+            return False
+        if self._market_data_stream_running:
+            return True
+
+        self._market_data_stream_symbols = list(dict.fromkeys(normalized_symbols))
+        self._market_data_update_callback = on_update
+        self._market_data_stream_running = True
+
+        def _run_stream() -> None:
+            try:
+                from alpaca.data.live.stock import StockDataStream  # type: ignore
+            except (ImportError, ModuleNotFoundError) as exc:
+                logger.warning(f"StockDataStream not available, market-data streaming disabled: {exc}")
+                self._market_data_stream_running = False
+                return
+
+            async def _quote_handler(data: Any) -> None:
+                try:
+                    symbol = str(getattr(data, "symbol", "")).strip().upper()
+                    ask_price = self._safe_optional_float(getattr(data, "ask_price", None)) or 0.0
+                    bid_price = self._safe_optional_float(getattr(data, "bid_price", None)) or 0.0
+                    mid_price = float((ask_price + bid_price) / 2.0) if (ask_price > 0 and bid_price > 0) else max(ask_price, bid_price)
+                    payload = {
+                        "event": "quote",
+                        "symbol": symbol,
+                        "price": mid_price,
+                        "ask_price": ask_price,
+                        "bid_price": bid_price,
+                        "ask_size": int(getattr(data, "ask_size", 0) or 0),
+                        "bid_size": int(getattr(data, "bid_size", 0) or 0),
+                        "timestamp": getattr(data, "timestamp", datetime.now(timezone.utc)).isoformat(),
+                    }
+                    if symbol:
+                        with self._live_quote_cache_lock:
+                            self._live_quote_cache[symbol] = dict(payload)
+                    if self._market_data_update_callback:
+                        self._market_data_update_callback(payload)
+                except (RuntimeError, ValueError, TypeError) as callback_exc:
+                    logger.warning(f"Market data stream callback error: {callback_exc}")
+
+            try:
+                self._market_data_stream = StockDataStream(self.api_key, self.secret_key)
+                self._market_data_stream.subscribe_quotes(_quote_handler, *self._market_data_stream_symbols)
+                self._market_data_stream.run()
+            except (RuntimeError, APIError, OSError) as stream_exc:
+                logger.warning(f"Market data stream ended: {stream_exc}")
+            finally:
+                self._market_data_stream_running = False
+                self._market_data_stream = None
+
+        self._market_data_stream_thread = threading.Thread(target=_run_stream, daemon=True)
+        self._market_data_stream_thread.start()
+        logger.info("Alpaca market data stream started for %d symbol(s)", len(self._market_data_stream_symbols))
+        return True
+
+    def stop_market_data_stream(self) -> bool:
+        """Stop Alpaca market-data websocket stream."""
+        self._market_data_stream_running = False
+        try:
+            if self._market_data_stream is not None:
+                stop_ws = getattr(self._market_data_stream, "stop_ws", None)
+                if callable(stop_ws):
+                    stop_ws()
+            self._market_data_stream = None
+            return True
+        except (RuntimeError, OSError) as exc:
+            logger.warning(f"Failed to stop market data stream cleanly: {exc}")
+            return False
+
     def stop_trade_update_stream(self) -> bool:
         """Stop Alpaca trade update websocket stream."""
         self._trade_stream_running = False
@@ -725,15 +1050,14 @@ class AlpacaBroker(BrokerInterface):
         }
         return mapping.get(alpaca_status, OrderStatus.PENDING.value)
     
-    def _map_to_alpaca_status(self, status: OrderStatus) -> Optional[AlpacaOrderStatus]:
-        """Map our OrderStatus to Alpaca's (for filtering)."""
-        # This is simplified - Alpaca has more granular statuses
+    def _map_to_alpaca_status(self, status: OrderStatus) -> Optional[QueryOrderStatus]:
+        """Map our OrderStatus to Alpaca query status (open/closed)."""
         mapping = {
-            OrderStatus.PENDING: AlpacaOrderStatus.NEW,
-            OrderStatus.SUBMITTED: AlpacaOrderStatus.ACCEPTED,
-            OrderStatus.FILLED: AlpacaOrderStatus.FILLED,
-            OrderStatus.PARTIALLY_FILLED: AlpacaOrderStatus.PARTIALLY_FILLED,
-            OrderStatus.CANCELLED: AlpacaOrderStatus.CANCELED,
-            OrderStatus.REJECTED: AlpacaOrderStatus.REJECTED,
+            OrderStatus.PENDING: QueryOrderStatus.OPEN,
+            OrderStatus.SUBMITTED: QueryOrderStatus.OPEN,
+            OrderStatus.PARTIALLY_FILLED: QueryOrderStatus.OPEN,
+            OrderStatus.FILLED: QueryOrderStatus.CLOSED,
+            OrderStatus.CANCELLED: QueryOrderStatus.CLOSED,
+            OrderStatus.REJECTED: QueryOrderStatus.CLOSED,
         }
         return mapping.get(status)

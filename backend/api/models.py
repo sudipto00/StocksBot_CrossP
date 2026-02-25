@@ -77,6 +77,14 @@ class ConfigResponse(BaseModel):
     log_retention_days: int = Field(default=30, description="Retention period for log files")
     audit_retention_days: int = Field(default=90, description="Retention period for audit logs/files")
     broker: str = Field(default="paper", description="Broker name")
+    smtp_host: str = Field(default="", description="SMTP host")
+    smtp_port: int = Field(default=587, description="SMTP port")
+    smtp_username: str = Field(default="", description="SMTP username")
+    smtp_password: str = Field(default="", description="SMTP password")
+    smtp_from_email: str = Field(default="", description="SMTP from email")
+    smtp_use_tls: bool = Field(default=True, description="Use SMTP STARTTLS")
+    smtp_use_ssl: bool = Field(default=False, description="Use SMTP SSL")
+    smtp_timeout_seconds: int = Field(default=15, description="SMTP timeout in seconds")
 
 
 class Position(BaseModel):
@@ -124,6 +132,10 @@ class Order(BaseModel):
     attached_order_ids: List[str] = Field(
         default_factory=list,
         description="Optional attached exit order IDs (take-profit/stop-loss) created with this request",
+    )
+    oco_group_id: Optional[str] = Field(
+        default=None,
+        description="Optional OCO group identifier linking attached sibling exit orders",
     )
     attached_order_warnings: List[str] = Field(
         default_factory=list,
@@ -214,6 +226,14 @@ class ConfigUpdateRequest(BaseModel):
     log_retention_days: Optional[int] = Field(None, description="Retention days for logs", ge=1, le=3650)
     audit_retention_days: Optional[int] = Field(None, description="Retention days for audit logs/files", ge=1, le=3650)
     broker: Optional[str] = Field(None, description="Broker name (paper/alpaca)")
+    smtp_host: Optional[str] = Field(None, description="SMTP host")
+    smtp_port: Optional[int] = Field(None, description="SMTP port", ge=1, le=65535)
+    smtp_username: Optional[str] = Field(None, description="SMTP username")
+    smtp_password: Optional[str] = Field(None, description="SMTP password")
+    smtp_from_email: Optional[str] = Field(None, description="SMTP from email")
+    smtp_use_tls: Optional[bool] = Field(None, description="Use SMTP STARTTLS")
+    smtp_use_ssl: Optional[bool] = Field(None, description="Use SMTP SSL")
+    smtp_timeout_seconds: Optional[int] = Field(None, description="SMTP timeout in seconds", ge=1, le=300)
 
 
 class BrokerCredentialsRequest(BaseModel):
@@ -509,6 +529,42 @@ class RunnerStartRequest(BaseModel):
     max_spread_bps: Optional[float] = Field(default=None, ge=1, description="Guardrail override: max spread in bps.")
     max_sector_weight_pct: Optional[float] = Field(default=None, ge=5, le=100, description="Guardrail override: sector concentration cap.")
     auto_regime_adjust: Optional[bool] = Field(default=None, description="Guardrail override: enable regime-based adjustment.")
+    execution_latency_ms: Optional[float] = Field(
+        default=None,
+        ge=0,
+        le=20000,
+        description="Execution model latency in milliseconds",
+    )
+    queue_position_bps: Optional[float] = Field(
+        default=None,
+        ge=0,
+        le=200,
+        description="Queue-priority penalty component in bps",
+    )
+    max_participation_rate: Optional[float] = Field(
+        default=None,
+        ge=0.001,
+        le=0.5,
+        description="Maximum fraction of per-bar volume that can be filled by one order",
+    )
+    simulate_queue_position: Optional[bool] = Field(
+        default=None,
+        description="Enable latency/queue-position execution simulation",
+    )
+    enforce_liquidity_limits: Optional[bool] = Field(
+        default=None,
+        description="Enforce liquidity participation caps with partial/no-fill outcomes",
+    )
+    reconcile_fees_with_broker: Optional[bool] = Field(
+        default=None,
+        description="Use broker-style rounded fee reconciliation for simulated fills",
+    )
+    execution_seed: Optional[int] = Field(
+        default=None,
+        ge=0,
+        le=2_147_483_647,
+        description="Optional deterministic seed for execution simulation randomness",
+    )
 
 
 class WebSocketAuthTicketResponse(BaseModel):
@@ -591,7 +647,7 @@ class BacktestRequest(BaseModel):
     parameters: Optional[Dict[str, float]] = Field(None, description="Strategy parameters")
     # Live-equivalence controls (optional for backward compatibility).
     emulate_live_trading: bool = Field(
-        default=False,
+        default=True,
         description="When true, enforce live-like backtest constraints and strict real data.",
     )
     use_workspace_universe: bool = Field(
@@ -624,6 +680,42 @@ class BacktestRequest(BaseModel):
     max_spread_bps: Optional[float] = Field(default=None, ge=1, description="Guardrail override: max spread in bps.")
     max_sector_weight_pct: Optional[float] = Field(default=None, ge=5, le=100, description="Guardrail override: sector concentration cap.")
     auto_regime_adjust: Optional[bool] = Field(default=None, description="Guardrail override: enable regime-based adjustment.")
+    execution_latency_ms: Optional[float] = Field(
+        default=None,
+        ge=0,
+        le=20000,
+        description="Execution model latency in milliseconds",
+    )
+    queue_position_bps: Optional[float] = Field(
+        default=None,
+        ge=0,
+        le=200,
+        description="Queue-priority penalty component in bps",
+    )
+    max_participation_rate: Optional[float] = Field(
+        default=None,
+        ge=0.001,
+        le=0.5,
+        description="Maximum fraction of per-bar volume that can be filled by one order",
+    )
+    simulate_queue_position: Optional[bool] = Field(
+        default=None,
+        description="Enable latency/queue-position execution simulation",
+    )
+    enforce_liquidity_limits: Optional[bool] = Field(
+        default=None,
+        description="Enforce liquidity participation caps with partial/no-fill outcomes",
+    )
+    reconcile_fees_with_broker: Optional[bool] = Field(
+        default=None,
+        description="Use broker-style rounded fee reconciliation for simulated fills",
+    )
+    execution_seed: Optional[int] = Field(
+        default=None,
+        ge=0,
+        le=2_147_483_647,
+        description="Optional deterministic seed for execution simulation randomness",
+    )
 
 
 class BacktestResponse(BaseModel):
@@ -714,6 +806,42 @@ class StrategyOptimizationRequest(BaseModel):
     max_spread_bps: Optional[float] = Field(default=None, ge=1, description="Guardrail override: max spread in bps.")
     max_sector_weight_pct: Optional[float] = Field(default=None, ge=5, le=100, description="Guardrail override: sector concentration cap.")
     auto_regime_adjust: Optional[bool] = Field(default=None, description="Guardrail override: enable regime-based adjustment.")
+    execution_latency_ms: Optional[float] = Field(
+        default=None,
+        ge=0,
+        le=20000,
+        description="Execution model latency in milliseconds",
+    )
+    queue_position_bps: Optional[float] = Field(
+        default=None,
+        ge=0,
+        le=200,
+        description="Queue-priority penalty component in bps",
+    )
+    max_participation_rate: Optional[float] = Field(
+        default=None,
+        ge=0.001,
+        le=0.5,
+        description="Maximum fraction of per-bar volume that can be filled by one order",
+    )
+    simulate_queue_position: Optional[bool] = Field(
+        default=None,
+        description="Enable latency/queue-position execution simulation",
+    )
+    enforce_liquidity_limits: Optional[bool] = Field(
+        default=None,
+        description="Enforce liquidity participation caps with partial/no-fill outcomes",
+    )
+    reconcile_fees_with_broker: Optional[bool] = Field(
+        default=None,
+        description="Use broker-style rounded fee reconciliation for simulated fills",
+    )
+    execution_seed: Optional[int] = Field(
+        default=None,
+        ge=0,
+        le=2_147_483_647,
+        description="Optional deterministic seed for execution simulation randomness",
+    )
     iterations: int = Field(default=36, ge=8, le=240, description="Number of optimization candidates to evaluate")
     min_trades: int = Field(default=12, ge=0, le=1000, description="Minimum desired trade count for scoring penalty")
     objective: Literal["balanced", "sharpe", "return"] = Field(
@@ -813,10 +941,18 @@ class StrategyOptimizationResponse(BaseModel):
     min_trades_target: int = Field(default=0, description="Trade-count target used by optimizer")
     strict_min_trades: bool = Field(default=False, description="Whether strict min-trades gating was enabled")
     best_candidate_meets_min_trades: bool = Field(default=True, description="Whether selected candidate meets min_trades target")
-    recommended_parameters: Dict[str, float] = Field(default_factory=dict, description="Recommended parameter set")
+    recommended_parameters: Dict[str, float] = Field(default_factory=dict, description="Executable recommended parameter set (safe to apply directly)")
+    recommended_parameters_raw: Dict[str, float] = Field(
+        default_factory=dict,
+        description="Raw best-candidate parameter set before execution-limit adjustments",
+    )
     recommended_symbols: List[str] = Field(default_factory=list, description="Recommended symbol universe")
     top_candidates: List[StrategyOptimizationCandidate] = Field(default_factory=list, description="Top candidate summaries")
     best_result: BacktestResponse = Field(..., description="Backtest result for recommended configuration")
+    confidence: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Composite confidence summary for transferring optimizer output to live execution",
+    )
     walk_forward: Optional[StrategyOptimizationWalkForwardReport] = Field(
         default=None,
         description="Optional walk-forward validation report",
@@ -876,7 +1012,8 @@ class StrategyOptimizationHistoryItem(BaseModel):
     error: Optional[str] = Field(default=None, description="Error text when status=failed")
     request_summary: Dict[str, Any] = Field(default_factory=dict, description="Normalized input summary for comparisons")
     metrics_summary: Dict[str, Any] = Field(default_factory=dict, description="Normalized key output metrics")
-    recommended_parameters: Dict[str, float] = Field(default_factory=dict, description="Recommended parameter set")
+    recommended_parameters: Dict[str, float] = Field(default_factory=dict, description="Executable recommended parameter set")
+    recommended_parameters_raw: Dict[str, float] = Field(default_factory=dict, description="Raw best-candidate parameter set")
     recommended_symbols: List[str] = Field(default_factory=list, description="Recommended symbol universe")
     request_payload: Optional[Dict[str, Any]] = Field(default=None, description="Raw optimizer request payload")
     result_payload: Optional[StrategyOptimizationResponse] = Field(default=None, description="Raw optimizer result payload when completed")

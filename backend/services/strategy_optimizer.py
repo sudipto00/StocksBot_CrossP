@@ -43,6 +43,13 @@ class OptimizationContext:
     max_position_size: float
     risk_limit_daily: float
     fee_bps: float
+    execution_latency_ms: float
+    queue_position_bps: float
+    max_participation_rate: float
+    simulate_queue_position: bool
+    enforce_liquidity_limits: bool
+    reconcile_fees_with_broker: bool
+    execution_seed: Optional[int]
     universe_context: Dict[str, Any]
     symbol_capabilities: Dict[str, Dict[str, bool]]
     alpaca_creds: Optional[Dict[str, str]]
@@ -262,6 +269,18 @@ def _evaluate_ensemble_candidate_worker(payload: Dict[str, Any]) -> Dict[str, An
         else {}
     )
     base_fee_bps = max(0.0, float(context.get("fee_bps", 0.0) or 0.0))
+    execution_latency_ms = max(0.0, float(context.get("execution_latency_ms", 220.0) or 0.0))
+    queue_position_bps = max(0.0, float(context.get("queue_position_bps", 6.0) or 0.0))
+    max_participation_rate = max(
+        0.001,
+        min(0.5, float(context.get("max_participation_rate", 0.03) or 0.03)),
+    )
+    simulate_queue_position = bool(context.get("simulate_queue_position", True))
+    enforce_liquidity_limits = bool(context.get("enforce_liquidity_limits", True))
+    reconcile_fees_with_broker = bool(context.get("reconcile_fees_with_broker", True))
+    execution_seed = context.get("execution_seed")
+    if execution_seed is not None:
+        execution_seed = int(execution_seed)
     cancel_token_path = str(context.get("cancel_token_path") or "").strip() or None
 
     def _worker_should_cancel() -> bool:
@@ -279,6 +298,8 @@ def _evaluate_ensemble_candidate_worker(payload: Dict[str, Any]) -> Dict[str, An
         )
         scenario_fee_bps = max(0.0, base_fee_bps + rng.uniform(-1.5, 4.0))
         scenario_slippage_bps = max(1.0, min(75.0, 5.0 + rng.uniform(-2.0, 12.0)))
+        scenario_latency_ms = max(0.0, execution_latency_ms + rng.uniform(-80.0, 220.0))
+        scenario_queue_bps = max(0.0, queue_position_bps + rng.uniform(-2.0, 6.0))
         # Price path perturbation: ~5-20 bps noise stdev per bar.
         scenario_price_noise_bps = rng.uniform(5.0, 20.0)
         scenario_price_noise_seed = rng.randint(0, 2_147_483_647)
@@ -318,6 +339,17 @@ def _evaluate_ensemble_candidate_worker(payload: Dict[str, Any]) -> Dict[str, An
             max_position_size=float(context.get("max_position_size") or 0.0) or None,
             risk_limit_daily=float(context.get("risk_limit_daily") or 0.0) or None,
             fee_bps=float(scenario_fee_bps),
+            execution_latency_ms=float(scenario_latency_ms),
+            queue_position_bps=float(scenario_queue_bps),
+            max_participation_rate=float(max_participation_rate),
+            simulate_queue_position=simulate_queue_position,
+            enforce_liquidity_limits=enforce_liquidity_limits,
+            reconcile_fees_with_broker=reconcile_fees_with_broker,
+            execution_seed=(
+                int(execution_seed) + int(run_index)
+                if execution_seed is not None
+                else None
+            ),
             price_noise_bps=float(scenario_price_noise_bps),
             price_noise_seed=int(scenario_price_noise_seed),
             universe_context=scenario_universe_context,
@@ -407,7 +439,10 @@ class StrategyOptimizerService:
         if iterations < 1:
             raise ValueError("iterations must be >= 1")
 
-        base_params = self._normalize_parameters(base_parameters)
+        runtime_bounds = self._resolve_runtime_bounds(
+            context=context,
+        )
+        base_params = self._normalize_parameters(base_parameters, bounds=runtime_bounds)
         objective_key = self._normalize_objective(objective)
         rng = random.Random(random_seed)
         ensemble_enabled = bool(ensemble_mode)
@@ -417,6 +452,7 @@ class StrategyOptimizerService:
             base=base_params,
             iterations=iterations,
             rng=rng,
+            bounds=runtime_bounds,
         )
         trim_steps = max(0, len(self._candidate_symbol_counts(total=len(symbols))) - 1)
         walk_forward_steps = int(walk_forward_folds) if walk_forward_enabled else 0
@@ -636,7 +672,11 @@ class StrategyOptimizerService:
                 if trial.number == 0:
                     params = dict(base_params)
                 else:
-                    params = _optuna_self._optuna_suggest_parameters(trial, base_params)
+                    params = _optuna_self._optuna_suggest_parameters(
+                        trial,
+                        base_params,
+                        bounds=runtime_bounds,
+                    )
                 result = _optuna_self._run_backtest(
                     context=context,
                     symbols=symbols,
@@ -669,7 +709,11 @@ class StrategyOptimizerService:
             study = optuna.create_study(direction="maximize", sampler=sampler)
             # Enqueue baseline as the first trial.
             study.enqueue_trial(
-                {name: base_params.get(name, 0.0) for name in self._TUNABLE_PARAMETER_NAMES if name in self._bounds}
+                {
+                    name: base_params.get(name, 0.0)
+                    for name in self._TUNABLE_PARAMETER_NAMES
+                    if name in runtime_bounds
+                }
             )
             try:
                 study.optimize(_optuna_objective, n_trials=iterations, show_progress_bar=False)
@@ -770,12 +814,29 @@ class StrategyOptimizerService:
                 min_trades=min_trades,
                 strict_min_trades=strict_min_trades,
                 folds=walk_forward_folds,
+                bounds=runtime_bounds,
                 should_cancel=should_cancel,
             )
             completed_steps += int(walk_forward_report.get("folds_completed", 0))
             _emit("walk_forward")
         completed_steps = total_steps
         _emit("finalizing")
+
+        raw_recommended_parameters = {
+            key: float(value)
+            for key, value in best.parameters.items()
+        }
+        executable_recommended_parameters = self._derive_executable_parameters(
+            context=context,
+            best_result=best.result,
+            raw_parameters=raw_recommended_parameters,
+            bounds=runtime_bounds,
+        )
+        clamped_parameter_names = sorted(
+            name
+            for name, raw_value in raw_recommended_parameters.items()
+            if abs(float(executable_recommended_parameters.get(name, raw_value)) - float(raw_value)) > 0.000001
+        )
 
         top_candidates = outcomes[:5]
         payload_candidates: List[Dict[str, Any]] = []
@@ -795,14 +856,23 @@ class StrategyOptimizerService:
                 }
             )
 
+        confidence = self._build_optimizer_confidence_summary(
+            best_result=best.result,
+            walk_forward_report=walk_forward_report,
+            min_trades=min_trades,
+            best_meets_min_trades=best.meets_min_trades,
+        )
+
         return {
             "requested_iterations": int(iterations),
             "evaluated_iterations": int(len(outcomes)),
             "objective": self._objective_label(objective_key),
-            "recommended_parameters": {key: float(value) for key, value in best.parameters.items()},
+            "recommended_parameters": executable_recommended_parameters,
+            "recommended_parameters_raw": raw_recommended_parameters,
             "recommended_symbols": list(best.symbols),
             "top_candidates": payload_candidates,
             "best_result": best.result,
+            "confidence": confidence,
             "score": round(best.score, 6),
             "ensemble_mode": bool(ensemble_enabled),
             "ensemble_runs": int(safe_ensemble_runs if ensemble_enabled else 1),
@@ -825,6 +895,12 @@ class StrategyOptimizerService:
                     f"ensemble_runs={safe_ensemble_runs if ensemble_enabled else 1}; workers={resolved_max_workers if ensemble_enabled else 1}."
                 ),
                 "Final symbol set may be trimmed from the candidate universe when trim variants improve objective score.",
+                (
+                    "Recommended parameters were adjusted to executable limits: "
+                    + ", ".join(clamped_parameter_names)
+                    if clamped_parameter_names
+                    else "Recommended parameters are directly executable under current live-equivalent limits."
+                ),
                 (
                     "No candidate met strict min-trades target; best available candidate was returned."
                     if strict_min_trades and not any(item.meets_min_trades for item in outcomes)
@@ -878,6 +954,13 @@ class StrategyOptimizerService:
             max_position_size=context.max_position_size,
             risk_limit_daily=context.risk_limit_daily,
             fee_bps=context.fee_bps,
+            execution_latency_ms=context.execution_latency_ms,
+            queue_position_bps=context.queue_position_bps,
+            max_participation_rate=context.max_participation_rate,
+            simulate_queue_position=context.simulate_queue_position,
+            enforce_liquidity_limits=context.enforce_liquidity_limits,
+            reconcile_fees_with_broker=context.reconcile_fees_with_broker,
+            execution_seed=context.execution_seed,
             universe_context=ctx,
         )
         try:
@@ -898,6 +981,17 @@ class StrategyOptimizerService:
             "max_position_size": float(context.max_position_size),
             "risk_limit_daily": float(context.risk_limit_daily),
             "fee_bps": float(context.fee_bps),
+            "execution_latency_ms": float(context.execution_latency_ms),
+            "queue_position_bps": float(context.queue_position_bps),
+            "max_participation_rate": float(context.max_participation_rate),
+            "simulate_queue_position": bool(context.simulate_queue_position),
+            "enforce_liquidity_limits": bool(context.enforce_liquidity_limits),
+            "reconcile_fees_with_broker": bool(context.reconcile_fees_with_broker),
+            "execution_seed": (
+                int(context.execution_seed)
+                if context.execution_seed is not None
+                else None
+            ),
             "universe_context": dict(context.universe_context or {}),
             "symbol_capabilities": {
                 str(symbol): {
@@ -1005,30 +1099,163 @@ class StrategyOptimizerService:
         ordered.sort(key=_symbol_score, reverse=True)
         return ordered
 
+    def _build_optimizer_confidence_summary(
+        self,
+        *,
+        best_result: BacktestResult,
+        walk_forward_report: Optional[Dict[str, Any]],
+        min_trades: int,
+        best_meets_min_trades: bool,
+    ) -> Dict[str, Any]:
+        diagnostics = (
+            dict(best_result.diagnostics)
+            if isinstance(best_result.diagnostics, dict)
+            else {}
+        )
+        backtest_confidence = (
+            dict(diagnostics.get("confidence"))
+            if isinstance(diagnostics.get("confidence"), dict)
+            else {}
+        )
+        live_parity = (
+            dict(diagnostics.get("live_parity"))
+            if isinstance(diagnostics.get("live_parity"), dict)
+            else {}
+        )
+        base_score = float(backtest_confidence.get("overall_confidence_score", 0.0) or 0.0)
+        trades = int(best_result.total_trades or 0)
+        trade_target = max(1, int(min_trades))
+        trade_ratio = min(1.0, float(trades) / float(trade_target))
+        walk_forward_pass_rate = None
+        walk_forward_score = None
+        if isinstance(walk_forward_report, dict):
+            try:
+                walk_forward_pass_rate = float(walk_forward_report.get("pass_rate_pct", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                walk_forward_pass_rate = 0.0
+            walk_forward_score = max(0.0, min(100.0, walk_forward_pass_rate))
+        composite = (
+            (0.62 * base_score)
+            + (0.23 * (walk_forward_score if walk_forward_score is not None else base_score))
+            + (0.15 * (trade_ratio * 100.0))
+        )
+        if not best_meets_min_trades:
+            composite *= 0.8
+        composite = max(0.0, min(100.0, composite))
+        if composite >= 80.0:
+            band = "high"
+        elif composite >= 60.0:
+            band = "medium"
+        else:
+            band = "low"
+        return {
+            "overall_confidence_score": round(composite, 2),
+            "confidence_band": band,
+            "backtest_confidence_score": round(base_score, 2),
+            "walk_forward_pass_rate_pct": (
+                round(float(walk_forward_pass_rate), 2)
+                if walk_forward_pass_rate is not None
+                else None
+            ),
+            "execution_fill_model": str(live_parity.get("execution_fill_model", "")),
+            "fee_reconciliation_mode": str(live_parity.get("fee_reconciliation_mode", "")),
+            "total_trades": int(trades),
+            "min_trades_target": int(trade_target),
+            "meets_min_trades_target": bool(best_meets_min_trades),
+        }
+
+    def _resolve_runtime_bounds(
+        self,
+        *,
+        context: OptimizationContext,
+    ) -> Dict[str, Tuple[float, float, float]]:
+        resolved = dict(self._bounds)
+        position_bounds = resolved.get("position_size")
+        if position_bounds is None:
+            return resolved
+        low, high, step = position_bounds
+        raw_cap = float(context.max_position_size or 0.0)
+        if not math.isfinite(raw_cap) or raw_cap <= 0.0:
+            return resolved
+        capped_high = max(low, min(high, raw_cap))
+        resolved["position_size"] = (low, capped_high, step)
+        return resolved
+
+    def _resolve_position_size_cap(
+        self,
+        *,
+        context: OptimizationContext,
+        best_result: BacktestResult,
+    ) -> float:
+        default_cap = max(1.0, float(context.max_position_size or 1.0))
+        diagnostics = (
+            dict(best_result.diagnostics)
+            if isinstance(best_result.diagnostics, dict)
+            else {}
+        )
+        live_parity = diagnostics.get("live_parity")
+        if not isinstance(live_parity, dict):
+            return default_cap
+        try:
+            applied = float(live_parity.get("max_position_size_applied"))
+        except (TypeError, ValueError):
+            return default_cap
+        if not math.isfinite(applied) or applied <= 0.0:
+            return default_cap
+        return max(1.0, applied)
+
+    def _derive_executable_parameters(
+        self,
+        *,
+        context: OptimizationContext,
+        best_result: BacktestResult,
+        raw_parameters: Dict[str, float],
+        bounds: Dict[str, Tuple[float, float, float]],
+    ) -> Dict[str, float]:
+        executable = self._normalize_parameters(raw_parameters, bounds=bounds)
+        position_bounds = bounds.get("position_size")
+        if position_bounds is None or "position_size" not in executable:
+            return executable
+        low, high, step = position_bounds
+        applied_cap = self._resolve_position_size_cap(
+            context=context,
+            best_result=best_result,
+        )
+        capped_high = max(low, min(high, applied_cap))
+        position_size = float(executable.get("position_size", low))
+        position_size = max(low, min(capped_high, position_size))
+        position_size = self._snap(position_size, step)
+        position_size = max(low, min(capped_high, position_size))
+        executable["position_size"] = position_size
+        return executable
+
     def _build_parameter_candidates(
         self,
         *,
         base: Dict[str, float],
         iterations: int,
         rng: random.Random,
+        bounds: Dict[str, Tuple[float, float, float]],
     ) -> List[Dict[str, float]]:
         candidates: List[Dict[str, float]] = [dict(base)]
         while len(candidates) < iterations:
-            candidates.append(self._mutate_parameters(base=base, rng=rng))
+            candidates.append(self._mutate_parameters(base=base, rng=rng, bounds=bounds))
         return candidates
 
     def _optuna_suggest_parameters(
         self,
         trial: Any,
         base: Dict[str, float],
+        *,
+        bounds: Dict[str, Tuple[float, float, float]],
     ) -> Dict[str, float]:
         """Use an Optuna trial to suggest a parameter set respecting bounds/steps."""
         candidate = dict(base)
         for name in self._TUNABLE_PARAMETER_NAMES:
-            bounds = self._bounds.get(name)
-            if bounds is None:
+            bound = bounds.get(name)
+            if bound is None:
                 continue
-            low, high, step = bounds
+            low, high, step = bound
             if name in self._INTEGER_PARAMETERS:
                 candidate[name] = float(trial.suggest_int(name, int(low), int(high), step=max(1, int(step))))
             else:
@@ -1037,23 +1264,29 @@ class StrategyOptimizerService:
         # Enforce parameter constraints (same as _mutate_parameters).
         stop_loss = float(candidate.get("stop_loss_pct", base.get("stop_loss_pct", 2.0)))
         min_take_profit = stop_loss * 1.8
-        tp_bounds = self._bounds.get("take_profit_pct", (1.0, 20.0, 0.5))
+        tp_bounds = bounds.get("take_profit_pct", (1.0, 20.0, 0.5))
         candidate["take_profit_pct"] = max(min_take_profit, candidate.get("take_profit_pct", 5.0))
         candidate["take_profit_pct"] = min(float(tp_bounds[1]), candidate["take_profit_pct"])
         candidate["take_profit_pct"] = self._snap(candidate["take_profit_pct"], tp_bounds[2])
-        trail_bounds = self._bounds.get("trailing_stop_pct", (0.5, 15.0, 0.25))
+        trail_bounds = bounds.get("trailing_stop_pct", (0.5, 15.0, 0.25))
         candidate["trailing_stop_pct"] = max(candidate.get("trailing_stop_pct", 2.5), stop_loss * 0.9)
         candidate["trailing_stop_pct"] = min(float(trail_bounds[1]), candidate["trailing_stop_pct"])
         candidate["trailing_stop_pct"] = self._snap(candidate["trailing_stop_pct"], trail_bounds[2])
-        return self._normalize_parameters(candidate)
+        return self._normalize_parameters(candidate, bounds=bounds)
 
-    def _mutate_parameters(self, *, base: Dict[str, float], rng: random.Random) -> Dict[str, float]:
+    def _mutate_parameters(
+        self,
+        *,
+        base: Dict[str, float],
+        rng: random.Random,
+        bounds: Dict[str, Tuple[float, float, float]],
+    ) -> Dict[str, float]:
         candidate = dict(base)
         for name in self._TUNABLE_PARAMETER_NAMES:
-            bounds = self._bounds.get(name)
-            if bounds is None:
+            bound = bounds.get(name)
+            if bound is None:
                 continue
-            low, high, step = bounds
+            low, high, step = bound
             base_value = float(candidate.get(name, (low + high) / 2.0))
             span = high - low
             if span <= 0:
@@ -1072,7 +1305,7 @@ class StrategyOptimizerService:
         # Maintain defensible relationship between key risk parameters.
         stop_loss = float(candidate.get("stop_loss_pct", base.get("stop_loss_pct", 2.0)))
         min_take_profit = stop_loss * 1.8
-        take_profit_bounds = self._bounds.get("take_profit_pct", (1.0, 20.0, 0.5))
+        take_profit_bounds = bounds.get("take_profit_pct", (1.0, 20.0, 0.5))
         candidate["take_profit_pct"] = max(
             min_take_profit,
             float(candidate.get("take_profit_pct", base.get("take_profit_pct", 5.0))),
@@ -1080,7 +1313,7 @@ class StrategyOptimizerService:
         candidate["take_profit_pct"] = min(float(take_profit_bounds[1]), candidate["take_profit_pct"])
         candidate["take_profit_pct"] = self._snap(candidate["take_profit_pct"], take_profit_bounds[2])
 
-        trailing_bounds = self._bounds.get("trailing_stop_pct", (0.5, 15.0, 0.25))
+        trailing_bounds = bounds.get("trailing_stop_pct", (0.5, 15.0, 0.25))
         candidate["trailing_stop_pct"] = max(
             float(candidate.get("trailing_stop_pct", base.get("trailing_stop_pct", 2.5))),
             stop_loss * 0.9,
@@ -1088,11 +1321,17 @@ class StrategyOptimizerService:
         candidate["trailing_stop_pct"] = min(float(trailing_bounds[1]), candidate["trailing_stop_pct"])
         candidate["trailing_stop_pct"] = self._snap(candidate["trailing_stop_pct"], trailing_bounds[2])
 
-        return self._normalize_parameters(candidate)
+        return self._normalize_parameters(candidate, bounds=bounds)
 
-    def _normalize_parameters(self, parameters: Dict[str, float]) -> Dict[str, float]:
+    def _normalize_parameters(
+        self,
+        parameters: Dict[str, float],
+        *,
+        bounds: Optional[Dict[str, Tuple[float, float, float]]] = None,
+    ) -> Dict[str, float]:
+        active_bounds = bounds or self._bounds
         normalized = dict(parameters)
-        for name, (low, high, step) in self._bounds.items():
+        for name, (low, high, step) in active_bounds.items():
             if name not in normalized:
                 continue
             raw = normalized[name]
@@ -1106,6 +1345,7 @@ class StrategyOptimizerService:
             value = self._snap(value, step)
             if name in self._INTEGER_PARAMETERS:
                 value = float(int(round(value)))
+            value = max(low, min(high, value))
             normalized[name] = value
         return normalized
 
@@ -1137,6 +1377,7 @@ class StrategyOptimizerService:
         min_trades: int,
         strict_min_trades: bool,
         folds: int,
+        bounds: Dict[str, Tuple[float, float, float]],
         should_cancel: Optional[Callable[[], bool]] = None,
     ) -> Dict[str, Any]:
         """Adaptive walk-forward: re-optimize on each fold's train window,
@@ -1202,6 +1443,13 @@ class StrategyOptimizerService:
                     max_position_size=context.max_position_size,
                     risk_limit_daily=context.risk_limit_daily,
                     fee_bps=context.fee_bps,
+                    execution_latency_ms=context.execution_latency_ms,
+                    queue_position_bps=context.queue_position_bps,
+                    max_participation_rate=context.max_participation_rate,
+                    simulate_queue_position=context.simulate_queue_position,
+                    enforce_liquidity_limits=context.enforce_liquidity_limits,
+                    reconcile_fees_with_broker=context.reconcile_fees_with_broker,
+                    execution_seed=context.execution_seed,
                     universe_context=dict(context.universe_context or {}),
                     symbol_capabilities=dict(context.symbol_capabilities or {}),
                     alpaca_creds=dict(context.alpaca_creds) if isinstance(context.alpaca_creds, dict) else None,
@@ -1213,6 +1461,7 @@ class StrategyOptimizerService:
                     base=parameters,
                     iterations=self._WF_FOLD_ITERATIONS,
                     rng=rng,
+                    bounds=bounds,
                 )
                 best_fold_score = -1e18
                 for cand in fold_candidates:
@@ -1248,6 +1497,13 @@ class StrategyOptimizerService:
                 max_position_size=context.max_position_size,
                 risk_limit_daily=context.risk_limit_daily,
                 fee_bps=context.fee_bps,
+                execution_latency_ms=context.execution_latency_ms,
+                queue_position_bps=context.queue_position_bps,
+                max_participation_rate=context.max_participation_rate,
+                simulate_queue_position=context.simulate_queue_position,
+                enforce_liquidity_limits=context.enforce_liquidity_limits,
+                reconcile_fees_with_broker=context.reconcile_fees_with_broker,
+                execution_seed=context.execution_seed,
                 universe_context=dict(context.universe_context or {}),
                 symbol_capabilities=dict(context.symbol_capabilities or {}),
                 alpaca_creds=dict(context.alpaca_creds) if isinstance(context.alpaca_creds, dict) else None,

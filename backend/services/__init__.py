@@ -1,9 +1,4 @@
-"""
-Business services module.
+"""Business services package marker.
 
-TODO: Implement business logic services
-- Portfolio management service
-- Analytics service
-- Notification service
-- Scheduling service
+Concrete implementations are defined in sibling modules under `services/`.
 """

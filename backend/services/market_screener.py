@@ -6,7 +6,7 @@ Supports different asset types and volume-based screening.
 """
 
 from typing import List, Dict, Any, Optional, Literal, Tuple
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone, date as date_type
 import logging
 from enum import Enum
 import math
@@ -17,10 +17,15 @@ try:
     from alpaca.data.historical import StockHistoricalDataClient
     from alpaca.data.requests import StockBarsRequest
     from alpaca.data.timeframe import TimeFrame
+    try:
+        from alpaca.data.enums import DataFeed
+    except Exception:
+        DataFeed = None
 except Exception:
     StockHistoricalDataClient = None
     StockBarsRequest = None
     TimeFrame = None
+    DataFeed = None
 
 try:
     from alpaca.trading.client import TradingClient
@@ -113,6 +118,55 @@ class MarketScreener:
                 secret_key=secret_key,
                 paper=paper,
             )
+
+    def _is_sip_permission_error(self, exc: Exception) -> bool:
+        """Detect Alpaca SIP entitlement failures that can be retried via IEX feed."""
+        msg = str(exc or "").strip().lower()
+        if not msg:
+            return False
+        if "sip" not in msg:
+            return False
+        return (
+            "subscription" in msg
+            or "not permit" in msg
+            or "not allowed" in msg
+            or "forbidden" in msg
+        )
+
+    def _stock_bars_request_with_feed_fallback(self, **kwargs: Any) -> Any:
+        """
+        Request stock bars and retry with IEX feed when SIP permission is unavailable.
+        """
+        if not self._data_client or not StockBarsRequest:
+            raise RuntimeError("Alpaca data client unavailable")
+
+        try:
+            request = StockBarsRequest(**kwargs)
+            return self._data_client.get_stock_bars(request)
+        except Exception as primary_exc:
+            if not self._is_sip_permission_error(primary_exc):
+                raise
+
+            feed_candidates: List[Any] = []
+            if DataFeed is not None:
+                try:
+                    feed_candidates.append(DataFeed.IEX)
+                except Exception:
+                    pass
+            feed_candidates.append("iex")
+
+            last_exc: Exception = primary_exc
+            for feed in feed_candidates:
+                try:
+                    request = StockBarsRequest(**{**kwargs, "feed": feed})
+                    return self._data_client.get_stock_bars(request)
+                except TypeError:
+                    # Older SDK signatures may not accept feed kwarg.
+                    continue
+                except Exception as iex_exc:
+                    last_exc = iex_exc
+                    continue
+            raise last_exc
     
     def get_active_stocks(self, limit: int = 100) -> List[Dict[str, Any]]:
         """
@@ -389,12 +443,11 @@ class MarketScreener:
         bars_by_symbol: Dict[str, List[Any]] = {}
         for chunk_start in range(0, len(symbols), 200):
             chunk = symbols[chunk_start:chunk_start + 200]
-            req = StockBarsRequest(
+            bars_resp = self._stock_bars_request_with_feed_fallback(
                 symbol_or_symbols=chunk,
                 timeframe=TimeFrame.Day,
                 start=start,
             )
-            bars_resp = self._data_client.get_stock_bars(req)
             if hasattr(bars_resp, "data"):
                 chunk_data = bars_resp.data or {}
             elif isinstance(bars_resp, dict):
@@ -899,16 +952,32 @@ class MarketScreener:
 
     def get_symbol_chart(self, symbol: str, days: int = 300) -> List[Dict[str, Any]]:
         """Get historical chart with SMA50 and SMA250 overlays."""
-        days = max(60, min(730, days))
+        return self.get_symbol_chart_window(symbol=symbol, days=days)
+
+    def get_symbol_chart_window(
+        self,
+        symbol: str,
+        days: int = 300,
+        start_date: Optional[Any] = None,
+        end_date: Optional[Any] = None,
+    ) -> List[Dict[str, Any]]:
+        """Get historical chart with explicit optional window bounds."""
+        days = max(60, min(2500, days))
+        end_dt = self._coerce_datetime(end_date, end_of_day=True) or datetime.now(timezone.utc)
+        start_dt = self._coerce_datetime(start_date)
+        if start_dt is None:
+            # Include extra warmup bars for SMA/ATR lookbacks.
+            start_dt = end_dt - timedelta(days=days + 30)
+        if end_dt <= start_dt:
+            end_dt = start_dt + timedelta(days=max(60, days))
         if self._data_client and StockBarsRequest and TimeFrame:
             try:
-                start = datetime.now() - timedelta(days=days + 30)
-                req = StockBarsRequest(
+                bars_resp = self._stock_bars_request_with_feed_fallback(
                     symbol_or_symbols=[symbol.upper()],
                     timeframe=TimeFrame.Day,
-                    start=start
+                    start=start_dt,
+                    end=end_dt,
                 )
-                bars_resp = self._data_client.get_stock_bars(req)
                 bars = []
                 if hasattr(bars_resp, "data"):
                     bars = bars_resp.data.get(symbol.upper(), [])
@@ -919,14 +988,18 @@ class MarketScreener:
                     close = float(getattr(bar, "close", getattr(bar, "c", 0.0)))
                     high = float(getattr(bar, "high", getattr(bar, "h", close)))
                     low = float(getattr(bar, "low", getattr(bar, "l", close)))
+                    open_price = float(getattr(bar, "open", getattr(bar, "o", close)))
+                    volume = float(getattr(bar, "volume", getattr(bar, "v", 0.0)) or 0.0)
                     if high < low:
                         high, low = low, high
                     ts = getattr(bar, "timestamp", getattr(bar, "t", datetime.now()))
                     prices.append({
                         "timestamp": ts.isoformat() if hasattr(ts, "isoformat") else str(ts),
+                        "open": open_price if open_price > 0 else close,
                         "close": close,
                         "high": high,
                         "low": low,
+                        "volume": max(0.0, volume),
                     })
                 if prices:
                     self._last_source = "alpaca"
@@ -948,22 +1021,53 @@ class MarketScreener:
                 base_price = float(item["price"])
                 break
         points = []
-        now = datetime.now()
-        for i in range(days):
-            dt = now - timedelta(days=days - i)
+        span_days = max(60, int((end_dt.date() - start_dt.date()).days) + 1)
+        for i in range(span_days):
+            dt = start_dt + timedelta(days=i)
             noise = math.sin(i / 7.0) * 0.8 + math.cos(i / 17.0) * 0.4
-            trend = (i / max(days, 1)) * 0.05
+            trend = (i / max(span_days, 1)) * 0.05
             close = max(1.0, base_price * (1 + trend + noise / 100.0))
+            open_price = max(1.0, close * (1.0 - (noise / 250.0)))
             intraday_range_pct = 0.004 + abs(noise) / 300.0
             high = close * (1.0 + intraday_range_pct)
             low = max(0.01, close * (1.0 - intraday_range_pct))
             points.append({
                 "timestamp": dt.isoformat(),
+                "open": open_price,
                 "close": close,
                 "high": high,
                 "low": low,
+                "volume": max(1000.0, 250000.0 * (1.0 + abs(noise))),
             })
         return self._with_sma(points)
+
+    def _coerce_datetime(self, value: Optional[Any], *, end_of_day: bool = False) -> Optional[datetime]:
+        """Best-effort datetime coercion for chart window bounds."""
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        if isinstance(value, date_type):
+            base = datetime.combine(value, datetime.min.time(), tzinfo=timezone.utc)
+            if end_of_day:
+                return base + timedelta(days=1) - timedelta(microseconds=1)
+            return base
+        text = str(value).strip()
+        if not text:
+            return None
+        if end_of_day and len(text) == 10 and text[4:5] == "-" and text[7:8] == "-":
+            try:
+                parsed_date = datetime.strptime(text, "%Y-%m-%d").date()
+            except ValueError:
+                parsed_date = None
+            if parsed_date is not None:
+                base = datetime.combine(parsed_date, datetime.min.time(), tzinfo=timezone.utc)
+                return base + timedelta(days=1) - timedelta(microseconds=1)
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
     def get_chart_indicators(
         self,
@@ -1095,10 +1199,14 @@ class MarketScreener:
                 "sma50": sma50,
                 "sma250": sma250,
             }
+            if p.get("open") is not None:
+                point["open"] = p["open"]
             if p.get("high") is not None:
                 point["high"] = p["high"]
             if p.get("low") is not None:
                 point["low"] = p["low"]
+            if p.get("volume") is not None:
+                point["volume"] = p["volume"]
             result.append(point)
         return result
     

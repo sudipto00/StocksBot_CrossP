@@ -12,7 +12,7 @@ import OnboardingChecklist from '../components/OnboardingChecklist';
 import SectionErrorBoundary from '../components/SectionErrorBoundary';
 import ConfirmDialog from '../components/ConfirmDialog';
 import { SkeletonStatGrid, SkeletonChart, SkeletonTable } from '../components/Skeleton';
-import { useToast } from '../components/Toast';
+import { useToast } from '../components/toastContext';
 import { showErrorNotification, showSuccessNotification } from '../utils/notifications';
 import { formatDateTime } from '../utils/datetime';
 

@@ -477,9 +477,13 @@ fn apply_backend_storage_env(cmd: &mut Command, app: &AppHandle) {
                 );
             }
             cmd.env("STOCKSBOT_APP_DATA_DIR", &app_data_dir);
+            let db_path = app_data_dir.join("stocksbot.db");
+            let database_url = format!("sqlite:///{}", db_path.display());
+            cmd.env("DATABASE_URL", &database_url);
             println!(
-                "Configured backend app data directory: {}",
-                app_data_dir.display()
+                "Configured backend app data directory: {} (DATABASE_URL={})",
+                app_data_dir.display(),
+                database_url
             );
         }
         Err(err) => {

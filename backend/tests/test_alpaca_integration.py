@@ -7,7 +7,7 @@ without requiring real API credentials or making real API calls.
 
 import pytest
 from unittest.mock import Mock, MagicMock, patch
-from datetime import datetime
+from datetime import datetime, timezone
 import uuid
 
 from integrations.alpaca_broker import AlpacaBroker
@@ -469,6 +469,75 @@ class TestAlpacaBrokerOrders:
         assert len(result) == 1
         assert result[0]["id"] == "order-123"
 
+    @patch('integrations.alpaca_broker.TradingClient')
+    @patch('integrations.alpaca_broker.StockHistoricalDataClient')
+    def test_get_orders_supports_filters_and_pagination(
+        self, mock_data_client, mock_trading_client, alpaca_broker, mock_account
+    ):
+        """get_orders should pass filters to Alpaca and paginate until limit."""
+        from alpaca.trading.enums import (
+            OrderStatus as AlpacaOrderStatus,
+            OrderSide as AlpacaOrderSide,
+            OrderType as AlpacaOrderType,
+        )
+
+        def _mk_order(order_id: str, symbol: str, created_at: datetime) -> Mock:
+            row = Mock()
+            row.id = order_id
+            row.client_order_id = f"client-{order_id}"
+            row.symbol = symbol
+            row.side = AlpacaOrderSide.BUY
+            row.order_type = AlpacaOrderType.MARKET
+            row.qty = "1"
+            row.filled_qty = "0"
+            row.limit_price = None
+            row.stop_price = None
+            row.filled_avg_price = None
+            row.status = AlpacaOrderStatus.NEW
+            row.created_at = created_at
+            row.updated_at = created_at
+            return row
+
+        newer = datetime(2026, 2, 10, 14, 0, tzinfo=timezone.utc)
+        older = datetime(2026, 2, 9, 14, 0, tzinfo=timezone.utc)
+        oldest = datetime(2026, 2, 8, 14, 0, tzinfo=timezone.utc)
+        page1 = [_mk_order("order-aapl-new", "AAPL", newer), _mk_order("order-msft", "MSFT", older)]
+        page2 = [_mk_order("order-aapl-new", "AAPL", newer), _mk_order("order-aapl-old", "AAPL", oldest)]
+
+        mock_client_instance = MagicMock()
+        mock_client_instance.get_account.return_value = mock_account
+        requests = []
+
+        def _side_effect(*args, **kwargs):
+            req = kwargs.get("filter")
+            requests.append(req)
+            if len(requests) == 1:
+                return page1
+            if len(requests) == 2:
+                return page2
+            return []
+
+        mock_client_instance.get_orders.side_effect = _side_effect
+        mock_trading_client.return_value = mock_client_instance
+        alpaca_broker.connect()
+
+        start = datetime(2026, 2, 1, 0, 0, 0)
+        end = datetime(2026, 2, 28, 23, 59, 59)
+        result = alpaca_broker.get_orders(
+            status=OrderStatus.PENDING,
+            start=start,
+            end=end,
+            limit=2,
+            symbols=["aapl"],
+        )
+
+        assert [row["id"] for row in result] == ["order-aapl-new", "order-aapl-old"]
+        assert all(row["symbol"] == "AAPL" for row in result)
+        assert len(requests) >= 2
+        assert list(requests[0].symbols) == ["AAPL"]
+        assert requests[0].after is not None
+        assert requests[0].until is not None
+
 
 class TestAlpacaBrokerMarketData:
     """Test Alpaca market data methods."""
@@ -520,3 +589,94 @@ class TestAlpacaBrokerMarketData:
         assert result["symbol"] == "INVALID"
         assert result["price"] == 0.0
         assert "error" in result
+
+    @patch('integrations.alpaca_broker.TradingClient')
+    @patch('integrations.alpaca_broker.StockHistoricalDataClient')
+    def test_get_market_data_multi_includes_bars_and_stream_cache_fallback(
+        self, mock_data_client_class, mock_trading_client, alpaca_broker, mock_account, mock_quote
+    ):
+        """Multi-symbol market data should combine quote, bars, and stream-cache fallback."""
+        mock_trading_instance = MagicMock()
+        mock_trading_instance.get_account.return_value = mock_account
+        mock_trading_client.return_value = mock_trading_instance
+
+        mock_bar = Mock()
+        mock_bar.timestamp = datetime.now(timezone.utc)
+        mock_bar.open = "100.0"
+        mock_bar.high = "102.0"
+        mock_bar.low = "99.5"
+        mock_bar.close = "101.0"
+        mock_bar.volume = 1234
+
+        mock_data_instance = MagicMock()
+        mock_data_instance.get_stock_latest_quote.return_value = {"AAPL": mock_quote}
+        mock_data_instance.get_stock_bars.return_value = {"AAPL": [mock_bar], "MSFT": []}
+        mock_data_client_class.return_value = mock_data_instance
+        alpaca_broker.connect()
+
+        alpaca_broker._live_quote_cache["MSFT"] = {
+            "price": 250.5,
+            "ask_price": 250.7,
+            "bid_price": 250.3,
+            "ask_size": 10,
+            "bid_size": 12,
+            "volume": 0,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        result = alpaca_broker.get_market_data_multi(["aapl", "msft"], include_bars=True, bars_limit=1)
+
+        assert set(result.keys()) == {"AAPL", "MSFT"}
+        assert result["AAPL"]["data_source"] == "quote"
+        assert len(result["AAPL"]["bars"]) == 1
+        assert result["MSFT"]["data_source"] == "stream_cache"
+        assert result["MSFT"]["price"] == 250.5
+
+    @patch('integrations.alpaca_broker.TradingClient')
+    @patch('integrations.alpaca_broker.StockHistoricalDataClient')
+    def test_get_market_data_multi_falls_back_to_historical_bars_when_missing_quotes(
+        self, mock_data_client_class, mock_trading_client, alpaca_broker, mock_account
+    ):
+        """Missing quote and cache should still derive price from recent bars."""
+        mock_trading_instance = MagicMock()
+        mock_trading_instance.get_account.return_value = mock_account
+        mock_trading_client.return_value = mock_trading_instance
+
+        mock_data_instance = MagicMock()
+        mock_data_instance.get_stock_latest_quote.return_value = {}
+        mock_data_instance.get_stock_bars.return_value = {}
+        mock_data_client_class.return_value = mock_data_instance
+        alpaca_broker.connect()
+
+        alpaca_broker.get_historical_bars = MagicMock(return_value=[
+            {
+                "timestamp": datetime.now(timezone.utc),
+                "open": 299.0,
+                "high": 301.0,
+                "low": 298.0,
+                "close": 300.5,
+                "volume": 999,
+            }
+        ])
+        result = alpaca_broker.get_market_data_multi(["TSLA"], include_bars=True, bars_limit=1)
+
+        assert result["TSLA"]["data_source"] == "bars_fallback"
+        assert result["TSLA"]["price"] == 300.5
+        assert len(result["TSLA"]["bars"]) == 1
+        alpaca_broker.get_historical_bars.assert_called_once()
+
+    def test_start_market_data_stream_requires_connection(self, alpaca_broker):
+        """Market-data stream should refuse to start when broker is disconnected."""
+        started = alpaca_broker.start_market_data_stream(["AAPL"], lambda _: None)
+        assert started is False
+
+    def test_stop_market_data_stream_stops_underlying_socket(self, alpaca_broker):
+        """stop_market_data_stream should invoke stop_ws when available."""
+        mock_stream = MagicMock()
+        alpaca_broker._market_data_stream = mock_stream
+        alpaca_broker._market_data_stream_running = True
+
+        stopped = alpaca_broker.stop_market_data_stream()
+
+        assert stopped is True
+        mock_stream.stop_ws.assert_called_once()
+        assert alpaca_broker._market_data_stream is None

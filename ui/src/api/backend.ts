@@ -722,7 +722,7 @@ export async function runMaintenanceCleanup(): Promise<MaintenanceCleanupRespons
   });
 
   if (!response.ok) {
-    throw new Error(`Backend returned ${response.status}`);
+    throw new Error(await buildBackendError(response));
   }
 
   return response.json();

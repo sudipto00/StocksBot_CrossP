@@ -5,13 +5,14 @@ Orchestrates the order lifecycle from submission to fill tracking.
 Handles validation, broker integration, and storage persistence.
 """
 
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from datetime import datetime
 import logging
 import threading
 import time
 import uuid
 import math
+import json
 from collections import deque
 
 from sqlalchemy.orm import Session
@@ -27,6 +28,8 @@ _GLOBAL_KILL_SWITCH = False
 _GLOBAL_KILL_SWITCH_LOCK = threading.Lock()
 _GLOBAL_TRADING_ENABLED = True
 _GLOBAL_TRADING_ENABLED_LOCK = threading.Lock()
+_OCO_CONFIG_KEY = "oco_groups_v1"
+_OCO_MAX_GROUPS = 500
 
 
 def set_global_kill_switch(active: bool) -> None:
@@ -127,6 +130,184 @@ class OrderExecutionService:
         if a is None or b is None:
             return False
         return math.isclose(float(a), float(b), rel_tol=0.0, abs_tol=1e-9)
+
+    @staticmethod
+    def _parse_json_list(raw: Optional[str]) -> List[Dict[str, Any]]:
+        """Parse a JSON list payload defensively."""
+        if not raw:
+            return []
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return []
+        if not isinstance(parsed, list):
+            return []
+        return [row for row in parsed if isinstance(row, dict)]
+
+    def _load_oco_groups(self) -> List[Dict[str, Any]]:
+        raw = self.storage.get_config_value(_OCO_CONFIG_KEY, default="[]")
+        return self._parse_json_list(raw)
+
+    def _save_oco_groups(self, groups: List[Dict[str, Any]]) -> None:
+        sanitized = [row for row in groups if isinstance(row, dict)]
+        if len(sanitized) > _OCO_MAX_GROUPS:
+            sanitized = sanitized[-_OCO_MAX_GROUPS:]
+        self.storage.set_config_value(
+            key=_OCO_CONFIG_KEY,
+            value=json.dumps(sanitized, separators=(",", ":")),
+            value_type="json",
+            description="OCO/bracket linkage map for attached exit orders",
+        )
+
+    def register_oco_group(
+        self,
+        *,
+        parent_order_id: int,
+        symbol: str,
+        order_ids: List[int],
+    ) -> Optional[str]:
+        """
+        Register a group of linked sibling exit orders.
+
+        When one sibling fills, remaining siblings are canceled automatically.
+        """
+        unique_ids: List[int] = []
+        seen: set[int] = set()
+        for raw_id in order_ids:
+            try:
+                order_id = int(raw_id)
+            except (TypeError, ValueError):
+                continue
+            if order_id <= 0 or order_id in seen:
+                continue
+            seen.add(order_id)
+            unique_ids.append(order_id)
+        if len(unique_ids) < 2:
+            return None
+
+        group_id = str(uuid.uuid4())
+        groups = self._load_oco_groups()
+        groups.append(
+            {
+                "group_id": group_id,
+                "parent_order_id": int(parent_order_id),
+                "symbol": str(symbol or "").strip().upper(),
+                "order_ids": unique_ids,
+                "active": True,
+                "created_at": datetime.utcnow().isoformat(),
+                "triggered_order_id": None,
+                "cancelled_sibling_ids": [],
+                "failed_cancel_sibling_ids": [],
+            }
+        )
+        self._save_oco_groups(groups)
+        return group_id
+
+    def _is_terminal_status(self, status: Any) -> bool:
+        value = str(getattr(status, "value", status) or "").strip().lower()
+        return value in {"filled", "cancelled", "rejected"}
+
+    def _handle_oco_sibling_cancel(
+        self,
+        *,
+        triggered_order: Order,
+        new_status: OrderStatusEnum,
+        fill_delta: float,
+    ) -> None:
+        """
+        If an OCO sibling fills, cancel remaining active siblings.
+        """
+        if fill_delta <= 0:
+            return
+        if new_status not in {OrderStatusEnum.FILLED, OrderStatusEnum.PARTIALLY_FILLED}:
+            return
+
+        groups = self._load_oco_groups()
+        if not groups:
+            return
+
+        triggered_id = int(getattr(triggered_order, "id", 0) or 0)
+        if triggered_id <= 0:
+            return
+
+        groups_changed = False
+        for group in groups:
+            if not bool(group.get("active", True)):
+                continue
+            raw_group_ids = group.get("order_ids", [])
+            if not isinstance(raw_group_ids, list):
+                continue
+            group_ids: List[int] = []
+            for row in raw_group_ids:
+                try:
+                    group_ids.append(int(row))
+                except (TypeError, ValueError):
+                    continue
+            if triggered_id not in group_ids:
+                continue
+
+            cancelled_ids: List[int] = []
+            failed_ids: List[int] = []
+            for sibling_id in group_ids:
+                if sibling_id == triggered_id:
+                    continue
+                sibling = self.storage.orders.get_by_id(int(sibling_id))
+                if sibling is None or self._is_terminal_status(sibling.status):
+                    continue
+
+                cancel_ok = True
+                if sibling.external_id:
+                    try:
+                        cancel_ok = bool(self.broker.cancel_order(str(sibling.external_id)))
+                    except Exception:
+                        cancel_ok = False
+                if cancel_ok:
+                    sibling.status = OrderStatusEnum.CANCELLED
+                    self.storage.orders.update(sibling, auto_commit=False)
+                    cancelled_ids.append(int(sibling.id))
+                    self.storage.create_audit_log(
+                        event_type="order_cancelled",
+                        description=(
+                            f"OCO sibling auto-cancelled after fill of order {triggered_id}"
+                        ),
+                        details={
+                            "triggered_order_id": triggered_id,
+                            "cancelled_sibling_order_id": int(sibling.id),
+                            "oco_group_id": str(group.get("group_id", "")),
+                        },
+                        order_id=int(sibling.id),
+                        auto_commit=False,
+                    )
+                else:
+                    failed_ids.append(int(sibling.id))
+
+            existing_cancelled = [
+                int(row) for row in group.get("cancelled_sibling_ids", [])
+                if isinstance(row, (int, float, str)) and str(row).strip().isdigit()
+            ]
+            existing_failed = [
+                int(row) for row in group.get("failed_cancel_sibling_ids", [])
+                if isinstance(row, (int, float, str)) and str(row).strip().isdigit()
+            ]
+            group["cancelled_sibling_ids"] = sorted(set(existing_cancelled + cancelled_ids))
+            group["failed_cancel_sibling_ids"] = sorted(set(existing_failed + failed_ids))
+            group["triggered_order_id"] = triggered_id
+
+            remaining_open = 0
+            for sibling_id in group_ids:
+                if sibling_id == triggered_id:
+                    continue
+                sibling = self.storage.orders.get_by_id(int(sibling_id))
+                if sibling is None:
+                    continue
+                if not self._is_terminal_status(sibling.status):
+                    remaining_open += 1
+            group["active"] = remaining_open > 0
+            group["last_processed_at"] = datetime.utcnow().isoformat()
+            groups_changed = True
+
+        if groups_changed:
+            self._save_oco_groups(groups)
     
     def validate_order(
         self,
@@ -503,6 +684,13 @@ class OrderExecutionService:
                     if filled_quantity > 0 and fill_delta < filled_quantity:
                         commission = commission * (fill_delta / filled_quantity)
                     self._process_fill(order, fill_delta, avg_fill_price, commission=commission)
+
+                # OCO/bracket behavior: if one sibling fills, cancel remaining siblings.
+                self._handle_oco_sibling_cancel(
+                    triggered_order=order,
+                    new_status=new_status,
+                    fill_delta=fill_delta,
+                )
             
             return order
             

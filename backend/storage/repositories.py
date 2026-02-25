@@ -384,22 +384,52 @@ class AuditLogRepository:
         order_id: Optional[int] = None,
         auto_commit: bool = True,
     ) -> AuditLog:
-        """Create a new audit log entry."""
-        audit_log = AuditLog(
+        """
+        Create a new audit log entry.
+
+        Uses a Core INSERT to avoid Session.add() inside active flush cycles.
+        """
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        stmt = (
+            insert(AuditLog)
+            .values(
+                event_type=event_type,
+                description=description,
+                details=details,
+                user_id=user_id,
+                strategy_id=strategy_id,
+                order_id=order_id,
+                timestamp=now,
+                created_at=now,
+            )
+        )
+        result = self.db.execute(stmt)
+        is_flushing = bool(getattr(self.db, "_flushing", False))
+        if auto_commit and not is_flushing:
+            self.db.commit()
+        elif (not auto_commit) and not is_flushing:
+            self.db.flush()
+
+        inserted_ids = list(result.inserted_primary_key or [])
+        log_id = int(inserted_ids[0]) if inserted_ids else None
+        if log_id is not None:
+            found = self.get_by_id(log_id)
+            if found is not None:
+                return found
+
+        fallback = AuditLog(
             event_type=event_type,
             description=description,
             details=details,
             user_id=user_id,
             strategy_id=strategy_id,
-            order_id=order_id
+            order_id=order_id,
+            timestamp=now,
+            created_at=now,
         )
-        self.db.add(audit_log)
-        if auto_commit:
-            self.db.commit()
-        else:
-            self.db.flush()
-        self.db.refresh(audit_log)
-        return audit_log
+        if log_id is not None:
+            fallback.id = log_id
+        return fallback
     
     def get_by_id(self, log_id: int) -> Optional[AuditLog]:
         """Get audit log by ID."""

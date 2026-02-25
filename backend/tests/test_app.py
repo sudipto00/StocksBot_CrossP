@@ -87,6 +87,31 @@ def test_update_config():
     assert data["max_position_size"] == 20000.0
 
 
+def test_update_config_smtp_fields():
+    """SMTP fields should persist through runtime config."""
+    update_data = {
+        "smtp_host": "smtp.example.com",
+        "smtp_port": 587,
+        "smtp_username": "bot@example.com",
+        "smtp_password": "app-password-123",
+        "smtp_from_email": "bot@example.com",
+        "smtp_use_tls": True,
+        "smtp_use_ssl": False,
+        "smtp_timeout_seconds": 20,
+    }
+    response = client.post("/config", json=update_data)
+    assert response.status_code == 200
+    data = response.json()
+    assert data["smtp_host"] == "smtp.example.com"
+    assert data["smtp_port"] == 587
+    assert data["smtp_username"] == "bot@example.com"
+    assert data["smtp_password"] == "app-password-123"
+    assert data["smtp_from_email"] == "bot@example.com"
+    assert data["smtp_use_tls"] is True
+    assert data["smtp_use_ssl"] is False
+    assert data["smtp_timeout_seconds"] == 20
+
+
 def test_get_positions():
     """Test get positions endpoint."""
     response = client.get("/positions")
@@ -199,6 +224,61 @@ def test_request_notification(monkeypatch):
     data = response.json()
     assert data["success"] == True
     assert "Email sent to notify@example.com" in data["message"]
+
+
+def test_request_notification_uses_runtime_smtp_overrides(monkeypatch):
+    """Notification endpoint should pass SMTP config from runtime /config to delivery service."""
+    config_response = client.post(
+        "/config",
+        json={
+            "smtp_host": "smtp.runtime.test",
+            "smtp_port": 2525,
+            "smtp_username": "runtime-user",
+            "smtp_password": "runtime-pass",
+            "smtp_from_email": "runtime@test.local",
+            "smtp_use_tls": True,
+            "smtp_use_ssl": False,
+            "smtp_timeout_seconds": 12,
+        },
+    )
+    assert config_response.status_code == 200
+    prefs_response = client.post(
+        "/notifications/summary/preferences",
+        json={
+            "enabled": True,
+            "frequency": "daily",
+            "channel": "email",
+            "recipient": "notify@example.com",
+        },
+    )
+    assert prefs_response.status_code == 200
+
+    seen = {}
+
+    def _fake_send(self, channel, recipient, subject, body):
+        seen["smtp_host"] = self._smtp_value("smtp_host", None)
+        seen["smtp_port"] = self._smtp_value("smtp_port", None)
+        seen["smtp_username"] = self._smtp_value("smtp_username", None)
+        return f"Email sent to {recipient}"
+
+    monkeypatch.setattr(
+        "services.notification_delivery.NotificationDeliveryService.send_summary",
+        _fake_send,
+    )
+
+    response = client.post(
+        "/notifications",
+        json={
+            "title": "Test Notification",
+            "message": "Runtime SMTP override check",
+            "severity": "info",
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["success"] is True
+    assert seen["smtp_host"] == "smtp.runtime.test"
+    assert seen["smtp_port"] == 2525
+    assert seen["smtp_username"] == "runtime-user"
 
 
 def test_create_ws_ticket_requires_api_auth_enabled(monkeypatch):

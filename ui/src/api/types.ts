@@ -73,6 +73,14 @@ export interface ConfigResponse {
   log_retention_days: number;
   audit_retention_days: number;
   broker: string;
+  smtp_host: string;
+  smtp_port: number;
+  smtp_username: string;
+  smtp_password: string;
+  smtp_from_email: string;
+  smtp_use_tls: boolean;
+  smtp_use_ssl: boolean;
+  smtp_timeout_seconds: number;
 }
 
 export interface Position {
@@ -112,6 +120,7 @@ export interface Order {
   filled_quantity: number;
   avg_fill_price?: number;
   attached_order_ids?: string[];
+  oco_group_id?: string;
   attached_order_warnings?: string[];
   created_at: string; // ISO datetime string
   updated_at: string; // ISO datetime string
@@ -151,6 +160,14 @@ export interface ConfigUpdateRequest {
   log_retention_days?: number;
   audit_retention_days?: number;
   broker?: string;
+  smtp_host?: string;
+  smtp_port?: number;
+  smtp_username?: string;
+  smtp_password?: string;
+  smtp_from_email?: string;
+  smtp_use_tls?: boolean;
+  smtp_use_ssl?: boolean;
+  smtp_timeout_seconds?: number;
 }
 
 export interface BrokerCredentialsRequest {
@@ -225,6 +242,7 @@ export interface Strategy {
   name: string;
   description?: string;
   status: StrategyStatus;
+  asset_type?: 'stock' | 'etf' | 'both';
   symbols: string[];
   created_at: string; // ISO datetime string
   updated_at: string; // ISO datetime string
@@ -233,12 +251,14 @@ export interface Strategy {
 export interface StrategyCreateRequest {
   name: string;
   description?: string;
+  asset_type?: 'stock' | 'etf' | 'both';
   symbols: string[];
 }
 
 export interface StrategyUpdateRequest {
   name?: string;
   description?: string;
+  asset_type?: 'stock' | 'etf' | 'both';
   symbols?: string[];
   status?: StrategyStatus;
 }
@@ -367,6 +387,13 @@ export interface RunnerStartRequest {
   max_spread_bps?: number;
   max_sector_weight_pct?: number;
   auto_regime_adjust?: boolean;
+  execution_latency_ms?: number;
+  queue_position_bps?: number;
+  max_participation_rate?: number;
+  simulate_queue_position?: boolean;
+  enforce_liquidity_limits?: boolean;
+  reconcile_fees_with_broker?: boolean;
+  execution_seed?: number;
 }
 
 export interface WebSocketAuthTicketResponse {
@@ -629,6 +656,13 @@ export interface BacktestLiveParityReport {
   fee_model: string;
   fee_bps_applied: number;
   fees_paid_total: number;
+  execution_fill_model?: string;
+  execution_latency_ms_applied?: number;
+  queue_position_bps_applied?: number;
+  max_participation_rate_applied?: number;
+  simulate_queue_position?: boolean;
+  enforce_liquidity_limits?: boolean;
+  fee_reconciliation_mode?: string;
 }
 
 export interface BacktestUniverseContext {
@@ -672,6 +706,7 @@ export interface BacktestDiagnostics {
   advanced_metrics?: BacktestAdvancedMetrics;
   live_parity?: BacktestLiveParityReport;
   universe_context?: BacktestUniverseContext;
+  confidence?: Record<string, unknown>;
 }
 
 export interface BacktestResult {
@@ -714,6 +749,13 @@ export interface StrategyOptimizationRequest {
   max_spread_bps?: number;
   max_sector_weight_pct?: number;
   auto_regime_adjust?: boolean;
+  execution_latency_ms?: number;
+  queue_position_bps?: number;
+  max_participation_rate?: number;
+  simulate_queue_position?: boolean;
+  enforce_liquidity_limits?: boolean;
+  reconcile_fees_with_broker?: boolean;
+  execution_seed?: number;
   iterations?: number;
   min_trades?: number;
   objective?: 'balanced' | 'sharpe' | 'return';
@@ -783,9 +825,11 @@ export interface StrategyOptimizationResult {
   strict_min_trades: boolean;
   best_candidate_meets_min_trades: boolean;
   recommended_parameters: Record<string, number>;
+  recommended_parameters_raw?: Record<string, number>;
   recommended_symbols: string[];
   top_candidates: StrategyOptimizationCandidate[];
   best_result: BacktestResult;
+  confidence?: Record<string, unknown>;
   walk_forward?: StrategyOptimizationWalkForwardReport | null;
   notes: string[];
 }
@@ -879,6 +923,7 @@ export interface StrategyOptimizationHistoryItem {
   request_summary: Record<string, unknown>;
   metrics_summary: Record<string, unknown>;
   recommended_parameters: Record<string, number>;
+  recommended_parameters_raw?: Record<string, number>;
   recommended_symbols: string[];
   request_payload?: Record<string, unknown> | null;
   result_payload?: StrategyOptimizationResult | null;

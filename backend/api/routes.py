@@ -356,6 +356,7 @@ def get_order_execution_service(
 # ============================================================================
 
 # In-memory runtime snapshot backed by persistent config storage.
+_settings_snapshot = get_settings()
 _config = ConfigResponse(
     environment="development",
     trading_enabled=False,
@@ -371,6 +372,14 @@ _config = ConfigResponse(
     log_retention_days=30,
     audit_retention_days=90,
     broker="paper",
+    smtp_host=str(_settings_snapshot.smtp_host or "").strip(),
+    smtp_port=int(_settings_snapshot.smtp_port),
+    smtp_username=str(_settings_snapshot.smtp_username or "").strip(),
+    smtp_password=str(_settings_snapshot.smtp_password or "").strip(),
+    smtp_from_email=str(_settings_snapshot.smtp_from_email or "").strip(),
+    smtp_use_tls=bool(_settings_snapshot.smtp_use_tls),
+    smtp_use_ssl=bool(_settings_snapshot.smtp_use_ssl),
+    smtp_timeout_seconds=max(1, int(_settings_snapshot.smtp_timeout_seconds)),
 )
 set_global_trading_enabled(bool(_config.trading_enabled))
 configure_file_logging(_config.log_directory)
@@ -1791,6 +1800,12 @@ def _build_optimization_request_summary(payload: Dict[str, Any]) -> Dict[str, An
         "max_workers": _safe_int(payload.get("max_workers"), 0),
         "use_workspace_universe": bool(payload.get("use_workspace_universe", True)),
         "emulate_live_trading": bool(payload.get("emulate_live_trading", True)),
+        "execution_latency_ms": _safe_float(payload.get("execution_latency_ms"), 0.0),
+        "queue_position_bps": _safe_float(payload.get("queue_position_bps"), 0.0),
+        "max_participation_rate": _safe_float(payload.get("max_participation_rate"), 0.0),
+        "simulate_queue_position": bool(payload.get("simulate_queue_position", True)),
+        "enforce_liquidity_limits": bool(payload.get("enforce_liquidity_limits", True)),
+        "reconcile_fees_with_broker": bool(payload.get("reconcile_fees_with_broker", True)),
         "symbol_count": symbol_count,
         "parameter_count": parameter_count,
     }
@@ -1798,6 +1813,11 @@ def _build_optimization_request_summary(payload: Dict[str, Any]) -> Dict[str, An
 
 def _build_optimization_metrics_summary(result_model: Optional[StrategyOptimizationResponse], row: DBOptimizationRun) -> Dict[str, Any]:
     if result_model is not None:
+        confidence = (
+            dict(result_model.confidence)
+            if isinstance(result_model.confidence, dict)
+            else {}
+        )
         return {
             "score": float(result_model.score),
             "objective": str(result_model.objective),
@@ -1809,6 +1829,12 @@ def _build_optimization_metrics_summary(result_model: Optional[StrategyOptimizat
             "win_rate": float(result_model.best_result.win_rate),
             "total_trades": int(result_model.best_result.total_trades),
             "recommended_symbol_count": len(result_model.recommended_symbols),
+            "confidence_score": _safe_float(confidence.get("overall_confidence_score"), 0.0),
+            "confidence_band": str(confidence.get("confidence_band") or ""),
+            "backtest_confidence_score": _safe_float(confidence.get("backtest_confidence_score"), 0.0),
+            "walk_forward_pass_rate_pct": _safe_float(confidence.get("walk_forward_pass_rate_pct"), 0.0),
+            "execution_fill_model": str(confidence.get("execution_fill_model") or ""),
+            "fee_reconciliation_mode": str(confidence.get("fee_reconciliation_mode") or ""),
         }
     return {
         "score": _safe_float(row.score, 0.0),
@@ -1950,11 +1976,19 @@ def _to_optimization_history_item(
     completed_at = _ensure_utc_datetime(row.completed_at)
     created_at = _ensure_utc_datetime(row.created_at) or datetime.now(timezone.utc)
     recommended_parameters: Dict[str, float] = {}
+    recommended_parameters_raw: Dict[str, float] = {}
     recommended_symbols: List[str] = []
     if result_model is not None:
         recommended_parameters = {
             key: float(value)
             for key, value in result_model.recommended_parameters.items()
+        }
+        recommended_parameters_raw = {
+            key: float(value)
+            for key, value in (
+                result_model.recommended_parameters_raw
+                or result_model.recommended_parameters
+            ).items()
         }
         recommended_symbols = [str(symbol).upper() for symbol in result_model.recommended_symbols if str(symbol).strip()]
     source_value = str(row.source or "").strip().lower()
@@ -1978,6 +2012,7 @@ def _to_optimization_history_item(
         request_summary=_build_optimization_request_summary(request_payload),
         metrics_summary=_build_optimization_metrics_summary(result_model, row),
         recommended_parameters=recommended_parameters,
+        recommended_parameters_raw=recommended_parameters_raw,
         recommended_symbols=recommended_symbols,
         request_payload=request_payload if include_payload else None,
         result_payload=result_model if include_payload else None,
@@ -2024,7 +2059,13 @@ def _load_runtime_config(storage: StorageService) -> ConfigResponse:
         return _get_config_snapshot()
     try:
         raw = json.loads(entry.value)
-        return ConfigResponse(**raw)
+        if not isinstance(raw, dict):
+            return _get_config_snapshot()
+        base = _get_config_snapshot()
+        allowed = {field for field in ConfigResponse.model_fields.keys()}
+        updates = {k: raw.get(k) for k in raw.keys() if k in allowed}
+        merged = {**base.model_dump(), **updates}
+        return ConfigResponse(**merged)
     except (TypeError, ValueError, json.JSONDecodeError):
         return _get_config_snapshot()
 
@@ -2037,6 +2078,20 @@ def _save_runtime_config(storage: StorageService, cfg: ConfigResponse) -> None:
         value_type="json",
         description="Runtime backend config persisted for restart consistency",
     )
+
+
+def _runtime_smtp_config(cfg: ConfigResponse) -> Dict[str, Any]:
+    """Build SMTP delivery config from runtime persisted settings."""
+    return {
+        "smtp_host": str(cfg.smtp_host or "").strip(),
+        "smtp_port": int(cfg.smtp_port),
+        "smtp_username": str(cfg.smtp_username or "").strip(),
+        "smtp_password": str(cfg.smtp_password or "").strip(),
+        "smtp_from_email": str(cfg.smtp_from_email or "").strip(),
+        "smtp_use_tls": bool(cfg.smtp_use_tls),
+        "smtp_use_ssl": bool(cfg.smtp_use_ssl),
+        "smtp_timeout_seconds": max(1, int(cfg.smtp_timeout_seconds)),
+    }
 
 
 def _load_kill_switch(storage: StorageService) -> bool:
@@ -2189,6 +2244,8 @@ def _paper_market_hours_enabled_for_runtime() -> bool:
 def _collect_symbol_capabilities(
     broker: Optional[BrokerInterface],
     assets: List[Dict[str, Any]],
+    *,
+    fail_open: bool = True,
 ) -> Dict[str, Dict[str, bool]]:
     """Resolve tradable/fractionable capabilities for symbols in the candidate universe."""
     capabilities: Dict[str, Dict[str, bool]] = {}
@@ -2210,12 +2267,12 @@ def _collect_symbol_capabilities(
             try:
                 raw["tradable"] = bool(broker.is_symbol_tradable(symbol))
             except (RuntimeError, ValueError, TypeError, KeyError, AttributeError):
-                raw["tradable"] = True
+                raw["tradable"] = bool(fail_open)
         if "fractionable" not in raw:
             try:
                 raw["fractionable"] = bool(broker.is_symbol_fractionable(symbol))
             except (RuntimeError, ValueError, TypeError, KeyError, AttributeError):
-                raw["fractionable"] = True
+                raw["fractionable"] = bool(fail_open)
 
         capabilities[symbol] = {
             "tradable": bool(raw.get("tradable", True)),
@@ -2658,7 +2715,7 @@ def _submit_attached_exit_orders(
     order_request: OrderRequest,
     primary_order: Any,
     execution_service: OrderExecutionService,
-) -> tuple[List[str], List[str]]:
+) -> tuple[List[str], List[str], Optional[str]]:
     """
     Optionally submit attached exit orders for a filled buy entry.
 
@@ -2674,11 +2731,11 @@ def _submit_attached_exit_orders(
         order_request.trailing_stop_percent is not None,
     ])
     if not requested_any_exit:
-        return attached_ids, warnings
+        return attached_ids, warnings, None
 
     if order_request.side != OrderSide.BUY:
         warnings.append("Attached exits are supported only for buy entries; ignoring exit fields.")
-        return attached_ids, warnings
+        return attached_ids, warnings, None
 
     status_value = str(getattr(getattr(primary_order, "status", None), "value", "")).strip().lower()
     if status_value not in {"filled", "partially_filled"}:
@@ -2686,14 +2743,14 @@ def _submit_attached_exit_orders(
             "Primary order is not filled yet; attached exits were not submitted. "
             "Retry exits after fill confirmation."
         )
-        return attached_ids, warnings
+        return attached_ids, warnings, None
 
     exit_quantity = _safe_float(getattr(primary_order, "filled_quantity", 0.0), 0.0)
     if exit_quantity <= 0:
         exit_quantity = _safe_float(getattr(primary_order, "quantity", 0.0), 0.0)
     if exit_quantity <= 0:
         warnings.append("Unable to resolve fill quantity for attached exits.")
-        return attached_ids, warnings
+        return attached_ids, warnings, None
 
     def _submit_leg(*, order_type: str, leg_price: float, label: str) -> None:
         try:
@@ -2745,7 +2802,19 @@ def _submit_attached_exit_orders(
                     label=f"trailing_stop({trail_pct:.2f}%)",
                 )
 
-    return attached_ids, warnings
+    oco_group_id: Optional[str] = None
+    if len(attached_ids) >= 2:
+        try:
+            parsed_ids = [int(order_id) for order_id in attached_ids]
+            oco_group_id = execution_service.register_oco_group(
+                parent_order_id=int(getattr(primary_order, "id", 0) or 0),
+                symbol=order_request.symbol,
+                order_ids=parsed_ids,
+            )
+        except Exception as exc:
+            warnings.append(f"oco_registration failed: {exc}")
+
+    return attached_ids, warnings, oco_group_id
 
 
 def _load_summary_notification_preferences(storage: StorageService) -> SummaryNotificationPreferencesResponse:
@@ -3097,8 +3166,9 @@ def _send_summary_with_stats(
     trade_count = int(stats.get("trade_count", 0))
     gross_notional = float(stats.get("gross_notional", 0.0))
     realized_pnl = float(stats.get("realized_pnl", 0.0))
+    runtime_config = _load_runtime_config(storage)
     try:
-        delivery = NotificationDeliveryService()
+        delivery = NotificationDeliveryService(smtp_overrides=_runtime_smtp_config(runtime_config))
         delivery_result = delivery.send_summary(
             channel=prefs.channel,
             recipient=prefs.recipient,
@@ -3365,6 +3435,24 @@ async def update_config(
         if broker_value not in {"paper", "alpaca"}:
             raise HTTPException(status_code=400, detail="broker must be either 'paper' or 'alpaca'")
         config.broker = broker_value
+    if request.smtp_host is not None:
+        config.smtp_host = request.smtp_host.strip()
+    if request.smtp_port is not None:
+        config.smtp_port = int(request.smtp_port)
+    if request.smtp_username is not None:
+        config.smtp_username = request.smtp_username.strip()
+    if request.smtp_password is not None:
+        config.smtp_password = request.smtp_password
+    if request.smtp_from_email is not None:
+        config.smtp_from_email = request.smtp_from_email.strip()
+    if request.smtp_use_tls is not None:
+        config.smtp_use_tls = bool(request.smtp_use_tls)
+    if request.smtp_use_ssl is not None:
+        config.smtp_use_ssl = bool(request.smtp_use_ssl)
+    if request.smtp_timeout_seconds is not None:
+        config.smtp_timeout_seconds = int(request.smtp_timeout_seconds)
+    if config.smtp_use_ssl:
+        config.smtp_use_tls = False
 
     # Recreate broker on next use when mode changes.
     _set_config_snapshot(config)
@@ -3710,7 +3798,7 @@ async def create_order(
             quantity=order_request.quantity,
             price=order_request.price
         )
-        attached_order_ids, attached_order_warnings = _submit_attached_exit_orders(
+        attached_order_ids, attached_order_warnings, oco_group_id = _submit_attached_exit_orders(
             order_request=order_request,
             primary_order=order,
             execution_service=execution_service,
@@ -3726,6 +3814,7 @@ async def create_order(
                         "symbol": order.symbol,
                         "attached_order_ids": attached_order_ids,
                         "attached_order_warnings": attached_order_warnings,
+                        "oco_group_id": oco_group_id,
                         "take_profit_price": order_request.take_profit_price,
                         "stop_loss_price": order_request.stop_loss_price,
                         "trailing_stop_percent": order_request.trailing_stop_percent,
@@ -3748,6 +3837,7 @@ async def create_order(
             filled_quantity=order.filled_quantity or 0.0,
             avg_fill_price=order.avg_fill_price,
             attached_order_ids=attached_order_ids,
+            oco_group_id=oco_group_id,
             attached_order_warnings=attached_order_warnings,
             created_at=_ensure_utc_datetime(order.created_at),
             updated_at=_ensure_utc_datetime(order.updated_at),
@@ -3772,6 +3862,7 @@ async def request_notification(request: NotificationRequest, db: Session = Depen
     Uses configured summary notification channel + recipient.
     """
     storage = StorageService(db)
+    runtime_config = _load_runtime_config(storage)
     prefs = _load_summary_notification_preferences(storage)
 
     if not prefs.enabled:
@@ -3790,7 +3881,7 @@ async def request_notification(request: NotificationRequest, db: Session = Depen
     body = f"{title}\n\n{message}"
 
     try:
-        delivery = NotificationDeliveryService()
+        delivery = NotificationDeliveryService(smtp_overrides=_runtime_smtp_config(runtime_config))
         delivery_result = delivery.send_summary(
             channel=prefs.channel,
             recipient=prefs.recipient,
@@ -4284,7 +4375,11 @@ async def get_runner_preflight(db: Session = Depends(get_db)):
             return {"tradable": False, "fractionable": False}
         if normalized in capability_cache:
             return capability_cache[normalized]
-        raw = _collect_symbol_capabilities(broker, [{"symbol": normalized}]).get(normalized, {})
+        raw = _collect_symbol_capabilities(
+            broker,
+            [{"symbol": normalized}],
+            fail_open=False,
+        ).get(normalized, {})
         payload = {
             "tradable": bool(raw.get("tradable", True)),
             "fractionable": bool(raw.get("fractionable", True)),
@@ -5369,7 +5464,11 @@ def _resolve_workspace_universe_for_backtest(
     require_fractionable = _should_require_fractionable_symbols(final_asset_type, prefs, synthetic_account)
     enforce_execution_capabilities = bool(final_asset_type == AssetType.STOCK and require_fractionable)
     symbol_capabilities = (
-        _collect_symbol_capabilities(broker, assets_pre_optimized)
+        _collect_symbol_capabilities(
+            broker,
+            assets_pre_optimized,
+            fail_open=False,
+        )
         if enforce_execution_capabilities
         else {}
     )
@@ -5599,6 +5698,7 @@ def _prepare_backtest_execution_context(
             symbol_capabilities = _collect_symbol_capabilities(
                 broker_for_constraints,
                 [{"symbol": symbol} for symbol in selected_symbols],
+                fail_open=False,
             )
         enforced_symbols: List[str] = []
         for symbol in selected_symbols:
@@ -5635,12 +5735,49 @@ def _prepare_backtest_execution_context(
             requested_max_position_size=max_position_size,
             requested_risk_limit_daily=risk_limit_daily,
         )
+    execution_latency_ms = max(
+        0.0,
+        min(20000.0, _safe_float(getattr(request, "execution_latency_ms", None), 220.0)),
+    )
+    queue_position_bps = max(
+        0.0,
+        min(200.0, _safe_float(getattr(request, "queue_position_bps", None), 6.0)),
+    )
+    max_participation_rate = max(
+        0.001,
+        min(0.5, _safe_float(getattr(request, "max_participation_rate", None), 0.03)),
+    )
+    simulate_queue_position = bool(
+        getattr(request, "simulate_queue_position", emulate_live_trading)
+        if getattr(request, "simulate_queue_position", None) is not None
+        else emulate_live_trading
+    )
+    enforce_liquidity_limits = bool(
+        getattr(request, "enforce_liquidity_limits", emulate_live_trading)
+        if getattr(request, "enforce_liquidity_limits", None) is not None
+        else emulate_live_trading
+    )
+    reconcile_fees_with_broker = bool(
+        getattr(request, "reconcile_fees_with_broker", emulate_live_trading)
+        if getattr(request, "reconcile_fees_with_broker", None) is not None
+        else emulate_live_trading
+    )
+    execution_seed = getattr(request, "execution_seed", None)
+    if execution_seed is not None:
+        execution_seed = _safe_int(execution_seed, 0)
+        execution_seed = max(0, min(2_147_483_647, int(execution_seed)))
     live_parity_context["require_fractionable"] = require_fractionable
     live_parity_context["symbol_capabilities_checked"] = bool(symbol_capabilities)
     live_parity_context["symbols_selected"] = len(selected_symbols)
     live_parity_context["symbols_filtered_out_count"] = len(filtered_out)
     live_parity_context["max_position_size"] = max_position_size
     live_parity_context["risk_limit_daily"] = risk_limit_daily
+    live_parity_context["execution_latency_ms"] = execution_latency_ms
+    live_parity_context["queue_position_bps"] = queue_position_bps
+    live_parity_context["max_participation_rate"] = max_participation_rate
+    live_parity_context["simulate_queue_position"] = simulate_queue_position
+    live_parity_context["enforce_liquidity_limits"] = enforce_liquidity_limits
+    live_parity_context["reconcile_fees_with_broker"] = reconcile_fees_with_broker
     universe_context["live_parity_context"] = live_parity_context
 
     analytics = StrategyAnalyticsService(
@@ -5662,6 +5799,13 @@ def _prepare_backtest_execution_context(
         # so generic fee_bps stays at 0.  For standard backtests, apply a small
         # generic cost (1 bps per side) to avoid zero-cost optimism.
         "fee_bps": 0.0 if emulate_live_trading else 1.0,
+        "execution_latency_ms": execution_latency_ms,
+        "queue_position_bps": queue_position_bps,
+        "max_participation_rate": max_participation_rate,
+        "simulate_queue_position": simulate_queue_position,
+        "enforce_liquidity_limits": enforce_liquidity_limits,
+        "reconcile_fees_with_broker": reconcile_fees_with_broker,
+        "execution_seed": execution_seed,
     }
 
 
@@ -5749,6 +5893,13 @@ def _compute_strategy_optimization_response(
         max_spread_bps=request.max_spread_bps,
         max_sector_weight_pct=request.max_sector_weight_pct,
         auto_regime_adjust=request.auto_regime_adjust,
+        execution_latency_ms=request.execution_latency_ms,
+        queue_position_bps=request.queue_position_bps,
+        max_participation_rate=request.max_participation_rate,
+        simulate_queue_position=request.simulate_queue_position,
+        enforce_liquidity_limits=request.enforce_liquidity_limits,
+        reconcile_fees_with_broker=request.reconcile_fees_with_broker,
+        execution_seed=request.execution_seed,
     )
     resolved_parameters = _resolve_strategy_backtest_parameters(
         db_strategy=db_strategy,
@@ -5786,6 +5937,17 @@ def _compute_strategy_optimization_response(
         max_position_size=float(exec_context["max_position_size"]),
         risk_limit_daily=float(exec_context["risk_limit_daily"]),
         fee_bps=float(exec_context["fee_bps"]),
+        execution_latency_ms=float(exec_context["execution_latency_ms"]),
+        queue_position_bps=float(exec_context["queue_position_bps"]),
+        max_participation_rate=float(exec_context["max_participation_rate"]),
+        simulate_queue_position=bool(exec_context["simulate_queue_position"]),
+        enforce_liquidity_limits=bool(exec_context["enforce_liquidity_limits"]),
+        reconcile_fees_with_broker=bool(exec_context["reconcile_fees_with_broker"]),
+        execution_seed=(
+            int(exec_context["execution_seed"])
+            if exec_context.get("execution_seed") is not None
+            else None
+        ),
         universe_context=dict(exec_context["universe_context"]),
         symbol_capabilities=symbol_capabilities,
         alpaca_creds=(
@@ -5845,6 +6007,14 @@ def _compute_strategy_optimization_response(
             key: float(value)
             for key, value in (optimize_payload.get("recommended_parameters") or {}).items()
         },
+        recommended_parameters_raw={
+            key: float(value)
+            for key, value in (
+                optimize_payload.get("recommended_parameters_raw")
+                or optimize_payload.get("recommended_parameters")
+                or {}
+            ).items()
+        },
         recommended_symbols=[
             str(symbol).upper()
             for symbol in (optimize_payload.get("recommended_symbols") or [])
@@ -5852,6 +6022,11 @@ def _compute_strategy_optimization_response(
         ],
         top_candidates=top_candidates,
         best_result=best_response,
+        confidence=(
+            dict(optimize_payload.get("confidence"))
+            if isinstance(optimize_payload.get("confidence"), dict)
+            else {}
+        ),
         walk_forward=(
             StrategyOptimizationWalkForwardReport(**optimize_payload["walk_forward"])
             if isinstance(optimize_payload.get("walk_forward"), dict)
@@ -6169,6 +6344,13 @@ async def run_strategy_backtest(
         max_position_size=exec_context["max_position_size"],
         risk_limit_daily=exec_context["risk_limit_daily"],
         fee_bps=exec_context["fee_bps"],
+        execution_latency_ms=exec_context["execution_latency_ms"],
+        queue_position_bps=exec_context["queue_position_bps"],
+        max_participation_rate=exec_context["max_participation_rate"],
+        simulate_queue_position=exec_context["simulate_queue_position"],
+        enforce_liquidity_limits=exec_context["enforce_liquidity_limits"],
+        reconcile_fees_with_broker=exec_context["reconcile_fees_with_broker"],
+        execution_seed=exec_context["execution_seed"],
         universe_context=exec_context["universe_context"],
     )
     
@@ -7327,7 +7509,11 @@ async def get_screener_results(
     require_fractionable = _should_require_fractionable_symbols(final_asset_type, prefs, account_snapshot)
     enforce_execution_capabilities = bool(final_asset_type == AssetType.STOCK and require_fractionable)
     symbol_capabilities = (
-        _collect_symbol_capabilities(broker, results)
+        _collect_symbol_capabilities(
+            broker,
+            results,
+            fail_open=False,
+        )
         if enforce_execution_capabilities
         else {}
     )
@@ -7488,7 +7674,11 @@ async def get_screener_preset(
     require_fractionable = _should_require_fractionable_symbols(asset_type, prefs, account_snapshot)
     enforce_execution_capabilities = bool(asset_type == AssetType.STOCK and require_fractionable)
     symbol_capabilities = (
-        _collect_symbol_capabilities(broker, assets_raw)
+        _collect_symbol_capabilities(
+            broker,
+            assets_raw,
+            fail_open=False,
+        )
         if enforce_execution_capabilities
         else {}
     )

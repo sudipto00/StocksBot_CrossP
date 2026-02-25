@@ -1,4 +1,4 @@
-import { BrowserRouter, Routes, Route, Navigate, useNavigate } from 'react-router-dom';
+import { BrowserRouter, Routes, Route, useNavigate } from 'react-router-dom';
 import { Component, lazy, Suspense, useEffect, useRef } from 'react';
 import type { ErrorInfo, ReactNode } from 'react';
 import Sidebar from './components/Sidebar';
@@ -423,7 +423,6 @@ function App() {
                 <Route path="/" element={<DashboardPage />} />
                 <Route path="/dashboard" element={<DashboardPage />} />
                 <Route path="/strategy" element={<StrategyPage />} />
-                <Route path="/analytics" element={<Navigate to="/" replace />} />
                 <Route path="/screener" element={<ScreenerPage />} />
                 <Route path="/audit" element={<AuditPage />} />
                 <Route path="/settings" element={<SettingsPage />} />

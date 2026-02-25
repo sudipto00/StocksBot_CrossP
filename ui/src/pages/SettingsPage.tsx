@@ -34,7 +34,11 @@ import CollapsibleSection from '../components/CollapsibleSection';
 import PageHeader from '../components/PageHeader';
 import ConfirmDialog from '../components/ConfirmDialog';
 import { SkeletonPage } from '../components/Skeleton';
-import { useToast } from '../components/Toast';
+import { useToast } from '../components/toastContext';
+import {
+  STOCK_PRESET_PARAMETER_DEFAULTS,
+  ETF_PRESET_PARAMETER_DEFAULTS,
+} from '../constants/presetDefaults';
 
 type CredentialMode = 'paper' | 'live';
 
@@ -53,6 +57,10 @@ const SETTINGS_LIMITS = {
   tickIntervalMax: 3600,
   retentionDaysMin: 1,
   retentionDaysMax: 3650,
+  smtpPortMin: 1,
+  smtpPortMax: 65535,
+  smtpTimeoutMin: 1,
+  smtpTimeoutMax: 300,
 };
 
 const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
@@ -97,6 +105,14 @@ function SettingsPage() {
   const [auditExportDirectory, setAuditExportDirectory] = useState('');
   const [logRetentionDays, setLogRetentionDays] = useState(30);
   const [auditRetentionDays, setAuditRetentionDays] = useState(90);
+  const [smtpHost, setSmtpHost] = useState('');
+  const [smtpPort, setSmtpPort] = useState(587);
+  const [smtpUsername, setSmtpUsername] = useState('');
+  const [smtpPassword, setSmtpPassword] = useState('');
+  const [smtpFromEmail, setSmtpFromEmail] = useState('');
+  const [smtpUseTls, setSmtpUseTls] = useState(true);
+  const [smtpUseSsl, setSmtpUseSsl] = useState(false);
+  const [smtpTimeoutSeconds, setSmtpTimeoutSeconds] = useState(15);
   const [storageInfo, setStorageInfo] = useState<MaintenanceStorageResponse | null>(null);
   const [cleanupLoading, setCleanupLoading] = useState(false);
   const [credentialMode, setCredentialMode] = useState<CredentialMode>('paper');
@@ -121,6 +137,7 @@ function SettingsPage() {
   const [summaryFrequency, setSummaryFrequency] = useState<SummaryNotificationFrequency>('daily');
   const [summaryChannel, setSummaryChannel] = useState<SummaryNotificationChannel>('email');
   const [summaryRecipient, setSummaryRecipient] = useState('');
+  const [summarySending, setSummarySending] = useState(false);
   const [killSwitchActive, setKillSwitchActive] = useState(false);
   const [panicLoading, setPanicLoading] = useState(false);
   const [appVersion, setAppVersion] = useState('dev');
@@ -163,6 +180,12 @@ function SettingsPage() {
     if (auditRetentionDays < SETTINGS_LIMITS.retentionDaysMin || auditRetentionDays > SETTINGS_LIMITS.retentionDaysMax) {
       errors.auditRetentionDays = `Audit retention must be between ${SETTINGS_LIMITS.retentionDaysMin} and ${SETTINGS_LIMITS.retentionDaysMax} days`;
     }
+    if (smtpPort < SETTINGS_LIMITS.smtpPortMin || smtpPort > SETTINGS_LIMITS.smtpPortMax) {
+      errors.smtpPort = `SMTP port must be between ${SETTINGS_LIMITS.smtpPortMin} and ${SETTINGS_LIMITS.smtpPortMax}`;
+    }
+    if (smtpTimeoutSeconds < SETTINGS_LIMITS.smtpTimeoutMin || smtpTimeoutSeconds > SETTINGS_LIMITS.smtpTimeoutMax) {
+      errors.smtpTimeoutSeconds = `SMTP timeout must be between ${SETTINGS_LIMITS.smtpTimeoutMin} and ${SETTINGS_LIMITS.smtpTimeoutMax} seconds`;
+    }
     if (summaryEnabled) {
       const recipient = summaryRecipient.trim();
       if (!recipient) {
@@ -171,6 +194,22 @@ function SettingsPage() {
         errors.summaryRecipient = 'Recipient must be a valid email address';
       } else if (summaryChannel === 'sms' && !PHONE_RE.test(recipient)) {
         errors.summaryRecipient = 'Recipient must be a valid phone number like +15551234567';
+      }
+      if (summaryChannel === 'email') {
+        if (!smtpHost.trim()) {
+          errors.smtpHost = 'SMTP host is required for email summary notifications';
+        }
+        if (!smtpFromEmail.trim()) {
+          errors.smtpFromEmail = 'SMTP from email is required for email summary notifications';
+        } else if (!EMAIL_RE.test(smtpFromEmail.trim())) {
+          errors.smtpFromEmail = 'SMTP from email must be a valid email address';
+        }
+        if (!smtpUsername.trim()) {
+          errors.smtpUsername = 'SMTP username is required for email summary notifications';
+        }
+        if (!smtpPassword.trim()) {
+          errors.smtpPassword = 'SMTP password is required for email summary notifications';
+        }
       }
     }
     return errors;
@@ -197,6 +236,14 @@ function SettingsPage() {
       setAuditExportDirectory(config.audit_export_directory || '');
       setLogRetentionDays(config.log_retention_days || 30);
       setAuditRetentionDays(config.audit_retention_days || 90);
+      setSmtpHost(config.smtp_host || '');
+      setSmtpPort(config.smtp_port || 587);
+      setSmtpUsername(config.smtp_username || '');
+      setSmtpPassword(config.smtp_password || '');
+      setSmtpFromEmail(config.smtp_from_email || '');
+      setSmtpUseTls(config.smtp_use_tls !== false);
+      setSmtpUseSsl(Boolean(config.smtp_use_ssl));
+      setSmtpTimeoutSeconds(config.smtp_timeout_seconds || 15);
       setLoading(false);
 
       const [prefsResult, summaryPrefsResult, safetyResult] = await Promise.allSettled([
@@ -267,6 +314,14 @@ function SettingsPage() {
         log_retention_days: logRetentionDays,
         audit_retention_days: auditRetentionDays,
         broker,
+        smtp_host: smtpHost.trim(),
+        smtp_port: smtpPort,
+        smtp_username: smtpUsername.trim(),
+        smtp_password: smtpPassword,
+        smtp_from_email: smtpFromEmail.trim(),
+        smtp_use_tls: smtpUseTls,
+        smtp_use_ssl: smtpUseSsl,
+        smtp_timeout_seconds: smtpTimeoutSeconds,
       });
       await updateSummaryNotificationPreferences({
         enabled: summaryEnabled,
@@ -289,7 +344,15 @@ function SettingsPage() {
         (verifiedConfig.audit_export_directory || '').trim() === auditExportDirectory.trim() &&
         verifiedConfig.log_retention_days === logRetentionDays &&
         verifiedConfig.audit_retention_days === auditRetentionDays &&
-        verifiedConfig.broker === broker;
+        verifiedConfig.broker === broker &&
+        (verifiedConfig.smtp_host || '').trim() === smtpHost.trim() &&
+        verifiedConfig.smtp_port === smtpPort &&
+        (verifiedConfig.smtp_username || '').trim() === smtpUsername.trim() &&
+        (verifiedConfig.smtp_password || '') === smtpPassword &&
+        (verifiedConfig.smtp_from_email || '').trim() === smtpFromEmail.trim() &&
+        Boolean(verifiedConfig.smtp_use_tls) === smtpUseTls &&
+        Boolean(verifiedConfig.smtp_use_ssl) === smtpUseSsl &&
+        verifiedConfig.smtp_timeout_seconds === smtpTimeoutSeconds;
       const summaryVerified =
         verifiedSummary.enabled === summaryEnabled &&
         verifiedSummary.frequency === summaryFrequency &&
@@ -444,15 +507,27 @@ function SettingsPage() {
   };
 
   const handleSendSummaryNow = async () => {
+    if (!summaryEnabled) {
+      addToast('warning', 'Summary Disabled', 'Enable transaction summary notifications first.');
+      await showWarningNotification('Summary Disabled', 'Enable transaction summary notifications first.');
+      return;
+    }
     try {
+      setSummarySending(true);
       const response = await sendSummaryNotificationNow();
       if (response.success) {
+        addToast('success', 'Summary Queued', response.message);
         await showSuccessNotification('Summary Queued', response.message);
       } else {
+        addToast('error', 'Summary Not Sent', response.message);
         await showErrorNotification('Summary Not Sent', response.message);
       }
     } catch (err) {
-      await showErrorNotification('Summary Error', err instanceof Error ? err.message : 'Failed to send summary');
+      const message = err instanceof Error ? err.message : 'Failed to send summary';
+      addToast('error', 'Summary Error', message);
+      await showErrorNotification('Summary Error', message);
+    } finally {
+      setSummarySending(false);
     }
   };
 
@@ -1027,21 +1102,9 @@ function SettingsPage() {
 
           {/* Active Preset Trading Parameters */}
           {(() => {
-            const stockPresets: Record<string, Record<string, number>> = {
-              weekly_optimized: { position_size: 1200, risk_per_trade: 1.5, stop_loss_pct: 2.0, take_profit_pct: 5.0, trailing_stop_pct: 2.5, atr_stop_mult: 2.0, zscore_entry_threshold: -1.2, dip_buy_threshold_pct: 1.5, max_hold_days: 10, dca_tranches: 1, max_consecutive_losses: 3, max_drawdown_pct: 15.0 },
-              three_to_five_weekly: { position_size: 1000, risk_per_trade: 1.2, stop_loss_pct: 2.5, take_profit_pct: 6.0, trailing_stop_pct: 2.8, atr_stop_mult: 1.9, zscore_entry_threshold: -1.3, dip_buy_threshold_pct: 2.0, max_hold_days: 7, dca_tranches: 1, max_consecutive_losses: 3, max_drawdown_pct: 15.0 },
-              monthly_optimized: { position_size: 900, risk_per_trade: 1.0, stop_loss_pct: 3.5, take_profit_pct: 8.0, trailing_stop_pct: 3.5, atr_stop_mult: 2.2, zscore_entry_threshold: -1.5, dip_buy_threshold_pct: 2.5, max_hold_days: 30, dca_tranches: 1, max_consecutive_losses: 3, max_drawdown_pct: 15.0 },
-              small_budget_weekly: { position_size: 500, risk_per_trade: 0.8, stop_loss_pct: 2.0, take_profit_pct: 5.0, trailing_stop_pct: 2.5, atr_stop_mult: 1.8, zscore_entry_threshold: -1.2, dip_buy_threshold_pct: 1.5, max_hold_days: 10, dca_tranches: 1, max_consecutive_losses: 3, max_drawdown_pct: 15.0 },
-              micro_budget: { position_size: 75, risk_per_trade: 0.5, stop_loss_pct: 1.5, take_profit_pct: 4.0, trailing_stop_pct: 2.0, atr_stop_mult: 1.5, zscore_entry_threshold: -1.0, dip_buy_threshold_pct: 1.2, max_hold_days: 7, dca_tranches: 2, max_consecutive_losses: 2, max_drawdown_pct: 10.0 },
-            };
-            const etfPresets: Record<string, Record<string, number>> = {
-              conservative: { position_size: 1000, risk_per_trade: 0.8, stop_loss_pct: 2.0, take_profit_pct: 5.0, trailing_stop_pct: 2.5, atr_stop_mult: 1.6, zscore_entry_threshold: -1.0, dip_buy_threshold_pct: 1.2, max_hold_days: 12, dca_tranches: 1, max_consecutive_losses: 3, max_drawdown_pct: 15.0 },
-              balanced: { position_size: 1000, risk_per_trade: 1.0, stop_loss_pct: 2.5, take_profit_pct: 6.0, trailing_stop_pct: 2.8, atr_stop_mult: 1.9, zscore_entry_threshold: -1.2, dip_buy_threshold_pct: 1.5, max_hold_days: 10, dca_tranches: 1, max_consecutive_losses: 3, max_drawdown_pct: 15.0 },
-              aggressive: { position_size: 1300, risk_per_trade: 1.4, stop_loss_pct: 3.5, take_profit_pct: 8.0, trailing_stop_pct: 3.5, atr_stop_mult: 2.0, zscore_entry_threshold: -1.5, dip_buy_threshold_pct: 2.0, max_hold_days: 8, dca_tranches: 1, max_consecutive_losses: 3, max_drawdown_pct: 15.0 },
-            };
             const activePreset = assetType === 'etf'
-              ? etfPresets[etfPreset] || etfPresets.balanced
-              : stockPresets[stockPreset] || stockPresets.weekly_optimized;
+              ? ETF_PRESET_PARAMETER_DEFAULTS[etfPreset] || ETF_PRESET_PARAMETER_DEFAULTS.balanced
+              : STOCK_PRESET_PARAMETER_DEFAULTS[stockPreset] || STOCK_PRESET_PARAMETER_DEFAULTS.weekly_optimized;
             const tpSlRatio = (activePreset.take_profit_pct / activePreset.stop_loss_pct).toFixed(1);
             return (
               <div className="mt-1 rounded-lg border border-gray-700 bg-gray-800/30 p-3">
@@ -1100,6 +1163,139 @@ function SettingsPage() {
           </div>
 
           <div className="border-t border-gray-700 pt-4 space-y-3">
+            <div className="rounded border border-gray-700 bg-gray-900/40 p-3 space-y-3">
+              <div>
+                <label className="text-white font-medium">SMTP Delivery Settings</label>
+                <p className="text-gray-400 text-xs">Used for email summary notifications. Saved with runtime config.</p>
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <div>
+                  <label className="text-white text-sm block mb-1">SMTP Host</label>
+                  <input
+                    type="text"
+                    value={smtpHost}
+                    onChange={(e) => setSmtpHost(e.target.value)}
+                    placeholder="smtp.gmail.com"
+                    className={`w-full bg-gray-700 text-white px-3 py-2 rounded border ${
+                      validationErrors.smtpHost ? 'border-red-500' : 'border-gray-600'
+                    }`}
+                  />
+                  {validationErrors.smtpHost && (
+                    <p className="text-red-400 text-xs mt-1">{validationErrors.smtpHost}</p>
+                  )}
+                </div>
+                <div>
+                  <label className="text-white text-sm block mb-1">SMTP From Email</label>
+                  <input
+                    type="email"
+                    value={smtpFromEmail}
+                    onChange={(e) => setSmtpFromEmail(e.target.value)}
+                    placeholder="yourname@gmail.com"
+                    className={`w-full bg-gray-700 text-white px-3 py-2 rounded border ${
+                      validationErrors.smtpFromEmail ? 'border-red-500' : 'border-gray-600'
+                    }`}
+                  />
+                  {validationErrors.smtpFromEmail && (
+                    <p className="text-red-400 text-xs mt-1">{validationErrors.smtpFromEmail}</p>
+                  )}
+                </div>
+                <div>
+                  <label className="text-white text-sm block mb-1">SMTP Username</label>
+                  <input
+                    type="text"
+                    value={smtpUsername}
+                    onChange={(e) => setSmtpUsername(e.target.value)}
+                    placeholder="yourname@gmail.com"
+                    className={`w-full bg-gray-700 text-white px-3 py-2 rounded border ${
+                      validationErrors.smtpUsername ? 'border-red-500' : 'border-gray-600'
+                    }`}
+                  />
+                  {validationErrors.smtpUsername && (
+                    <p className="text-red-400 text-xs mt-1">{validationErrors.smtpUsername}</p>
+                  )}
+                </div>
+                <div>
+                  <label className="text-white text-sm block mb-1">SMTP Password / App Password</label>
+                  <input
+                    type="password"
+                    value={smtpPassword}
+                    onChange={(e) => setSmtpPassword(e.target.value)}
+                    placeholder="App password"
+                    className={`w-full bg-gray-700 text-white px-3 py-2 rounded border ${
+                      validationErrors.smtpPassword ? 'border-red-500' : 'border-gray-600'
+                    }`}
+                  />
+                  {validationErrors.smtpPassword && (
+                    <p className="text-red-400 text-xs mt-1">{validationErrors.smtpPassword}</p>
+                  )}
+                </div>
+                <div>
+                  <label className="text-white text-sm block mb-1">SMTP Port</label>
+                  <input
+                    type="number"
+                    value={smtpPort}
+                    min={SETTINGS_LIMITS.smtpPortMin}
+                    max={SETTINGS_LIMITS.smtpPortMax}
+                    onChange={(e) => setSmtpPort(parseInt(e.target.value || '0', 10) || 0)}
+                    className={`w-full bg-gray-700 text-white px-3 py-2 rounded border ${
+                      validationErrors.smtpPort ? 'border-red-500' : 'border-gray-600'
+                    }`}
+                  />
+                  {validationErrors.smtpPort && (
+                    <p className="text-red-400 text-xs mt-1">{validationErrors.smtpPort}</p>
+                  )}
+                </div>
+                <div>
+                  <label className="text-white text-sm block mb-1">SMTP Timeout (seconds)</label>
+                  <input
+                    type="number"
+                    value={smtpTimeoutSeconds}
+                    min={SETTINGS_LIMITS.smtpTimeoutMin}
+                    max={SETTINGS_LIMITS.smtpTimeoutMax}
+                    onChange={(e) => setSmtpTimeoutSeconds(parseInt(e.target.value || '0', 10) || 0)}
+                    className={`w-full bg-gray-700 text-white px-3 py-2 rounded border ${
+                      validationErrors.smtpTimeoutSeconds ? 'border-red-500' : 'border-gray-600'
+                    }`}
+                  />
+                  {validationErrors.smtpTimeoutSeconds && (
+                    <p className="text-red-400 text-xs mt-1">{validationErrors.smtpTimeoutSeconds}</p>
+                  )}
+                </div>
+              </div>
+              <div className="flex flex-wrap gap-4">
+                <label className="inline-flex items-center gap-2 text-sm text-gray-200">
+                  <input
+                    type="checkbox"
+                    checked={smtpUseTls}
+                    onChange={(e) => {
+                      const checked = e.target.checked;
+                      setSmtpUseTls(checked);
+                      if (checked) {
+                        setSmtpUseSsl(false);
+                      }
+                    }}
+                    className="rounded border-gray-600 bg-gray-700"
+                  />
+                  Use TLS (STARTTLS)
+                </label>
+                <label className="inline-flex items-center gap-2 text-sm text-gray-200">
+                  <input
+                    type="checkbox"
+                    checked={smtpUseSsl}
+                    onChange={(e) => {
+                      const checked = e.target.checked;
+                      setSmtpUseSsl(checked);
+                      if (checked) {
+                        setSmtpUseTls(false);
+                      }
+                    }}
+                    className="rounded border-gray-600 bg-gray-700"
+                  />
+                  Use SSL
+                </label>
+              </div>
+            </div>
+
             <div className="flex items-center justify-between">
               <div>
                 <label className="text-white font-medium">Transaction Summary via Email/SMS</label>
@@ -1164,10 +1360,10 @@ function SettingsPage() {
 
             <button
               onClick={handleSendSummaryNow}
-              disabled={!summaryEnabled}
+              disabled={summarySending}
               className="bg-emerald-600 hover:bg-emerald-700 disabled:bg-gray-600 text-white px-4 py-2 rounded font-medium"
             >
-              Send Summary Now
+              {summarySending ? 'Sending...' : 'Send Summary Now'}
             </button>
           </div>
         </div>

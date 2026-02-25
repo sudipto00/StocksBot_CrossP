@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import smtplib
 from email.message import EmailMessage
-from typing import Optional
+from typing import Optional, Any, Dict
 
 import httpx
 
@@ -18,8 +18,15 @@ from api.models import SummaryNotificationChannel
 class NotificationDeliveryService:
     """Dispatches summary notifications over configured delivery channels."""
 
-    def __init__(self) -> None:
+    def __init__(self, smtp_overrides: Optional[Dict[str, Any]] = None) -> None:
         self.settings = get_settings()
+        self.smtp_overrides = smtp_overrides or {}
+
+    def _smtp_value(self, key: str, default: Any) -> Any:
+        value = self.smtp_overrides.get(key)
+        if value is None:
+            return default
+        return value
 
     def send_summary(
         self,
@@ -44,10 +51,10 @@ class NotificationDeliveryService:
 
     def _send_email(self, recipient: str, subject: str, body: str) -> None:
         """Send summary via SMTP."""
-        smtp_host = (self.settings.smtp_host or "").strip()
-        smtp_username = (self.settings.smtp_username or "").strip()
-        smtp_password = (self.settings.smtp_password or "").strip()
-        from_email = (self.settings.smtp_from_email or "").strip()
+        smtp_host = str(self._smtp_value("smtp_host", self.settings.smtp_host) or "").strip()
+        smtp_username = str(self._smtp_value("smtp_username", self.settings.smtp_username) or "").strip()
+        smtp_password = str(self._smtp_value("smtp_password", self.settings.smtp_password) or "").strip()
+        from_email = str(self._smtp_value("smtp_from_email", self.settings.smtp_from_email) or "").strip()
 
         if not smtp_host:
             raise RuntimeError("SMTP host is not configured (STOCKSBOT_SMTP_HOST)")
@@ -62,10 +69,10 @@ class NotificationDeliveryService:
         message["To"] = recipient
         message.set_content(body)
 
-        timeout = max(1, int(self.settings.smtp_timeout_seconds))
-        port = int(self.settings.smtp_port)
-        use_ssl = bool(self.settings.smtp_use_ssl)
-        use_tls = bool(self.settings.smtp_use_tls)
+        timeout = max(1, int(self._smtp_value("smtp_timeout_seconds", self.settings.smtp_timeout_seconds)))
+        port = int(self._smtp_value("smtp_port", self.settings.smtp_port))
+        use_ssl = bool(self._smtp_value("smtp_use_ssl", self.settings.smtp_use_ssl))
+        use_tls = bool(self._smtp_value("smtp_use_tls", self.settings.smtp_use_tls))
 
         smtp_client: Optional[smtplib.SMTP] = None
         try:

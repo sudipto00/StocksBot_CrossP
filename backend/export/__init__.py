@@ -1,9 +1,4 @@
-"""
-Export module for data export.
+"""Export package marker.
 
-TODO: Implement export functionality
-- CSV export
-- PDF reports
-- Excel exports
-- Custom format exports
+Reserved for data export integrations used by UI and reporting workflows.
 """

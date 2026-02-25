@@ -1,9 +1,4 @@
-"""
-External integrations module.
+"""External integrations package marker.
 
-TODO: Implement integrations with:
-- Broker APIs (e.g., Alpaca, Interactive Brokers)
-- Market data providers
-- News feeds
-- Sentiment analysis services
+Broker and data integrations are implemented in dedicated modules.
 """

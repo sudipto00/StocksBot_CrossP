@@ -219,7 +219,7 @@ async def _lifespan(_app: FastAPI):
 app = FastAPI(
     title="StocksBot API",
     description="Cross-platform StocksBot backend service",
-    version="1.0.7",
+    version="1.0.8",
     lifespan=_lifespan,
     openapi_tags=[
         {"name": "Config", "description": "Application configuration"},

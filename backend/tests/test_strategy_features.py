@@ -297,6 +297,7 @@ class TestStrategyBacktesting:
                 "start_date": start_date,
                 "end_date": end_date,
                 "initial_capital": 100000.0,
+                "emulate_live_trading": False,
             }
         )
         assert response.status_code == 200
@@ -325,6 +326,7 @@ class TestStrategyBacktesting:
                 "start_date": "2024-01-01",
                 "end_date": "2024-06-30",
                 "initial_capital": 50000.0,
+                "emulate_live_trading": False,
             }
         )
         assert response.status_code == 200
@@ -342,6 +344,7 @@ class TestStrategyBacktesting:
                 "initial_capital": 1000.0,
                 "contribution_amount": 30.0,
                 "contribution_frequency": "weekly",
+                "emulate_live_trading": False,
             },
         )
         assert response.status_code == 200
@@ -371,6 +374,7 @@ class TestStrategyBacktesting:
                 "start_date": "2024-01-01",
                 "end_date": "2024-03-31",
                 "initial_capital": 100000.0,
+                "emulate_live_trading": False,
             }
         )
         assert response.status_code == 200
@@ -399,6 +403,7 @@ class TestStrategyBacktesting:
                 "end_date": "2024-03-31",
                 "initial_capital": 100000.0,
                 "symbols": ["AAPL", "MSFT"],
+                "emulate_live_trading": False,
                 "parameters": {
                     "position_size": 1200.0,
                     "risk_per_trade": 1.2,
@@ -483,6 +488,7 @@ class TestStrategyBacktesting:
                 "start_date": "2024-01-01",
                 "end_date": "2024-03-31",
                 "initial_capital": 10000.0,
+                "emulate_live_trading": False,
                 "use_workspace_universe": True,
                 "preset_universe_mode": "seed_only",
                 "screener_mode": "preset",
@@ -723,6 +729,7 @@ class TestMicroBudgetPreset:
                 "start_date": "2024-01-01",
                 "end_date": "2024-03-31",
                 "initial_capital": 5000.0,
+                "emulate_live_trading": False,
                 "parameters": {
                     "position_size": 500.0,
                     "dca_tranches": 2.0,
