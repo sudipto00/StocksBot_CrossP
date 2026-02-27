@@ -1,7 +1,7 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from 'recharts';
-import { createStrategy, getApiAuthKey, getBrokerAccount, getConfig, getPortfolioSummary, getPreferenceRecommendation, getStrategies, getStrategyConfig, getSafetyPreflight, getSafetyStatus, updateConfig, updateStrategy } from '../api/backend';
-import { BrokerAccountResponse, PortfolioSummaryResponse, Strategy, StrategyStatus } from '../api/types';
+import { getApiAuthKey, getBrokerAccount, getEtfInvestingPolicy, getPortfolioSummary, getSafetyPreflight, getSafetyStatus, updateEtfInvestingPolicy } from '../api/backend';
+import { BrokerAccountResponse, EtfInvestingPolicy, PortfolioSummaryResponse } from '../api/types';
 import HelpTooltip from '../components/HelpTooltip';
 import PageHeader from '../components/PageHeader';
 import GuidedFlowStrip from '../components/GuidedFlowStrip';
@@ -24,15 +24,12 @@ interface Asset {
 }
 
 interface Preferences {
-  asset_type: 'stock' | 'etf';
-  risk_profile: 'conservative' | 'balanced' | 'aggressive' | 'micro_budget';
+  asset_type: 'etf';
+  risk_profile: 'conservative' | 'balanced' | 'aggressive';
   weekly_budget: number;
   screener_limit: number;
-  stock_most_active_limit: number;
-  stock_preset_limit: number;
   etf_preset_limit: number;
-  screener_mode: 'most_active' | 'preset';
-  stock_preset: 'weekly_optimized' | 'three_to_five_weekly' | 'monthly_optimized' | 'small_budget_weekly' | 'micro_budget';
+  screener_mode: 'preset';
   etf_preset: 'conservative' | 'balanced' | 'aggressive';
 }
 
@@ -57,13 +54,27 @@ interface ChartPoint {
 const BACKEND_URL =
   (import.meta as { env?: { VITE_BACKEND_URL?: string } }).env?.VITE_BACKEND_URL ||
   'http://127.0.0.1:8000';
-type ScreenerMode = 'most_active' | 'preset';
-type StockPreset = 'weekly_optimized' | 'three_to_five_weekly' | 'monthly_optimized' | 'small_budget_weekly' | 'micro_budget';
+type ScreenerMode = 'preset';
 type EtfPreset = 'conservative' | 'balanced' | 'aggressive';
-type PresetType = StockPreset | EtfPreset;
+type PresetType = EtfPreset;
 type PresetUniverseMode = 'seed_only' | 'seed_guardrail_blend' | 'guardrail_only';
 type ChartRange = '1m' | '3m' | '1y';
-type RiskProfile = 'conservative' | 'balanced' | 'aggressive' | 'micro_budget';
+
+interface PolicyDraft {
+  dynamic_candidates_enabled: boolean;
+  screen_interval_days: number;
+  replacement_interval_days: number;
+  max_replacements_per_quarter: number;
+  min_hold_days_for_replacement: number;
+  min_replacement_score_delta_pct: number;
+  min_dollar_volume: number;
+  rebalance_drift_threshold_pct: number;
+  buy_only_rebalance: boolean;
+  tlh_enabled: boolean;
+  tlh_min_loss_dollars: number;
+  tlh_min_loss_pct: number;
+  tlh_min_hold_days: number;
+}
 
 function daysForRange(range: ChartRange): number {
   if (range === '1m') return 30;
@@ -94,10 +105,6 @@ function authFetch(input: RequestInfo | URL, init: RequestInit = {}): Promise<Re
 const WORKSPACE_LIMITS = {
   weeklyBudgetMin: 50,
   weeklyBudgetMax: 1_000_000,
-  maxPositionMin: 1,
-  maxPositionMax: 10_000_000,
-  riskDailyMin: 1,
-  riskDailyMax: 1_000_000,
   minDollarVolumeMin: 0,
   minDollarVolumeMax: 1_000_000_000_000,
   maxSpreadBpsMin: 1,
@@ -106,9 +113,6 @@ const WORKSPACE_LIMITS = {
   maxSectorWeightMax: 100,
 };
 const WORKSPACE_LAST_APPLIED_AT_KEY = 'stocksbot.workspace.lastAppliedAt';
-const WORKSPACE_SNAPSHOT_KEY = 'stocksbot.workspace.snapshot';
-const SCREENER_PRESET_UNIVERSE_MODE_KEY = 'stocksbot.screener.preset.universeMode';
-const SCREENER_PRESET_SEED_ONLY_KEY = 'stocksbot.screener.preset.seedOnly';
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
@@ -129,103 +133,43 @@ function markWorkspaceApplied(source: 'manual' | 'auto_optimize' = 'manual'): vo
   }
 }
 
-function persistWorkspaceSnapshot(snapshot: {
-  asset_type: Preferences['asset_type'];
-  screener_mode: ScreenerMode;
-  stock_preset: StockPreset;
-  etf_preset: EtfPreset;
-  preset_universe_mode: PresetUniverseMode;
-  seed_only_preset: boolean;
-  screener_limit: number;
-  stock_most_active_limit: number;
-  stock_preset_limit: number;
-  etf_preset_limit: number;
-  min_dollar_volume: number;
-  max_spread_bps: number;
-  max_sector_weight_pct: number;
-  auto_regime_adjust: boolean;
-}): void {
-  if (typeof window === 'undefined') return;
-  try {
-    window.localStorage.setItem(WORKSPACE_SNAPSHOT_KEY, JSON.stringify(snapshot));
-  } catch {
-    // Best effort only.
-  }
-}
-
 function resolveScreenerLimitForContext(
-  prefs: Pick<Preferences, 'stock_most_active_limit' | 'stock_preset_limit' | 'etf_preset_limit' | 'screener_limit'>,
-  assetType: Preferences['asset_type'],
-  mode: ScreenerMode,
+  prefs: Pick<Preferences, 'etf_preset_limit' | 'screener_limit'>,
 ): number {
   const fallback = clamp(Number(prefs.screener_limit || 50), 10, 200);
-  if (assetType === 'etf') {
-    return clamp(Number(prefs.etf_preset_limit || fallback), 10, 200);
-  }
-  if (mode === 'preset') {
-    return clamp(Number(prefs.stock_preset_limit || fallback), 10, 200);
-  }
-  return clamp(Number(prefs.stock_most_active_limit || fallback), 10, 200);
-}
-
-function withContextScreenerLimit(
-  prefs: Preferences,
-  assetType: Preferences['asset_type'],
-  mode: ScreenerMode,
-  limit: number,
-): Preferences {
-  const next = { ...prefs };
-  const clamped = clamp(Math.round(limit), 10, 200);
-  if (assetType === 'etf') {
-    next.etf_preset_limit = clamped;
-  } else if (mode === 'preset') {
-    next.stock_preset_limit = clamped;
-  } else {
-    next.stock_most_active_limit = clamped;
-  }
-  next.screener_limit = resolveScreenerLimitForContext(next, assetType, mode);
-  return next;
+  return clamp(Number(prefs.etf_preset_limit || fallback), 10, 200);
 }
 
 function normalizePreferences(raw: Partial<Preferences>): Preferences {
-  const normalizedAssetType: Preferences['asset_type'] = raw.asset_type === 'etf' ? 'etf' : 'stock';
-  const normalizedMode: ScreenerMode =
-    normalizedAssetType === 'stock' ? (raw.screener_mode || 'most_active') : 'preset';
   const fallback = clamp(Number(raw.screener_limit || 50), 10, 200);
   const normalized: Preferences = {
-    asset_type: normalizedAssetType,
-    risk_profile: (raw.risk_profile || 'balanced') as Preferences['risk_profile'],
-    weekly_budget: Number(raw.weekly_budget || 200),
+    asset_type: 'etf',
+    risk_profile: ((raw.risk_profile || raw.etf_preset || 'balanced') as Preferences['risk_profile']),
+    weekly_budget: Number(raw.weekly_budget || 50),
     screener_limit: fallback,
-    stock_most_active_limit: clamp(Number(raw.stock_most_active_limit || fallback), 10, 200),
-    stock_preset_limit: clamp(Number(raw.stock_preset_limit || fallback), 10, 200),
     etf_preset_limit: clamp(Number(raw.etf_preset_limit || fallback), 10, 200),
-    screener_mode: normalizedMode,
-    stock_preset: (raw.stock_preset || 'weekly_optimized') as StockPreset,
+    screener_mode: 'preset',
     etf_preset: (raw.etf_preset || 'balanced') as EtfPreset,
   };
-  normalized.screener_limit = resolveScreenerLimitForContext(normalized, normalized.asset_type, normalized.screener_mode);
+  normalized.screener_limit = resolveScreenerLimitForContext(normalized);
   return normalized;
 }
 
 const ScreenerPage: React.FC = () => {
   const [assets, setAssets] = useState<Asset[]>([]);
   const [preferences, setPreferences] = useState<Preferences>({
-    asset_type: 'stock',
+    asset_type: 'etf',
     risk_profile: 'balanced',
-    weekly_budget: 200,
+    weekly_budget: 50,
     screener_limit: 50,
-    stock_most_active_limit: 50,
-    stock_preset_limit: 50,
     etf_preset_limit: 50,
-    screener_mode: 'most_active',
-    stock_preset: 'weekly_optimized',
+    screener_mode: 'preset',
     etf_preset: 'balanced',
   });
   const [appliedUniverseQuery, setAppliedUniverseQuery] = useState({
-    asset_type: 'stock' as Preferences['asset_type'],
-    screener_mode: 'most_active' as ScreenerMode,
-    preset: 'weekly_optimized' as PresetType,
+    asset_type: 'etf' as Preferences['asset_type'],
+    screener_mode: 'preset' as ScreenerMode,
+    preset: 'balanced' as EtfPreset,
     preset_universe_mode: 'seed_guardrail_blend' as PresetUniverseMode,
     screener_limit: 50,
     min_dollar_volume: 10000000,
@@ -234,21 +178,22 @@ const ScreenerPage: React.FC = () => {
     auto_regime_adjust: true,
   });
   const [budgetStatus, setBudgetStatus] = useState<BudgetStatus | null>(null);
-  const [screenerMode, setScreenerMode] = useState<ScreenerMode>('most_active');
-  const [preset, setPreset] = useState<PresetType>('weekly_optimized');
-  const [presetUniverseMode, setPresetUniverseMode] = useState<PresetUniverseMode>(() => {
-    if (typeof window === 'undefined') return 'seed_guardrail_blend';
-    try {
-      const storedMode = window.localStorage.getItem(SCREENER_PRESET_UNIVERSE_MODE_KEY);
-      if (storedMode === 'seed_only' || storedMode === 'seed_guardrail_blend' || storedMode === 'guardrail_only') {
-        return storedMode;
-      }
-      return window.localStorage.getItem(SCREENER_PRESET_SEED_ONLY_KEY) === 'true'
-        ? 'seed_only'
-        : 'seed_guardrail_blend';
-    } catch {
-      return 'seed_guardrail_blend';
-    }
+  const [preset, setPreset] = useState<EtfPreset>('balanced');
+  const [etfPolicy, setEtfPolicy] = useState<EtfInvestingPolicy | null>(null);
+  const [policyDraft, setPolicyDraft] = useState<PolicyDraft>({
+    dynamic_candidates_enabled: true,
+    screen_interval_days: 7,
+    replacement_interval_days: 90,
+    max_replacements_per_quarter: 2,
+    min_hold_days_for_replacement: 30,
+    min_replacement_score_delta_pct: 10,
+    min_dollar_volume: 10_000_000,
+    rebalance_drift_threshold_pct: 5,
+    buy_only_rebalance: true,
+    tlh_enabled: false,
+    tlh_min_loss_dollars: 150,
+    tlh_min_loss_pct: 5,
+    tlh_min_hold_days: 31,
   });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -258,20 +203,13 @@ const ScreenerPage: React.FC = () => {
   const [chartError, setChartError] = useState<string | null>(null);
   const [chartRange, setChartRange] = useState<ChartRange>('3m');
   const [chartIndicators, setChartIndicators] = useState<Record<string, number | boolean | null>>({});
-  const [strategies, setStrategies] = useState<Strategy[]>([]);
-  const [selectedStrategyId, setSelectedStrategyId] = useState<string>('');
-  const [newStrategyName, setNewStrategyName] = useState('');
-  const [pinLoading, setPinLoading] = useState(false);
-  const [pinMessage, setPinMessage] = useState<string | null>(null);
-  const [maxPositionSize, setMaxPositionSize] = useState(10000);
-  const [riskLimitDaily, setRiskLimitDaily] = useState(500);
-  const [paperTrading, setPaperTrading] = useState(true);
   const [workspaceSaving, setWorkspaceSaving] = useState(false);
   const [workspaceMessage, setWorkspaceMessage] = useState<string | null>(null);
+  const [deferredUniverseProposal, setDeferredUniverseProposal] = useState(false);
   const [portfolioSummary, setPortfolioSummary] = useState<PortfolioSummaryResponse | null>(null);
   const [brokerAccount, setBrokerAccount] = useState<BrokerAccountResponse | null>(null);
   const [lastRefreshAt, setLastRefreshAt] = useState<string | null>(null);
-  const [lastDataSource, setLastDataSource] = useState<string>('most_active');
+  const [lastDataSource, setLastDataSource] = useState<string>('etf_preset:balanced');
   const [currentPage, setCurrentPage] = useState(1);
   const [pageSize, setPageSize] = useState(25);
   const [totalAssetCount, setTotalAssetCount] = useState(0);
@@ -284,23 +222,29 @@ const ScreenerPage: React.FC = () => {
   const [workspaceValidationError, setWorkspaceValidationError] = useState<string | null>(null);
   const [killSwitchActive, setKillSwitchActive] = useState(false);
   const [blockedReason, setBlockedReason] = useState('');
-  const [optimizingWorkspace, setOptimizingWorkspace] = useState(false);
-  const [portfolioOptimizationSummary, setPortfolioOptimizationSummary] = useState<string | null>(null);
   const [prefsLoaded, setPrefsLoaded] = useState(false);
   const chartSectionRef = useRef<HTMLDivElement | null>(null);
-  const optimizeRequestIdRef = useRef(0);
   const abortControllerRef = useRef<AbortController | null>(null);
   const chartRequestIdRef = useRef(0);
   const chartCacheRef = useRef(
     new Map<string, { points: ChartPoint[]; indicators: Record<string, number | boolean | null>; fetchedAt: number }>()
   );
-  const [strategySignalParams, setStrategySignalParams] = useState({
+  const [strategySignalParams] = useState({
     take_profit_pct: 5.0,
     trailing_stop_pct: 2.5,
     atr_stop_mult: 1.8,
     zscore_entry_threshold: -1.5,
     dip_buy_threshold_pct: 2.0,
   });
+
+  useEffect(() => {
+    try {
+      const raw = window.localStorage.getItem('stocksbot.universe.proposal.deferred');
+      setDeferredUniverseProposal(raw === '1');
+    } catch {
+      setDeferredUniverseProposal(false);
+    }
+  }, []);
 
   const fetchPreferences = useCallback(async () => {
     try {
@@ -309,26 +253,42 @@ const ScreenerPage: React.FC = () => {
       const data = await response.json();
       const normalized = normalizePreferences(data as Partial<Preferences>);
       setPreferences(normalized);
-      setScreenerMode(normalized.screener_mode);
-      if (normalized.asset_type === 'stock') {
-        setPreset(normalized.stock_preset);
-      } else {
-        setPreset(normalized.etf_preset);
-      }
+      setPreset(normalized.etf_preset);
       setAppliedUniverseQuery((prev) => ({
         ...prev,
-        asset_type: normalized.asset_type,
-        screener_mode: normalized.screener_mode,
-        preset: normalized.asset_type === 'etf' ? normalized.etf_preset : normalized.stock_preset,
-        screener_limit: resolveScreenerLimitForContext(
-          normalized,
-          normalized.asset_type,
-          normalized.screener_mode,
-        ),
+        asset_type: 'etf',
+        screener_mode: 'preset',
+        preset: normalized.etf_preset,
+        screener_limit: resolveScreenerLimitForContext(normalized),
       }));
       setPrefsLoaded(true);
     } catch (err) {
       console.error('Error fetching preferences:', err);
+    }
+  }, []);
+
+  const fetchEtfPolicy = useCallback(async () => {
+    try {
+      const policy = await getEtfInvestingPolicy();
+      setEtfPolicy(policy);
+      setPolicyDraft({
+        dynamic_candidates_enabled: Boolean(policy.dynamic_candidates_enabled),
+        screen_interval_days: Number(policy.screen_interval_days || 7),
+        replacement_interval_days: Number(policy.replacement_interval_days || 90),
+        max_replacements_per_quarter: Number(policy.max_replacements_per_quarter || 2),
+        min_hold_days_for_replacement: Number(policy.min_hold_days_for_replacement || 30),
+        min_replacement_score_delta_pct: Number(policy.min_replacement_score_delta_pct || 10),
+        min_dollar_volume: Number(policy.min_dollar_volume || 10_000_000),
+        rebalance_drift_threshold_pct: Number(policy.rebalance_drift_threshold_pct || 5),
+        buy_only_rebalance: Boolean(policy.buy_only_rebalance),
+        tlh_enabled: Boolean(policy.tlh_enabled),
+        tlh_min_loss_dollars: Number(policy.tlh_min_loss_dollars || 150),
+        tlh_min_loss_pct: Number(policy.tlh_min_loss_pct || 5),
+        tlh_min_hold_days: Number(policy.tlh_min_hold_days || 31),
+      });
+      setMinDollarVolume(Number(policy.min_dollar_volume || 10_000_000));
+    } catch (err) {
+      console.error('Error fetching ETF investing policy:', err);
     }
   }, []);
 
@@ -428,8 +388,7 @@ const ScreenerPage: React.FC = () => {
       let url = `${BACKEND_URL}/screener/all?asset_type=${appliedUniverseQuery.asset_type}&limit=${appliedUniverseQuery.screener_limit}&screener_mode=${appliedUniverseQuery.screener_mode}`;
       let dataSource: string = appliedUniverseQuery.screener_mode;
       if (appliedUniverseQuery.screener_mode === 'preset') {
-        const seedOnly = appliedUniverseQuery.preset_universe_mode === 'seed_only';
-        url = `${BACKEND_URL}/screener/preset?asset_type=${appliedUniverseQuery.asset_type}&preset=${appliedUniverseQuery.preset}&limit=${appliedUniverseQuery.screener_limit}&seed_only=${seedOnly}&preset_universe_mode=${appliedUniverseQuery.preset_universe_mode}`;
+        url = `${BACKEND_URL}/screener/preset?asset_type=${appliedUniverseQuery.asset_type}&preset=${appliedUniverseQuery.preset}&limit=${appliedUniverseQuery.screener_limit}&preset_universe_mode=${appliedUniverseQuery.preset_universe_mode}`;
         dataSource = `${appliedUniverseQuery.asset_type}_preset:${appliedUniverseQuery.preset}:${appliedUniverseQuery.preset_universe_mode}`;
       }
       url = `${url}&page=${currentPage}&page_size=${pageSize}&min_dollar_volume=${appliedUniverseQuery.min_dollar_volume}&max_spread_bps=${appliedUniverseQuery.max_spread_bps}&max_sector_weight_pct=${appliedUniverseQuery.max_sector_weight_pct}&auto_regime_adjust=${appliedUniverseQuery.auto_regime_adjust}`;
@@ -446,13 +405,6 @@ const ScreenerPage: React.FC = () => {
       setMarketRegime(data.market_regime || 'unknown');
       setLastDataSource(data.data_source || dataSource);
       setLastRefreshAt(new Date().toISOString());
-      const applied = data.applied_guardrails || {};
-      const holdingsCount = Number(applied.holdings_count || 0);
-      if (applied.portfolio_adjusted) {
-        setPortfolioOptimizationSummary(
-          `Portfolio-aware guardrails active (${holdingsCount} holding${holdingsCount === 1 ? '' : 's'}, buying power ${formatCurrency(Number(applied.buying_power || 0))}).`
-        );
-      }
       if (data.assets?.length > 0) {
         setSelectedSymbol((prev) => {
           const hasSelectedOnPage = prev && data.assets.some((asset: Asset) => asset.symbol === prev);
@@ -491,149 +443,6 @@ const ScreenerPage: React.FC = () => {
     }
   };
 
-  const targetTradesPerWeek = (assetType: Preferences['asset_type'], mode: ScreenerMode, selectedPreset: PresetType): number => {
-    if (assetType === 'etf') return 4;
-    if (mode === 'most_active') return 6;
-    if (selectedPreset === 'monthly_optimized') return 2;
-    if (selectedPreset === 'three_to_five_weekly') return 4;
-    if (selectedPreset === 'small_budget_weekly') return 3;
-    if (selectedPreset === 'micro_budget') return 1;
-    return 6;
-  };
-
-  const applyAdaptiveOptimization = useCallback(async (overrides?: {
-    assetType?: Preferences['asset_type'];
-    mode?: ScreenerMode;
-    preset?: PresetType;
-  }) => {
-    const assetType = overrides?.assetType || preferences.asset_type;
-    const mode = overrides?.mode || (assetType === 'stock' ? screenerMode : 'preset');
-    const presetCandidate =
-      overrides?.preset ||
-      (assetType === 'etf' ? preferences.etf_preset : mode === 'preset' ? preferences.stock_preset : preferences.stock_preset);
-    const presetValue = presetCandidate as PresetType;
-    const requestId = ++optimizeRequestIdRef.current;
-    try {
-      setOptimizingWorkspace(true);
-      const recommendation = await getPreferenceRecommendation({
-        asset_type: assetType,
-        preset: presetValue,
-        weekly_budget: preferences.weekly_budget,
-        target_trades_per_week: targetTradesPerWeek(assetType, mode, presetValue),
-      });
-      if (requestId !== optimizeRequestIdRef.current) return;
-      const guardrails = recommendation.guardrails;
-      const nextMinDollar = Math.max(WORKSPACE_LIMITS.minDollarVolumeMin, Math.min(WORKSPACE_LIMITS.minDollarVolumeMax, Math.round(guardrails.min_dollar_volume)));
-      const nextSpread = Math.max(WORKSPACE_LIMITS.maxSpreadBpsMin, Math.min(WORKSPACE_LIMITS.maxSpreadBpsMax, Math.round(guardrails.max_spread_bps)));
-      const nextSector = Math.max(WORKSPACE_LIMITS.maxSectorWeightMin, Math.min(WORKSPACE_LIMITS.maxSectorWeightMax, Math.round(guardrails.max_sector_weight_pct)));
-      const nextMaxPosition = Math.max(WORKSPACE_LIMITS.maxPositionMin, Math.min(WORKSPACE_LIMITS.maxPositionMax, guardrails.max_position_size));
-      const nextRiskDaily = Math.max(WORKSPACE_LIMITS.riskDailyMin, Math.min(WORKSPACE_LIMITS.riskDailyMax, guardrails.risk_limit_daily));
-      const nextScreenerLimit = Math.max(10, Math.min(200, Math.round(guardrails.screener_limit)));
-      const optimizedDraft = withContextScreenerLimit(
-        {
-          ...preferences,
-          asset_type: assetType,
-          risk_profile: recommendation.risk_profile as RiskProfile,
-          screener_mode: assetType === 'stock' ? mode : 'preset',
-          stock_preset: assetType === 'stock' && mode === 'preset' ? (presetValue as StockPreset) : preferences.stock_preset,
-          etf_preset: assetType === 'etf' ? (presetValue as EtfPreset) : preferences.etf_preset,
-        },
-        assetType,
-        assetType === 'stock' ? mode : 'preset',
-        nextScreenerLimit,
-      );
-
-      setMinDollarVolume(nextMinDollar);
-      setMaxSpreadBps(nextSpread);
-      setMaxSectorWeightPct(nextSector);
-      setMaxPositionSize(nextMaxPosition);
-      setRiskLimitDaily(nextRiskDaily);
-      setPreferences(optimizedDraft);
-      setScreenerMode(optimizedDraft.screener_mode);
-      setPreset(assetType === 'etf' ? optimizedDraft.etf_preset : optimizedDraft.stock_preset);
-      const [, updatedPrefs] = await Promise.all([
-        updateConfig({
-          max_position_size: nextMaxPosition,
-          risk_limit_daily: nextRiskDaily,
-        }),
-        updatePreferences({
-          asset_type: optimizedDraft.asset_type,
-          risk_profile: optimizedDraft.risk_profile,
-          weekly_budget: optimizedDraft.weekly_budget,
-          screener_mode: optimizedDraft.screener_mode,
-          stock_preset: optimizedDraft.stock_preset,
-          etf_preset: optimizedDraft.etf_preset,
-          screener_limit: optimizedDraft.screener_limit,
-          stock_most_active_limit: optimizedDraft.stock_most_active_limit,
-          stock_preset_limit: optimizedDraft.stock_preset_limit,
-          etf_preset_limit: optimizedDraft.etf_preset_limit,
-        }),
-      ]);
-      const snapshotPrefs = updatedPrefs || optimizedDraft;
-      const effectiveMode = snapshotPrefs.asset_type === 'stock' ? snapshotPrefs.screener_mode : 'preset';
-      const effectivePreset = snapshotPrefs.asset_type === 'etf' ? snapshotPrefs.etf_preset : snapshotPrefs.stock_preset;
-      setCurrentPage(1);
-      resetUniverseSelectionState();
-      setAppliedUniverseQuery((prev) => ({
-        ...prev,
-        asset_type: snapshotPrefs.asset_type,
-        screener_mode: effectiveMode,
-        preset: effectivePreset,
-        preset_universe_mode: presetUniverseMode,
-        screener_limit: resolveScreenerLimitForContext(snapshotPrefs, snapshotPrefs.asset_type, effectiveMode),
-        min_dollar_volume: nextMinDollar,
-        max_spread_bps: nextSpread,
-        max_sector_weight_pct: nextSector,
-        auto_regime_adjust: autoRegimeAdjust,
-      }));
-      persistWorkspaceSnapshot({
-        asset_type: snapshotPrefs.asset_type,
-        screener_mode: effectiveMode,
-        stock_preset: snapshotPrefs.stock_preset,
-        etf_preset: snapshotPrefs.etf_preset,
-        preset_universe_mode: presetUniverseMode,
-        seed_only_preset: presetUniverseMode === 'seed_only',
-        screener_limit: resolveScreenerLimitForContext(snapshotPrefs, snapshotPrefs.asset_type, effectiveMode),
-        stock_most_active_limit: snapshotPrefs.stock_most_active_limit,
-        stock_preset_limit: snapshotPrefs.stock_preset_limit,
-        etf_preset_limit: snapshotPrefs.etf_preset_limit,
-        min_dollar_volume: nextMinDollar,
-        max_spread_bps: nextSpread,
-        max_sector_weight_pct: nextSector,
-        auto_regime_adjust: autoRegimeAdjust,
-      });
-      markWorkspaceApplied('auto_optimize');
-      setPortfolioOptimizationSummary(
-        `Auto-optimized for ${recommendation.asset_type.toUpperCase()} ${recommendation.preset}: Equity ${formatCurrency(recommendation.portfolio_context.equity)}, Buying Power ${formatCurrency(recommendation.portfolio_context.buying_power)}, Holdings ${recommendation.portfolio_context.holdings_count}.`
-      );
-      setWorkspaceMessage('Auto-optimization applied from current portfolio context.');
-    } catch (err) {
-      if (requestId !== optimizeRequestIdRef.current) return;
-      setWorkspaceMessage(err instanceof Error ? err.message : 'Failed to auto-optimize from portfolio context.');
-    } finally {
-      if (requestId === optimizeRequestIdRef.current) {
-        setOptimizingWorkspace(false);
-      }
-    }
-  }, [
-    autoRegimeAdjust,
-    preferences,
-    screenerMode,
-    presetUniverseMode,
-    resetUniverseSelectionState,
-  ]);
-
-  const fetchConfig = useCallback(async () => {
-    try {
-      const config = await getConfig();
-      setMaxPositionSize(config.max_position_size);
-      setRiskLimitDaily(config.risk_limit_daily);
-      setPaperTrading(config.paper_trading);
-    } catch (err) {
-      console.error('Error fetching config:', err);
-    }
-  }, []);
-
   const fetchPortfolioSummary = useCallback(async () => {
     try {
       const summary = await getPortfolioSummary();
@@ -663,7 +472,7 @@ const ScreenerPage: React.FC = () => {
 
   const fetchSafetyPreflight = useCallback(async (symbol?: string) => {
     try {
-      const preflight = await getSafetyPreflight((symbol || 'AAPL').toUpperCase());
+      const preflight = await getSafetyPreflight((symbol || 'SPY').toUpperCase());
       setBlockedReason(preflight.allowed ? '' : preflight.reason);
     } catch {
       setBlockedReason('');
@@ -675,12 +484,6 @@ const ScreenerPage: React.FC = () => {
     if (preferences.weekly_budget < WORKSPACE_LIMITS.weeklyBudgetMin || preferences.weekly_budget > WORKSPACE_LIMITS.weeklyBudgetMax) {
       validationErrors.push(`Weekly budget must be between ${WORKSPACE_LIMITS.weeklyBudgetMin} and ${WORKSPACE_LIMITS.weeklyBudgetMax}.`);
     }
-    if (maxPositionSize < WORKSPACE_LIMITS.maxPositionMin || maxPositionSize > WORKSPACE_LIMITS.maxPositionMax) {
-      validationErrors.push(`Max position size must be between ${WORKSPACE_LIMITS.maxPositionMin} and ${WORKSPACE_LIMITS.maxPositionMax}.`);
-    }
-    if (riskLimitDaily < WORKSPACE_LIMITS.riskDailyMin || riskLimitDaily > WORKSPACE_LIMITS.riskDailyMax) {
-      validationErrors.push(`Daily loss limit must be between ${WORKSPACE_LIMITS.riskDailyMin} and ${WORKSPACE_LIMITS.riskDailyMax}.`);
-    }
     if (minDollarVolume < WORKSPACE_LIMITS.minDollarVolumeMin || minDollarVolume > WORKSPACE_LIMITS.minDollarVolumeMax) {
       validationErrors.push(`Min dollar volume must be between ${WORKSPACE_LIMITS.minDollarVolumeMin} and ${WORKSPACE_LIMITS.minDollarVolumeMax}.`);
     }
@@ -689,9 +492,6 @@ const ScreenerPage: React.FC = () => {
     }
     if (maxSectorWeightPct < WORKSPACE_LIMITS.maxSectorWeightMin || maxSectorWeightPct > WORKSPACE_LIMITS.maxSectorWeightMax) {
       validationErrors.push(`Max sector weight must be between ${WORKSPACE_LIMITS.maxSectorWeightMin}% and ${WORKSPACE_LIMITS.maxSectorWeightMax}%.`);
-    }
-    if (preferences.asset_type !== 'stock' && screenerMode === 'most_active') {
-      validationErrors.push('Most Active universe is only available for Stocks.');
     }
     if (validationErrors.length > 0) {
       setWorkspaceValidationError(validationErrors[0]);
@@ -702,10 +502,8 @@ const ScreenerPage: React.FC = () => {
       setWorkspaceSaving(true);
       setWorkspaceMessage(null);
       setWorkspaceValidationError(null);
-      const effectiveRiskProfile: RiskProfile =
-        preferences.asset_type === 'etf' ? preferences.etf_preset : preferences.risk_profile;
-      const effectiveScreenerMode: ScreenerMode =
-        preferences.asset_type === 'stock' ? screenerMode : 'preset';
+      const effectiveRiskProfile: Preferences['risk_profile'] = preferences.etf_preset;
+      const effectiveScreenerMode: ScreenerMode = 'preset';
       const draftToCommit = normalizePreferences({
         ...preferences,
         screener_mode: effectiveScreenerMode,
@@ -713,33 +511,58 @@ const ScreenerPage: React.FC = () => {
       });
 
       const committedPrefs = await updatePreferences({
-        asset_type: draftToCommit.asset_type,
+        asset_type: 'etf',
         risk_profile: draftToCommit.risk_profile,
         weekly_budget: draftToCommit.weekly_budget,
-        screener_limit: resolveScreenerLimitForContext(draftToCommit, draftToCommit.asset_type, effectiveScreenerMode),
-        stock_most_active_limit: draftToCommit.stock_most_active_limit,
-        stock_preset_limit: draftToCommit.stock_preset_limit,
         etf_preset_limit: draftToCommit.etf_preset_limit,
         screener_mode: effectiveScreenerMode,
-        stock_preset: draftToCommit.stock_preset,
         etf_preset: draftToCommit.etf_preset,
       });
-      await updateConfig({
-        max_position_size: maxPositionSize,
-        risk_limit_daily: riskLimitDaily,
+      const committedPolicy = await updateEtfInvestingPolicy({
+        dynamic_candidates_enabled: policyDraft.dynamic_candidates_enabled,
+        screen_interval_days: Math.max(1, Math.round(policyDraft.screen_interval_days)),
+        replacement_interval_days: Math.max(1, Math.round(policyDraft.replacement_interval_days)),
+        max_replacements_per_quarter: Math.max(0, Math.round(policyDraft.max_replacements_per_quarter)),
+        min_hold_days_for_replacement: Math.max(0, Math.round(policyDraft.min_hold_days_for_replacement)),
+        min_replacement_score_delta_pct: Math.max(0, Number(policyDraft.min_replacement_score_delta_pct)),
+        min_dollar_volume: clamp(minDollarVolume, WORKSPACE_LIMITS.minDollarVolumeMin, WORKSPACE_LIMITS.minDollarVolumeMax),
+        rebalance_drift_threshold_pct: Math.max(0, Number(policyDraft.rebalance_drift_threshold_pct)),
+        buy_only_rebalance: policyDraft.buy_only_rebalance,
+        tlh_enabled: policyDraft.tlh_enabled,
+        tlh_min_loss_dollars: Math.max(0, Number(policyDraft.tlh_min_loss_dollars)),
+        tlh_min_loss_pct: Math.max(0, Number(policyDraft.tlh_min_loss_pct)),
+        tlh_min_hold_days: Math.max(0, Math.round(policyDraft.tlh_min_hold_days)),
       });
+      setEtfPolicy(committedPolicy);
+      setPolicyDraft({
+        dynamic_candidates_enabled: Boolean(committedPolicy.dynamic_candidates_enabled),
+        screen_interval_days: Number(committedPolicy.screen_interval_days || 7),
+        replacement_interval_days: Number(committedPolicy.replacement_interval_days || 90),
+        max_replacements_per_quarter: Number(committedPolicy.max_replacements_per_quarter || 2),
+        min_hold_days_for_replacement: Number(committedPolicy.min_hold_days_for_replacement || 30),
+        min_replacement_score_delta_pct: Number(committedPolicy.min_replacement_score_delta_pct || 10),
+        min_dollar_volume: Number(committedPolicy.min_dollar_volume || 10_000_000),
+        rebalance_drift_threshold_pct: Number(committedPolicy.rebalance_drift_threshold_pct || 5),
+        buy_only_rebalance: Boolean(committedPolicy.buy_only_rebalance),
+        tlh_enabled: Boolean(committedPolicy.tlh_enabled),
+        tlh_min_loss_dollars: Number(committedPolicy.tlh_min_loss_dollars || 150),
+        tlh_min_loss_pct: Number(committedPolicy.tlh_min_loss_pct || 5),
+        tlh_min_hold_days: Number(committedPolicy.tlh_min_hold_days || 31),
+      });
+      setMinDollarVolume(Number(committedPolicy.min_dollar_volume || minDollarVolume));
       const snapshotPrefs = committedPrefs || draftToCommit;
-      const effectiveMode = snapshotPrefs.asset_type === 'stock' ? snapshotPrefs.screener_mode : 'preset';
-      const effectivePreset = snapshotPrefs.asset_type === 'etf' ? snapshotPrefs.etf_preset : snapshotPrefs.stock_preset;
+      const effectiveMode: ScreenerMode = 'preset';
+      const effectivePreset = snapshotPrefs.etf_preset;
       setCurrentPage(1);
+      resetUniverseSelectionState();
       setAppliedUniverseQuery((prev) => ({
         ...prev,
-        asset_type: snapshotPrefs.asset_type,
+        asset_type: 'etf',
         screener_mode: effectiveMode,
         preset: effectivePreset,
-        preset_universe_mode: presetUniverseMode,
-        screener_limit: resolveScreenerLimitForContext(snapshotPrefs, snapshotPrefs.asset_type, effectiveMode),
-        min_dollar_volume: clamp(minDollarVolume, WORKSPACE_LIMITS.minDollarVolumeMin, WORKSPACE_LIMITS.minDollarVolumeMax),
+        preset_universe_mode: 'seed_guardrail_blend',
+        screener_limit: resolveScreenerLimitForContext(snapshotPrefs),
+        min_dollar_volume: Number(committedPolicy.min_dollar_volume || minDollarVolume),
         max_spread_bps: clamp(maxSpreadBps, WORKSPACE_LIMITS.maxSpreadBpsMin, WORKSPACE_LIMITS.maxSpreadBpsMax),
         max_sector_weight_pct: clamp(maxSectorWeightPct, WORKSPACE_LIMITS.maxSectorWeightMin, WORKSPACE_LIMITS.maxSectorWeightMax),
         auto_regime_adjust: autoRegimeAdjust,
@@ -747,24 +570,8 @@ const ScreenerPage: React.FC = () => {
       await fetchBudgetStatus();
       await fetchPortfolioSummary();
       await fetchBrokerAccount();
-      persistWorkspaceSnapshot({
-        asset_type: snapshotPrefs.asset_type,
-        screener_mode: effectiveMode,
-        stock_preset: snapshotPrefs.stock_preset,
-        etf_preset: snapshotPrefs.etf_preset,
-        preset_universe_mode: presetUniverseMode,
-        seed_only_preset: presetUniverseMode === 'seed_only',
-        screener_limit: resolveScreenerLimitForContext(snapshotPrefs, snapshotPrefs.asset_type, effectiveMode),
-        stock_most_active_limit: snapshotPrefs.stock_most_active_limit,
-        stock_preset_limit: snapshotPrefs.stock_preset_limit,
-        etf_preset_limit: snapshotPrefs.etf_preset_limit,
-        min_dollar_volume: minDollarVolume,
-        max_spread_bps: maxSpreadBps,
-        max_sector_weight_pct: maxSectorWeightPct,
-        auto_regime_adjust: autoRegimeAdjust,
-      });
       markWorkspaceApplied('manual');
-      setWorkspaceMessage('Workspace settings applied successfully.');
+      setWorkspaceMessage('ETF policy and universe settings saved.');
     } catch (err) {
       setWorkspaceMessage(err instanceof Error ? err.message : 'Failed to apply workspace settings.');
     } finally {
@@ -772,106 +579,19 @@ const ScreenerPage: React.FC = () => {
     }
   };
 
-  const fetchStrategies = useCallback(async () => {
-    try {
-      const response = await getStrategies();
-      const allStrategies = response.strategies || [];
-      setStrategies(allStrategies);
-      setSelectedStrategyId((prev) => {
-        if (allStrategies.length === 0) return '__new__';
-        const hasExistingSelection = allStrategies.some((s) => s.id === prev);
-        if (hasExistingSelection && prev) return prev;
-        const active = allStrategies.find((s) => s.status === StrategyStatus.ACTIVE);
-        return (active || allStrategies[0]).id;
-      });
-    } catch (err) {
-      console.error('Error fetching strategies:', err);
-    }
-  }, []);
-
   useEffect(() => {
     fetchPreferences();
+    fetchEtfPolicy();
     fetchBudgetStatus();
-    fetchStrategies();
-    fetchConfig();
     fetchPortfolioSummary();
     fetchBrokerAccount();
     fetchSafetyStatus();
-    fetchSafetyPreflight('AAPL');
-  }, [fetchPreferences, fetchBudgetStatus, fetchStrategies, fetchConfig, fetchPortfolioSummary, fetchBrokerAccount, fetchSafetyStatus, fetchSafetyPreflight]);
+    fetchSafetyPreflight('SPY');
+  }, [fetchPreferences, fetchEtfPolicy, fetchBudgetStatus, fetchPortfolioSummary, fetchBrokerAccount, fetchSafetyStatus, fetchSafetyPreflight]);
 
   useEffect(() => {
-    void fetchSafetyPreflight(selectedSymbol || 'AAPL');
+    void fetchSafetyPreflight(selectedSymbol || 'SPY');
   }, [selectedSymbol, fetchSafetyPreflight]);
-
-  /* Restore workspace guardrails once preferences have been loaded from the API.
-     First tries the localStorage snapshot (instant, no API call). */
-  useEffect(() => {
-    if (!prefsLoaded) return;
-
-    // Try to restore from localStorage snapshot
-    try {
-      const raw = window.localStorage.getItem(WORKSPACE_SNAPSHOT_KEY);
-      if (raw) {
-        const snapshot = JSON.parse(raw);
-        const currentPreset = preferences.asset_type === 'etf' ? preferences.etf_preset : preferences.stock_preset;
-        if (
-          snapshot.asset_type === preferences.asset_type &&
-          (snapshot.stock_preset === currentPreset || snapshot.etf_preset === currentPreset)
-        ) {
-          const restoredPrefs = normalizePreferences({
-            ...preferences,
-            stock_most_active_limit: Number.isFinite(snapshot.stock_most_active_limit)
-              ? Number(snapshot.stock_most_active_limit)
-              : preferences.stock_most_active_limit,
-            stock_preset_limit: Number.isFinite(snapshot.stock_preset_limit)
-              ? Number(snapshot.stock_preset_limit)
-              : preferences.stock_preset_limit,
-            etf_preset_limit: Number.isFinite(snapshot.etf_preset_limit)
-              ? Number(snapshot.etf_preset_limit)
-              : preferences.etf_preset_limit,
-          });
-          setPreferences(restoredPrefs);
-          if (
-            snapshot.preset_universe_mode === 'seed_only'
-            || snapshot.preset_universe_mode === 'seed_guardrail_blend'
-            || snapshot.preset_universe_mode === 'guardrail_only'
-          ) {
-            setPresetUniverseMode(snapshot.preset_universe_mode);
-          } else if (typeof snapshot.seed_only_preset === 'boolean') {
-            setPresetUniverseMode(snapshot.seed_only_preset ? 'seed_only' : 'seed_guardrail_blend');
-          }
-          if (Number.isFinite(snapshot.min_dollar_volume)) setMinDollarVolume(snapshot.min_dollar_volume);
-          if (Number.isFinite(snapshot.max_spread_bps)) setMaxSpreadBps(snapshot.max_spread_bps);
-          if (Number.isFinite(snapshot.max_sector_weight_pct)) setMaxSectorWeightPct(snapshot.max_sector_weight_pct);
-          if (typeof snapshot.auto_regime_adjust === 'boolean') setAutoRegimeAdjust(snapshot.auto_regime_adjust);
-          setAppliedUniverseQuery((prev) => ({
-            ...prev,
-            asset_type: restoredPrefs.asset_type,
-            screener_mode: restoredPrefs.asset_type === 'stock' ? restoredPrefs.screener_mode : 'preset',
-            preset: (restoredPrefs.asset_type === 'etf' ? restoredPrefs.etf_preset : restoredPrefs.stock_preset),
-            preset_universe_mode:
-              snapshot.preset_universe_mode === 'seed_only'
-              || snapshot.preset_universe_mode === 'seed_guardrail_blend'
-              || snapshot.preset_universe_mode === 'guardrail_only'
-                ? snapshot.preset_universe_mode
-                : presetUniverseMode,
-            screener_limit: resolveScreenerLimitForContext(
-              restoredPrefs,
-              restoredPrefs.asset_type,
-              restoredPrefs.asset_type === 'stock' ? restoredPrefs.screener_mode : 'preset',
-            ),
-            min_dollar_volume: Number.isFinite(snapshot.min_dollar_volume) ? Number(snapshot.min_dollar_volume) : prev.min_dollar_volume,
-            max_spread_bps: Number.isFinite(snapshot.max_spread_bps) ? Number(snapshot.max_spread_bps) : prev.max_spread_bps,
-            max_sector_weight_pct: Number.isFinite(snapshot.max_sector_weight_pct) ? Number(snapshot.max_sector_weight_pct) : prev.max_sector_weight_pct,
-            auto_regime_adjust: typeof snapshot.auto_regime_adjust === 'boolean' ? snapshot.auto_regime_adjust : prev.auto_regime_adjust,
-          }));
-          return; // Restored successfully
-        }
-      }
-    } catch { /* ignore parse errors */ }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [prefsLoaded]);
 
   useEffect(() => {
     if (!prefsLoaded) return;
@@ -882,129 +602,30 @@ const ScreenerPage: React.FC = () => {
   }, [prefsLoaded, fetchAssets]);
 
   useEffect(() => {
-    if (typeof window === 'undefined') return;
-    try {
-      window.localStorage.setItem(SCREENER_PRESET_UNIVERSE_MODE_KEY, presetUniverseMode);
-      window.localStorage.setItem(
-        SCREENER_PRESET_SEED_ONLY_KEY,
-        String(presetUniverseMode === 'seed_only'),
-      );
-    } catch {
-      // Best effort only.
-    }
-  }, [presetUniverseMode]);
-
-  useEffect(() => {
     if (selectedSymbol) {
       fetchChart(selectedSymbol);
     }
   }, [selectedSymbol, fetchChart]);
 
-  useEffect(() => {
-    const loadStrategySignalParams = async () => {
-      if (!selectedStrategyId || selectedStrategyId === '__new__') return;
-      try {
-        const config = await getStrategyConfig(selectedStrategyId);
-        const map = Object.fromEntries(config.parameters.map((p) => [p.name, p.value]));
-        setStrategySignalParams({
-          take_profit_pct: Number(map.take_profit_pct ?? 5.0),
-          trailing_stop_pct: Number(map.trailing_stop_pct ?? 2.5),
-          atr_stop_mult: Number(map.atr_stop_mult ?? 1.8),
-          zscore_entry_threshold: Number(map.zscore_entry_threshold ?? -1.5),
-          dip_buy_threshold_pct: Number(map.dip_buy_threshold_pct ?? 2.0),
-        });
-      } catch (err) {
-        console.error('Failed to load strategy signal params:', err);
-      }
-    };
-    loadStrategySignalParams();
-  }, [selectedStrategyId]);
-
-  const handlePinToStrategy = async () => {
-    if (!selectedSymbol) {
-      setPinMessage('Select a symbol first.');
-      return;
-    }
-
-    try {
-      setPinLoading(true);
-      setPinMessage(null);
-
-      if (selectedStrategyId === '__new__') {
-        const strategyName = newStrategyName.trim() || `Pinned ${selectedSymbol}`;
-        await createStrategy({
-          name: strategyName,
-          description: 'Created from Screener chart pin',
-          symbols: [selectedSymbol],
-        });
-        setPinMessage(`Created strategy "${strategyName}" with ${selectedSymbol}.`);
-        setNewStrategyName('');
-      } else {
-        const target = strategies.find((s) => s.id === selectedStrategyId);
-        if (!target) {
-          setPinMessage('Select a valid strategy.');
-          return;
-        }
-        const nextSymbols = Array.from(new Set([...(target.symbols || []), selectedSymbol]));
-        await updateStrategy(target.id, { symbols: nextSymbols });
-        setPinMessage(`Pinned ${selectedSymbol} to strategy "${target.name}".`);
-      }
-
-      await fetchStrategies();
-    } catch (err) {
-      setPinMessage(err instanceof Error ? err.message : 'Failed to pin symbol to strategy.');
-    } finally {
-      setPinLoading(false);
-    }
-  };
-
   const formatPercent = (value: number) => `${value >= 0 ? '+' : ''}${value.toFixed(2)}%`;
-  const appliedPresetUniverseModeLabel =
-    appliedUniverseQuery.preset_universe_mode === 'seed_only'
-      ? 'Seed Only'
-      : appliedUniverseQuery.preset_universe_mode === 'guardrail_only'
-      ? 'Guardrail Universe Only'
-      : 'Seed + Guardrail Blend';
   const activePresetLabel = String(appliedUniverseQuery.preset || '').replace(/_/g, ' ');
-  const draftScreenerLimit = resolveScreenerLimitForContext(
-    preferences,
-    preferences.asset_type,
-    preferences.asset_type === 'stock' ? screenerMode : 'preset',
-  );
-  const activeUniverseLabel =
-    appliedUniverseQuery.asset_type === 'stock'
-      ? appliedUniverseQuery.screener_mode === 'most_active'
-        ? `Most Active (${appliedUniverseQuery.screener_limit})`
-        : `Stock Preset: ${activePresetLabel} (${appliedPresetUniverseModeLabel})`
-      : appliedUniverseQuery.asset_type === 'etf'
-      ? `ETF Preset: ${activePresetLabel} (${appliedPresetUniverseModeLabel})`
-      : `Stock Preset: ${activePresetLabel}`;
-  const draftMode = preferences.asset_type === 'stock' ? screenerMode : 'preset';
-  const draftPreset = preferences.asset_type === 'etf' ? preferences.etf_preset : preferences.stock_preset;
+  const activeUniverseLabel = `ETF Profile: ${activePresetLabel}`;
   const hasPendingUniverseChanges =
-    appliedUniverseQuery.asset_type !== preferences.asset_type
-    || appliedUniverseQuery.screener_mode !== draftMode
-    || appliedUniverseQuery.preset !== draftPreset
-    || appliedUniverseQuery.preset_universe_mode !== presetUniverseMode
-    || appliedUniverseQuery.screener_limit !== draftScreenerLimit
+    appliedUniverseQuery.asset_type !== 'etf'
+    || appliedUniverseQuery.screener_mode !== 'preset'
+    || appliedUniverseQuery.preset !== preferences.etf_preset
+    || appliedUniverseQuery.screener_limit !== resolveScreenerLimitForContext(preferences)
     || appliedUniverseQuery.min_dollar_volume !== clamp(minDollarVolume, WORKSPACE_LIMITS.minDollarVolumeMin, WORKSPACE_LIMITS.minDollarVolumeMax)
     || appliedUniverseQuery.max_spread_bps !== clamp(maxSpreadBps, WORKSPACE_LIMITS.maxSpreadBpsMin, WORKSPACE_LIMITS.maxSpreadBpsMax)
     || appliedUniverseQuery.max_sector_weight_pct !== clamp(maxSectorWeightPct, WORKSPACE_LIMITS.maxSectorWeightMin, WORKSPACE_LIMITS.maxSectorWeightMax)
     || appliedUniverseQuery.auto_regime_adjust !== autoRegimeAdjust;
 
-  const stockPresets: Array<{ value: StockPreset; label: string }> = [
-    { value: 'weekly_optimized', label: 'Weekly Optimized' },
-    { value: 'three_to_five_weekly', label: '3-5 Trades / Week' },
-    { value: 'monthly_optimized', label: 'Monthly Optimized' },
-    { value: 'small_budget_weekly', label: 'Small Budget Weekly' },
-    { value: 'micro_budget', label: 'Micro Budget ($20-50/wk)' },
-  ];
   const etfPresets: Array<{ value: EtfPreset; label: string }> = [
     { value: 'conservative', label: 'Conservative' },
     { value: 'balanced', label: 'Balanced' },
     { value: 'aggressive', label: 'Aggressive' },
   ];
-  const presetOptions = preferences.asset_type === 'etf' ? etfPresets : stockPresets;
+  const presetOptions = etfPresets;
   const prettyLastRefresh = lastRefreshAt ? formatTimestamp(lastRefreshAt) : 'Not refreshed yet';
   const prettyDataSource =
     lastDataSource === 'alpaca'
@@ -1013,32 +634,47 @@ const ScreenerPage: React.FC = () => {
       ? 'Fallback'
       : lastDataSource === 'mixed'
       ? 'Mixed (Alpaca + Fallback)'
-      : lastDataSource === 'most_active'
-      ? 'Most Active'
       : lastDataSource
           .replace('_preset:', ' Preset: ')
-          .replace(':seed_only', ' (Seed Only)')
-          .replace(':seed_guardrail_blend', ' (Seed + Guardrail Blend)')
-          .replace(':guardrail_only', ' (Guardrail Universe Only)')
           .replace('stock', 'Stock')
           .replace('etf', 'ETF');
   const safePage = Math.max(1, Math.min(currentPage, totalPages));
   const pageStartLabel = totalAssetCount === 0 ? 0 : (safePage - 1) * pageSize + 1;
   const pageEndLabel = totalAssetCount === 0 ? 0 : Math.min((safePage - 1) * pageSize + assets.length, totalAssetCount);
+  const allowListRoleBySymbol = useMemo(() => {
+    const rows = etfPolicy?.allow_list || [];
+    return rows.reduce((acc, row) => {
+      if (!row?.symbol) return acc;
+      acc[String(row.symbol).toUpperCase()] = String(row.role || 'both').toUpperCase();
+      return acc;
+    }, {} as Record<string, string>);
+  }, [etfPolicy?.allow_list]);
+  const curatedAssets = assets.slice(0, 8);
+  const enabledAllowSymbols = useMemo(
+    () =>
+      (etfPolicy?.allow_list || [])
+        .filter((row) => row.enabled !== false)
+        .map((row) => String(row.symbol || '').toUpperCase())
+        .filter(Boolean),
+    [etfPolicy?.allow_list],
+  );
+  const candidateAdds = curatedAssets
+    .map((asset) => asset.symbol.toUpperCase())
+    .filter((symbol) => !enabledAllowSymbols.includes(symbol))
+    .slice(0, 3);
+  const candidateDrops = enabledAllowSymbols
+    .filter((symbol) => !curatedAssets.some((asset) => asset.symbol.toUpperCase() === symbol))
+    .slice(0, 3);
+  const hasUniverseProposal = !deferredUniverseProposal && (candidateAdds.length > 0 || candidateDrops.length > 0);
   const workspaceHasValidationError =
     preferences.weekly_budget < WORKSPACE_LIMITS.weeklyBudgetMin ||
     preferences.weekly_budget > WORKSPACE_LIMITS.weeklyBudgetMax ||
-    maxPositionSize < WORKSPACE_LIMITS.maxPositionMin ||
-    maxPositionSize > WORKSPACE_LIMITS.maxPositionMax ||
-    riskLimitDaily < WORKSPACE_LIMITS.riskDailyMin ||
-    riskLimitDaily > WORKSPACE_LIMITS.riskDailyMax ||
     minDollarVolume < WORKSPACE_LIMITS.minDollarVolumeMin ||
     minDollarVolume > WORKSPACE_LIMITS.minDollarVolumeMax ||
     maxSpreadBps < WORKSPACE_LIMITS.maxSpreadBpsMin ||
     maxSpreadBps > WORKSPACE_LIMITS.maxSpreadBpsMax ||
     maxSectorWeightPct < WORKSPACE_LIMITS.maxSectorWeightMin ||
-    maxSectorWeightPct > WORKSPACE_LIMITS.maxSectorWeightMax ||
-    (preferences.asset_type !== 'stock' && screenerMode === 'most_active');
+    maxSectorWeightPct > WORKSPACE_LIMITS.maxSectorWeightMax;
 
   useEffect(() => {
     if (currentPage !== safePage) {
@@ -1046,29 +682,54 @@ const ScreenerPage: React.FC = () => {
     }
   }, [currentPage, safePage]);
 
+  const classifyLiquidity = (asset: Asset): { label: string; tone: string } => {
+    const dollarVolume = Number(asset.dollar_volume || 0);
+    const spread = Number(asset.spread_bps || 9999);
+    if (dollarVolume >= 100_000_000 && spread <= 10) return { label: 'High Liquidity', tone: 'text-emerald-300 border-emerald-700 bg-emerald-900/30' };
+    if (dollarVolume >= 25_000_000 && spread <= 25) return { label: 'Good Liquidity', tone: 'text-sky-300 border-sky-700 bg-sky-900/30' };
+    return { label: 'Watch Liquidity', tone: 'text-amber-300 border-amber-700 bg-amber-900/30' };
+  };
+
+  const classifyCluster = (asset: Asset): string => {
+    const sector = String(asset.sector || '').toLowerCase();
+    if (sector.includes('technology')) return 'Growth Cluster';
+    if (sector.includes('health') || sector.includes('defensive')) return 'Defensive Cluster';
+    if (sector.includes('bond') || sector.includes('fixed')) return 'Income Cluster';
+    return 'Core Market Cluster';
+  };
+
+  const handleUniverseProposalAcknowledge = (mode: 'approve' | 'defer') => {
+    const deferred = mode === 'defer';
+    setDeferredUniverseProposal(true);
+    setWorkspaceMessage(
+      deferred
+        ? 'Universe recommendation deferred. Current allow-list remains active.'
+        : 'Universe recommendation approved for review. Apply policy changes before next quarter rollover.',
+    );
+    try {
+      window.localStorage.setItem('stocksbot.universe.proposal.deferred', '1');
+    } catch {
+      // best effort
+    }
+  };
+
   return (
     <div className="p-4 md:p-6 xl:p-8">
       <div className="mx-auto w-full max-w-[1600px]">
         <PageHeader
-          title="Market Screener"
-          description="Unified trading workspace: universe, symbols, charts, metrics, and guardrails"
+          title="ETF Universe"
+          description="Dynamic ETF selection, guardrails, symbols, and chart context"
           helpSection="screener"
         />
         <div className="mb-4 rounded-lg border border-emerald-700 bg-emerald-900/20 px-4 py-3">
           <p className="text-sm text-emerald-100">
-            Active Setup:
-            {' '}
-            <span className="font-semibold uppercase">{preferences.asset_type}</span>
-            {' | '}
-            <span className="font-semibold">{activeUniverseLabel}</span>
-            {' | '}
-            <span className="font-semibold">Risk {preferences.asset_type === 'etf' ? preferences.etf_preset : preferences.risk_profile}</span>
-            {' | '}
-            <span className="font-semibold">Weekly Budget {formatCurrency(preferences.weekly_budget)}</span>
+            Active Setup: <span className="font-semibold">{activeUniverseLabel}</span>
+            {' | '}Contribution <span className="font-semibold">{formatCurrency(preferences.weekly_budget)}</span>
+            {' | '}Mode <span className="font-semibold">{(brokerAccount?.mode || 'paper').toUpperCase()}</span>
           </p>
           {hasPendingUniverseChanges && (
             <p className="mt-1 text-xs text-amber-200">
-              Draft changes pending. Click <span className="font-semibold">Apply Universe &amp; Guardrails</span> to refresh the active universe.
+              Draft changes pending. Click <span className="font-semibold">Save &amp; Refresh Universe</span> to apply.
             </p>
           )}
           <p className="mt-1 text-xs text-emerald-200/90">
@@ -1078,15 +739,8 @@ const ScreenerPage: React.FC = () => {
             {' | '}
             Regime: <span className="font-semibold">{marketRegime.replace('_', ' ')}</span>
             {' | '}
-            Symbols returned: <span className="font-semibold">{assets.length}</span>
-            {' | '}
-            Total symbols: <span className="font-semibold">{totalAssetCount}</span>
-            {' | '}
-            Runner Mode: <span className="font-semibold">{paperTrading ? 'Paper' : 'Live'}</span>
-            {' | '}
-            Selected: <span className="font-semibold">{selectedSymbol || '-'}</span>
-            {' | '}
-            Chart Range: <span className="font-semibold">{chartRange.toUpperCase()}</span>
+            Symbols: <span className="font-semibold">{assets.length}/{totalAssetCount}</span>
+            {' | '}Selected: <span className="font-semibold">{selectedSymbol || '-'}</span>
           </p>
           <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
             <span className={`rounded px-2 py-1 font-semibold ${killSwitchActive ? 'bg-red-900/70 text-red-200' : 'bg-emerald-800/60 text-emerald-100'}`}>
@@ -1095,14 +749,90 @@ const ScreenerPage: React.FC = () => {
             {!killSwitchActive && blockedReason && (
               <span className="rounded bg-amber-900/70 px-2 py-1 text-amber-200">Block reason: {blockedReason}</span>
             )}
-            {portfolioOptimizationSummary && (
-              <span className="rounded bg-blue-900/60 px-2 py-1 text-blue-100">{portfolioOptimizationSummary}</span>
-            )}
           </div>
           {lastDataSource !== 'alpaca' && (
             <p className="mt-2 text-xs text-amber-200">
               Screener is not fully Alpaca-backed right now. Check Alpaca credentials/runtime connectivity.
             </p>
+          )}
+        </div>
+
+        {hasUniverseProposal && (
+          <div className="mb-4 rounded-lg border border-amber-700 bg-amber-900/20 p-4">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h3 className="text-sm font-semibold text-amber-100">Next Quarter Recommendation</h3>
+                <p className="text-xs text-amber-200/90">
+                  Proposed universe adjustments detected from latest scored ETF set.
+                </p>
+                <p className="mt-1 text-xs text-amber-200">
+                  Impact: turnover +{candidateAdds.length + candidateDrops.length}, diversification review required, volatility profile should be rechecked before live apply.
+                </p>
+                <p className="mt-1 text-xs text-amber-200">
+                  Adds: <span className="font-semibold">{candidateAdds.length > 0 ? candidateAdds.join(', ') : 'None'}</span>
+                  {' | '}
+                  Drops: <span className="font-semibold">{candidateDrops.length > 0 ? candidateDrops.join(', ') : 'None'}</span>
+                </p>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => handleUniverseProposalAcknowledge('approve')}
+                  className="rounded bg-amber-600 px-3 py-2 text-xs font-medium text-white hover:bg-amber-700"
+                >
+                  Approve
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleUniverseProposalAcknowledge('defer')}
+                  className="rounded bg-gray-700 px-3 py-2 text-xs font-medium text-gray-100 hover:bg-gray-600"
+                >
+                  Defer
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        <div className="mb-6 rounded-lg border border-gray-700 bg-gray-800 p-4">
+          <div className="mb-3 flex items-center justify-between">
+            <h3 className="text-base font-semibold text-white">Curated ETF Universe</h3>
+            <p className="text-xs text-gray-400">Liquidity, role, score, and correlation cluster at a glance</p>
+          </div>
+          {curatedAssets.length === 0 ? (
+            <p className="text-sm text-gray-400">No ETF candidates loaded yet.</p>
+          ) : (
+            <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-4">
+              {curatedAssets.map((asset) => {
+                const liquidity = classifyLiquidity(asset);
+                const symbol = asset.symbol.toUpperCase();
+                const role = allowListRoleBySymbol[symbol] || 'ACTIVE';
+                return (
+                  <div key={`curated-${asset.symbol}`} className="rounded border border-gray-700 bg-gray-900/60 p-3">
+                    <div className="flex items-start justify-between gap-2">
+                      <div>
+                        <p className="text-sm font-semibold text-white">{asset.symbol}</p>
+                        <p className="line-clamp-1 text-[11px] text-gray-400">{asset.name}</p>
+                      </div>
+                      <span className="rounded border border-indigo-700 bg-indigo-900/40 px-2 py-0.5 text-[10px] font-semibold text-indigo-200">
+                        {role}
+                      </span>
+                    </div>
+                    <div className="mt-2 flex flex-wrap gap-1">
+                      <span className={`rounded border px-1.5 py-0.5 text-[10px] ${liquidity.tone}`}>{liquidity.label}</span>
+                      <span className="rounded border border-gray-600 bg-gray-800 px-1.5 py-0.5 text-[10px] text-gray-200">
+                        {classifyCluster(asset)}
+                      </span>
+                    </div>
+                    <div className="mt-2 text-xs text-gray-300">
+                      <p>Score: <span className="font-semibold text-white">{Number(asset.score || 0).toFixed(1)}</span></p>
+                      <p>Spread: <span className="font-semibold text-white">{Number(asset.spread_bps || 0).toFixed(1)} bps</span></p>
+                      <p>Dollar volume: <span className="font-semibold text-white">{formatCurrency(Number(asset.dollar_volume || 0))}</span></p>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
           )}
         </div>
         <GuidedFlowStrip />
@@ -1165,248 +895,45 @@ const ScreenerPage: React.FC = () => {
         )}
 
         <div className="bg-gray-800 rounded-lg p-6 border border-gray-700 mb-6">
-          <h2 className="text-xl text-white font-semibold mb-4">Workspace Controls</h2>
+          <h2 className="text-xl text-white font-semibold mb-4">Core Controls</h2>
           <div className="mb-4 rounded-lg border border-blue-800 bg-blue-900/20 px-3 py-2 text-xs text-blue-100">
-            Step 1: choose asset type. Step 2: choose universe source/preset. Step 3: set budget and guardrails, then apply.
-            Execution mode remains in Settings and is reflected in the banner.
+            Configure the ETF universe and liquidity guardrails used by screening and strategy inputs.
           </div>
+          {etfPolicy && (
+            <div className="mb-4 rounded-lg border border-emerald-900 bg-emerald-900/20 px-3 py-2 text-xs text-emerald-100">
+              Dynamic ETF policy loaded from backend. Changes here apply to screener refresh and ETF candidate management.
+            </div>
+          )}
           <div className="grid grid-cols-1 md:grid-cols-3 xl:grid-cols-4 gap-4">
             <div>
-              <label className="block text-sm font-medium text-gray-200 mb-2">Step 1: Asset Type <HelpTooltip text="Select whether to trade Stocks or ETFs." /></label>
+              <label className="block text-sm font-medium text-gray-200 mb-2">Universe Profile <HelpTooltip text="Controls candidate basket selection for conservative/balanced/aggressive investing." /></label>
               <select
-                value={preferences.asset_type}
+                value={preset}
                 onChange={(e) => {
-                  const next = e.target.value as Preferences['asset_type'];
+                  const nextPreset = e.target.value as PresetType;
+                  setPreset(nextPreset);
                   resetUniverseSelectionState();
-                  if (next === 'etf') {
-                    const nextPreset = preferences.etf_preset || 'balanced';
-                    setPreset(nextPreset);
-                    setScreenerMode('preset');
-                    setPreferences((prev) =>
-                      normalizePreferences({
-                        ...prev,
-                        asset_type: next,
-                        screener_mode: 'preset',
-                        risk_profile: nextPreset as RiskProfile,
-                        etf_preset: nextPreset,
-                      })
-                    );
-                  } else {
-                    const nextPreset = preferences.stock_preset || 'weekly_optimized';
-                    setPreset(nextPreset);
-                    setPreferences((prev) =>
-                      normalizePreferences({
-                        ...prev,
-                        asset_type: next,
-                        screener_mode: screenerMode,
-                        stock_preset: nextPreset,
-                      })
-                    );
-                  }
+                  setPreferences((prev) =>
+                    normalizePreferences({
+                      ...prev,
+                      etf_preset: nextPreset as EtfPreset,
+                      risk_profile: nextPreset as Preferences['risk_profile'],
+                    })
+                  );
                 }}
                 className="w-full px-3 py-2 bg-gray-700 text-white border border-gray-600 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
               >
-                <option value="stock">Stocks Only</option>
-                <option value="etf">ETFs Only</option>
-              </select>
-              <p className="mt-1 text-xs text-gray-500">Choose which asset universe to analyze and trade.</p>
-            </div>
-
-            {preferences.asset_type === 'stock' && (
-              <div>
-                <label className="block text-sm font-medium text-gray-200 mb-2">Step 2: Universe Source <HelpTooltip text="Most Active pulls liquid stocks; Preset uses strategy-curated lists." /></label>
-                <select
-                  value={screenerMode}
-                  onChange={(e) => {
-                    const nextMode = e.target.value as ScreenerMode;
-                    setScreenerMode(nextMode);
-                    resetUniverseSelectionState();
-                    setPreferences((prev) =>
-                      normalizePreferences({
-                        ...prev,
-                        screener_mode: nextMode,
-                      })
-                    );
-                  }}
-                  className="w-full px-3 py-2 bg-gray-700 text-white border border-gray-600 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-                >
-                  <option value="most_active">Most Active (10-200)</option>
-                  <option value="preset">Strategy Preset</option>
-                </select>
-                <p className="mt-1 text-xs text-gray-500">Most Active is liquidity-ranked; Preset is strategy-curated.</p>
-              </div>
-            )}
-
-            {((preferences.asset_type === 'stock' && screenerMode === 'preset') || preferences.asset_type === 'etf') && (
-              <div>
-                <label className="block text-sm font-medium text-gray-200 mb-2">Step 2: Preset <HelpTooltip text="Select prebuilt strategy baskets for stocks or ETFs." /></label>
-                <select
-                  value={preset}
-                  onChange={(e) => {
-                    const nextPreset = e.target.value as PresetType;
-                    setPreset(nextPreset);
-                    resetUniverseSelectionState();
-                    if (preferences.asset_type === 'stock') {
-                      setPreferences((prev) =>
-                        normalizePreferences({
-                          ...prev,
-                          stock_preset: nextPreset as StockPreset,
-                        })
-                      );
-                    } else if (preferences.asset_type === 'etf') {
-                      setPreferences((prev) =>
-                        normalizePreferences({
-                          ...prev,
-                          etf_preset: nextPreset as EtfPreset,
-                          risk_profile: nextPreset as RiskProfile,
-                        })
-                      );
-                    }
-                  }}
-                  className="w-full px-3 py-2 bg-gray-700 text-white border border-gray-600 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-                >
-                  {presetOptions.map((option) => (
-                    <option key={option.value} value={option.value}>
-                      {option.label}
-                    </option>
-                  ))}
-                </select>
-                <p className="mt-1 text-xs text-gray-500">Preset controls symbol curation and default strategy behavior.</p>
-              </div>
-            )}
-
-            {((preferences.asset_type === 'stock' && screenerMode === 'preset') || preferences.asset_type === 'etf') && (
-              <div>
-                <label className="block text-sm font-medium text-gray-200 mb-2">Step 2: Preset Universe</label>
-                <select
-                  value={presetUniverseMode}
-                  onChange={(e) => {
-                    const nextMode = e.target.value as PresetUniverseMode;
-                    setPresetUniverseMode(nextMode);
-                    resetUniverseSelectionState();
-                  }}
-                  className="w-full px-3 py-2 bg-gray-700 text-white border border-gray-600 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-                >
-                  <option value="seed_only">Seed Only</option>
-                  <option value="seed_guardrail_blend">Seed + Guardrail Blend</option>
-                  <option value="guardrail_only">Guardrail Universe Only</option>
-                </select>
-                <p className="mt-1 text-xs text-gray-500">Choose whether presets use fixed seeds, blended seeds + ranking, or only guardrail-ranked active universe symbols.</p>
-              </div>
-            )}
-
-            <div>
-              <label className="block text-sm font-medium text-gray-200 mb-2">
-                Step 2: Symbol Count
-                <HelpTooltip text="Set universe size for the selected Stock/ETF mode. Applied only when you click Apply Universe & Guardrails." />
-              </label>
-              <div className="flex items-center gap-2">
-                <button
-                  type="button"
-                  onClick={() => {
-                    resetUniverseSelectionState();
-                    setPreferences((prev) =>
-                      withContextScreenerLimit(
-                        prev,
-                        prev.asset_type,
-                        prev.asset_type === 'stock' ? screenerMode : 'preset',
-                        draftScreenerLimit - 5,
-                      )
-                    );
-                  }}
-                  className="rounded border border-gray-600 bg-gray-700 px-2 py-2 text-sm text-gray-200 hover:bg-gray-600"
-                >
-                  -5
-                </button>
-                <input
-                  type="number"
-                  min={10}
-                  max={200}
-                  step={1}
-                  value={draftScreenerLimit}
-                  onChange={(e) => {
-                    const parsed = Number.parseInt(e.target.value, 10);
-                    resetUniverseSelectionState();
-                    if (Number.isFinite(parsed)) {
-                      setPreferences((prev) =>
-                        withContextScreenerLimit(
-                          prev,
-                          prev.asset_type,
-                          prev.asset_type === 'stock' ? screenerMode : 'preset',
-                          parsed,
-                        )
-                      );
-                    }
-                  }}
-                  onBlur={(e) => {
-                    const parsed = Number.parseInt(e.target.value, 10);
-                    const target = Number.isFinite(parsed) ? parsed : draftScreenerLimit;
-                    setPreferences((prev) =>
-                      withContextScreenerLimit(
-                        prev,
-                        prev.asset_type,
-                        prev.asset_type === 'stock' ? screenerMode : 'preset',
-                        target,
-                      )
-                    );
-                  }}
-                  className="w-full rounded border border-gray-600 bg-gray-700 px-3 py-2 text-white"
-                />
-                <button
-                  type="button"
-                  onClick={() => {
-                    resetUniverseSelectionState();
-                    setPreferences((prev) =>
-                      withContextScreenerLimit(
-                        prev,
-                        prev.asset_type,
-                        prev.asset_type === 'stock' ? screenerMode : 'preset',
-                        draftScreenerLimit + 5,
-                      )
-                    );
-                  }}
-                  className="rounded border border-gray-600 bg-gray-700 px-2 py-2 text-sm text-gray-200 hover:bg-gray-600"
-                >
-                  +5
-                </button>
-              </div>
-              <div className="mt-2 flex flex-wrap gap-2">
-                {[25, 50, 75, 100, 150, 200].map((count) => (
-                  <button
-                    key={count}
-                    type="button"
-                    onClick={() => {
-                      resetUniverseSelectionState();
-                      setPreferences((prev) =>
-                        withContextScreenerLimit(
-                          prev,
-                          prev.asset_type,
-                          prev.asset_type === 'stock' ? screenerMode : 'preset',
-                          count,
-                        )
-                      );
-                    }}
-                    className={`rounded border px-2 py-1 text-xs ${
-                      draftScreenerLimit === count
-                        ? 'border-blue-400 bg-blue-800/50 text-blue-100'
-                        : 'border-gray-600 bg-gray-700 text-gray-300 hover:bg-gray-600'
-                    }`}
-                  >
-                    {count}
-                  </button>
+                {presetOptions.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
                 ))}
-              </div>
-              <p className="mt-1 text-xs text-gray-500">
-                {preferences.asset_type === 'etf'
-                  ? 'Applies to ETF preset universe size.'
-                  : screenerMode === 'preset'
-                    ? 'Applies to Stock preset universe size.'
-                    : 'Applies to Stock Most Active universe size.'}
-              </p>
+              </select>
+              <p className="mt-1 text-xs text-gray-500">Profile controls ETF candidate curation.</p>
             </div>
 
             <div>
-              <label className="block text-sm font-medium text-gray-200 mb-2">Step 3: Weekly Budget ($)</label>
+              <label className="block text-sm font-medium text-gray-200 mb-2">Weekly Contribution ($)</label>
               <input
                 type="number"
                 min={WORKSPACE_LIMITS.weeklyBudgetMin}
@@ -1426,55 +953,69 @@ const ScreenerPage: React.FC = () => {
                 }}
                 className="w-full px-3 py-2 bg-gray-700 text-white border border-gray-600 rounded-md"
               />
-              <p className="mt-1 text-xs text-gray-500">Maximum new budget allocated for trading each week (min ${WORKSPACE_LIMITS.weeklyBudgetMin}).</p>
+              <p className="mt-1 text-xs text-gray-500">New weekly cash input used by ETF policy and budget guardrails.</p>
             </div>
 
             <div>
-              <label className="block text-sm font-medium text-gray-200 mb-2">Step 3: Max Position Size ($)</label>
+              <label className="block text-sm font-medium text-gray-200 mb-2">Dynamic ETF Selection</label>
+              <select
+                value={policyDraft.dynamic_candidates_enabled ? 'on' : 'off'}
+                onChange={(e) =>
+                  setPolicyDraft((prev) => ({
+                    ...prev,
+                    dynamic_candidates_enabled: e.target.value === 'on',
+                  }))
+                }
+                className="w-full px-3 py-2 bg-gray-700 text-white border border-gray-600 rounded-md"
+              >
+                <option value="on">Enabled</option>
+                <option value="off">Disabled</option>
+              </select>
+              <p className="mt-1 text-xs text-gray-500">When enabled, candidates are re-screened and rotated on schedule.</p>
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium text-gray-200 mb-2">Screen Interval (days)</label>
               <input
                 type="number"
-                value={maxPositionSize}
-                onChange={(e) => setMaxPositionSize(parseFloat(e.target.value) || 0)}
+                min={1}
+                value={policyDraft.screen_interval_days}
+                onChange={(e) =>
+                  setPolicyDraft((prev) => ({
+                    ...prev,
+                    screen_interval_days: Number.parseInt(e.target.value, 10) || 1,
+                  }))
+                }
                 onBlur={(e) => {
-                  const parsed = Number.parseFloat(e.target.value);
-                  setMaxPositionSize(Number.isFinite(parsed) ? clamp(parsed, WORKSPACE_LIMITS.maxPositionMin, WORKSPACE_LIMITS.maxPositionMax) : WORKSPACE_LIMITS.maxPositionMin);
+                  const parsed = Number.parseInt(e.target.value, 10);
+                  setPolicyDraft((prev) => ({
+                    ...prev,
+                    screen_interval_days: Number.isFinite(parsed) ? Math.max(1, parsed) : 7,
+                  }));
                 }}
                 className="w-full px-3 py-2 bg-gray-700 text-white border border-gray-600 rounded-md"
               />
-              <p className="mt-1 text-xs text-gray-500">Upper cap per position to prevent concentration risk.</p>
+              <p className="mt-1 text-xs text-gray-500">How often to refresh ETF candidates.</p>
             </div>
 
             <div>
-              <label className="block text-sm font-medium text-gray-200 mb-2">Step 3: Daily Loss Limit ($)</label>
-              <input
-                type="number"
-                value={riskLimitDaily}
-                onChange={(e) => setRiskLimitDaily(parseFloat(e.target.value) || 0)}
-                onBlur={(e) => {
-                  const parsed = Number.parseFloat(e.target.value);
-                  setRiskLimitDaily(Number.isFinite(parsed) ? clamp(parsed, WORKSPACE_LIMITS.riskDailyMin, WORKSPACE_LIMITS.riskDailyMax) : WORKSPACE_LIMITS.riskDailyMin);
-                }}
-                className="w-full px-3 py-2 bg-gray-700 text-white border border-gray-600 rounded-md"
-              />
-              <p className="mt-1 text-xs text-gray-500">Daily max loss threshold before risk-off behavior.</p>
-            </div>
-
-            <div>
-              <label className="block text-sm font-medium text-gray-200 mb-2">Step 3: Min Dollar Volume ($)</label>
+              <label className="block text-sm font-medium text-gray-200 mb-2">Min Dollar Volume ($)</label>
               <input
                 type="number"
                 value={minDollarVolume}
                 onChange={(e) => {
                   setCurrentPage(1);
-                  setMinDollarVolume(parseFloat(e.target.value) || 0);
+                  const next = parseFloat(e.target.value) || 0;
+                  setMinDollarVolume(next);
+                  setPolicyDraft((prev) => ({ ...prev, min_dollar_volume: next }));
                 }}
                 onBlur={(e) => {
                   const parsed = Number.parseFloat(e.target.value);
-                  setMinDollarVolume(
-                    Number.isFinite(parsed)
-                      ? clamp(parsed, WORKSPACE_LIMITS.minDollarVolumeMin, WORKSPACE_LIMITS.minDollarVolumeMax)
-                      : WORKSPACE_LIMITS.minDollarVolumeMin
-                  );
+                  const next = Number.isFinite(parsed)
+                    ? clamp(parsed, WORKSPACE_LIMITS.minDollarVolumeMin, WORKSPACE_LIMITS.minDollarVolumeMax)
+                    : WORKSPACE_LIMITS.minDollarVolumeMin;
+                  setMinDollarVolume(next);
+                  setPolicyDraft((prev) => ({ ...prev, min_dollar_volume: next }));
                 }}
                 className="w-full px-3 py-2 bg-gray-700 text-white border border-gray-600 rounded-md"
               />
@@ -1482,7 +1023,7 @@ const ScreenerPage: React.FC = () => {
             </div>
 
             <div>
-              <label className="block text-sm font-medium text-gray-200 mb-2">Step 3: Max Spread (bps)</label>
+              <label className="block text-sm font-medium text-gray-200 mb-2">Max Spread (bps)</label>
               <input
                 type="number"
                 value={maxSpreadBps}
@@ -1504,7 +1045,7 @@ const ScreenerPage: React.FC = () => {
             </div>
 
             <div>
-              <label className="block text-sm font-medium text-gray-200 mb-2">Step 3: Max Sector Weight (%)</label>
+              <label className="block text-sm font-medium text-gray-200 mb-2">Max Sector Weight (%)</label>
               <input
                 type="number"
                 min={20}
@@ -1528,7 +1069,7 @@ const ScreenerPage: React.FC = () => {
             </div>
 
             <div>
-              <label className="block text-sm font-medium text-gray-200 mb-2">Step 3: Auto Regime Adjust</label>
+              <label className="block text-sm font-medium text-gray-200 mb-2">Auto Regime Adjust</label>
               <select
                 value={autoRegimeAdjust ? 'on' : 'off'}
                 onChange={(e) => {
@@ -1544,20 +1085,249 @@ const ScreenerPage: React.FC = () => {
             </div>
           </div>
 
+          <details className="mt-4 rounded-lg border border-gray-700 bg-gray-900/20 p-4">
+            <summary className="cursor-pointer text-sm font-semibold text-gray-200">Advanced Controls</summary>
+            <p className="mt-1 text-xs text-gray-500">
+              Optional turnover, rebalance, and tax policy settings.
+            </p>
+            <div className="mt-3 grid grid-cols-1 md:grid-cols-3 xl:grid-cols-4 gap-4">
+              <div>
+                <label className="block text-sm font-medium text-gray-200 mb-2">Replacement Interval (days)</label>
+                <input
+                  type="number"
+                  min={1}
+                  value={policyDraft.replacement_interval_days}
+                  onChange={(e) =>
+                    setPolicyDraft((prev) => ({
+                      ...prev,
+                      replacement_interval_days: Number.parseInt(e.target.value, 10) || 1,
+                    }))
+                  }
+                  onBlur={(e) => {
+                    const parsed = Number.parseInt(e.target.value, 10);
+                    setPolicyDraft((prev) => ({
+                      ...prev,
+                      replacement_interval_days: Number.isFinite(parsed) ? Math.max(1, parsed) : 90,
+                    }));
+                  }}
+                  className="w-full px-3 py-2 bg-gray-700 text-white border border-gray-600 rounded-md"
+                />
+                <p className="mt-1 text-xs text-gray-500">Minimum days between active ETF replacements.</p>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-200 mb-2">Max Replacements / Quarter</label>
+                <input
+                  type="number"
+                  min={0}
+                  value={policyDraft.max_replacements_per_quarter}
+                  onChange={(e) =>
+                    setPolicyDraft((prev) => ({
+                      ...prev,
+                      max_replacements_per_quarter: Number.parseInt(e.target.value, 10) || 0,
+                    }))
+                  }
+                  onBlur={(e) => {
+                    const parsed = Number.parseInt(e.target.value, 10);
+                    setPolicyDraft((prev) => ({
+                      ...prev,
+                      max_replacements_per_quarter: Number.isFinite(parsed) ? Math.max(0, parsed) : 2,
+                    }));
+                  }}
+                  className="w-full px-3 py-2 bg-gray-700 text-white border border-gray-600 rounded-md"
+                />
+                <p className="mt-1 text-xs text-gray-500">Hard cap to reduce turnover and taxes.</p>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-200 mb-2">Min Hold Days</label>
+                <input
+                  type="number"
+                  min={0}
+                  value={policyDraft.min_hold_days_for_replacement}
+                  onChange={(e) =>
+                    setPolicyDraft((prev) => ({
+                      ...prev,
+                      min_hold_days_for_replacement: Number.parseInt(e.target.value, 10) || 0,
+                    }))
+                  }
+                  onBlur={(e) => {
+                    const parsed = Number.parseInt(e.target.value, 10);
+                    setPolicyDraft((prev) => ({
+                      ...prev,
+                      min_hold_days_for_replacement: Number.isFinite(parsed) ? Math.max(0, parsed) : 30,
+                    }));
+                  }}
+                  className="w-full px-3 py-2 bg-gray-700 text-white border border-gray-600 rounded-md"
+                />
+                <p className="mt-1 text-xs text-gray-500">Minimum holding period before a replacement is considered.</p>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-200 mb-2">Min Score Delta (%)</label>
+                <input
+                  type="number"
+                  min={0}
+                  value={policyDraft.min_replacement_score_delta_pct}
+                  onChange={(e) =>
+                    setPolicyDraft((prev) => ({
+                      ...prev,
+                      min_replacement_score_delta_pct: Number.parseFloat(e.target.value) || 0,
+                    }))
+                  }
+                  onBlur={(e) => {
+                    const parsed = Number.parseFloat(e.target.value);
+                    setPolicyDraft((prev) => ({
+                      ...prev,
+                      min_replacement_score_delta_pct: Number.isFinite(parsed) ? Math.max(0, parsed) : 10,
+                    }));
+                  }}
+                  className="w-full px-3 py-2 bg-gray-700 text-white border border-gray-600 rounded-md"
+                />
+                <p className="mt-1 text-xs text-gray-500">Replacement needs this much score improvement.</p>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-200 mb-2">Rebalance Drift Threshold (%)</label>
+                <input
+                  type="number"
+                  min={0}
+                  value={policyDraft.rebalance_drift_threshold_pct}
+                  onChange={(e) =>
+                    setPolicyDraft((prev) => ({
+                      ...prev,
+                      rebalance_drift_threshold_pct: Number.parseFloat(e.target.value) || 0,
+                    }))
+                  }
+                  onBlur={(e) => {
+                    const parsed = Number.parseFloat(e.target.value);
+                    setPolicyDraft((prev) => ({
+                      ...prev,
+                      rebalance_drift_threshold_pct: Number.isFinite(parsed) ? Math.max(0, parsed) : 5,
+                    }));
+                  }}
+                  className="w-full px-3 py-2 bg-gray-700 text-white border border-gray-600 rounded-md"
+                />
+                <p className="mt-1 text-xs text-gray-500">Threshold before rebalancing sleeve weights.</p>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-200 mb-2">Buy-Only Rebalance</label>
+                <select
+                  value={policyDraft.buy_only_rebalance ? 'on' : 'off'}
+                  onChange={(e) =>
+                    setPolicyDraft((prev) => ({
+                      ...prev,
+                      buy_only_rebalance: e.target.value === 'on',
+                    }))
+                  }
+                  className="w-full px-3 py-2 bg-gray-700 text-white border border-gray-600 rounded-md"
+                >
+                  <option value="on">On</option>
+                  <option value="off">Off</option>
+                </select>
+                <p className="mt-1 text-xs text-gray-500">Prefer buys over sells during rebalancing.</p>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-200 mb-2">Tax-Loss Harvesting</label>
+                <select
+                  value={policyDraft.tlh_enabled ? 'on' : 'off'}
+                  onChange={(e) =>
+                    setPolicyDraft((prev) => ({
+                      ...prev,
+                      tlh_enabled: e.target.value === 'on',
+                    }))
+                  }
+                  className="w-full px-3 py-2 bg-gray-700 text-white border border-gray-600 rounded-md"
+                >
+                  <option value="off">Off</option>
+                  <option value="on">On</option>
+                </select>
+                <p className="mt-1 text-xs text-gray-500">Enable tax-aware replacement checks.</p>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-200 mb-2">TLH Min Loss ($)</label>
+                <input
+                  type="number"
+                  min={0}
+                  value={policyDraft.tlh_min_loss_dollars}
+                  onChange={(e) =>
+                    setPolicyDraft((prev) => ({
+                      ...prev,
+                      tlh_min_loss_dollars: Number.parseFloat(e.target.value) || 0,
+                    }))
+                  }
+                  onBlur={(e) => {
+                    const parsed = Number.parseFloat(e.target.value);
+                    setPolicyDraft((prev) => ({
+                      ...prev,
+                      tlh_min_loss_dollars: Number.isFinite(parsed) ? Math.max(0, parsed) : 150,
+                    }));
+                  }}
+                  className="w-full px-3 py-2 bg-gray-700 text-white border border-gray-600 rounded-md"
+                />
+                <p className="mt-1 text-xs text-gray-500">Dollar loss floor before TLH is considered.</p>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-200 mb-2">TLH Min Loss (%)</label>
+                <input
+                  type="number"
+                  min={0}
+                  value={policyDraft.tlh_min_loss_pct}
+                  onChange={(e) =>
+                    setPolicyDraft((prev) => ({
+                      ...prev,
+                      tlh_min_loss_pct: Number.parseFloat(e.target.value) || 0,
+                    }))
+                  }
+                  onBlur={(e) => {
+                    const parsed = Number.parseFloat(e.target.value);
+                    setPolicyDraft((prev) => ({
+                      ...prev,
+                      tlh_min_loss_pct: Number.isFinite(parsed) ? Math.max(0, parsed) : 5,
+                    }));
+                  }}
+                  className="w-full px-3 py-2 bg-gray-700 text-white border border-gray-600 rounded-md"
+                />
+                <p className="mt-1 text-xs text-gray-500">Percent loss floor for TLH checks.</p>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-200 mb-2">TLH Min Hold Days</label>
+                <input
+                  type="number"
+                  min={0}
+                  value={policyDraft.tlh_min_hold_days}
+                  onChange={(e) =>
+                    setPolicyDraft((prev) => ({
+                      ...prev,
+                      tlh_min_hold_days: Number.parseInt(e.target.value, 10) || 0,
+                    }))
+                  }
+                  onBlur={(e) => {
+                    const parsed = Number.parseInt(e.target.value, 10);
+                    setPolicyDraft((prev) => ({
+                      ...prev,
+                      tlh_min_hold_days: Number.isFinite(parsed) ? Math.max(0, parsed) : 31,
+                    }));
+                  }}
+                  className="w-full px-3 py-2 bg-gray-700 text-white border border-gray-600 rounded-md"
+                />
+                <p className="mt-1 text-xs text-gray-500">Minimum hold time before TLH replacement.</p>
+              </div>
+            </div>
+          </details>
+
           <div className="mt-4 flex flex-wrap items-center gap-3">
             <button
               onClick={handleApplyWorkspaceSettings}
-              disabled={workspaceSaving || workspaceHasValidationError || optimizingWorkspace}
+              disabled={workspaceSaving || workspaceHasValidationError}
               className="px-4 py-2 rounded bg-blue-600 hover:bg-blue-700 disabled:bg-gray-600 text-white font-medium"
             >
-              {workspaceSaving ? 'Applying...' : 'Apply Universe & Guardrails'}
-            </button>
-            <button
-              onClick={() => void applyAdaptiveOptimization()}
-              disabled={workspaceSaving || optimizingWorkspace}
-              className="px-4 py-2 rounded bg-emerald-700 hover:bg-emerald-600 disabled:bg-gray-600 text-white font-medium"
-            >
-              {optimizingWorkspace ? 'Optimizing...' : 'Auto-Optimize from Portfolio'}
+              {workspaceSaving ? 'Saving...' : 'Save & Refresh Universe'}
             </button>
             {workspaceValidationError && <p className="text-sm text-amber-300">{workspaceValidationError}</p>}
             {workspaceMessage && <p className="text-sm text-gray-300">{workspaceMessage}</p>}
@@ -1568,7 +1338,7 @@ const ScreenerPage: React.FC = () => {
         <div className="min-w-0 2xl:col-span-7 bg-gray-800 rounded-lg border border-gray-700 overflow-hidden">
           <div className="px-6 py-4 border-b border-gray-200 flex justify-between items-center">
             <h2 className="text-xl font-semibold text-white">
-              Active {preferences.asset_type === 'stock' ? 'Stocks' : 'ETFs'}
+              Active ETFs
               <span className="ml-2 text-sm font-normal text-gray-400">({assets.length} loaded / {totalAssetCount} total)</span>
             </h2>
             <button
@@ -1592,11 +1362,8 @@ const ScreenerPage: React.FC = () => {
                     <th className="px-2 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">View</th>
                     <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Symbol</th>
                     <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Name</th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Type</th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Sector</th>
                     <th className="px-6 py-3 text-right text-xs font-medium text-gray-400 uppercase tracking-wider">Price</th>
                     <th className="px-6 py-3 text-right text-xs font-medium text-gray-400 uppercase tracking-wider">Change</th>
-                    <th className="px-6 py-3 text-right text-xs font-medium text-gray-400 uppercase tracking-wider">Volume</th>
                     <th className="px-6 py-3 text-right text-xs font-medium text-gray-400 uppercase tracking-wider">Score</th>
                     <th className="px-6 py-3 text-right text-xs font-medium text-gray-400 uppercase tracking-wider">Spread</th>
                     <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Reason</th>
@@ -1619,16 +1386,6 @@ const ScreenerPage: React.FC = () => {
                       <td className="px-6 py-4 whitespace-nowrap">
                         <span className="text-sm text-gray-200">{asset.name}</span>
                       </td>
-                      <td className="px-6 py-4 whitespace-nowrap">
-                        <span
-                          className={`px-2 py-1 text-xs font-semibold rounded ${
-                            asset.asset_type === 'stock' ? 'bg-blue-100 text-blue-800' : 'bg-green-100 text-green-800'
-                          }`}
-                        >
-                          {asset.asset_type.toUpperCase()}
-                        </span>
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-300">{asset.sector || '-'}</td>
                       <td className="px-6 py-4 whitespace-nowrap text-right">
                         <span className="text-sm text-gray-100">{formatCurrency(asset.price)}</span>
                       </td>
@@ -1636,9 +1393,6 @@ const ScreenerPage: React.FC = () => {
                         <span className={`text-sm font-semibold ${asset.change_percent >= 0 ? 'text-green-600' : 'text-red-600'}`}>
                           {formatPercent(asset.change_percent)}
                         </span>
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-right">
-                        <span className="text-sm text-gray-400">{asset.volume.toLocaleString()}</span>
                       </td>
                       <td className="px-6 py-4 whitespace-nowrap text-right text-sm text-gray-300">{asset.score?.toFixed(1) ?? '-'}</td>
                       <td className="px-6 py-4 whitespace-nowrap text-right text-sm text-gray-300">{asset.spread_bps?.toFixed(1) ?? '-'} bps</td>
@@ -1708,41 +1462,9 @@ const ScreenerPage: React.FC = () => {
             </div>
           </div>
 
-          <div className="mb-4 grid grid-cols-1 md:grid-cols-4 gap-2 items-end">
-            <div className="md:col-span-2">
-              <label className="block text-xs font-medium text-gray-200 mb-1">Pin Selected Symbol To Strategy <HelpTooltip text="Append selected symbol to a strategy or create a new one." /></label>
-              <select
-                value={selectedStrategyId}
-                onChange={(e) => setSelectedStrategyId(e.target.value)}
-                className="w-full px-3 py-2 bg-gray-700 text-white border border-gray-600 rounded-md"
-              >
-                {strategies.map((s) => (
-                  <option key={s.id} value={s.id}>
-                    {s.name}
-                  </option>
-                ))}
-                <option value="__new__">+ Create New Strategy</option>
-              </select>
-            </div>
-            <div>
-              <label className="block text-xs font-medium text-gray-200 mb-1">New Strategy Name</label>
-              <input
-                value={newStrategyName}
-                onChange={(e) => setNewStrategyName(e.target.value)}
-                disabled={selectedStrategyId !== '__new__'}
-                placeholder="Optional"
-                className="w-full px-3 py-2 bg-gray-700 text-white border border-gray-600 rounded-md disabled:bg-gray-800"
-              />
-            </div>
-            <button
-              onClick={handlePinToStrategy}
-              disabled={pinLoading || !selectedSymbol}
-              className="px-4 py-2 bg-emerald-600 text-white rounded-md hover:bg-emerald-700 disabled:bg-gray-400"
-            >
-              {pinLoading ? 'Pinning...' : 'Pin to Strategy'}
-            </button>
-          </div>
-          {pinMessage && <p className="text-sm text-gray-300 mb-3">{pinMessage}</p>}
+          <p className="mb-3 text-xs text-gray-400">
+            Chart indicators use ETF investing defaults for trend/pullback context.
+          </p>
 
           <div className="mb-3 grid grid-cols-2 md:grid-cols-3 gap-2 text-xs">
             <div className="rounded bg-gray-900 border border-gray-700 p-2 text-gray-200">

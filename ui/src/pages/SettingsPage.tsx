@@ -10,24 +10,20 @@ import {
   setBrokerCredentials,
   getMaintenanceStorage,
   runMaintenanceCleanup,
-  getTradingPreferences,
   getSummaryNotificationPreferences,
   updateSummaryNotificationPreferences,
   sendSummaryNotificationNow,
+  getEtfInvestingPolicySummary,
   getSafetyStatus,
   setKillSwitch,
   runPanicStop,
 } from '../api/backend';
 import {
-  AssetTypePreference,
-  RiskProfilePreference,
-  ScreenerModePreference,
-  StockPresetPreference,
-  EtfPresetPreference,
   SummaryNotificationFrequency,
   SummaryNotificationChannel,
   BrokerCredentialsStatusResponse,
   MaintenanceStorageResponse,
+  EtfInvestingPolicySummary,
 } from '../api/types';
 import HelpTooltip from '../components/HelpTooltip';
 import CollapsibleSection from '../components/CollapsibleSection';
@@ -35,10 +31,7 @@ import PageHeader from '../components/PageHeader';
 import ConfirmDialog from '../components/ConfirmDialog';
 import { SkeletonPage } from '../components/Skeleton';
 import { useToast } from '../components/toastContext';
-import {
-  STOCK_PRESET_PARAMETER_DEFAULTS,
-  ETF_PRESET_PARAMETER_DEFAULTS,
-} from '../constants/presetDefaults';
+import { ETF_INVESTING_DEFAULTS } from '../constants/investingDefaults';
 
 type CredentialMode = 'paper' | 'live';
 
@@ -62,6 +55,8 @@ const SETTINGS_LIMITS = {
   smtpTimeoutMin: 1,
   smtpTimeoutMax: 300,
 };
+const ETF_FIXED_MAX_CONCURRENT_POSITIONS = 1;
+const ETF_FIXED_MAX_TRADES_PER_DAY = 1;
 
 const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
 const PHONE_RE = /^\+?[1-9]\d{7,14}$/;
@@ -87,6 +82,7 @@ function SettingsPage() {
   const { addToast } = useToast();
   const [panicConfirmOpen, setPanicConfirmOpen] = useState(false);
   const [cleanupConfirmOpen, setCleanupConfirmOpen] = useState(false);
+  const [modeSwitchConfirmOpen, setModeSwitchConfirmOpen] = useState(false);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -94,8 +90,19 @@ function SettingsPage() {
   // Settings state
   const [tradingEnabled, setTradingEnabled] = useState(false);
   const [paperTrading, setPaperTrading] = useState(true);
-  const [maxPositionSize, setMaxPositionSize] = useState(10000);
-  const [riskLimitDaily, setRiskLimitDaily] = useState(500);
+  const [loadedPaperTrading, setLoadedPaperTrading] = useState(true);
+  const [modeSwitchCooldownSeconds, setModeSwitchCooldownSeconds] = useState(60);
+  const [etfInvestingModeEnabled, setEtfInvestingModeEnabled] = useState<boolean>(ETF_INVESTING_DEFAULTS.modeEnabled);
+  const [etfInvestingAutoEnabled, setEtfInvestingAutoEnabled] = useState<boolean>(ETF_INVESTING_DEFAULTS.autoEnabled);
+  const [etfInvestingCoreDcaPct, setEtfInvestingCoreDcaPct] = useState<number>(ETF_INVESTING_DEFAULTS.coreDcaPct);
+  const [etfInvestingActiveSleevePct, setEtfInvestingActiveSleevePct] = useState<number>(ETF_INVESTING_DEFAULTS.activeSleevePct);
+  const [etfInvestingMaxTradesPerDay, setEtfInvestingMaxTradesPerDay] = useState<number>(ETF_FIXED_MAX_TRADES_PER_DAY);
+  const [etfInvestingMaxConcurrentPositions, setEtfInvestingMaxConcurrentPositions] = useState<number>(ETF_FIXED_MAX_CONCURRENT_POSITIONS);
+  const [etfInvestingMaxSymbolExposurePct, setEtfInvestingMaxSymbolExposurePct] = useState<number>(ETF_INVESTING_DEFAULTS.maxSymbolExposurePct);
+  const [etfInvestingMaxTotalExposurePct, setEtfInvestingMaxTotalExposurePct] = useState<number>(ETF_INVESTING_DEFAULTS.maxTotalExposurePct);
+  const [etfInvestingSinglePositionEquityThreshold, setEtfInvestingSinglePositionEquityThreshold] = useState<number>(ETF_INVESTING_DEFAULTS.singlePositionEquityThreshold);
+  const [etfInvestingDailyLossLimitPct, setEtfInvestingDailyLossLimitPct] = useState<number>(ETF_INVESTING_DEFAULTS.dailyLossLimitPct);
+  const [etfInvestingWeeklyLossLimitPct, setEtfInvestingWeeklyLossLimitPct] = useState<number>(ETF_INVESTING_DEFAULTS.weeklyLossLimitPct);
   const [tickIntervalSeconds, setTickIntervalSeconds] = useState(60);
   const [streamingEnabled, setStreamingEnabled] = useState(false);
   const [strictAlpacaData, setStrictAlpacaData] = useState(true);
@@ -126,13 +133,7 @@ function SettingsPage() {
   const [keychainStatusCheckedAt, setKeychainStatusCheckedAt] = useState<string | null>(null);
   const [keychainStatusError, setKeychainStatusError] = useState<string | null>(null);
   const [runtimeCredentialStatus, setRuntimeCredentialStatus] = useState<BrokerCredentialsStatusResponse | null>(null);
-  const [assetType, setAssetType] = useState<AssetTypePreference>('stock');
-  const [riskProfile, setRiskProfile] = useState<RiskProfilePreference>('balanced');
-  const [weeklyBudget, setWeeklyBudget] = useState(200);
-  const [screenerLimit, setScreenerLimit] = useState(50);
-  const [universeMode, setUniverseMode] = useState<ScreenerModePreference>('most_active');
-  const [stockPreset, setStockPreset] = useState<StockPresetPreference>('weekly_optimized');
-  const [etfPreset, setEtfPreset] = useState<EtfPresetPreference>('balanced');
+  const [etfPolicySummary, setEtfPolicySummary] = useState<EtfInvestingPolicySummary | null>(null);
   const [summaryEnabled, setSummaryEnabled] = useState(false);
   const [summaryFrequency, setSummaryFrequency] = useState<SummaryNotificationFrequency>('daily');
   const [summaryChannel, setSummaryChannel] = useState<SummaryNotificationChannel>('email');
@@ -147,9 +148,10 @@ function SettingsPage() {
   const [validationErrors, setValidationErrors] = useState<Record<string, string>>({});
 
   const refreshAuxiliarySettingsData = useCallback(async () => {
-    const [runtimeStatusResult, storageInfoResult] = await Promise.allSettled([
+    const [runtimeStatusResult, storageInfoResult, policySummaryResult] = await Promise.allSettled([
       getBrokerCredentialsStatus(),
       getMaintenanceStorage(),
+      getEtfInvestingPolicySummary(),
     ]);
     if (runtimeStatusResult.status === 'fulfilled') {
       setRuntimeCredentialStatus(runtimeStatusResult.value);
@@ -160,6 +162,11 @@ function SettingsPage() {
       setStorageInfo(storageInfoResult.value);
     } else {
       setStorageInfo(null);
+    }
+    if (policySummaryResult.status === 'fulfilled') {
+      setEtfPolicySummary(policySummaryResult.value);
+    } else {
+      setEtfPolicySummary(null);
     }
   }, []);
 
@@ -212,6 +219,16 @@ function SettingsPage() {
         }
       }
     }
+    const sleeveTotal = Number(etfInvestingCoreDcaPct) + Number(etfInvestingActiveSleevePct);
+    if (Math.abs(sleeveTotal - 100) > 0.001) {
+      errors.etfInvestingSleeves = 'ETF investing core DCA % + active sleeve % must equal 100';
+    }
+    if (Number(etfInvestingMaxConcurrentPositions) !== ETF_FIXED_MAX_CONCURRENT_POSITIONS) {
+      errors.etfInvestingMaxConcurrentPositions = `ETF investing max concurrent positions is fixed to ${ETF_FIXED_MAX_CONCURRENT_POSITIONS}`;
+    }
+    if (Number(etfInvestingMaxTradesPerDay) !== ETF_FIXED_MAX_TRADES_PER_DAY) {
+      errors.etfInvestingMaxTradesPerDay = `ETF investing max trades/day is fixed to ${ETF_FIXED_MAX_TRADES_PER_DAY}`;
+    }
     return errors;
   };
 
@@ -225,48 +242,46 @@ function SettingsPage() {
 
       setTradingEnabled(config.trading_enabled);
       setPaperTrading(config.paper_trading);
-      setMaxPositionSize(config.max_position_size);
-      setRiskLimitDaily(config.risk_limit_daily);
-      setTickIntervalSeconds(config.tick_interval_seconds || 60);
+      setLoadedPaperTrading(config.paper_trading);
+      setModeSwitchCooldownSeconds(Math.max(10, Number(config.mode_switch_cooldown_seconds || 60)));
+      setEtfInvestingModeEnabled(Boolean(config.etf_investing_mode_enabled));
+      setEtfInvestingAutoEnabled(config.etf_investing_auto_enabled !== false);
+      setEtfInvestingCoreDcaPct(config.etf_investing_core_dca_pct ?? ETF_INVESTING_DEFAULTS.coreDcaPct);
+      setEtfInvestingActiveSleevePct(config.etf_investing_active_sleeve_pct ?? ETF_INVESTING_DEFAULTS.activeSleevePct);
+      setEtfInvestingMaxTradesPerDay(ETF_FIXED_MAX_TRADES_PER_DAY);
+      setEtfInvestingMaxConcurrentPositions(ETF_FIXED_MAX_CONCURRENT_POSITIONS);
+      setEtfInvestingMaxSymbolExposurePct(config.etf_investing_max_symbol_exposure_pct ?? ETF_INVESTING_DEFAULTS.maxSymbolExposurePct);
+      setEtfInvestingMaxTotalExposurePct(config.etf_investing_max_total_exposure_pct ?? ETF_INVESTING_DEFAULTS.maxTotalExposurePct);
+      setEtfInvestingSinglePositionEquityThreshold(
+        config.etf_investing_single_position_equity_threshold ?? ETF_INVESTING_DEFAULTS.singlePositionEquityThreshold
+      );
+      setEtfInvestingDailyLossLimitPct(config.etf_investing_daily_loss_limit_pct ?? ETF_INVESTING_DEFAULTS.dailyLossLimitPct);
+      setEtfInvestingWeeklyLossLimitPct(config.etf_investing_weekly_loss_limit_pct ?? ETF_INVESTING_DEFAULTS.weeklyLossLimitPct);
+      setTickIntervalSeconds(config.tick_interval_seconds ?? 60);
       setStreamingEnabled(Boolean(config.streaming_enabled));
       setStrictAlpacaData(config.strict_alpaca_data !== false);
       setBackendReloadEnabled(Boolean(config.backend_reload_enabled));
       setBroker(config.broker);
-      setLogDirectory(config.log_directory || '');
-      setAuditExportDirectory(config.audit_export_directory || '');
-      setLogRetentionDays(config.log_retention_days || 30);
-      setAuditRetentionDays(config.audit_retention_days || 90);
-      setSmtpHost(config.smtp_host || '');
-      setSmtpPort(config.smtp_port || 587);
-      setSmtpUsername(config.smtp_username || '');
-      setSmtpPassword(config.smtp_password || '');
-      setSmtpFromEmail(config.smtp_from_email || '');
+      setLogDirectory(config.log_directory ?? '');
+      setAuditExportDirectory(config.audit_export_directory ?? '');
+      setLogRetentionDays(config.log_retention_days ?? 30);
+      setAuditRetentionDays(config.audit_retention_days ?? 90);
+      setSmtpHost(config.smtp_host ?? '');
+      setSmtpPort(config.smtp_port ?? 587);
+      setSmtpUsername(config.smtp_username ?? '');
+      setSmtpPassword(config.smtp_password ?? '');
+      setSmtpFromEmail(config.smtp_from_email ?? '');
       setSmtpUseTls(config.smtp_use_tls !== false);
       setSmtpUseSsl(Boolean(config.smtp_use_ssl));
-      setSmtpTimeoutSeconds(config.smtp_timeout_seconds || 15);
+      setSmtpTimeoutSeconds(config.smtp_timeout_seconds ?? 15);
       setLoading(false);
 
-      const [prefsResult, summaryPrefsResult, safetyResult] = await Promise.allSettled([
-        getTradingPreferences(),
+      const [summaryPrefsResult, safetyResult] = await Promise.allSettled([
         getSummaryNotificationPreferences(),
         getSafetyStatus().catch(() => ({ kill_switch_active: false, last_broker_sync_at: null })),
       ]);
-      const prefs = prefsResult.status === 'fulfilled' ? prefsResult.value : null;
       const summaryPrefs = summaryPrefsResult.status === 'fulfilled' ? summaryPrefsResult.value : null;
       const safety = safetyResult.status === 'fulfilled' ? safetyResult.value : null;
-
-      if (prefs) {
-      const normalizedAssetType: AssetTypePreference = prefs.asset_type === 'etf' ? 'etf' : 'stock';
-      const normalizedUniverseMode: ScreenerModePreference =
-        normalizedAssetType === 'stock' ? prefs.screener_mode : 'preset';
-      setAssetType(normalizedAssetType);
-      setRiskProfile(prefs.risk_profile);
-      setWeeklyBudget(prefs.weekly_budget);
-      setScreenerLimit(prefs.screener_limit);
-      setUniverseMode(normalizedUniverseMode);
-      setStockPreset(prefs.stock_preset);
-      setEtfPreset(prefs.etf_preset);
-      }
 
       if (summaryPrefs) {
         setSummaryEnabled(summaryPrefs.enabled);
@@ -292,6 +307,104 @@ function SettingsPage() {
   };
   const hasValidationErrors = Object.keys(collectValidationErrors()).length > 0;
 
+  const persistSettings = async (modeSwitchConfirm: boolean) => {
+    setSaving(true);
+    setError(null);
+
+    await updateConfig({
+      trading_enabled: tradingEnabled,
+      paper_trading: paperTrading,
+      mode_switch_confirm: modeSwitchConfirm ? true : undefined,
+      etf_investing_mode_enabled: etfInvestingModeEnabled,
+      etf_investing_auto_enabled: etfInvestingAutoEnabled,
+      etf_investing_core_dca_pct: etfInvestingCoreDcaPct,
+      etf_investing_active_sleeve_pct: etfInvestingActiveSleevePct,
+      etf_investing_max_trades_per_day: ETF_FIXED_MAX_TRADES_PER_DAY,
+      etf_investing_max_concurrent_positions: ETF_FIXED_MAX_CONCURRENT_POSITIONS,
+      etf_investing_max_symbol_exposure_pct: etfInvestingMaxSymbolExposurePct,
+      etf_investing_max_total_exposure_pct: etfInvestingMaxTotalExposurePct,
+      etf_investing_single_position_equity_threshold: etfInvestingSinglePositionEquityThreshold,
+      etf_investing_daily_loss_limit_pct: etfInvestingDailyLossLimitPct,
+      etf_investing_weekly_loss_limit_pct: etfInvestingWeeklyLossLimitPct,
+      tick_interval_seconds: tickIntervalSeconds,
+      streaming_enabled: streamingEnabled,
+      strict_alpaca_data: strictAlpacaData,
+      backend_reload_enabled: backendReloadEnabled,
+      log_directory: logDirectory.trim(),
+      audit_export_directory: auditExportDirectory.trim(),
+      log_retention_days: logRetentionDays,
+      audit_retention_days: auditRetentionDays,
+      broker,
+      smtp_host: smtpHost.trim(),
+      smtp_port: smtpPort,
+      smtp_username: smtpUsername.trim(),
+      smtp_password: smtpPassword,
+      smtp_from_email: smtpFromEmail.trim(),
+      smtp_use_tls: smtpUseTls,
+      smtp_use_ssl: smtpUseSsl,
+      smtp_timeout_seconds: smtpTimeoutSeconds,
+    });
+    await updateSummaryNotificationPreferences({
+      enabled: summaryEnabled,
+      frequency: summaryFrequency,
+      channel: summaryChannel,
+      recipient: summaryRecipient.trim(),
+    });
+    const [verifiedConfig, verifiedSummary] = await Promise.all([
+      getConfig(),
+      getSummaryNotificationPreferences(),
+    ]);
+    const configVerified =
+      verifiedConfig.trading_enabled === tradingEnabled &&
+      verifiedConfig.paper_trading === paperTrading &&
+      Boolean(verifiedConfig.etf_investing_mode_enabled) === etfInvestingModeEnabled &&
+      Boolean(verifiedConfig.etf_investing_auto_enabled) === etfInvestingAutoEnabled &&
+      Number(verifiedConfig.etf_investing_core_dca_pct) === Number(etfInvestingCoreDcaPct) &&
+      Number(verifiedConfig.etf_investing_active_sleeve_pct) === Number(etfInvestingActiveSleevePct) &&
+      Number(verifiedConfig.etf_investing_max_trades_per_day) === Number(ETF_FIXED_MAX_TRADES_PER_DAY) &&
+      Number(verifiedConfig.etf_investing_max_concurrent_positions) === Number(ETF_FIXED_MAX_CONCURRENT_POSITIONS) &&
+      Number(verifiedConfig.etf_investing_max_symbol_exposure_pct) === Number(etfInvestingMaxSymbolExposurePct) &&
+      Number(verifiedConfig.etf_investing_max_total_exposure_pct) === Number(etfInvestingMaxTotalExposurePct) &&
+      Number(verifiedConfig.etf_investing_single_position_equity_threshold) === Number(etfInvestingSinglePositionEquityThreshold) &&
+      Number(verifiedConfig.etf_investing_daily_loss_limit_pct) === Number(etfInvestingDailyLossLimitPct) &&
+      Number(verifiedConfig.etf_investing_weekly_loss_limit_pct) === Number(etfInvestingWeeklyLossLimitPct) &&
+      verifiedConfig.tick_interval_seconds === tickIntervalSeconds &&
+      Boolean(verifiedConfig.streaming_enabled) === streamingEnabled &&
+      Boolean(verifiedConfig.strict_alpaca_data) === strictAlpacaData &&
+      Boolean(verifiedConfig.backend_reload_enabled) === backendReloadEnabled &&
+      (verifiedConfig.log_directory || '').trim() === logDirectory.trim() &&
+      (verifiedConfig.audit_export_directory || '').trim() === auditExportDirectory.trim() &&
+      verifiedConfig.log_retention_days === logRetentionDays &&
+      verifiedConfig.audit_retention_days === auditRetentionDays &&
+      verifiedConfig.broker === broker &&
+      (verifiedConfig.smtp_host || '').trim() === smtpHost.trim() &&
+      verifiedConfig.smtp_port === smtpPort &&
+      (verifiedConfig.smtp_username || '').trim() === smtpUsername.trim() &&
+      (verifiedConfig.smtp_password || '') === smtpPassword &&
+      (verifiedConfig.smtp_from_email || '').trim() === smtpFromEmail.trim() &&
+      Boolean(verifiedConfig.smtp_use_tls) === smtpUseTls &&
+      Boolean(verifiedConfig.smtp_use_ssl) === smtpUseSsl &&
+      verifiedConfig.smtp_timeout_seconds === smtpTimeoutSeconds;
+    const summaryVerified =
+      verifiedSummary.enabled === summaryEnabled &&
+      verifiedSummary.frequency === summaryFrequency &&
+      verifiedSummary.channel === summaryChannel &&
+      (verifiedSummary.recipient || '').trim() === summaryRecipient.trim();
+    if (!configVerified || !summaryVerified) {
+      throw new Error('Save verification failed. Reload settings and retry.');
+    }
+    setLoadedPaperTrading(Boolean(verifiedConfig.paper_trading));
+    setModeSwitchCooldownSeconds(Math.max(10, Number(verifiedConfig.mode_switch_cooldown_seconds || 60)));
+    setSaveVerificationMessage(`Settings saved and verified at ${new Date().toLocaleString()}`);
+    try {
+      setStorageInfo(await getMaintenanceStorage());
+    } catch {
+      setStorageInfo(null);
+    }
+    addToast('success', 'Settings Saved', 'Your settings have been saved and verified.');
+    await showSuccessNotification('Settings Saved', 'Your settings have been saved successfully');
+  };
+
   const handleSave = async () => {
     if (!validateSettings()) {
       await showErrorNotification('Validation Error', 'Please fix the validation errors');
@@ -299,81 +412,33 @@ function SettingsPage() {
     }
     
     try {
-      setSaving(true);
-      setError(null);
-      
-      await updateConfig({
-        trading_enabled: tradingEnabled,
-        paper_trading: paperTrading,
-        tick_interval_seconds: tickIntervalSeconds,
-        streaming_enabled: streamingEnabled,
-        strict_alpaca_data: strictAlpacaData,
-        backend_reload_enabled: backendReloadEnabled,
-        log_directory: logDirectory.trim(),
-        audit_export_directory: auditExportDirectory.trim(),
-        log_retention_days: logRetentionDays,
-        audit_retention_days: auditRetentionDays,
-        broker,
-        smtp_host: smtpHost.trim(),
-        smtp_port: smtpPort,
-        smtp_username: smtpUsername.trim(),
-        smtp_password: smtpPassword,
-        smtp_from_email: smtpFromEmail.trim(),
-        smtp_use_tls: smtpUseTls,
-        smtp_use_ssl: smtpUseSsl,
-        smtp_timeout_seconds: smtpTimeoutSeconds,
-      });
-      await updateSummaryNotificationPreferences({
-        enabled: summaryEnabled,
-        frequency: summaryFrequency,
-        channel: summaryChannel,
-        recipient: summaryRecipient.trim(),
-      });
-      const [verifiedConfig, verifiedSummary] = await Promise.all([
-        getConfig(),
-        getSummaryNotificationPreferences(),
-      ]);
-      const configVerified =
-        verifiedConfig.trading_enabled === tradingEnabled &&
-        verifiedConfig.paper_trading === paperTrading &&
-        verifiedConfig.tick_interval_seconds === tickIntervalSeconds &&
-        Boolean(verifiedConfig.streaming_enabled) === streamingEnabled &&
-        Boolean(verifiedConfig.strict_alpaca_data) === strictAlpacaData &&
-        Boolean(verifiedConfig.backend_reload_enabled) === backendReloadEnabled &&
-        (verifiedConfig.log_directory || '').trim() === logDirectory.trim() &&
-        (verifiedConfig.audit_export_directory || '').trim() === auditExportDirectory.trim() &&
-        verifiedConfig.log_retention_days === logRetentionDays &&
-        verifiedConfig.audit_retention_days === auditRetentionDays &&
-        verifiedConfig.broker === broker &&
-        (verifiedConfig.smtp_host || '').trim() === smtpHost.trim() &&
-        verifiedConfig.smtp_port === smtpPort &&
-        (verifiedConfig.smtp_username || '').trim() === smtpUsername.trim() &&
-        (verifiedConfig.smtp_password || '') === smtpPassword &&
-        (verifiedConfig.smtp_from_email || '').trim() === smtpFromEmail.trim() &&
-        Boolean(verifiedConfig.smtp_use_tls) === smtpUseTls &&
-        Boolean(verifiedConfig.smtp_use_ssl) === smtpUseSsl &&
-        verifiedConfig.smtp_timeout_seconds === smtpTimeoutSeconds;
-      const summaryVerified =
-        verifiedSummary.enabled === summaryEnabled &&
-        verifiedSummary.frequency === summaryFrequency &&
-        verifiedSummary.channel === summaryChannel &&
-        (verifiedSummary.recipient || '').trim() === summaryRecipient.trim();
-      if (!configVerified || !summaryVerified) {
-        throw new Error('Save verification failed. Reload settings and retry.');
+      if (paperTrading !== loadedPaperTrading) {
+        setModeSwitchConfirmOpen(true);
+        return;
       }
-      setSaveVerificationMessage(`Settings saved and verified at ${new Date().toLocaleString()}`);
-      try {
-        setStorageInfo(await getMaintenanceStorage());
-      } catch {
-        setStorageInfo(null);
-      }
-
-      addToast('success', 'Settings Saved', 'Your settings have been saved and verified.');
-      await showSuccessNotification('Settings Saved', 'Your settings have been saved successfully');
+      await persistSettings(false);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to save settings');
       addToast('error', 'Save Failed', err instanceof Error ? err.message : 'Failed to save settings');
       await showErrorNotification('Save Error', 'Failed to save settings');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleConfirmModeSwitch = async () => {
+    if (!validateSettings()) {
+      await showErrorNotification('Validation Error', 'Please fix the validation errors');
+      return;
+    }
+    try {
+      setModeSwitchConfirmOpen(false);
+      await persistSettings(true);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to save settings';
+      setError(message);
+      addToast('error', 'Save Failed', message);
+      await showErrorNotification('Save Error', message);
     } finally {
       setSaving(false);
     }
@@ -594,6 +659,16 @@ function SettingsPage() {
   const buildDateDisplay = buildDateRaw
     ? (Number.isNaN(Date.parse(buildDateRaw)) ? buildDateRaw : new Date(buildDateRaw).toLocaleString())
     : 'dev';
+  const etfPolicyState = (etfPolicySummary?.state ?? {}) as Record<string, unknown>;
+  const etfSelectedSymbols = (
+    ((etfPolicyState.selected_symbols as Record<string, unknown> | undefined) ?? {})
+  );
+  const activeGovernanceSymbols = Array.isArray(etfSelectedSymbols.active)
+    ? etfSelectedSymbols.active.map((row) => String(row)).filter(Boolean)
+    : [];
+  const dcaGovernanceSymbols = Array.isArray(etfSelectedSymbols.dca)
+    ? etfSelectedSymbols.dca.map((row) => String(row)).filter(Boolean)
+    : [];
 
   return (
     <div className="p-8">
@@ -661,6 +736,10 @@ function SettingsPage() {
             <div>
               <label className="text-white font-medium flex items-center gap-1">Paper Trading Mode <HelpTooltip text="Selects paper account mode only. Trading Enabled must still be ON to run execution." /></label>
               <p className="text-gray-400 text-sm">Simulate trading without real money</p>
+              <p className="text-amber-300 text-xs mt-1">
+                Switching paper/live requires confirmation and enforces a {modeSwitchCooldownSeconds}s cooldown.
+                Trading is auto-disabled after mode switch.
+              </p>
             </div>
             <button
               onClick={() => setPaperTrading(!paperTrading)}
@@ -697,6 +776,228 @@ function SettingsPage() {
         </div>
       </CollapsibleSection>
 
+      <CollapsibleSection title="ETF Investing Policy" summary="Low-frequency ETF swing/DCA guardrails">
+        <div className="space-y-4">
+          <div className="flex items-center justify-between">
+            <div>
+              <label className="text-white font-medium flex items-center gap-1">
+                Enable ETF Investing Mode
+                <HelpTooltip text="Apply ETF-focused discipline rules: low trade frequency, exposure caps, and drawdown-loss throttles." />
+              </label>
+              <p className="text-gray-400 text-sm">Use when running a disciplined ETF-first investing workflow.</p>
+            </div>
+            <button
+              onClick={() => setEtfInvestingModeEnabled(!etfInvestingModeEnabled)}
+              className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                etfInvestingModeEnabled ? 'bg-emerald-600' : 'bg-gray-600'
+              }`}
+            >
+              <span
+                className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                  etfInvestingModeEnabled ? 'translate-x-6' : 'translate-x-1'
+                }`}
+              />
+            </button>
+          </div>
+
+          <div className="flex items-center justify-between">
+            <div>
+              <label className="text-white font-medium flex items-center gap-1">
+                Auto-Enable For ETF Workspace
+                <HelpTooltip text="Automatically apply ETF investing guardrails when workspace asset type is set to ETF." />
+              </label>
+              <p className="text-gray-400 text-sm">Keeps execution behavior aligned with ETF universe workflows.</p>
+            </div>
+            <button
+              onClick={() => setEtfInvestingAutoEnabled(!etfInvestingAutoEnabled)}
+              className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                etfInvestingAutoEnabled ? 'bg-blue-600' : 'bg-gray-600'
+              }`}
+            >
+              <span
+                className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                  etfInvestingAutoEnabled ? 'translate-x-6' : 'translate-x-1'
+                }`}
+              />
+            </button>
+          </div>
+
+          <div className="rounded border border-gray-700 bg-gray-900/40 p-3">
+            <p className="text-xs font-semibold text-gray-100 mb-2">Core Controls</p>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div>
+                <label className="text-white font-medium block mb-2">Core DCA Sleeve (%)</label>
+                <input
+                  type="number"
+                  value={etfInvestingCoreDcaPct}
+                  onChange={(e) => setEtfInvestingCoreDcaPct(Math.min(95, Math.max(50, Number.parseFloat(e.target.value) || 50)))}
+                  className="bg-gray-700 text-white px-4 py-2 rounded border border-gray-600 w-full"
+                  min={50}
+                  max={95}
+                  step="1"
+                />
+              </div>
+              <div>
+                <label className="text-white font-medium block mb-2">Active Sleeve (%)</label>
+                <input
+                  type="number"
+                  value={etfInvestingActiveSleevePct}
+                  onChange={(e) => setEtfInvestingActiveSleevePct(Math.min(50, Math.max(5, Number.parseFloat(e.target.value) || 5)))}
+                  className="bg-gray-700 text-white px-4 py-2 rounded border border-gray-600 w-full"
+                  min={5}
+                  max={50}
+                  step="1"
+                />
+              </div>
+              <div>
+                <label className="text-white font-medium block mb-2">Max Symbol Exposure (%)</label>
+                <input
+                  type="number"
+                  value={etfInvestingMaxSymbolExposurePct}
+                  onChange={(e) => setEtfInvestingMaxSymbolExposurePct(Math.min(50, Math.max(2, Number.parseFloat(e.target.value) || 2)))}
+                  className="bg-gray-700 text-white px-4 py-2 rounded border border-gray-600 w-full"
+                  min={2}
+                  max={50}
+                  step="0.5"
+                />
+              </div>
+              <div>
+                <label className="text-white font-medium block mb-2">Max Total Exposure (%)</label>
+                <input
+                  type="number"
+                  value={etfInvestingMaxTotalExposurePct}
+                  onChange={(e) => setEtfInvestingMaxTotalExposurePct(Math.min(100, Math.max(10, Number.parseFloat(e.target.value) || 10)))}
+                  className="bg-gray-700 text-white px-4 py-2 rounded border border-gray-600 w-full"
+                  min={10}
+                  max={100}
+                  step="0.5"
+                />
+              </div>
+              <div>
+                <label className="text-white font-medium block mb-2">Daily Loss Cap (%)</label>
+                <input
+                  type="number"
+                  value={etfInvestingDailyLossLimitPct}
+                  onChange={(e) => setEtfInvestingDailyLossLimitPct(Math.min(10, Math.max(0.2, Number.parseFloat(e.target.value) || 0.2)))}
+                  className="bg-gray-700 text-white px-4 py-2 rounded border border-gray-600 w-full"
+                  min={0.2}
+                  max={10}
+                  step="0.1"
+                />
+              </div>
+              <div>
+                <label className="text-white font-medium block mb-2">Weekly Loss Cap (%)</label>
+                <input
+                  type="number"
+                  value={etfInvestingWeeklyLossLimitPct}
+                  onChange={(e) => setEtfInvestingWeeklyLossLimitPct(Math.min(20, Math.max(0.5, Number.parseFloat(e.target.value) || 0.5)))}
+                  className="bg-gray-700 text-white px-4 py-2 rounded border border-gray-600 w-full"
+                  min={0.5}
+                  max={20}
+                  step="0.1"
+                />
+              </div>
+            </div>
+          </div>
+          <details className="rounded border border-gray-700 bg-gray-900/30 p-3">
+            <summary className="cursor-pointer text-sm font-semibold text-gray-200">
+              Advanced Policy Controls
+            </summary>
+            <div className="mt-3 space-y-3">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                  <label className="text-white font-medium block mb-2">Max Trades / Day</label>
+                  <input
+                    type="number"
+                    value={etfInvestingMaxTradesPerDay}
+                    readOnly
+                    disabled
+                    className="bg-gray-700 text-white px-4 py-2 rounded border border-gray-600 w-full"
+                    min={ETF_FIXED_MAX_TRADES_PER_DAY}
+                    max={ETF_FIXED_MAX_TRADES_PER_DAY}
+                    step="1"
+                  />
+                  <p className="mt-1 text-xs text-gray-400">
+                    Fixed to {ETF_FIXED_MAX_TRADES_PER_DAY} in ETF investing mode.
+                  </p>
+                </div>
+                <div>
+                  <label className="text-white font-medium block mb-2">Max Concurrent Positions</label>
+                  <input
+                    type="number"
+                    value={etfInvestingMaxConcurrentPositions}
+                    readOnly
+                    disabled
+                    className="bg-gray-700 text-white px-4 py-2 rounded border border-gray-600 w-full"
+                    min={ETF_FIXED_MAX_CONCURRENT_POSITIONS}
+                    max={ETF_FIXED_MAX_CONCURRENT_POSITIONS}
+                    step="1"
+                  />
+                  <p className="mt-1 text-xs text-gray-400">
+                    Fixed to {ETF_FIXED_MAX_CONCURRENT_POSITIONS} in ETF investing mode.
+                  </p>
+                </div>
+                <div>
+                  <label className="text-white font-medium block mb-2">Single-Position Threshold ($)</label>
+                  <input
+                    type="number"
+                    value={etfInvestingSinglePositionEquityThreshold}
+                    onChange={(e) => setEtfInvestingSinglePositionEquityThreshold(Math.max(100, Number.parseFloat(e.target.value) || 100))}
+                    className="bg-gray-700 text-white px-4 py-2 rounded border border-gray-600 w-full"
+                    min={100}
+                    step="50"
+                  />
+                </div>
+              </div>
+              {etfPolicySummary && (
+                <div className="rounded-lg border border-gray-700 bg-gray-900/50 p-3">
+                  <div className="text-sm font-semibold text-white mb-2">Scenario-2 Governance Snapshot</div>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-xs text-gray-300">
+                    <div>Screen cadence: every {etfPolicySummary.policy.screen_interval_days} days</div>
+                    <div>Replacement cadence: every {etfPolicySummary.policy.replacement_interval_days} days</div>
+                    <div>Max replacements / quarter: {etfPolicySummary.policy.max_replacements_per_quarter}</div>
+                    <div>Min hold before replacement: {etfPolicySummary.policy.min_hold_days_for_replacement} days</div>
+                    <div>Min score delta for replacement: {etfPolicySummary.policy.min_replacement_score_delta_pct}%</div>
+                    <div>Min ETF dollar volume: ${Number(etfPolicySummary.policy.min_dollar_volume).toLocaleString()}</div>
+                    <div>Rebalance drift threshold: {etfPolicySummary.policy.rebalance_drift_threshold_pct}%</div>
+                    <div>Tax-loss harvesting: {etfPolicySummary.policy.tlh_enabled ? 'Enabled' : 'Disabled'}</div>
+                    <div>
+                      Last screened:{' '}
+                      {String(etfPolicyState.last_screened_at || 'n/a')}
+                    </div>
+                    <div>
+                      Last replacement:{' '}
+                      {String(etfPolicyState.last_replacement_at || 'n/a')}
+                    </div>
+                    <div className="md:col-span-2">
+                      Active universe:{' '}
+                      {activeGovernanceSymbols.length > 0
+                        ? activeGovernanceSymbols.join(', ')
+                        : 'n/a'}
+                    </div>
+                    <div className="md:col-span-2">
+                      DCA universe:{' '}
+                      {dcaGovernanceSymbols.length > 0
+                        ? dcaGovernanceSymbols.join(', ')
+                        : 'n/a'}
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+          </details>
+          {validationErrors.etfInvestingSleeves && (
+            <p className="text-red-400 text-sm">{validationErrors.etfInvestingSleeves}</p>
+          )}
+          {validationErrors.etfInvestingMaxTradesPerDay && (
+            <p className="text-red-400 text-sm">{validationErrors.etfInvestingMaxTradesPerDay}</p>
+          )}
+          <p className="text-gray-500 text-xs">
+            Core DCA + Active sleeve must total 100%. In Strategy optimizer, use objective "Scenario 2" when this policy is active.
+          </p>
+        </div>
+      </CollapsibleSection>
+
       <CollapsibleSection title="Runner & Sync" summary="Execution polling interval and update cadence">
         <div className="space-y-4">
           <div>
@@ -725,38 +1026,45 @@ function SettingsPage() {
               <p className="text-red-400 text-sm mt-1">{validationErrors.tickIntervalSeconds}</p>
             )}
           </div>
-          <div className="flex items-center justify-between rounded border border-gray-700 bg-gray-900/40 p-3">
-            <div className="pr-4">
-              <label className="text-white font-medium flex items-center gap-1">
-                Backend Hot Reload
-                <HelpTooltip text="Developer-only file watcher that restarts backend on code changes. Keep OFF for long-running optimizer jobs and standalone stability. Requires backend restart after changing." />
-              </label>
-              <p className="text-gray-400 text-sm">Default OFF. Turn ON only when actively developing backend code.</p>
+          <details className="rounded border border-gray-700 bg-gray-900/30 p-3">
+            <summary className="cursor-pointer text-sm font-semibold text-gray-200">
+              Advanced Runner Controls
+            </summary>
+            <div className="mt-3 space-y-3">
+              <div className="flex items-center justify-between rounded border border-gray-700 bg-gray-900/40 p-3">
+                <div className="pr-4">
+                  <label className="text-white font-medium flex items-center gap-1">
+                    Backend Hot Reload
+                    <HelpTooltip text="Developer-only file watcher that restarts backend on code changes. Keep OFF for long-running optimizer jobs and standalone stability. Requires backend restart after changing." />
+                  </label>
+                  <p className="text-gray-400 text-sm">Default OFF. Turn ON only when actively developing backend code.</p>
+                </div>
+                <button
+                  onClick={() => setBackendReloadEnabled(!backendReloadEnabled)}
+                  className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                    backendReloadEnabled ? 'bg-amber-600' : 'bg-gray-600'
+                  }`}
+                >
+                  <span
+                    className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                      backendReloadEnabled ? 'translate-x-6' : 'translate-x-1'
+                    }`}
+                  />
+                </button>
+              </div>
+              <p className="text-amber-300 text-xs">Applies on next backend start.</p>
+              <div className="rounded-lg border border-blue-800 bg-blue-900/20 p-3 text-sm text-blue-100">
+                Position sizing, daily loss caps, universe filters, and budget guardrails are managed in
+                <span className="font-semibold"> Screener Workspace Controls</span> to avoid duplicate risk inputs.
+              </div>
+              <button
+                onClick={() => navigate('/screener')}
+                className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded font-medium"
+              >
+                Open Screener Workspace
+              </button>
             </div>
-            <button
-              onClick={() => setBackendReloadEnabled(!backendReloadEnabled)}
-              className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
-                backendReloadEnabled ? 'bg-amber-600' : 'bg-gray-600'
-              }`}
-            >
-              <span
-                className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
-                  backendReloadEnabled ? 'translate-x-6' : 'translate-x-1'
-                }`}
-              />
-            </button>
-          </div>
-          <p className="text-amber-300 text-xs -mt-2">Applies on next backend start.</p>
-          <div className="rounded-lg border border-blue-800 bg-blue-900/20 p-3 text-sm text-blue-100">
-            Position sizing, daily loss caps, universe filters, and budget guardrails are managed in
-            <span className="font-semibold"> Screener Workspace Controls</span> to avoid duplicate risk inputs.
-          </div>
-          <button
-            onClick={() => navigate('/screener')}
-            className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded font-medium"
-          >
-            Open Screener Workspace
-          </button>
+          </details>
         </div>
       </CollapsibleSection>
 
@@ -1059,83 +1367,6 @@ function SettingsPage() {
         </div>
       </CollapsibleSection>
 
-      <CollapsibleSection title="Universe Workspace" summary="Managed from Screener to avoid duplicated controls">
-        <div className="space-y-4">
-          <div className="rounded-lg border border-blue-800 bg-blue-900/20 p-3 text-sm text-blue-100">
-            Universe selection, symbol list, charts, metrics, and guardrails are all managed in
-            <span className="font-semibold"> Screener</span> now.
-          </div>
-          <div className="grid grid-cols-1 md:grid-cols-3 xl:grid-cols-4 gap-3">
-            <div className="rounded border border-gray-700 bg-gray-800/40 p-3">
-              <p className="text-xs text-gray-400">Asset Type</p>
-              <p className="text-white font-medium uppercase">{assetType}</p>
-            </div>
-            <div className="rounded border border-gray-700 bg-gray-800/40 p-3">
-              <p className="text-xs text-gray-400">Universe Mode</p>
-              <p className="text-white font-medium">{universeMode === 'most_active' ? 'Most Active' : 'Preset'}</p>
-            </div>
-            <div className="rounded border border-gray-700 bg-gray-800/40 p-3">
-              <p className="text-xs text-gray-400">Current Preset</p>
-              <p className="text-white font-medium">{assetType === 'etf' ? etfPreset : stockPreset}</p>
-            </div>
-            <div className="rounded border border-gray-700 bg-gray-800/40 p-3">
-              <p className="text-xs text-gray-400">Most Active Count</p>
-              <p className="text-white font-medium">{screenerLimit}</p>
-            </div>
-            <div className="rounded border border-gray-700 bg-gray-800/40 p-3">
-              <p className="text-xs text-gray-400">Risk Profile</p>
-              <p className="text-white font-medium uppercase">{riskProfile}</p>
-            </div>
-            <div className="rounded border border-gray-700 bg-gray-800/40 p-3">
-              <p className="text-xs text-gray-400">Weekly Budget</p>
-              <p className="text-white font-medium">${weeklyBudget.toLocaleString()}</p>
-            </div>
-            <div className="rounded border border-gray-700 bg-gray-800/40 p-3">
-              <p className="text-xs text-gray-400">Max Position Size</p>
-              <p className="text-white font-medium">${maxPositionSize.toLocaleString()}</p>
-            </div>
-            <div className="rounded border border-gray-700 bg-gray-800/40 p-3">
-              <p className="text-xs text-gray-400">Daily Loss Limit</p>
-              <p className="text-white font-medium">${riskLimitDaily.toLocaleString()}</p>
-            </div>
-          </div>
-
-          {/* Active Preset Trading Parameters */}
-          {(() => {
-            const activePreset = assetType === 'etf'
-              ? ETF_PRESET_PARAMETER_DEFAULTS[etfPreset] || ETF_PRESET_PARAMETER_DEFAULTS.balanced
-              : STOCK_PRESET_PARAMETER_DEFAULTS[stockPreset] || STOCK_PRESET_PARAMETER_DEFAULTS.weekly_optimized;
-            const tpSlRatio = (activePreset.take_profit_pct / activePreset.stop_loss_pct).toFixed(1);
-            return (
-              <div className="mt-1 rounded-lg border border-gray-700 bg-gray-800/30 p-3">
-                <p className="text-xs text-gray-400 mb-2">Active Preset Defaults (applied to new strategies)</p>
-                <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2 text-sm">
-                  <div><span className="text-gray-500">Position:</span> <span className="text-white">${activePreset.position_size}</span></div>
-                  <div><span className="text-gray-500">SL:</span> <span className="text-white">{activePreset.stop_loss_pct}%</span></div>
-                  <div><span className="text-gray-500">TP:</span> <span className="text-white">{activePreset.take_profit_pct}%</span></div>
-                  <div><span className="text-gray-500">Trail:</span> <span className="text-white">{activePreset.trailing_stop_pct}%</span></div>
-                  <div><span className="text-gray-500">Hold:</span> <span className="text-white">{activePreset.max_hold_days}d</span></div>
-                  <div><span className="text-gray-500">TP:SL:</span> <span className={parseFloat(tpSlRatio) >= 2.0 ? 'text-green-400' : 'text-yellow-400'}>{tpSlRatio}:1</span></div>
-                  <div><span className="text-gray-500">ATR Mult:</span> <span className="text-white">{activePreset.atr_stop_mult}x</span></div>
-                  <div><span className="text-gray-500">Z-Score:</span> <span className="text-white">{activePreset.zscore_entry_threshold}</span></div>
-                  <div><span className="text-gray-500">Dip:</span> <span className="text-white">{activePreset.dip_buy_threshold_pct}%</span></div>
-                  <div><span className="text-gray-500">DCA:</span> <span className="text-white">{activePreset.dca_tranches}x</span></div>
-                  <div><span className="text-gray-500">Max Losses:</span> <span className="text-white">{activePreset.max_consecutive_losses}</span></div>
-                  <div><span className="text-gray-500">Max DD:</span> <span className="text-white">{activePreset.max_drawdown_pct}%</span></div>
-                </div>
-              </div>
-            );
-          })()}
-
-          <button
-            onClick={() => navigate('/screener')}
-            className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded font-medium"
-          >
-            Open Screener Workspace
-          </button>
-        </div>
-      </CollapsibleSection>
-
       <CollapsibleSection title="Notifications" summary="Desktop notification behavior and test action">
         <div className="space-y-4">
           <div className="flex items-center justify-between">
@@ -1162,210 +1393,215 @@ function SettingsPage() {
             </p>
           </div>
 
-          <div className="border-t border-gray-700 pt-4 space-y-3">
-            <div className="rounded border border-gray-700 bg-gray-900/40 p-3 space-y-3">
-              <div>
-                <label className="text-white font-medium">SMTP Delivery Settings</label>
-                <p className="text-gray-400 text-xs">Used for email summary notifications. Saved with runtime config.</p>
+          <details className="border-t border-gray-700 pt-4">
+            <summary className="cursor-pointer text-sm font-semibold text-gray-200">
+              Email/SMS Delivery Settings
+            </summary>
+            <div className="mt-3 space-y-3">
+              <div className="rounded border border-gray-700 bg-gray-900/40 p-3 space-y-3">
+                <div>
+                  <label className="text-white font-medium">SMTP Delivery Settings</label>
+                  <p className="text-gray-400 text-xs">Used for email summary notifications. Saved with runtime config.</p>
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                  <div>
+                    <label className="text-white text-sm block mb-1">SMTP Host</label>
+                    <input
+                      type="text"
+                      value={smtpHost}
+                      onChange={(e) => setSmtpHost(e.target.value)}
+                      placeholder="smtp.gmail.com"
+                      className={`w-full bg-gray-700 text-white px-3 py-2 rounded border ${
+                        validationErrors.smtpHost ? 'border-red-500' : 'border-gray-600'
+                      }`}
+                    />
+                    {validationErrors.smtpHost && (
+                      <p className="text-red-400 text-xs mt-1">{validationErrors.smtpHost}</p>
+                    )}
+                  </div>
+                  <div>
+                    <label className="text-white text-sm block mb-1">SMTP From Email</label>
+                    <input
+                      type="email"
+                      value={smtpFromEmail}
+                      onChange={(e) => setSmtpFromEmail(e.target.value)}
+                      placeholder="yourname@gmail.com"
+                      className={`w-full bg-gray-700 text-white px-3 py-2 rounded border ${
+                        validationErrors.smtpFromEmail ? 'border-red-500' : 'border-gray-600'
+                      }`}
+                    />
+                    {validationErrors.smtpFromEmail && (
+                      <p className="text-red-400 text-xs mt-1">{validationErrors.smtpFromEmail}</p>
+                    )}
+                  </div>
+                  <div>
+                    <label className="text-white text-sm block mb-1">SMTP Username</label>
+                    <input
+                      type="text"
+                      value={smtpUsername}
+                      onChange={(e) => setSmtpUsername(e.target.value)}
+                      placeholder="yourname@gmail.com"
+                      className={`w-full bg-gray-700 text-white px-3 py-2 rounded border ${
+                        validationErrors.smtpUsername ? 'border-red-500' : 'border-gray-600'
+                      }`}
+                    />
+                    {validationErrors.smtpUsername && (
+                      <p className="text-red-400 text-xs mt-1">{validationErrors.smtpUsername}</p>
+                    )}
+                  </div>
+                  <div>
+                    <label className="text-white text-sm block mb-1">SMTP Password / App Password</label>
+                    <input
+                      type="password"
+                      value={smtpPassword}
+                      onChange={(e) => setSmtpPassword(e.target.value)}
+                      placeholder="App password"
+                      className={`w-full bg-gray-700 text-white px-3 py-2 rounded border ${
+                        validationErrors.smtpPassword ? 'border-red-500' : 'border-gray-600'
+                      }`}
+                    />
+                    {validationErrors.smtpPassword && (
+                      <p className="text-red-400 text-xs mt-1">{validationErrors.smtpPassword}</p>
+                    )}
+                  </div>
+                  <div>
+                    <label className="text-white text-sm block mb-1">SMTP Port</label>
+                    <input
+                      type="number"
+                      value={smtpPort}
+                      min={SETTINGS_LIMITS.smtpPortMin}
+                      max={SETTINGS_LIMITS.smtpPortMax}
+                      onChange={(e) => setSmtpPort(parseInt(e.target.value || '0', 10) || 0)}
+                      className={`w-full bg-gray-700 text-white px-3 py-2 rounded border ${
+                        validationErrors.smtpPort ? 'border-red-500' : 'border-gray-600'
+                      }`}
+                    />
+                    {validationErrors.smtpPort && (
+                      <p className="text-red-400 text-xs mt-1">{validationErrors.smtpPort}</p>
+                    )}
+                  </div>
+                  <div>
+                    <label className="text-white text-sm block mb-1">SMTP Timeout (seconds)</label>
+                    <input
+                      type="number"
+                      value={smtpTimeoutSeconds}
+                      min={SETTINGS_LIMITS.smtpTimeoutMin}
+                      max={SETTINGS_LIMITS.smtpTimeoutMax}
+                      onChange={(e) => setSmtpTimeoutSeconds(parseInt(e.target.value || '0', 10) || 0)}
+                      className={`w-full bg-gray-700 text-white px-3 py-2 rounded border ${
+                        validationErrors.smtpTimeoutSeconds ? 'border-red-500' : 'border-gray-600'
+                      }`}
+                    />
+                    {validationErrors.smtpTimeoutSeconds && (
+                      <p className="text-red-400 text-xs mt-1">{validationErrors.smtpTimeoutSeconds}</p>
+                    )}
+                  </div>
+                </div>
+                <div className="flex flex-wrap gap-4">
+                  <label className="inline-flex items-center gap-2 text-sm text-gray-200">
+                    <input
+                      type="checkbox"
+                      checked={smtpUseTls}
+                      onChange={(e) => {
+                        const checked = e.target.checked;
+                        setSmtpUseTls(checked);
+                        if (checked) {
+                          setSmtpUseSsl(false);
+                        }
+                      }}
+                      className="rounded border-gray-600 bg-gray-700"
+                    />
+                    Use TLS (STARTTLS)
+                  </label>
+                  <label className="inline-flex items-center gap-2 text-sm text-gray-200">
+                    <input
+                      type="checkbox"
+                      checked={smtpUseSsl}
+                      onChange={(e) => {
+                        const checked = e.target.checked;
+                        setSmtpUseSsl(checked);
+                        if (checked) {
+                          setSmtpUseTls(false);
+                        }
+                      }}
+                      className="rounded border-gray-600 bg-gray-700"
+                    />
+                    Use SSL
+                  </label>
+                </div>
               </div>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                <div>
-                  <label className="text-white text-sm block mb-1">SMTP Host</label>
-                  <input
-                    type="text"
-                    value={smtpHost}
-                    onChange={(e) => setSmtpHost(e.target.value)}
-                    placeholder="smtp.gmail.com"
-                    className={`w-full bg-gray-700 text-white px-3 py-2 rounded border ${
-                      validationErrors.smtpHost ? 'border-red-500' : 'border-gray-600'
-                    }`}
-                  />
-                  {validationErrors.smtpHost && (
-                    <p className="text-red-400 text-xs mt-1">{validationErrors.smtpHost}</p>
-                  )}
-                </div>
-                <div>
-                  <label className="text-white text-sm block mb-1">SMTP From Email</label>
-                  <input
-                    type="email"
-                    value={smtpFromEmail}
-                    onChange={(e) => setSmtpFromEmail(e.target.value)}
-                    placeholder="yourname@gmail.com"
-                    className={`w-full bg-gray-700 text-white px-3 py-2 rounded border ${
-                      validationErrors.smtpFromEmail ? 'border-red-500' : 'border-gray-600'
-                    }`}
-                  />
-                  {validationErrors.smtpFromEmail && (
-                    <p className="text-red-400 text-xs mt-1">{validationErrors.smtpFromEmail}</p>
-                  )}
-                </div>
-                <div>
-                  <label className="text-white text-sm block mb-1">SMTP Username</label>
-                  <input
-                    type="text"
-                    value={smtpUsername}
-                    onChange={(e) => setSmtpUsername(e.target.value)}
-                    placeholder="yourname@gmail.com"
-                    className={`w-full bg-gray-700 text-white px-3 py-2 rounded border ${
-                      validationErrors.smtpUsername ? 'border-red-500' : 'border-gray-600'
-                    }`}
-                  />
-                  {validationErrors.smtpUsername && (
-                    <p className="text-red-400 text-xs mt-1">{validationErrors.smtpUsername}</p>
-                  )}
-                </div>
-                <div>
-                  <label className="text-white text-sm block mb-1">SMTP Password / App Password</label>
-                  <input
-                    type="password"
-                    value={smtpPassword}
-                    onChange={(e) => setSmtpPassword(e.target.value)}
-                    placeholder="App password"
-                    className={`w-full bg-gray-700 text-white px-3 py-2 rounded border ${
-                      validationErrors.smtpPassword ? 'border-red-500' : 'border-gray-600'
-                    }`}
-                  />
-                  {validationErrors.smtpPassword && (
-                    <p className="text-red-400 text-xs mt-1">{validationErrors.smtpPassword}</p>
-                  )}
-                </div>
-                <div>
-                  <label className="text-white text-sm block mb-1">SMTP Port</label>
-                  <input
-                    type="number"
-                    value={smtpPort}
-                    min={SETTINGS_LIMITS.smtpPortMin}
-                    max={SETTINGS_LIMITS.smtpPortMax}
-                    onChange={(e) => setSmtpPort(parseInt(e.target.value || '0', 10) || 0)}
-                    className={`w-full bg-gray-700 text-white px-3 py-2 rounded border ${
-                      validationErrors.smtpPort ? 'border-red-500' : 'border-gray-600'
-                    }`}
-                  />
-                  {validationErrors.smtpPort && (
-                    <p className="text-red-400 text-xs mt-1">{validationErrors.smtpPort}</p>
-                  )}
-                </div>
-                <div>
-                  <label className="text-white text-sm block mb-1">SMTP Timeout (seconds)</label>
-                  <input
-                    type="number"
-                    value={smtpTimeoutSeconds}
-                    min={SETTINGS_LIMITS.smtpTimeoutMin}
-                    max={SETTINGS_LIMITS.smtpTimeoutMax}
-                    onChange={(e) => setSmtpTimeoutSeconds(parseInt(e.target.value || '0', 10) || 0)}
-                    className={`w-full bg-gray-700 text-white px-3 py-2 rounded border ${
-                      validationErrors.smtpTimeoutSeconds ? 'border-red-500' : 'border-gray-600'
-                    }`}
-                  />
-                  {validationErrors.smtpTimeoutSeconds && (
-                    <p className="text-red-400 text-xs mt-1">{validationErrors.smtpTimeoutSeconds}</p>
-                  )}
-                </div>
-              </div>
-              <div className="flex flex-wrap gap-4">
-                <label className="inline-flex items-center gap-2 text-sm text-gray-200">
-                  <input
-                    type="checkbox"
-                    checked={smtpUseTls}
-                    onChange={(e) => {
-                      const checked = e.target.checked;
-                      setSmtpUseTls(checked);
-                      if (checked) {
-                        setSmtpUseSsl(false);
-                      }
-                    }}
-                    className="rounded border-gray-600 bg-gray-700"
-                  />
-                  Use TLS (STARTTLS)
-                </label>
-                <label className="inline-flex items-center gap-2 text-sm text-gray-200">
-                  <input
-                    type="checkbox"
-                    checked={smtpUseSsl}
-                    onChange={(e) => {
-                      const checked = e.target.checked;
-                      setSmtpUseSsl(checked);
-                      if (checked) {
-                        setSmtpUseTls(false);
-                      }
-                    }}
-                    className="rounded border-gray-600 bg-gray-700"
-                  />
-                  Use SSL
-                </label>
-              </div>
-            </div>
 
-            <div className="flex items-center justify-between">
-              <div>
-                <label className="text-white font-medium">Transaction Summary via Email/SMS</label>
-                <p className="text-gray-400 text-sm">Receive daily or weekly summaries of all transactions</p>
-              </div>
-              <button
-                onClick={() => setSummaryEnabled(!summaryEnabled)}
-                className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
-                  summaryEnabled ? 'bg-green-600' : 'bg-gray-600'
-                }`}
-              >
-                <span
-                  className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
-                    summaryEnabled ? 'translate-x-6' : 'translate-x-1'
+              <div className="flex items-center justify-between">
+                <div>
+                  <label className="text-white font-medium">Transaction Summary via Email/SMS</label>
+                  <p className="text-gray-400 text-sm">Receive daily or weekly summaries of all transactions</p>
+                </div>
+                <button
+                  onClick={() => setSummaryEnabled(!summaryEnabled)}
+                  className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                    summaryEnabled ? 'bg-green-600' : 'bg-gray-600'
                   }`}
-                />
+                >
+                  <span
+                    className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                      summaryEnabled ? 'translate-x-6' : 'translate-x-1'
+                    }`}
+                  />
+                </button>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                <div>
+                  <label className="text-white text-sm block mb-1">Frequency</label>
+                  <select
+                    value={summaryFrequency}
+                    onChange={(e) => setSummaryFrequency(e.target.value as SummaryNotificationFrequency)}
+                    disabled={!summaryEnabled}
+                    className="w-full bg-gray-700 text-white px-3 py-2 rounded border border-gray-600 disabled:bg-gray-800"
+                  >
+                    <option value="daily">Daily</option>
+                    <option value="weekly">Weekly</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="text-white text-sm block mb-1">Channel</label>
+                  <select
+                    value={summaryChannel}
+                    onChange={(e) => setSummaryChannel(e.target.value as SummaryNotificationChannel)}
+                    disabled={!summaryEnabled}
+                    className="w-full bg-gray-700 text-white px-3 py-2 rounded border border-gray-600 disabled:bg-gray-800"
+                  >
+                    <option value="email">Email</option>
+                    <option value="sms">SMS</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="text-white text-sm block mb-1">
+                    Recipient ({summaryChannel === 'email' ? 'email' : 'phone'})
+                  </label>
+                  <input
+                    type="text"
+                    value={summaryRecipient}
+                    onChange={(e) => setSummaryRecipient(e.target.value)}
+                    disabled={!summaryEnabled}
+                    placeholder={summaryChannel === 'email' ? 'name@example.com' : '+15551234567'}
+                    className="w-full bg-gray-700 text-white px-3 py-2 rounded border border-gray-600 disabled:bg-gray-800"
+                  />
+                  {validationErrors.summaryRecipient && (
+                    <p className="text-red-400 text-xs mt-1">{validationErrors.summaryRecipient}</p>
+                  )}
+                </div>
+              </div>
+
+              <button
+                onClick={handleSendSummaryNow}
+                disabled={summarySending}
+                className="bg-emerald-600 hover:bg-emerald-700 disabled:bg-gray-600 text-white px-4 py-2 rounded font-medium"
+              >
+                {summarySending ? 'Sending...' : 'Send Summary Now'}
               </button>
             </div>
-
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-              <div>
-                <label className="text-white text-sm block mb-1">Frequency</label>
-                <select
-                  value={summaryFrequency}
-                  onChange={(e) => setSummaryFrequency(e.target.value as SummaryNotificationFrequency)}
-                  disabled={!summaryEnabled}
-                  className="w-full bg-gray-700 text-white px-3 py-2 rounded border border-gray-600 disabled:bg-gray-800"
-                >
-                  <option value="daily">Daily</option>
-                  <option value="weekly">Weekly</option>
-                </select>
-              </div>
-              <div>
-                <label className="text-white text-sm block mb-1">Channel</label>
-                <select
-                  value={summaryChannel}
-                  onChange={(e) => setSummaryChannel(e.target.value as SummaryNotificationChannel)}
-                  disabled={!summaryEnabled}
-                  className="w-full bg-gray-700 text-white px-3 py-2 rounded border border-gray-600 disabled:bg-gray-800"
-                >
-                  <option value="email">Email</option>
-                  <option value="sms">SMS</option>
-                </select>
-              </div>
-              <div>
-                <label className="text-white text-sm block mb-1">
-                  Recipient ({summaryChannel === 'email' ? 'email' : 'phone'})
-                </label>
-                <input
-                  type="text"
-                  value={summaryRecipient}
-                  onChange={(e) => setSummaryRecipient(e.target.value)}
-                  disabled={!summaryEnabled}
-                  placeholder={summaryChannel === 'email' ? 'name@example.com' : '+15551234567'}
-                  className="w-full bg-gray-700 text-white px-3 py-2 rounded border border-gray-600 disabled:bg-gray-800"
-                />
-                {validationErrors.summaryRecipient && (
-                  <p className="text-red-400 text-xs mt-1">{validationErrors.summaryRecipient}</p>
-                )}
-              </div>
-            </div>
-
-            <button
-              onClick={handleSendSummaryNow}
-              disabled={summarySending}
-              className="bg-emerald-600 hover:bg-emerald-700 disabled:bg-gray-600 text-white px-4 py-2 rounded font-medium"
-            >
-              {summarySending ? 'Sending...' : 'Send Summary Now'}
-            </button>
-          </div>
+          </details>
         </div>
       </CollapsibleSection>
 
@@ -1384,33 +1620,6 @@ function SettingsPage() {
             <p className="text-white font-medium">{buildDateDisplay}</p>
           </div>
         </div>
-      </CollapsibleSection>
-
-      <CollapsibleSection title="Feature Highlights" summary="Current and upcoming capabilities" defaultOpen={false}>
-      <div className="bg-blue-900/20 border border-blue-700 rounded-lg p-6 mb-6">
-        <h4 className="text-lg font-semibold text-blue-400 mb-2">Features Available</h4>
-        <ul className="text-blue-200/80 text-sm space-y-1">
-          <li>✓ Market Screener - View most actively traded stocks and ETFs</li>
-          <li>✓ Risk Profiles - Conservative, Balanced, Aggressive, and Micro Budget</li>
-          <li>✓ Weekly Budget Tracking - Configurable weekly trading budget</li>
-          <li>✓ Asset Type Preferences - Choose stocks or ETFs</li>
-          <li>✓ DCA / Split Entries - Dollar-cost average into positions with 1-3 tranches</li>
-          <li>✓ Profit Reinvestment - Compound realized gains back into weekly budget</li>
-          <li>✓ Auto-Scaling Budget - Budget grows after consecutive profitable weeks</li>
-          <li>✓ Consecutive-Loss Circuit Breaker - Halts trading after N losing trades</li>
-          <li>✓ Drawdown Kill Switch - Halts trading when account drops below peak threshold</li>
-          <li>✓ Micro Budget Preset - Optimized for $20-$50/week accounts</li>
-        </ul>
-      </div>
-
-      <div className="bg-gray-800/50 border border-gray-700 rounded-lg p-6">
-        <h4 className="text-lg font-semibold text-gray-400 mb-2">Future Enhancements</h4>
-        <ul className="text-gray-500 text-sm space-y-1">
-          <li>• UI theme customization</li>
-          <li>• Data export settings</li>
-          <li>• Backup and restore</li>
-        </ul>
-      </div>
       </CollapsibleSection>
 
       <ConfirmDialog
@@ -1433,6 +1642,17 @@ function SettingsPage() {
         loading={cleanupLoading}
         onConfirm={handleRunCleanupNow}
         onCancel={() => setCleanupConfirmOpen(false)}
+      />
+
+      <ConfirmDialog
+        open={modeSwitchConfirmOpen}
+        title="Confirm Account Mode Switch"
+        message={`You are switching broker mode to ${paperTrading ? 'Paper' : 'Live'}. Trading will be disabled after this change and mode switching will be locked for ${modeSwitchCooldownSeconds} seconds.`}
+        confirmLabel={`Switch To ${paperTrading ? 'Paper' : 'Live'}`}
+        variant="warning"
+        loading={saving}
+        onConfirm={handleConfirmModeSwitch}
+        onCancel={() => setModeSwitchConfirmOpen(false)}
       />
     </div>
   );

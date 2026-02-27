@@ -42,9 +42,26 @@ from services.order_execution import (
 )
 from config.settings import get_settings, has_alpaca_credentials
 from config.paths import default_log_directory, default_audit_export_directory
+from config.investing_defaults import (
+    ETF_INVESTING_MODE_ENABLED_DEFAULT,
+    ETF_INVESTING_AUTO_ENABLED_DEFAULT,
+    ETF_INVESTING_CORE_DCA_PCT_DEFAULT,
+    ETF_INVESTING_ACTIVE_SLEEVE_PCT_DEFAULT,
+    ETF_INVESTING_MAX_TRADES_PER_DAY_DEFAULT,
+    ETF_INVESTING_MAX_CONCURRENT_POSITIONS_DEFAULT,
+    ETF_INVESTING_MAX_SYMBOL_EXPOSURE_PCT_DEFAULT,
+    ETF_INVESTING_MAX_TOTAL_EXPOSURE_PCT_DEFAULT,
+    ETF_INVESTING_SINGLE_POSITION_EQUITY_THRESHOLD_DEFAULT,
+    ETF_INVESTING_DAILY_LOSS_LIMIT_PCT_DEFAULT,
+    ETF_INVESTING_WEEKLY_LOSS_LIMIT_PCT_DEFAULT,
+    ETF_INVESTING_WEEKLY_CONTRIBUTION_DEFAULT,
+    ETF_DCA_BENCHMARK_WEIGHTS,
+    get_scenario2_thresholds,
+)
 from services.logging_service import configure_file_logging, cleanup_old_files
 from services.notification_delivery import NotificationDeliveryService
 from services.budget_tracker import get_budget_tracker
+from services.etf_investing_governance import ETFInvestingGovernanceService
 from config.risk_profiles import get_all_profiles
 
 from .models import (
@@ -112,6 +129,10 @@ from .models import (
     StockPreset,
     EtfPreset,
     TradingPreferencesResponse,
+    EtfAllowListItem,
+    EtfInvestingPolicyResponse,
+    EtfInvestingPolicySummaryResponse,
+    EtfInvestingPolicyUpdateRequest,
 )
 from .runner_manager import runner_manager
 from .middleware import limiter
@@ -173,19 +194,30 @@ def _set_runtime_credentials(mode: str, api_key: str, secret_key: str) -> None:
         _preference_recommendation_cache.clear()
 
 
-def _resolve_alpaca_credentials_for_mode(mode: str) -> Optional[Dict[str, str]]:
+def _resolve_alpaca_credentials_for_mode(mode: str) -> Optional[Dict[str, Any]]:
     """Resolve runtime-keychain credentials first, then environment credentials."""
-    runtime_creds = _get_runtime_credentials(mode)
+    mode_normalized = "paper" if str(mode).strip().lower() == "paper" else "live"
+    paper_mode = mode_normalized == "paper"
+    runtime_creds = _get_runtime_credentials(mode_normalized)
     runtime_api_key = (runtime_creds.get("api_key") or "").strip()
     runtime_secret_key = (runtime_creds.get("secret_key") or "").strip()
     if runtime_api_key and runtime_secret_key:
-        return {"api_key": runtime_api_key, "secret_key": runtime_secret_key}
+        return {
+            "api_key": runtime_api_key,
+            "secret_key": runtime_secret_key,
+            "paper": paper_mode,
+        }
     if has_alpaca_credentials():
         settings = get_settings()
         env_api_key = (settings.alpaca_api_key or "").strip()
         env_secret_key = (settings.alpaca_secret_key or "").strip()
         if env_api_key and env_secret_key:
-            return {"api_key": env_api_key, "secret_key": env_secret_key}
+            return {
+                "api_key": env_api_key,
+                "secret_key": env_secret_key,
+                # Prefer explicit mode selected in runtime config over static env defaults.
+                "paper": paper_mode,
+            }
     return None
 
 
@@ -319,6 +351,8 @@ def get_order_execution_service(
         OrderExecutionService instance
     """
     storage = StorageService(db)
+    runtime_cfg = _get_config_snapshot()
+    snapshot_mode = "paper" if bool(runtime_cfg.paper_trading) else "live"
     set_global_kill_switch(_load_kill_switch(storage))
     
     # Get config for risk limits
@@ -347,7 +381,24 @@ def get_order_execution_service(
         storage=storage,
         max_position_size=max_position_size,
         risk_limit_daily=risk_limit_daily,
-        enable_budget_tracking=enable_budget
+        enable_budget_tracking=enable_budget,
+        micro_mode_enabled=bool(config.micro_mode_enabled),
+        micro_mode_auto_enabled=bool(config.micro_mode_auto_enabled),
+        micro_mode_equity_threshold=float(config.micro_mode_equity_threshold),
+        micro_mode_single_trade_loss_pct=float(config.micro_mode_single_trade_loss_pct),
+        micro_mode_cash_reserve_pct=float(config.micro_mode_cash_reserve_pct),
+        micro_mode_max_spread_bps=float(config.micro_mode_max_spread_bps),
+        etf_investing_mode_enabled=bool(config.etf_investing_mode_enabled),
+        etf_investing_auto_enabled=bool(config.etf_investing_auto_enabled),
+        etf_investing_core_dca_pct=float(config.etf_investing_core_dca_pct),
+        etf_investing_active_sleeve_pct=float(config.etf_investing_active_sleeve_pct),
+        etf_investing_max_trades_per_day=int(config.etf_investing_max_trades_per_day),
+        etf_investing_max_concurrent_positions=int(config.etf_investing_max_concurrent_positions),
+        etf_investing_max_symbol_exposure_pct=float(config.etf_investing_max_symbol_exposure_pct),
+        etf_investing_max_total_exposure_pct=float(config.etf_investing_max_total_exposure_pct),
+        etf_investing_single_position_equity_threshold=float(config.etf_investing_single_position_equity_threshold),
+        etf_investing_daily_loss_limit_pct=float(config.etf_investing_daily_loss_limit_pct),
+        etf_investing_weekly_loss_limit_pct=float(config.etf_investing_weekly_loss_limit_pct),
     )
 
 
@@ -360,9 +411,30 @@ _settings_snapshot = get_settings()
 _config = ConfigResponse(
     environment="development",
     trading_enabled=False,
+    read_only_mode=True,
     paper_trading=True,
+    mode_switch_cooldown_seconds=60,
+    last_mode_switch_at=None,
+    mode_switch_available_at=None,
     max_position_size=10000.0,
     risk_limit_daily=500.0,
+    micro_mode_enabled=False,
+    micro_mode_auto_enabled=True,
+    micro_mode_equity_threshold=2500.0,
+    micro_mode_single_trade_loss_pct=1.5,
+    micro_mode_cash_reserve_pct=5.0,
+    micro_mode_max_spread_bps=40.0,
+    etf_investing_mode_enabled=ETF_INVESTING_MODE_ENABLED_DEFAULT,
+    etf_investing_auto_enabled=ETF_INVESTING_AUTO_ENABLED_DEFAULT,
+    etf_investing_core_dca_pct=ETF_INVESTING_CORE_DCA_PCT_DEFAULT,
+    etf_investing_active_sleeve_pct=ETF_INVESTING_ACTIVE_SLEEVE_PCT_DEFAULT,
+    etf_investing_max_trades_per_day=ETF_INVESTING_MAX_TRADES_PER_DAY_DEFAULT,
+    etf_investing_max_concurrent_positions=ETF_INVESTING_MAX_CONCURRENT_POSITIONS_DEFAULT,
+    etf_investing_max_symbol_exposure_pct=ETF_INVESTING_MAX_SYMBOL_EXPOSURE_PCT_DEFAULT,
+    etf_investing_max_total_exposure_pct=ETF_INVESTING_MAX_TOTAL_EXPOSURE_PCT_DEFAULT,
+    etf_investing_single_position_equity_threshold=ETF_INVESTING_SINGLE_POSITION_EQUITY_THRESHOLD_DEFAULT,
+    etf_investing_daily_loss_limit_pct=ETF_INVESTING_DAILY_LOSS_LIMIT_PCT_DEFAULT,
+    etf_investing_weekly_loss_limit_pct=ETF_INVESTING_WEEKLY_LOSS_LIMIT_PCT_DEFAULT,
     tick_interval_seconds=60.0,
     streaming_enabled=False,
     strict_alpaca_data=True,
@@ -450,6 +522,11 @@ _OPTIMIZER_FORCE_KILL_GRACE_SECONDS = 6.0
 _OPTIMIZER_DISPATCHER_POLL_SECONDS = 1.0
 _OPTIMIZER_RUNNING_STALE_SECONDS = 300.0  # 5 min; ensemble jobs can block for minutes per candidate
 _STRATEGY_CONFIG_VERSION_KEY = "_config_version"
+_STRATEGY_BASELINE_PARAMETERS_KEY = "baseline_parameters"
+_STRATEGY_BASELINE_PROFILE_KEY = "baseline_profile"
+_STRATEGY_MICRO_CALIBRATION_KEY = "micro_calibration"
+_RECONCILIATION_BLOCKED_KEY = "broker_reconciliation_blocked_v1"
+_RECONCILIATION_STATUS_KEY = "broker_reconciliation_status_v1"
 
 _SUMMARY_NOTIFICATION_PREFERENCES_KEY = "summary_notification_preferences"
 _SUMMARY_NOTIFICATION_SCHEDULE_STATE_KEY = "summary_notification_schedule_state"
@@ -1778,6 +1855,161 @@ def _strategy_bump_config_version(db_strategy: DBStrategy) -> int:
     return _strategy_set_config_version(db_strategy, current + 1)
 
 
+def _sanitize_strategy_parameter_map(
+    raw_params: Any,
+    *,
+    fallback: Optional[Dict[str, float]] = None,
+) -> Dict[str, float]:
+    """Normalize strategy parameter map and clamp to canonical bounds."""
+    fallback_map = dict(fallback or {})
+    param_defs = {param.name: param for param in get_default_parameters()}
+    sanitized: Dict[str, float] = {}
+    source = raw_params if isinstance(raw_params, dict) else {}
+    for name, param_def in param_defs.items():
+        default_value = _safe_float(
+            fallback_map.get(name, param_def.value),
+            _safe_float(param_def.value, 0.0),
+        )
+        candidate = source.get(name, default_value)
+        numeric = _safe_float(candidate, default_value)
+        sanitized[name] = max(param_def.min_value, min(param_def.max_value, numeric))
+    return sanitized
+
+
+def _normalize_strategy_baseline_profile(
+    storage: StorageService,
+    *,
+    strategy_asset_type: str,
+    profile_raw: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Resolve stable baseline preset profile for a strategy.
+
+    Existing valid profile fields are preserved to keep baseline immutable
+    after strategy creation. Legacy/invalid fields are backfilled.
+    """
+    prefs = _load_trading_preferences(storage)
+    profile = dict(profile_raw or {})
+    valid_etf = {"conservative", "balanced", "aggressive"}
+    _ = strategy_asset_type
+    asset_type = "etf"
+    stock_preset = str(profile.get("stock_preset") or prefs.stock_preset.value).strip().lower()
+    etf_preset = str(profile.get("etf_preset") or prefs.etf_preset.value).strip().lower()
+    if etf_preset not in valid_etf:
+        etf_preset = str(prefs.etf_preset.value)
+
+    return {
+        "asset_type": asset_type,
+        "stock_preset": stock_preset,
+        "etf_preset": etf_preset,
+    }
+
+
+def _strategy_default_parameters_for_profile(profile: Dict[str, Any]) -> Dict[str, float]:
+    """Return preset defaults for an explicit strategy baseline profile."""
+    defaults = runner_manager._strategy_param_defaults_from_prefs(
+        {
+            "asset_type": "etf",
+            "etf_preset": str(profile.get("etf_preset") or "balanced"),
+        }
+    )
+    return _sanitize_strategy_parameter_map(defaults)
+
+
+def _ensure_strategy_baseline_config(
+    storage: StorageService,
+    db_strategy: DBStrategy,
+    *,
+    strategy_asset_type: str,
+    force_save: bool = False,
+) -> Dict[str, Any]:
+    """
+    Ensure strategy config contains immutable baseline + saved parameter maps.
+
+    Legacy rows are backfilled lazily on first config read.
+    """
+    payload = _strategy_config_payload(db_strategy.config)
+    profile_raw = payload.get(_STRATEGY_BASELINE_PROFILE_KEY)
+    profile = _normalize_strategy_baseline_profile(
+        storage,
+        strategy_asset_type=strategy_asset_type,
+        profile_raw=profile_raw if isinstance(profile_raw, dict) else None,
+    )
+    default_map = _strategy_default_parameters_for_profile(profile)
+    baseline_map = _sanitize_strategy_parameter_map(
+        payload.get(_STRATEGY_BASELINE_PARAMETERS_KEY),
+        fallback=default_map,
+    )
+    saved_map = _sanitize_strategy_parameter_map(
+        payload.get("parameters"),
+        fallback=baseline_map,
+    )
+
+    changed = False
+    if payload.get(_STRATEGY_BASELINE_PROFILE_KEY) != profile:
+        payload[_STRATEGY_BASELINE_PROFILE_KEY] = profile
+        changed = True
+    if payload.get(_STRATEGY_BASELINE_PARAMETERS_KEY) != baseline_map:
+        payload[_STRATEGY_BASELINE_PARAMETERS_KEY] = baseline_map
+        changed = True
+    if payload.get("parameters") != saved_map:
+        payload["parameters"] = saved_map
+        changed = True
+    if _strategy_config_version(payload) < 1:
+        payload[_STRATEGY_CONFIG_VERSION_KEY] = 1
+        changed = True
+
+    if changed and force_save:
+        db_strategy.config = payload
+        try:
+            storage.strategies.update(db_strategy)
+        except Exception:
+            logger.exception("Failed to persist strategy baseline config for strategy_id=%s", db_strategy.id)
+    return payload
+
+
+def _resolve_strategy_parameter_maps_for_source(
+    *,
+    storage: StorageService,
+    db_strategy: DBStrategy,
+    strategy_asset_type: str,
+    use_workspace_universe: bool,
+) -> Dict[str, Any]:
+    """Resolve baseline/saved parameter maps and the effective source map."""
+    config_payload = _ensure_strategy_baseline_config(
+        storage,
+        db_strategy,
+        strategy_asset_type=strategy_asset_type,
+        force_save=False,
+    )
+    baseline_profile = (
+        dict(config_payload.get(_STRATEGY_BASELINE_PROFILE_KEY))
+        if isinstance(config_payload.get(_STRATEGY_BASELINE_PROFILE_KEY), dict)
+        else {}
+    )
+    baseline_map = _sanitize_strategy_parameter_map(
+        config_payload.get(_STRATEGY_BASELINE_PARAMETERS_KEY),
+        fallback=_strategy_default_parameters_for_profile(baseline_profile),
+    )
+    saved_map = _sanitize_strategy_parameter_map(
+        config_payload.get("parameters"),
+        fallback=baseline_map,
+    )
+    if use_workspace_universe:
+        effective_map = dict(baseline_map)
+        parameter_source = "workspace_strategy_baseline"
+    else:
+        effective_map = dict(saved_map)
+        parameter_source = "strategy_saved_hardened"
+    return {
+        "config_payload": config_payload,
+        "baseline_profile": baseline_profile,
+        "baseline_parameters": baseline_map,
+        "saved_parameters": saved_map,
+        "effective_parameters": effective_map,
+        "parameter_source": parameter_source,
+    }
+
+
 def _build_optimization_request_summary(payload: Dict[str, Any]) -> Dict[str, Any]:
     symbols_value = payload.get("symbols")
     symbol_count = len(symbols_value) if isinstance(symbols_value, list) else 0
@@ -1800,6 +2032,11 @@ def _build_optimization_request_summary(payload: Dict[str, Any]) -> Dict[str, An
         "max_workers": _safe_int(payload.get("max_workers"), 0),
         "use_workspace_universe": bool(payload.get("use_workspace_universe", True)),
         "emulate_live_trading": bool(payload.get("emulate_live_trading", True)),
+        "micro_strategy_mode": str(payload.get("micro_strategy_mode") or "auto"),
+        "micro_equity_threshold": _safe_float(payload.get("micro_equity_threshold"), 0.0),
+        "micro_single_trade_loss_pct": _safe_float(payload.get("micro_single_trade_loss_pct"), 0.0),
+        "micro_cash_reserve_pct": _safe_float(payload.get("micro_cash_reserve_pct"), 0.0),
+        "micro_max_spread_bps": _safe_float(payload.get("micro_max_spread_bps"), 0.0),
         "execution_latency_ms": _safe_float(payload.get("execution_latency_ms"), 0.0),
         "queue_position_bps": _safe_float(payload.get("queue_position_bps"), 0.0),
         "max_participation_rate": _safe_float(payload.get("max_participation_rate"), 0.0),
@@ -1812,13 +2049,89 @@ def _build_optimization_request_summary(payload: Dict[str, Any]) -> Dict[str, An
 
 
 def _build_optimization_metrics_summary(result_model: Optional[StrategyOptimizationResponse], row: DBOptimizationRun) -> Dict[str, Any]:
+    def _optional_float(value: Any) -> Optional[float]:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if math.isfinite(parsed) else None
+
+    def _optional_bool(value: Any) -> Optional[bool]:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"true", "1", "yes"}:
+                return True
+            if normalized in {"false", "0", "no"}:
+                return False
+            return None
+        if isinstance(value, (int, float)):
+            if value == 1:
+                return True
+            if value == 0:
+                return False
+        return None
+
+    result_payload = result_model.model_dump() if result_model is not None else (
+        dict(row.result_payload) if isinstance(row.result_payload, dict) else {}
+    )
+    result_confidence = (
+        dict(result_payload.get("confidence"))
+        if isinstance(result_payload.get("confidence"), dict)
+        else {}
+    )
+    result_best = (
+        dict(result_payload.get("best_result"))
+        if isinstance(result_payload.get("best_result"), dict)
+        else {}
+    )
+    result_diagnostics = (
+        dict(result_best.get("diagnostics"))
+        if isinstance(result_best.get("diagnostics"), dict)
+        else {}
+    )
+    advanced_metrics = (
+        dict(result_diagnostics.get("advanced_metrics"))
+        if isinstance(result_diagnostics.get("advanced_metrics"), dict)
+        else {}
+    )
+    micro_scorecard = (
+        dict(result_diagnostics.get("micro_scorecard"))
+        if isinstance(result_diagnostics.get("micro_scorecard"), dict)
+        else {}
+    )
+    investing_scorecard = (
+        dict(result_diagnostics.get("investing_scorecard"))
+        if isinstance(result_diagnostics.get("investing_scorecard"), dict)
+        else {}
+    )
+    live_parity = (
+        dict(result_diagnostics.get("live_parity"))
+        if isinstance(result_diagnostics.get("live_parity"), dict)
+        else {}
+    )
+
+    base_metrics = {
+        "score": _safe_float(row.score, 0.0),
+        "objective": str(row.objective or ""),
+        "requested_iterations": _safe_int(row.requested_iterations, 0),
+        "evaluated_iterations": _safe_int(row.evaluated_iterations, 0),
+        "total_return": _safe_float(row.total_return, 0.0),
+        "sharpe_ratio": _safe_float(row.sharpe_ratio, 0.0),
+        "max_drawdown": _safe_float(row.max_drawdown, 0.0),
+        "win_rate": _safe_float(row.win_rate, 0.0),
+        "total_trades": _safe_int(row.total_trades, 0),
+        "recommended_symbol_count": _safe_int(row.recommended_symbol_count, 0),
+    }
+
     if result_model is not None:
         confidence = (
             dict(result_model.confidence)
             if isinstance(result_model.confidence, dict)
             else {}
         )
-        return {
+        base_metrics = {
             "score": float(result_model.score),
             "objective": str(result_model.objective),
             "requested_iterations": int(result_model.requested_iterations),
@@ -1836,18 +2149,94 @@ def _build_optimization_metrics_summary(result_model: Optional[StrategyOptimizat
             "execution_fill_model": str(confidence.get("execution_fill_model") or ""),
             "fee_reconciliation_mode": str(confidence.get("fee_reconciliation_mode") or ""),
         }
-    return {
-        "score": _safe_float(row.score, 0.0),
-        "objective": str(row.objective or ""),
-        "requested_iterations": _safe_int(row.requested_iterations, 0),
-        "evaluated_iterations": _safe_int(row.evaluated_iterations, 0),
-        "total_return": _safe_float(row.total_return, 0.0),
-        "sharpe_ratio": _safe_float(row.sharpe_ratio, 0.0),
-        "max_drawdown": _safe_float(row.max_drawdown, 0.0),
-        "win_rate": _safe_float(row.win_rate, 0.0),
-        "total_trades": _safe_int(row.total_trades, 0),
-        "recommended_symbol_count": _safe_int(row.recommended_symbol_count, 0),
-    }
+
+    micro_confidence_score = (
+        _optional_float(micro_scorecard.get("confidence_score"))
+        if micro_scorecard
+        else _optional_float(result_confidence.get("micro_confidence_score"))
+    )
+    micro_final_score = (
+        _optional_float(micro_scorecard.get("final_score"))
+        if micro_scorecard
+        else _optional_float(result_confidence.get("micro_final_score"))
+    )
+    micro_pass = (
+        _optional_bool(micro_scorecard.get("pass"))
+        if micro_scorecard
+        else _optional_bool(result_confidence.get("micro_pass"))
+    )
+    investing_confidence_score = (
+        _optional_float(investing_scorecard.get("confidence_score"))
+        if investing_scorecard
+        else _optional_float(result_confidence.get("investing_confidence_score"))
+    )
+    investing_final_score = (
+        _optional_float(investing_scorecard.get("final_score"))
+        if investing_scorecard
+        else _optional_float(result_confidence.get("investing_final_score"))
+    )
+    investing_pass = (
+        _optional_bool(investing_scorecard.get("pass"))
+        if investing_scorecard
+        else _optional_bool(result_confidence.get("investing_pass"))
+    )
+
+    base_metrics.update(
+        {
+            "micro_policy_active": bool(
+                live_parity.get("micro_policy_active", result_diagnostics.get("micro_policy_active", False))
+            ),
+            "micro_policy_mode": str(
+                live_parity.get(
+                    "micro_policy_mode",
+                    result_diagnostics.get("micro_strategy_mode", ""),
+                )
+                or ""
+            ),
+            "micro_verdict": (
+                str(micro_scorecard.get("verdict") or "")
+                if micro_scorecard
+                else ""
+            ),
+            "micro_hard_gates_pass": (
+                _optional_bool(micro_scorecard.get("hard_gates_pass"))
+                if micro_scorecard
+                else None
+            ),
+            "micro_final_score": micro_final_score,
+            "micro_confidence_score": micro_confidence_score,
+            "micro_pass": micro_pass,
+            "investing_policy_active": bool(
+                live_parity.get("investing_policy_active", result_diagnostics.get("investing_policy_active", False))
+            ),
+            "investing_policy_reason": str(
+                live_parity.get("investing_policy_reason", result_diagnostics.get("investing_policy_reason", ""))
+                or ""
+            ),
+            "investing_verdict": (
+                str(investing_scorecard.get("verdict") or "")
+                if investing_scorecard
+                else ""
+            ),
+            "investing_hard_gates_pass": (
+                _optional_bool(investing_scorecard.get("hard_gates_pass"))
+                if investing_scorecard
+                else None
+            ),
+            "investing_final_score": investing_final_score,
+            "investing_confidence_score": investing_confidence_score,
+            "investing_pass": investing_pass,
+            "expectancy_r": _optional_float(advanced_metrics.get("expectancy_r")),
+            "payoff_ratio": _optional_float(advanced_metrics.get("payoff_ratio")),
+            "twr_annualized_pct": _optional_float(advanced_metrics.get("twr_annualized_pct")),
+            "xirr_pct": _optional_float(advanced_metrics.get("xirr_pct")),
+            "benchmark_xirr_pct": _optional_float(advanced_metrics.get("benchmark_xirr_pct")),
+            "xirr_excess_pct": _optional_float(advanced_metrics.get("xirr_excess_pct")),
+            "subperiod_fold_stability_pct": _optional_float(advanced_metrics.get("subperiod_fold_stability_pct")),
+            "max_single_trade_loss_pct_base": _optional_float(advanced_metrics.get("max_single_trade_loss_pct_base")),
+        }
+    )
+    return base_metrics
 
 
 def _persist_optimization_history_run(
@@ -2056,28 +2445,43 @@ def _load_runtime_config(storage: StorageService) -> ConfigResponse:
     """Load runtime config from DB config store or fallback to defaults."""
     entry = storage.config.get_by_key(_CONFIG_KEY)
     if not entry or not entry.value:
-        return _get_config_snapshot()
+        return _normalize_runtime_config(_get_config_snapshot())
     try:
         raw = json.loads(entry.value)
         if not isinstance(raw, dict):
-            return _get_config_snapshot()
+            return _normalize_runtime_config(_get_config_snapshot())
         base = _get_config_snapshot()
         allowed = {field for field in ConfigResponse.model_fields.keys()}
         updates = {k: raw.get(k) for k in raw.keys() if k in allowed}
         merged = {**base.model_dump(), **updates}
-        return ConfigResponse(**merged)
+        return _normalize_runtime_config(ConfigResponse(**merged))
     except (TypeError, ValueError, json.JSONDecodeError):
-        return _get_config_snapshot()
+        return _normalize_runtime_config(_get_config_snapshot())
 
 
 def _save_runtime_config(storage: StorageService, cfg: ConfigResponse) -> None:
     """Persist runtime config into DB config store."""
+    normalized = _normalize_runtime_config(cfg)
     storage.config.upsert(
         key=_CONFIG_KEY,
-        value=json.dumps(cfg.model_dump()),
+        value=json.dumps(normalized.model_dump()),
         value_type="json",
         description="Runtime backend config persisted for restart consistency",
     )
+
+
+def _normalize_runtime_config(cfg: ConfigResponse) -> ConfigResponse:
+    """Clamp and derive runtime config fields for consistent read/write behavior."""
+    cfg.read_only_mode = not bool(cfg.trading_enabled)
+    cfg.mode_switch_cooldown_seconds = max(
+        10,
+        min(3600, int(getattr(cfg, "mode_switch_cooldown_seconds", 60) or 60)),
+    )
+    last_sw = _ensure_utc_datetime(getattr(cfg, "last_mode_switch_at", None))
+    available_at = _ensure_utc_datetime(getattr(cfg, "mode_switch_available_at", None))
+    cfg.last_mode_switch_at = last_sw.isoformat() if last_sw is not None else None
+    cfg.mode_switch_available_at = available_at.isoformat() if available_at is not None else None
+    return cfg
 
 
 def _runtime_smtp_config(cfg: ConfigResponse) -> Dict[str, Any]:
@@ -2121,9 +2525,20 @@ def _get_last_broker_sync() -> Optional[str]:
         return _last_broker_sync_at
 
 
-def _ensure_utc_datetime(value: Optional[datetime]) -> Optional[datetime]:
+def _ensure_utc_datetime(value: Optional[Any]) -> Optional[datetime]:
     """Normalize datetimes to UTC for stable API serialization."""
     if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+        value = parsed
+    if not isinstance(value, datetime):
         return None
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
@@ -2178,6 +2593,398 @@ def _load_account_snapshot(broker: Optional[BrokerInterface]) -> Dict[str, float
         "buying_power": _safe_float(info.get("buying_power", 0.0), 0.0),
         "cash": _safe_float(info.get("cash", 0.0), 0.0),
     }
+
+
+def _resolve_micro_policy_context(
+    *,
+    runtime_config: ConfigResponse,
+    request_micro_mode: Optional[str],
+    request_micro_equity_threshold: Optional[float],
+    request_micro_single_trade_loss_pct: Optional[float],
+    request_micro_cash_reserve_pct: Optional[float],
+    request_micro_max_spread_bps: Optional[float],
+    initial_capital: float,
+    contribution_amount: float,
+    contribution_frequency: str,
+    stock_preset_hint: Optional[str],
+) -> Dict[str, Any]:
+    """Resolve whether micro policy should be active and expose effective limits."""
+    mode = str(request_micro_mode or "auto").strip().lower()
+    if mode not in {"off", "auto", "on"}:
+        mode = "auto"
+    threshold = _safe_float(
+        request_micro_equity_threshold,
+        _safe_float(runtime_config.micro_mode_equity_threshold, 2500.0),
+    )
+    threshold = max(100.0, min(1_000_000.0, threshold))
+    single_trade_loss_pct = _safe_float(
+        request_micro_single_trade_loss_pct,
+        _safe_float(runtime_config.micro_mode_single_trade_loss_pct, 1.5),
+    )
+    single_trade_loss_pct = max(0.1, min(10.0, single_trade_loss_pct))
+    cash_reserve_pct = _safe_float(
+        request_micro_cash_reserve_pct,
+        _safe_float(runtime_config.micro_mode_cash_reserve_pct, 5.0),
+    )
+    cash_reserve_pct = max(0.0, min(50.0, cash_reserve_pct))
+    max_spread_bps = _safe_float(
+        request_micro_max_spread_bps,
+        _safe_float(runtime_config.micro_mode_max_spread_bps, 40.0),
+    )
+    max_spread_bps = max(1.0, min(300.0, max_spread_bps))
+
+    contribution_frequency_normalized = str(contribution_frequency or "none").strip().lower()
+    if contribution_frequency_normalized not in {"none", "weekly", "monthly"}:
+        contribution_frequency_normalized = "none"
+    recurring = contribution_frequency_normalized != "none" and contribution_amount > 0
+    capital_profile_micro = float(initial_capital) <= threshold
+    recurring_profile_micro = recurring and float(initial_capital) <= (threshold * 1.5)
+    preset_micro = str(stock_preset_hint or "").strip().lower() == "micro_budget"
+    runtime_manual = bool(runtime_config.micro_mode_enabled)
+    runtime_auto = bool(runtime_config.micro_mode_auto_enabled)
+
+    if mode == "off":
+        active = False
+        reason = "request_mode_off"
+    elif mode == "on":
+        active = True
+        reason = "request_mode_on"
+    elif runtime_manual:
+        active = True
+        reason = "runtime_manual_enabled"
+    elif runtime_auto and (capital_profile_micro or recurring_profile_micro or preset_micro):
+        active = True
+        reason = (
+            "auto_threshold" if (capital_profile_micro or recurring_profile_micro)
+            else "preset_micro_budget"
+        )
+    else:
+        active = False
+        reason = "auto_not_triggered"
+
+    return {
+        "active": bool(active),
+        "mode": mode,
+        "reason": reason,
+        "runtime_manual_enabled": runtime_manual,
+        "runtime_auto_enabled": runtime_auto,
+        "equity_threshold": round(float(threshold), 4),
+        "single_trade_loss_pct": round(float(single_trade_loss_pct), 4),
+        "cash_reserve_pct": round(float(cash_reserve_pct), 4),
+        "max_spread_bps": round(float(max_spread_bps), 4),
+        "capital_profile_micro": bool(capital_profile_micro),
+        "recurring_profile_micro": bool(recurring_profile_micro),
+        "preset_micro_budget": bool(preset_micro),
+    }
+
+
+def _resolve_etf_investing_policy_context(
+    *,
+    runtime_config: ConfigResponse,
+    prefs: TradingPreferencesResponse,
+    request_asset_type: Optional[str],
+) -> Dict[str, Any]:
+    """Resolve ETF-investing policy activation and effective limits."""
+    requested_asset = str(request_asset_type or "").strip().lower()
+    workspace_asset = str(getattr(prefs, "asset_type", AssetType.STOCK).value).strip().lower()
+    effective_asset = requested_asset if requested_asset in {"stock", "etf"} else workspace_asset
+    mode_manual = bool(runtime_config.etf_investing_mode_enabled)
+    mode_auto = bool(runtime_config.etf_investing_auto_enabled)
+    auto_trigger = bool(mode_auto and effective_asset == "etf")
+    if mode_manual:
+        active = True
+        reason = "runtime_manual_enabled"
+    elif auto_trigger:
+        active = True
+        reason = "workspace_asset_type_etf"
+    else:
+        active = False
+        reason = "inactive"
+
+    core_dca_pct = max(
+        50.0,
+        min(95.0, _safe_float(runtime_config.etf_investing_core_dca_pct, ETF_INVESTING_CORE_DCA_PCT_DEFAULT)),
+    )
+    active_sleeve_pct = max(
+        5.0,
+        min(50.0, _safe_float(runtime_config.etf_investing_active_sleeve_pct, ETF_INVESTING_ACTIVE_SLEEVE_PCT_DEFAULT)),
+    )
+    sleeve_total = core_dca_pct + active_sleeve_pct
+    if sleeve_total > 0 and abs(sleeve_total - 100.0) > 0.001:
+        active_sleeve_pct = max(5.0, min(50.0, 100.0 - core_dca_pct))
+        sleeve_total = core_dca_pct + active_sleeve_pct
+    if sleeve_total > 0:
+        core_dca_pct = (core_dca_pct / sleeve_total) * 100.0
+        active_sleeve_pct = (active_sleeve_pct / sleeve_total) * 100.0
+
+    return {
+        "active": bool(active),
+        "reason": reason,
+        "mode_manual_enabled": mode_manual,
+        "mode_auto_enabled": mode_auto,
+        "effective_asset_type": effective_asset,
+        "core_dca_pct": round(float(core_dca_pct), 4),
+        "active_sleeve_pct": round(float(active_sleeve_pct), 4),
+        "max_trades_per_day": int(
+            max(1, min(20, int(getattr(runtime_config, "etf_investing_max_trades_per_day", ETF_INVESTING_MAX_TRADES_PER_DAY_DEFAULT))))
+        ),
+        "max_concurrent_positions": int(
+            max(
+                1,
+                min(
+                    1,
+                    int(
+                        getattr(
+                            runtime_config,
+                            "etf_investing_max_concurrent_positions",
+                            ETF_INVESTING_MAX_CONCURRENT_POSITIONS_DEFAULT,
+                        )
+                    ),
+                ),
+            )
+        ),
+        "max_symbol_exposure_pct": round(
+            float(
+                max(
+                    2.0,
+                    min(
+                        50.0,
+                        getattr(
+                            runtime_config,
+                            "etf_investing_max_symbol_exposure_pct",
+                            ETF_INVESTING_MAX_SYMBOL_EXPOSURE_PCT_DEFAULT,
+                        ),
+                    ),
+                )
+            ),
+            4,
+        ),
+        "max_total_exposure_pct": round(
+            float(
+                max(
+                    10.0,
+                    min(
+                        100.0,
+                        getattr(
+                            runtime_config,
+                            "etf_investing_max_total_exposure_pct",
+                            ETF_INVESTING_MAX_TOTAL_EXPOSURE_PCT_DEFAULT,
+                        ),
+                    ),
+                )
+            ),
+            4,
+        ),
+        "single_position_equity_threshold": round(
+            float(
+                max(
+                    100.0,
+                    min(
+                        1_000_000.0,
+                        getattr(
+                            runtime_config,
+                            "etf_investing_single_position_equity_threshold",
+                            ETF_INVESTING_SINGLE_POSITION_EQUITY_THRESHOLD_DEFAULT,
+                        ),
+                    ),
+                )
+            ),
+            4,
+        ),
+        "daily_loss_limit_pct": round(
+            float(
+                max(
+                    0.2,
+                    min(
+                        10.0,
+                        getattr(
+                            runtime_config,
+                            "etf_investing_daily_loss_limit_pct",
+                            ETF_INVESTING_DAILY_LOSS_LIMIT_PCT_DEFAULT,
+                        ),
+                    ),
+                )
+            ),
+            4,
+        ),
+        "weekly_loss_limit_pct": round(
+            float(
+                max(
+                    0.5,
+                    min(
+                        20.0,
+                        getattr(
+                            runtime_config,
+                            "etf_investing_weekly_loss_limit_pct",
+                            ETF_INVESTING_WEEKLY_LOSS_LIMIT_PCT_DEFAULT,
+                        ),
+                    ),
+                )
+            ),
+            4,
+        ),
+    }
+
+
+def _contribution_to_weekly_amount(amount: float, frequency: str) -> float:
+    """Convert recurring contribution amount to weekly equivalent."""
+    freq = str(frequency or "none").strip().lower()
+    recurring_amount = max(0.0, float(amount or 0.0))
+    if recurring_amount <= 0.0:
+        return 0.0
+    if freq == "weekly":
+        return recurring_amount
+    if freq == "monthly":
+        return recurring_amount / 4.345
+    return 0.0
+
+
+def _apply_micro_profile_parameter_calibration(
+    *,
+    parameters: Dict[str, float],
+    initial_capital: float,
+    contribution_amount: float,
+    contribution_frequency: str,
+    micro_policy: Dict[str, Any],
+    parameter_source: str,
+    max_position_size: float,
+) -> tuple[Dict[str, float], Dict[str, Any]]:
+    """
+    Apply a deterministic micro-capital calibration overlay on top of effective parameters.
+
+    Calibration is enforced when micro policy is active and returns metadata describing
+    exactly which fields were changed and why.
+    """
+    normalized = _sanitize_strategy_parameter_map(parameters)
+    policy_active = bool(micro_policy.get("active", False))
+    weekly_contribution = _contribution_to_weekly_amount(contribution_amount, contribution_frequency)
+    recurring = weekly_contribution > 0.0
+    micro_window_budget = max(
+        50.0,
+        float(initial_capital) + (weekly_contribution * 6.0),  # ~6-week runway
+    )
+
+    metadata: Dict[str, Any] = {
+        "version": 1,
+        "active": policy_active,
+        "micro_calibrated": False,
+        "mode": str(micro_policy.get("mode", "auto")),
+        "reason": str(micro_policy.get("reason", "")),
+        "parameter_source": str(parameter_source or "unknown"),
+        "inputs": {
+            "initial_capital": round(float(initial_capital), 4),
+            "contribution_amount": round(float(contribution_amount), 4),
+            "contribution_frequency": str(contribution_frequency or "none"),
+            "weekly_contribution_equivalent": round(float(weekly_contribution), 4),
+            "micro_window_budget": round(float(micro_window_budget), 4),
+            "equity_threshold": round(_safe_float(micro_policy.get("equity_threshold"), 0.0), 4),
+        },
+        "adjusted_fields": [],
+        "previous_values": {},
+        "adjusted_parameters": {},
+        "applied_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if not policy_active:
+        return normalized, metadata
+
+    param_defs = {param.name: param for param in get_default_parameters()}
+    adjusted = dict(normalized)
+    changed_fields: List[str] = []
+    previous_values: Dict[str, float] = {}
+    adjusted_values: Dict[str, float] = {}
+
+    def _set_param(name: str, candidate: float) -> None:
+        param_def = param_defs.get(name)
+        if param_def is None:
+            return
+        bounded = max(param_def.min_value, min(param_def.max_value, float(candidate)))
+        current = float(adjusted.get(name, normalized.get(name, param_def.value)))
+        if math.isclose(current, bounded, rel_tol=0.0, abs_tol=1e-9):
+            return
+        adjusted[name] = bounded
+        changed_fields.append(name)
+        previous_values[name] = round(current, 6)
+        adjusted_values[name] = round(bounded, 6)
+
+    # 1) Position sizing calibration for micro runway.
+    current_position_size = float(adjusted.get("position_size", 1000.0))
+    position_cap_from_budget = max(
+        50.0,
+        min(
+            max_position_size if max_position_size > 0 else current_position_size,
+            micro_window_budget * 0.35,
+        ),
+    )
+    _set_param("position_size", min(current_position_size, position_cap_from_budget))
+
+    # 2) Tighten risk and drawdown guardrails for micro capital.
+    current_risk = float(adjusted.get("risk_per_trade", 1.0))
+    target_risk = min(
+        current_risk,
+        max(
+            0.3,
+            min(
+                0.9,
+                0.4 + min(0.35, weekly_contribution / 250.0) + min(0.1, float(initial_capital) / 2000.0),
+            ),
+        ),
+    )
+    _set_param("risk_per_trade", target_risk)
+    current_drawdown = float(adjusted.get("max_drawdown_pct", 15.0))
+    target_drawdown = min(
+        current_drawdown,
+        max(6.0, min(12.0, 8.0 + min(4.0, weekly_contribution / 50.0))),
+    )
+    _set_param("max_drawdown_pct", target_drawdown)
+
+    # 3) Keep stop/TP/trailing relationship coherent after tightening.
+    current_stop = float(adjusted.get("stop_loss_pct", 2.0))
+    target_stop = min(current_stop, max(1.0, min(2.2, 1.6 + (weekly_contribution / 300.0))))
+    _set_param("stop_loss_pct", target_stop)
+    stop_for_relationship = float(adjusted.get("stop_loss_pct", target_stop))
+    current_take_profit = float(adjusted.get("take_profit_pct", 5.0))
+    target_take_profit = max(stop_for_relationship * 2.2, min(current_take_profit, stop_for_relationship * 2.8))
+    _set_param("take_profit_pct", target_take_profit)
+    current_trailing = float(adjusted.get("trailing_stop_pct", 2.5))
+    target_trailing = max(stop_for_relationship, min(current_trailing, stop_for_relationship * 1.4))
+    _set_param("trailing_stop_pct", target_trailing)
+
+    # 4) Micro resilience controls.
+    current_max_losses = float(adjusted.get("max_consecutive_losses", 3.0))
+    _set_param("max_consecutive_losses", min(current_max_losses, 2.0 if float(initial_capital) < 300.0 else 3.0))
+    current_dca = float(adjusted.get("dca_tranches", 1.0))
+    if recurring and float(initial_capital) <= 750.0:
+        _set_param("dca_tranches", max(current_dca, 2.0))
+
+    metadata["micro_calibrated"] = bool(changed_fields)
+    metadata["adjusted_fields"] = changed_fields
+    metadata["previous_values"] = previous_values
+    metadata["adjusted_parameters"] = adjusted_values
+    return adjusted, metadata
+
+
+def _persist_strategy_micro_calibration(
+    *,
+    storage: StorageService,
+    db_strategy: DBStrategy,
+    metadata: Dict[str, Any],
+) -> None:
+    """Persist latest micro-calibration metadata on strategy config for transparency."""
+    payload = _strategy_config_payload(db_strategy.config)
+    current = payload.get(_STRATEGY_MICRO_CALIBRATION_KEY)
+    if current == metadata:
+        return
+    payload[_STRATEGY_MICRO_CALIBRATION_KEY] = dict(metadata)
+    db_strategy.config = payload
+    try:
+        from sqlalchemy.orm.attributes import flag_modified
+        flag_modified(db_strategy, "config")
+    except Exception:
+        pass
+    try:
+        storage.strategies.update(db_strategy)
+    except Exception:
+        logger.exception("Failed to persist micro calibration metadata for strategy_id=%s", db_strategy.id)
 
 
 def _load_holdings_snapshot(storage: StorageService, broker: Optional[BrokerInterface]) -> List[Dict[str, Any]]:
@@ -2294,7 +3101,10 @@ def _should_require_fractionable_symbols(
     """
     if asset_type != AssetType.STOCK:
         return False
-    weekly_budget = _safe_float(prefs.weekly_budget, 200.0)
+    weekly_budget = _safe_float(
+        prefs.weekly_budget,
+        ETF_INVESTING_WEEKLY_CONTRIBUTION_DEFAULT,
+    )
     buying_power = _safe_float(account_snapshot.get("buying_power", 0.0), 0.0)
     equity = _safe_float(account_snapshot.get("equity", 0.0), 0.0)
     return (
@@ -2322,7 +3132,10 @@ def _capture_portfolio_snapshot(storage: StorageService, broker: Optional[Broker
         }
 
     now_utc = datetime.now(timezone.utc)
-    latest = storage.get_latest_portfolio_snapshot()
+    runtime_cfg = _load_runtime_config(storage)
+    _set_config_snapshot(runtime_cfg)
+    snapshot_mode = "paper" if bool(runtime_cfg.paper_trading) else "live"
+    latest = storage.get_latest_portfolio_snapshot(mode=snapshot_mode)
     try:
         market_open = bool(broker.is_market_open())
     except (RuntimeError, ValueError, TypeError, KeyError):
@@ -2421,6 +3234,7 @@ def _capture_portfolio_snapshot(storage: StorageService, broker: Optional[Broker
         unrealized_pnl=unrealized_pnl,
         realized_pnl_total=realized_pnl_total,
         open_positions=len(holdings_snapshot),
+        mode=snapshot_mode,
         timestamp=now_utc,
     )
     return _snapshot_to_payload(snapshot)
@@ -2906,18 +3720,33 @@ def _run_reconciliation(storage: StorageService, broker: BrokerInterface) -> Dic
         if abs(bq - lq) > 1e-6:
             discrepancies.append({"symbol": sym, "broker_quantity": bq, "local_quantity": lq})
 
+    reconciled_at = datetime.now(timezone.utc).isoformat()
+    result = {
+        "checked_symbols": len(symbols),
+        "discrepancy_count": len(discrepancies),
+        "discrepancies": discrepancies,
+        "reconciled_at": reconciled_at,
+    }
+    storage.set_config_value(
+        key=_RECONCILIATION_BLOCKED_KEY,
+        value="true" if discrepancies else "false",
+        value_type="bool",
+        description="True when latest broker/local reconciliation is unresolved",
+    )
+    storage.set_config_value(
+        key=_RECONCILIATION_STATUS_KEY,
+        value=json.dumps(result, separators=(",", ":")),
+        value_type="json",
+        description="Latest broker/local reconciliation status snapshot",
+    )
+
     if discrepancies:
         storage.create_audit_log(
             event_type="error",
             description=f"Reconciliation found {len(discrepancies)} discrepancy(ies)",
             details={"source": "reconciliation", "discrepancies": discrepancies[:100]},
         )
-    return {
-        "checked_symbols": len(symbols),
-        "discrepancy_count": len(discrepancies),
-        "discrepancies": discrepancies,
-        "reconciled_at": datetime.now(timezone.utc).isoformat(),
-    }
+    return result
 
 
 def _save_summary_notification_preferences(
@@ -3387,7 +4216,49 @@ async def update_config(
     if request.trading_enabled is not None:
         config.trading_enabled = request.trading_enabled
     if request.paper_trading is not None:
-        config.paper_trading = request.paper_trading
+        requested_paper_mode = bool(request.paper_trading)
+        if requested_paper_mode != bool(config.paper_trading):
+            if request.mode_switch_confirm is not True:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Mode switch requires explicit confirmation. "
+                        "Resubmit with mode_switch_confirm=true."
+                    ),
+                )
+            now_utc = datetime.now(timezone.utc)
+            last_sw = _ensure_utc_datetime(config.last_mode_switch_at)
+            cooldown_seconds = max(10, int(config.mode_switch_cooldown_seconds or 60))
+            if last_sw is not None:
+                elapsed = (now_utc - last_sw).total_seconds()
+                if elapsed < float(cooldown_seconds):
+                    remaining = max(1, int(math.ceil(float(cooldown_seconds) - elapsed)))
+                    available_at = last_sw + timedelta(seconds=cooldown_seconds)
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"Mode switch cooldown active. Retry in {remaining}s "
+                            f"(available_at={available_at.isoformat()})."
+                        ),
+                    )
+            previous_mode = "paper" if bool(config.paper_trading) else "live"
+            next_mode = "paper" if requested_paper_mode else "live"
+            config.paper_trading = requested_paper_mode
+            config.last_mode_switch_at = now_utc.isoformat()
+            config.mode_switch_available_at = (now_utc + timedelta(seconds=cooldown_seconds)).isoformat()
+            # Force explicit re-enable for trading after account-mode switch.
+            config.trading_enabled = False
+            storage.create_audit_log(
+                event_type="config_updated",
+                description=f"Broker mode switched from {previous_mode} to {next_mode}",
+                details={
+                    "source": "mode_switch",
+                    "previous_mode": previous_mode,
+                    "next_mode": next_mode,
+                    "cooldown_seconds": cooldown_seconds,
+                    "trading_enabled_after_switch": bool(config.trading_enabled),
+                },
+            )
     if request.max_position_size is not None:
         if not math.isfinite(request.max_position_size):
             raise HTTPException(status_code=400, detail="max_position_size must be a finite number")
@@ -3400,6 +4271,101 @@ async def update_config(
         if request.risk_limit_daily < 1 or request.risk_limit_daily > 1_000_000:
             raise HTTPException(status_code=400, detail="risk_limit_daily must be within [1, 1000000]")
         config.risk_limit_daily = request.risk_limit_daily
+    if request.micro_mode_enabled is not None:
+        config.micro_mode_enabled = bool(request.micro_mode_enabled)
+    if request.micro_mode_auto_enabled is not None:
+        config.micro_mode_auto_enabled = bool(request.micro_mode_auto_enabled)
+    if request.micro_mode_equity_threshold is not None:
+        if not math.isfinite(request.micro_mode_equity_threshold):
+            raise HTTPException(status_code=400, detail="micro_mode_equity_threshold must be a finite number")
+        if request.micro_mode_equity_threshold < 100 or request.micro_mode_equity_threshold > 1_000_000:
+            raise HTTPException(status_code=400, detail="micro_mode_equity_threshold must be within [100, 1000000]")
+        config.micro_mode_equity_threshold = float(request.micro_mode_equity_threshold)
+    if request.micro_mode_single_trade_loss_pct is not None:
+        if not math.isfinite(request.micro_mode_single_trade_loss_pct):
+            raise HTTPException(status_code=400, detail="micro_mode_single_trade_loss_pct must be a finite number")
+        if request.micro_mode_single_trade_loss_pct < 0.1 or request.micro_mode_single_trade_loss_pct > 10.0:
+            raise HTTPException(status_code=400, detail="micro_mode_single_trade_loss_pct must be within [0.1, 10.0]")
+        config.micro_mode_single_trade_loss_pct = float(request.micro_mode_single_trade_loss_pct)
+    if request.micro_mode_cash_reserve_pct is not None:
+        if not math.isfinite(request.micro_mode_cash_reserve_pct):
+            raise HTTPException(status_code=400, detail="micro_mode_cash_reserve_pct must be a finite number")
+        if request.micro_mode_cash_reserve_pct < 0.0 or request.micro_mode_cash_reserve_pct > 50.0:
+            raise HTTPException(status_code=400, detail="micro_mode_cash_reserve_pct must be within [0.0, 50.0]")
+        config.micro_mode_cash_reserve_pct = float(request.micro_mode_cash_reserve_pct)
+    if request.micro_mode_max_spread_bps is not None:
+        if not math.isfinite(request.micro_mode_max_spread_bps):
+            raise HTTPException(status_code=400, detail="micro_mode_max_spread_bps must be a finite number")
+        if request.micro_mode_max_spread_bps < 1.0 or request.micro_mode_max_spread_bps > 300.0:
+            raise HTTPException(status_code=400, detail="micro_mode_max_spread_bps must be within [1.0, 300.0]")
+        config.micro_mode_max_spread_bps = float(request.micro_mode_max_spread_bps)
+    if request.etf_investing_mode_enabled is not None:
+        config.etf_investing_mode_enabled = bool(request.etf_investing_mode_enabled)
+    if request.etf_investing_auto_enabled is not None:
+        config.etf_investing_auto_enabled = bool(request.etf_investing_auto_enabled)
+    if request.etf_investing_core_dca_pct is not None:
+        if not math.isfinite(request.etf_investing_core_dca_pct):
+            raise HTTPException(status_code=400, detail="etf_investing_core_dca_pct must be a finite number")
+        if request.etf_investing_core_dca_pct < 50.0 or request.etf_investing_core_dca_pct > 95.0:
+            raise HTTPException(status_code=400, detail="etf_investing_core_dca_pct must be within [50.0, 95.0]")
+        config.etf_investing_core_dca_pct = float(request.etf_investing_core_dca_pct)
+    if request.etf_investing_active_sleeve_pct is not None:
+        if not math.isfinite(request.etf_investing_active_sleeve_pct):
+            raise HTTPException(status_code=400, detail="etf_investing_active_sleeve_pct must be a finite number")
+        if request.etf_investing_active_sleeve_pct < 5.0 or request.etf_investing_active_sleeve_pct > 50.0:
+            raise HTTPException(status_code=400, detail="etf_investing_active_sleeve_pct must be within [5.0, 50.0]")
+        config.etf_investing_active_sleeve_pct = float(request.etf_investing_active_sleeve_pct)
+    if request.etf_investing_max_trades_per_day is not None:
+        if request.etf_investing_max_trades_per_day < 1 or request.etf_investing_max_trades_per_day > 20:
+            raise HTTPException(status_code=400, detail="etf_investing_max_trades_per_day must be within [1, 20]")
+        config.etf_investing_max_trades_per_day = int(request.etf_investing_max_trades_per_day)
+    if request.etf_investing_max_concurrent_positions is not None:
+        if request.etf_investing_max_concurrent_positions != 1:
+            raise HTTPException(
+                status_code=400,
+                detail="etf_investing_max_concurrent_positions is fixed to 1 in ETF investing mode",
+            )
+        config.etf_investing_max_concurrent_positions = 1
+    if request.etf_investing_max_symbol_exposure_pct is not None:
+        if not math.isfinite(request.etf_investing_max_symbol_exposure_pct):
+            raise HTTPException(status_code=400, detail="etf_investing_max_symbol_exposure_pct must be a finite number")
+        if request.etf_investing_max_symbol_exposure_pct < 2.0 or request.etf_investing_max_symbol_exposure_pct > 50.0:
+            raise HTTPException(status_code=400, detail="etf_investing_max_symbol_exposure_pct must be within [2.0, 50.0]")
+        config.etf_investing_max_symbol_exposure_pct = float(request.etf_investing_max_symbol_exposure_pct)
+    if request.etf_investing_max_total_exposure_pct is not None:
+        if not math.isfinite(request.etf_investing_max_total_exposure_pct):
+            raise HTTPException(status_code=400, detail="etf_investing_max_total_exposure_pct must be a finite number")
+        if request.etf_investing_max_total_exposure_pct < 10.0 or request.etf_investing_max_total_exposure_pct > 100.0:
+            raise HTTPException(status_code=400, detail="etf_investing_max_total_exposure_pct must be within [10.0, 100.0]")
+        config.etf_investing_max_total_exposure_pct = float(request.etf_investing_max_total_exposure_pct)
+    if request.etf_investing_single_position_equity_threshold is not None:
+        if not math.isfinite(request.etf_investing_single_position_equity_threshold):
+            raise HTTPException(status_code=400, detail="etf_investing_single_position_equity_threshold must be a finite number")
+        if request.etf_investing_single_position_equity_threshold < 100.0 or request.etf_investing_single_position_equity_threshold > 1_000_000.0:
+            raise HTTPException(status_code=400, detail="etf_investing_single_position_equity_threshold must be within [100, 1000000]")
+        config.etf_investing_single_position_equity_threshold = float(request.etf_investing_single_position_equity_threshold)
+    if request.etf_investing_daily_loss_limit_pct is not None:
+        if not math.isfinite(request.etf_investing_daily_loss_limit_pct):
+            raise HTTPException(status_code=400, detail="etf_investing_daily_loss_limit_pct must be a finite number")
+        if request.etf_investing_daily_loss_limit_pct < 0.2 or request.etf_investing_daily_loss_limit_pct > 10.0:
+            raise HTTPException(status_code=400, detail="etf_investing_daily_loss_limit_pct must be within [0.2, 10.0]")
+        config.etf_investing_daily_loss_limit_pct = float(request.etf_investing_daily_loss_limit_pct)
+    if request.etf_investing_weekly_loss_limit_pct is not None:
+        if not math.isfinite(request.etf_investing_weekly_loss_limit_pct):
+            raise HTTPException(status_code=400, detail="etf_investing_weekly_loss_limit_pct must be a finite number")
+        if request.etf_investing_weekly_loss_limit_pct < 0.5 or request.etf_investing_weekly_loss_limit_pct > 20.0:
+            raise HTTPException(status_code=400, detail="etf_investing_weekly_loss_limit_pct must be within [0.5, 20.0]")
+        config.etf_investing_weekly_loss_limit_pct = float(request.etf_investing_weekly_loss_limit_pct)
+    sleeve_total = float(config.etf_investing_core_dca_pct) + float(config.etf_investing_active_sleeve_pct)
+    if abs(sleeve_total - 100.0) > 0.001:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "ETF investing sleeve allocation must sum to 100.0 "
+                f"(core_dca={float(config.etf_investing_core_dca_pct):.2f}, "
+                f"active={float(config.etf_investing_active_sleeve_pct):.2f})"
+            ),
+        )
     if request.tick_interval_seconds is not None:
         if not math.isfinite(request.tick_interval_seconds):
             raise HTTPException(status_code=400, detail="tick_interval_seconds must be a finite number")
@@ -3455,6 +4421,7 @@ async def update_config(
         config.smtp_use_tls = False
 
     # Recreate broker on next use when mode changes.
+    config = _normalize_runtime_config(config)
     _set_config_snapshot(config)
     set_global_trading_enabled(bool(config.trading_enabled))
     _invalidate_broker_instance()
@@ -3543,7 +4510,7 @@ async def get_broker_account(db: Session = Depends(get_db)):
 
         if not market_open:
             storage = StorageService(db)
-            latest = storage.get_latest_portfolio_snapshot()
+            latest = storage.get_latest_portfolio_snapshot(mode=mode)
             if latest is not None:
                 response = BrokerAccountResponse(
                     broker=config.broker,
@@ -4042,13 +5009,16 @@ async def create_strategy(request: StrategyCreateRequest, db: Session = Depends(
     if existing:
         raise HTTPException(status_code=400, detail="Strategy with this name already exists")
     symbols = _normalize_symbols(request.symbols or [])
-    resolved_asset_type = (
-        str(request.asset_type).strip().lower()
-        if request.asset_type is not None
-        else _infer_strategy_asset_type_from_symbols(symbols)
+    # ETF-investing pivot: new strategies default to ETF policy profile.
+    # Symbols may still include liquid mega-cap stocks, but runtime policy remains ETF discipline.
+    resolved_asset_type = "etf"
+
+    baseline_profile = _normalize_strategy_baseline_profile(
+        storage,
+        strategy_asset_type=resolved_asset_type,
+        profile_raw=None,
     )
-    if resolved_asset_type not in {"stock", "etf", "both"}:
-        raise HTTPException(status_code=400, detail="asset_type must be one of: stock, etf, both")
+    baseline_parameters = _strategy_default_parameters_for_profile(baseline_profile)
 
     db_strategy = storage.strategies.create(
         name=request.name,
@@ -4057,6 +5027,9 @@ async def create_strategy(request: StrategyCreateRequest, db: Session = Depends(
         config={
             "symbols": symbols,
             "asset_type": resolved_asset_type,
+            "parameters": dict(baseline_parameters),
+            _STRATEGY_BASELINE_PARAMETERS_KEY: dict(baseline_parameters),
+            _STRATEGY_BASELINE_PROFILE_KEY: dict(baseline_profile),
             _STRATEGY_CONFIG_VERSION_KEY: 1,
         },
     )
@@ -4357,7 +5330,10 @@ async def get_runner_preflight(db: Session = Depends(get_db)):
     account_snapshot = _load_account_snapshot(broker)
     equity = _safe_float(account_snapshot.get("equity", 0.0), 0.0)
     buying_power = _safe_float(account_snapshot.get("buying_power", 0.0), 0.0)
-    weekly_budget = _safe_float(prefs.weekly_budget, 200.0)
+    weekly_budget = _safe_float(
+        prefs.weekly_budget,
+        ETF_INVESTING_WEEKLY_CONTRIBUTION_DEFAULT,
+    )
     budget_tracker = get_budget_tracker(weekly_budget)
     budget_tracker.set_weekly_budget(weekly_budget)
     remaining_weekly_budget = _safe_float(
@@ -4897,7 +5873,15 @@ async def start_runner(
         synthetic_initial_capital = max(
             100.0,
             buying_power if buying_power > 0 else (
-                equity if equity > 0 else (_safe_float(prefs.weekly_budget, 200.0) * 4.0)
+                equity
+                if equity > 0
+                else (
+                    _safe_float(
+                        prefs.weekly_budget,
+                        ETF_INVESTING_WEEKLY_CONTRIBUTION_DEFAULT,
+                    )
+                    * 4.0
+                )
             ),
         )
         today = datetime.now(timezone.utc).date().isoformat()
@@ -4911,7 +5895,6 @@ async def start_runner(
             stock_preset=start_request.stock_preset,
             etf_preset=start_request.etf_preset,
             screener_limit=start_request.screener_limit,
-            seed_only=start_request.seed_only,
             preset_universe_mode=start_request.preset_universe_mode,
             min_dollar_volume=start_request.min_dollar_volume,
             max_spread_bps=start_request.max_spread_bps,
@@ -4954,6 +5937,23 @@ async def start_runner(
         broker=broker,
         max_position_size=max_position_size,
         risk_limit_daily=risk_limit_daily,
+        micro_mode_enabled=bool(config.micro_mode_enabled),
+        micro_mode_auto_enabled=bool(config.micro_mode_auto_enabled),
+        micro_mode_equity_threshold=float(config.micro_mode_equity_threshold),
+        micro_mode_single_trade_loss_pct=float(config.micro_mode_single_trade_loss_pct),
+        micro_mode_cash_reserve_pct=float(config.micro_mode_cash_reserve_pct),
+        micro_mode_max_spread_bps=float(config.micro_mode_max_spread_bps),
+        etf_investing_mode_enabled=bool(config.etf_investing_mode_enabled),
+        etf_investing_auto_enabled=bool(config.etf_investing_auto_enabled),
+        etf_investing_core_dca_pct=float(config.etf_investing_core_dca_pct),
+        etf_investing_active_sleeve_pct=float(config.etf_investing_active_sleeve_pct),
+        etf_investing_max_trades_per_day=int(config.etf_investing_max_trades_per_day),
+        etf_investing_max_concurrent_positions=int(config.etf_investing_max_concurrent_positions),
+        etf_investing_max_symbol_exposure_pct=float(config.etf_investing_max_symbol_exposure_pct),
+        etf_investing_max_total_exposure_pct=float(config.etf_investing_max_total_exposure_pct),
+        etf_investing_single_position_equity_threshold=float(config.etf_investing_single_position_equity_threshold),
+        etf_investing_daily_loss_limit_pct=float(config.etf_investing_daily_loss_limit_pct),
+        etf_investing_weekly_loss_limit_pct=float(config.etf_investing_weekly_loss_limit_pct),
         tick_interval=config.tick_interval_seconds,
         streaming_enabled=config.streaming_enabled,
         alpaca_client=alpaca_creds,
@@ -5031,6 +6031,165 @@ async def selloff_all_positions(request: Request, x_idempotency_key: Optional[st
 # Portfolio Analytics Endpoints
 # ============================================================================
 
+def _annualize_total_return_pct(total_return_pct: float, span_days: int) -> float:
+    days = max(1, int(span_days))
+    gross = 1.0 + (float(total_return_pct) / 100.0)
+    if gross <= 0:
+        return -100.0
+    annualized = (gross ** (365.0 / float(days))) - 1.0
+    return max(-100.0, min(1_000.0, annualized * 100.0))
+
+
+def _weighted_benchmark_return_pct(
+    *,
+    start_date: datetime,
+    end_date: datetime,
+    weights: Optional[Dict[str, float]] = None,
+) -> Optional[float]:
+    """Estimate weighted benchmark return using SPY/QQQ bars over a window."""
+    window_days = max(5, int((end_date.date() - start_date.date()).days) + 10)
+    weight_map = dict(weights or ETF_DCA_BENCHMARK_WEIGHTS)
+    total_weight = sum(max(0.0, float(v or 0.0)) for v in weight_map.values())
+    if total_weight <= 0:
+        return None
+    normalized_weights = {
+        str(symbol or "").strip().upper(): (max(0.0, float(weight or 0.0)) / total_weight)
+        for symbol, weight in weight_map.items()
+        if str(symbol or "").strip()
+    }
+    config = _get_config_snapshot()
+    broker_mode = "paper" if bool(config.paper_trading) else "live"
+    creds = _resolve_alpaca_credentials_for_mode(broker_mode)
+    if not creds:
+        return None
+    screener = MarketScreener(
+        alpaca_client=creds,
+        require_real_data=bool(config.strict_alpaca_data),
+    )
+    weighted_return = 0.0
+    usable_weight = 0.0
+    start_day = start_date.date()
+    end_day = end_date.date()
+    for symbol, weight in normalized_weights.items():
+        if weight <= 0:
+            continue
+        try:
+            rows = screener.get_symbol_chart_window(
+                symbol=symbol,
+                days=window_days,
+                start_date=start_date - timedelta(days=5),
+                end_date=end_date + timedelta(days=1),
+            )
+        except Exception:
+            continue
+        first_close: Optional[float] = None
+        last_close: Optional[float] = None
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            ts_dt = _ensure_utc_datetime(row.get("timestamp"))
+            if ts_dt is None:
+                continue
+            day = ts_dt.date()
+            if day < start_day or day > end_day:
+                continue
+            close = _safe_float(row.get("close", 0.0), 0.0)
+            if close <= 0:
+                continue
+            if first_close is None:
+                first_close = close
+            last_close = close
+        if first_close is None or last_close is None or first_close <= 0:
+            continue
+        symbol_return = ((last_close - first_close) / first_close) * 100.0
+        weighted_return += symbol_return * weight
+        usable_weight += weight
+    if usable_weight <= 0:
+        return None
+    return float(weighted_return / usable_weight)
+
+
+def _build_live_monthly_edge_report(storage: StorageService, mode: str) -> Dict[str, Any]:
+    """Build monthly bot-vs-benchmark XIRR/edge report for dashboard transparency."""
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=400)
+    snapshots = storage.get_portfolio_snapshots_since(cutoff=cutoff, limit=5000, mode=mode)
+    if not snapshots:
+        return {"current_month": None, "months": [], "benchmark_weights": dict(ETF_DCA_BENCHMARK_WEIGHTS)}
+
+    buckets: Dict[str, List[Any]] = {}
+    for row in snapshots:
+        ts = _ensure_utc_datetime(getattr(row, "timestamp", None))
+        if ts is None:
+            continue
+        key = f"{ts.year:04d}-{ts.month:02d}"
+        buckets.setdefault(key, []).append(row)
+
+    monthly_rows: List[Dict[str, Any]] = []
+    for key in sorted(buckets.keys()):
+        rows = sorted(
+            buckets[key],
+            key=lambda r: _ensure_utc_datetime(getattr(r, "timestamp", None)) or datetime.min.replace(tzinfo=timezone.utc),
+        )
+        if len(rows) < 2:
+            continue
+        start_row = rows[0]
+        end_row = rows[-1]
+        start_ts = _ensure_utc_datetime(getattr(start_row, "timestamp", None))
+        end_ts = _ensure_utc_datetime(getattr(end_row, "timestamp", None))
+        if start_ts is None or end_ts is None or end_ts <= start_ts:
+            continue
+        start_equity = _safe_float(getattr(start_row, "equity", 0.0), 0.0)
+        end_equity = _safe_float(getattr(end_row, "equity", 0.0), 0.0)
+        if start_equity <= 0:
+            continue
+        span_days = max(1, int((end_ts.date() - start_ts.date()).days) + 1)
+        bot_total_return_pct = ((end_equity - start_equity) / start_equity) * 100.0
+        bot_xirr_pct = _annualize_total_return_pct(bot_total_return_pct, span_days)
+        bench_total_return_pct = _weighted_benchmark_return_pct(
+            start_date=start_ts,
+            end_date=end_ts,
+            weights=ETF_DCA_BENCHMARK_WEIGHTS,
+        )
+        if bench_total_return_pct is None:
+            bench_xirr_pct = None
+            edge_xirr_pct = None
+        else:
+            bench_xirr_pct = _annualize_total_return_pct(float(bench_total_return_pct), span_days)
+            edge_xirr_pct = bot_xirr_pct - bench_xirr_pct
+        monthly_rows.append(
+            {
+                "month": key,
+                "start_at": start_ts.isoformat(),
+                "end_at": end_ts.isoformat(),
+                "bot_xirr_pct": round(float(bot_xirr_pct), 4),
+                "dca_benchmark_xirr_pct": round(float(bench_xirr_pct), 4) if bench_xirr_pct is not None else None,
+                "edge_xirr_pct": round(float(edge_xirr_pct), 4) if edge_xirr_pct is not None else None,
+                "bot_total_return_pct": round(float(bot_total_return_pct), 4),
+                "dca_benchmark_total_return_pct": round(float(bench_total_return_pct), 4)
+                if bench_total_return_pct is not None
+                else None,
+            }
+        )
+
+    monthly_rows = monthly_rows[-12:]
+    current_key = f"{now.year:04d}-{now.month:02d}"
+    current_month = None
+    for row in monthly_rows:
+        if str(row.get("month")) == current_key:
+            current_month = row
+            break
+    if current_month is None and monthly_rows:
+        current_month = monthly_rows[-1]
+    return {
+        "current_month": current_month,
+        "months": monthly_rows,
+        "benchmark_weights": dict(ETF_DCA_BENCHMARK_WEIGHTS),
+    }
+
+
 @router.get("/analytics/portfolio", tags=["Analytics"])
 async def get_portfolio_analytics(
     days: Optional[int] = Query(default=None, ge=1, le=3650),
@@ -5046,6 +6205,9 @@ async def get_portfolio_analytics(
         return cached
 
     storage = StorageService(db)
+    runtime_cfg = _load_runtime_config(storage)
+    _set_config_snapshot(runtime_cfg)
+    snapshot_mode = "paper" if bool(runtime_cfg.paper_trading) else "live"
 
     trades = storage.get_recent_trades(limit=5000)
     cutoff = datetime.now(timezone.utc) - timedelta(days=days) if days is not None else None
@@ -5080,9 +6242,9 @@ async def get_portfolio_analytics(
     except (RuntimeError, ValueError, TypeError, KeyError):
         pass
 
-    snapshot_rows = storage.get_portfolio_snapshots_since(cutoff=cutoff, limit=5000)
+    snapshot_rows = storage.get_portfolio_snapshots_since(cutoff=cutoff, limit=5000, mode=snapshot_mode)
     if not snapshot_rows:
-        latest_snapshot = storage.get_latest_portfolio_snapshot()
+        latest_snapshot = storage.get_latest_portfolio_snapshot(mode=snapshot_mode)
         if latest_snapshot is not None:
             snapshot_rows = [latest_snapshot]
 
@@ -5190,6 +6352,9 @@ async def get_portfolio_summary(db: Session = Depends(get_db)):
         return cached
 
     storage = StorageService(db)
+    runtime_cfg = _load_runtime_config(storage)
+    _set_config_snapshot(runtime_cfg)
+    snapshot_mode = "paper" if bool(runtime_cfg.paper_trading) else "live"
 
     broker: Optional[BrokerInterface]
     try:
@@ -5217,11 +6382,13 @@ async def get_portfolio_summary(db: Session = Depends(get_db)):
     total_positions = len(holdings_snapshot) if holdings_snapshot else len(positions)
     equity = _safe_float(account_snapshot.get("equity", 0.0), 0.0)
     if equity <= 0.0:
-        latest_snapshot = storage.get_latest_portfolio_snapshot()
+        latest_snapshot = storage.get_latest_portfolio_snapshot(mode=snapshot_mode)
         if latest_snapshot is not None:
             equity = _safe_float(latest_snapshot.equity, 0.0)
         if equity <= 0.0:
             equity = max(0.0, total_position_value + total_pnl)
+    monthly_edge = _build_live_monthly_edge_report(storage, mode=snapshot_mode)
+    current_month_edge = monthly_edge.get("current_month") if isinstance(monthly_edge, dict) else None
 
     payload = {
         'total_trades': total_trades,
@@ -5232,6 +6399,17 @@ async def get_portfolio_summary(db: Session = Depends(get_db)):
         'total_positions': total_positions,
         'total_position_value': total_position_value,
         'equity': equity,
+        'bot_xirr_pct': _safe_float((current_month_edge or {}).get("bot_xirr_pct", 0.0), 0.0)
+        if isinstance(current_month_edge, dict)
+        else None,
+        'dca_benchmark_xirr_pct': _safe_float((current_month_edge or {}).get("dca_benchmark_xirr_pct", 0.0), 0.0)
+        if isinstance(current_month_edge, dict) and (current_month_edge or {}).get("dca_benchmark_xirr_pct") is not None
+        else None,
+        'edge_xirr_pct': _safe_float((current_month_edge or {}).get("edge_xirr_pct", 0.0), 0.0)
+        if isinstance(current_month_edge, dict) and (current_month_edge or {}).get("edge_xirr_pct") is not None
+        else None,
+        'monthly_edge': monthly_edge,
+        'scenario2_thresholds': get_scenario2_thresholds(),
     }
     _portfolio_summary_cache_set(payload)
     return payload
@@ -5288,7 +6466,10 @@ def _adaptive_strategy_parameter_defaults(
     account_snapshot = _load_account_snapshot(broker)
     equity = _safe_float(account_snapshot.get("equity", 0.0), 0.0)
     buying_power = _safe_float(account_snapshot.get("buying_power", 0.0), 0.0)
-    weekly_budget = _safe_float(prefs.weekly_budget, 200.0)
+    weekly_budget = _safe_float(
+        prefs.weekly_budget,
+        ETF_INVESTING_WEEKLY_CONTRIBUTION_DEFAULT,
+    )
     budget_tracker = get_budget_tracker(weekly_budget)
     budget_tracker.set_weekly_budget(weekly_budget)
     remaining_weekly_budget = _safe_float(
@@ -5315,12 +6496,9 @@ def _resolve_backtest_asset_type(
     prefs: TradingPreferencesResponse,
 ) -> AssetType:
     """Resolve workspace asset type for backtest universe generation."""
-    if request_asset_type in {"stock", "etf"}:
-        return AssetType(request_asset_type)
-    if prefs.asset_type in (AssetType.STOCK, AssetType.ETF):
-        return prefs.asset_type
-    # AssetType.BOTH is unsupported for preset backtesting; choose stock default.
-    return AssetType.STOCK
+    _ = request_asset_type
+    _ = prefs
+    return AssetType.ETF
 
 
 def _resolve_workspace_universe_for_backtest(
@@ -5336,25 +6514,15 @@ def _resolve_workspace_universe_for_backtest(
 
     Mirrors Screener universe mode + guardrails so backtest and runner inputs stay aligned.
     """
-    final_asset_type = _resolve_backtest_asset_type(request.asset_type, prefs)
+    final_asset_type = AssetType.ETF
     requested_mode = request.screener_mode
-    if requested_mode in {"most_active", "preset"}:
-        mode_candidate = ScreenerMode(requested_mode)
-        mode_explicit = True
-    else:
-        mode_candidate = (
-            prefs.screener_mode
-            if prefs.screener_mode in (ScreenerMode.MOST_ACTIVE, ScreenerMode.PRESET)
-            else ScreenerMode.MOST_ACTIVE
+    if requested_mode == "most_active":
+        raise HTTPException(
+            status_code=400,
+            detail="workspace backtest universe: screener_mode=most_active is not supported in ETF investing mode",
         )
-        mode_explicit = False
-    final_mode = _validate_asset_mode_combo(
-        final_asset_type,
-        mode_candidate,
-        mode_explicit=mode_explicit,
-        context="workspace backtest universe",
-    )
-    mode_auto_corrected = (not mode_explicit) and (final_mode != mode_candidate)
+    final_mode = ScreenerMode.PRESET
+    mode_auto_corrected = requested_mode not in {None, "preset"}
 
     final_limit = (
         int(request.screener_limit)
@@ -5375,49 +6543,35 @@ def _resolve_workspace_universe_for_backtest(
     resolved_preset_name: Optional[str] = None
     preset_metadata: Dict[str, Any] = {}
 
-    if final_mode == ScreenerMode.PRESET:
-        if final_asset_type == AssetType.STOCK:
-            resolved_preset_name = str(request.stock_preset or prefs.stock_preset.value).strip().lower()
-            valid_stock = {"weekly_optimized", "three_to_five_weekly", "monthly_optimized", "small_budget_weekly", "micro_budget"}
-            if resolved_preset_name not in valid_stock:
-                resolved_preset_name = prefs.stock_preset.value
-        else:
-            resolved_preset_name = str(request.etf_preset or prefs.etf_preset.value).strip().lower()
-            valid_etf = {"conservative", "balanced", "aggressive"}
-            if resolved_preset_name not in valid_etf:
-                resolved_preset_name = prefs.etf_preset.value
+    resolved_preset_name = str(request.etf_preset or prefs.etf_preset.value).strip().lower()
+    valid_etf = {"conservative", "balanced", "aggressive"}
+    if resolved_preset_name not in valid_etf:
+        resolved_preset_name = prefs.etf_preset.value
 
-        mode_candidate = (
-            str(request.preset_universe_mode).strip().lower()
-            if request.preset_universe_mode is not None
-            else ("seed_only" if bool(request.seed_only) else "seed_guardrail_blend")
+    mode_candidate = (
+        str(request.preset_universe_mode).strip().lower()
+        if request.preset_universe_mode is not None
+        else "seed_guardrail_blend"
+    )
+    if mode_candidate not in {"seed_only", "seed_guardrail_blend", "guardrail_only"}:
+        raise HTTPException(
+            status_code=400,
+            detail="preset_universe_mode must be one of: seed_only, seed_guardrail_blend, guardrail_only",
         )
-        if mode_candidate not in {"seed_only", "seed_guardrail_blend", "guardrail_only"}:
-            raise HTTPException(
-                status_code=400,
-                detail="preset_universe_mode must be one of: seed_only, seed_guardrail_blend, guardrail_only",
-            )
-        resolved_preset_universe_mode = mode_candidate
+    resolved_preset_universe_mode = mode_candidate
 
-        preset_guardrails = screener.get_preset_guardrails(final_asset_type.value, resolved_preset_name)
-        min_dollar_volume = max(min_dollar_volume, float(preset_guardrails["min_dollar_volume"]))
-        max_spread_bps = min(max_spread_bps, float(preset_guardrails["max_spread_bps"]))
-        max_sector_weight_pct = min(max_sector_weight_pct, float(preset_guardrails["max_sector_weight_pct"]))
-        assets_raw = screener.get_preset_assets(
-            final_asset_type.value,
-            resolved_preset_name,
-            final_limit,
-            seed_only=resolved_preset_universe_mode == "seed_only",
-            preset_universe_mode=resolved_preset_universe_mode,
-        )
-        preset_metadata = screener.get_last_preset_metadata()
-    else:
-        from services.market_screener import AssetType as ScreenerAssetType
-
-        assets_raw = screener.get_screener_results(
-            ScreenerAssetType(final_asset_type.value),
-            final_limit,
-        )
+    preset_guardrails = screener.get_preset_guardrails(final_asset_type.value, resolved_preset_name)
+    min_dollar_volume = max(min_dollar_volume, float(preset_guardrails["min_dollar_volume"]))
+    max_spread_bps = min(max_spread_bps, float(preset_guardrails["max_spread_bps"]))
+    max_sector_weight_pct = min(max_sector_weight_pct, float(preset_guardrails["max_sector_weight_pct"]))
+    assets_raw = screener.get_preset_assets(
+        final_asset_type.value,
+        resolved_preset_name,
+        final_limit,
+        seed_only=resolved_preset_universe_mode == "seed_only",
+        preset_universe_mode=resolved_preset_universe_mode,
+    )
+    preset_metadata = screener.get_last_preset_metadata()
 
     regime = screener.detect_market_regime()
     assets_pre_optimized, asset_type_filtering = _filter_assets_to_asset_type_with_backfill(
@@ -5450,7 +6604,10 @@ def _resolve_workspace_universe_for_backtest(
         requested_position_size=_safe_float(strategy_defaults.get("position_size", 1000.0), 1000.0),
         symbol_count=max(1, final_limit),
         existing_position_count=0,
-        remaining_weekly_budget=_safe_float(prefs.weekly_budget, 200.0),
+        remaining_weekly_budget=_safe_float(
+            prefs.weekly_budget,
+            ETF_INVESTING_WEEKLY_CONTRIBUTION_DEFAULT,
+        ),
         buying_power=max(0.0, float(initial_capital)),
         equity=max(0.0, float(initial_capital)),
         risk_per_trade_pct=_safe_float(strategy_defaults.get("risk_per_trade", 1.0), 1.0),
@@ -5462,7 +6619,7 @@ def _resolve_workspace_universe_for_backtest(
         "buying_power": max(0.0, float(initial_capital)),
     }
     require_fractionable = _should_require_fractionable_symbols(final_asset_type, prefs, synthetic_account)
-    enforce_execution_capabilities = bool(final_asset_type == AssetType.STOCK and require_fractionable)
+    enforce_execution_capabilities = False
     symbol_capabilities = (
         _collect_symbol_capabilities(
             broker,
@@ -5483,13 +6640,25 @@ def _resolve_workspace_universe_for_backtest(
         current_holdings=[],
         buying_power=max(0.0, float(initial_capital)),
         equity=max(0.0, float(initial_capital)),
-        weekly_budget=_safe_float(prefs.weekly_budget, 200.0),
+        weekly_budget=_safe_float(
+            prefs.weekly_budget,
+            ETF_INVESTING_WEEKLY_CONTRIBUTION_DEFAULT,
+        ),
         symbol_capabilities=symbol_capabilities,
         require_broker_tradable=enforce_execution_capabilities,
         require_fractionable=require_fractionable,
         target_position_size=target_position_size,
         dca_tranches=dca_tranches,
     )
+    governance = ETFInvestingGovernanceService(storage)
+    governed = governance.enforce(
+        screener=screener,
+        assets=optimized,
+        role="active",
+        holdings_snapshot=[],
+        force_screen=False,
+    )
+    optimized = governed.assets
     symbols = _normalize_symbols([str(asset.get("symbol", "")).upper() for asset in optimized if asset.get("symbol")])
     if not symbols:
         raise HTTPException(
@@ -5533,30 +6702,29 @@ def _resolve_workspace_universe_for_backtest(
         "target_position_size": target_position_size,
         "dca_tranches": dca_tranches,
         "symbol_capabilities": selected_capabilities,
+        "governance": governed.report,
     }
     return symbols, context
 
 
 def _resolve_strategy_backtest_parameters(
-    db_strategy: Any,
+    *,
+    storage: StorageService,
+    db_strategy: DBStrategy,
+    strategy_asset_type: str,
+    use_workspace_universe: bool,
     request_parameters: Optional[Dict[str, float]],
-) -> Dict[str, float]:
-    """Resolve backtest parameters from strategy config with request overrides."""
+) -> tuple[Dict[str, float], Dict[str, Any]]:
+    """Resolve backtest/optimizer parameters from source map with request overrides."""
     default_params = get_default_parameters()
     param_defs = {param.name: param for param in default_params}
-    resolved_parameters: Dict[str, float] = {}
-    if db_strategy.config and isinstance(db_strategy.config.get("parameters"), dict):
-        for name, value in db_strategy.config.get("parameters", {}).items():
-            if name not in param_defs:
-                continue
-            try:
-                numeric = float(value)
-            except (TypeError, ValueError):
-                continue
-            if not math.isfinite(numeric):
-                continue
-            pdef = param_defs[name]
-            resolved_parameters[name] = max(pdef.min_value, min(pdef.max_value, numeric))
+    source_maps = _resolve_strategy_parameter_maps_for_source(
+        storage=storage,
+        db_strategy=db_strategy,
+        strategy_asset_type=strategy_asset_type,
+        use_workspace_universe=use_workspace_universe,
+    )
+    resolved_parameters: Dict[str, float] = dict(source_maps["effective_parameters"])
     if request_parameters:
         for name, value in request_parameters.items():
             if name not in param_defs:
@@ -5574,7 +6742,12 @@ def _resolve_strategy_backtest_parameters(
                     detail=f"Backtest parameter {name} must be within [{pdef.min_value}, {pdef.max_value}]",
                 )
             resolved_parameters[name] = numeric
-    return resolved_parameters
+    return resolved_parameters, {
+        "parameter_source": str(source_maps["parameter_source"]),
+        "baseline_profile": dict(source_maps["baseline_profile"]),
+        "baseline_parameters": dict(source_maps["baseline_parameters"]),
+        "saved_parameters": dict(source_maps["saved_parameters"]),
+    }
 
 
 def _prepare_backtest_execution_context(
@@ -5727,6 +6900,29 @@ def _prepare_backtest_execution_context(
     if filtered_out:
         universe_context["symbols_filtered_out"] = filtered_out[:50]
 
+    stock_preset_hint = str(
+        universe_context.get("preset")
+        or request.stock_preset
+        or prefs.stock_preset.value
+    ).strip().lower()
+    micro_policy = _resolve_micro_policy_context(
+        runtime_config=_bt_config,
+        request_micro_mode=getattr(request, "micro_strategy_mode", "auto"),
+        request_micro_equity_threshold=getattr(request, "micro_equity_threshold", None),
+        request_micro_single_trade_loss_pct=getattr(request, "micro_single_trade_loss_pct", None),
+        request_micro_cash_reserve_pct=getattr(request, "micro_cash_reserve_pct", None),
+        request_micro_max_spread_bps=getattr(request, "micro_max_spread_bps", None),
+        initial_capital=float(request.initial_capital),
+        contribution_amount=float(getattr(request, "contribution_amount", 0.0) or 0.0),
+        contribution_frequency=str(getattr(request, "contribution_frequency", "none") or "none"),
+        stock_preset_hint=stock_preset_hint,
+    )
+    investing_policy = _resolve_etf_investing_policy_context(
+        runtime_config=_bt_config,
+        prefs=prefs,
+        request_asset_type=getattr(request, "asset_type", None),
+    )
+
     max_position_size = float(_bt_config.max_position_size)
     risk_limit_daily = float(_bt_config.risk_limit_daily)
     if broker_for_constraints is not None:
@@ -5778,6 +6974,13 @@ def _prepare_backtest_execution_context(
     live_parity_context["simulate_queue_position"] = simulate_queue_position
     live_parity_context["enforce_liquidity_limits"] = enforce_liquidity_limits
     live_parity_context["reconcile_fees_with_broker"] = reconcile_fees_with_broker
+    live_parity_context["micro_policy_active"] = bool(micro_policy.get("active", False))
+    live_parity_context["micro_policy_mode"] = str(micro_policy.get("mode", "auto"))
+    live_parity_context["micro_policy_reason"] = str(micro_policy.get("reason", ""))
+    live_parity_context["micro_policy"] = dict(micro_policy)
+    live_parity_context["investing_policy_active"] = bool(investing_policy.get("active", False))
+    live_parity_context["investing_policy_reason"] = str(investing_policy.get("reason", ""))
+    live_parity_context["investing_policy"] = dict(investing_policy)
     universe_context["live_parity_context"] = live_parity_context
 
     analytics = StrategyAnalyticsService(
@@ -5806,6 +7009,8 @@ def _prepare_backtest_execution_context(
         "enforce_liquidity_limits": enforce_liquidity_limits,
         "reconcile_fees_with_broker": reconcile_fees_with_broker,
         "execution_seed": execution_seed,
+        "micro_policy": micro_policy,
+        "investing_policy": investing_policy,
     }
 
 
@@ -5878,6 +7083,11 @@ def _compute_strategy_optimization_response(
         initial_capital=request.initial_capital,
         contribution_amount=request.contribution_amount,
         contribution_frequency=request.contribution_frequency,
+        micro_strategy_mode=request.micro_strategy_mode,
+        micro_equity_threshold=request.micro_equity_threshold,
+        micro_single_trade_loss_pct=request.micro_single_trade_loss_pct,
+        micro_cash_reserve_pct=request.micro_cash_reserve_pct,
+        micro_max_spread_bps=request.micro_max_spread_bps,
         symbols=request.symbols,
         parameters=request.parameters,
         emulate_live_trading=request.emulate_live_trading,
@@ -5887,7 +7097,6 @@ def _compute_strategy_optimization_response(
         stock_preset=request.stock_preset,
         etf_preset=request.etf_preset,
         screener_limit=request.screener_limit,
-        seed_only=request.seed_only,
         preset_universe_mode=request.preset_universe_mode,
         min_dollar_volume=request.min_dollar_volume,
         max_spread_bps=request.max_spread_bps,
@@ -5901,8 +7110,17 @@ def _compute_strategy_optimization_response(
         reconcile_fees_with_broker=request.reconcile_fees_with_broker,
         execution_seed=request.execution_seed,
     )
-    resolved_parameters = _resolve_strategy_backtest_parameters(
+    strategy_symbols_for_params = _normalize_symbols(
+        db_strategy.config.get("symbols", [])
+        if isinstance(db_strategy.config, dict) and isinstance(db_strategy.config.get("symbols"), list)
+        else []
+    )
+    strategy_asset_type_for_params = _strategy_config_asset_type(db_strategy.config, strategy_symbols_for_params)
+    resolved_parameters, parameter_resolution = _resolve_strategy_backtest_parameters(
+        storage=storage,
         db_strategy=db_strategy,
+        strategy_asset_type=strategy_asset_type_for_params,
+        use_workspace_universe=bool(backtest_request.use_workspace_universe),
         request_parameters=backtest_request.parameters,
     )
     _emit_setup("context_prep")
@@ -5910,6 +7128,23 @@ def _compute_strategy_optimization_response(
         storage=storage,
         db_strategy=db_strategy,
         request=backtest_request,
+    )
+    exec_context["universe_context"]["parameter_source"] = str(parameter_resolution.get("parameter_source", "unknown"))
+    exec_context["universe_context"]["baseline_profile"] = dict(parameter_resolution.get("baseline_profile", {}))
+    calibrated_parameters, calibration_meta = _apply_micro_profile_parameter_calibration(
+        parameters=resolved_parameters,
+        initial_capital=float(backtest_request.initial_capital),
+        contribution_amount=float(backtest_request.contribution_amount),
+        contribution_frequency=str(backtest_request.contribution_frequency or "none"),
+        micro_policy=dict(exec_context.get("micro_policy") or {}),
+        parameter_source=str(parameter_resolution.get("parameter_source", "unknown")),
+        max_position_size=float(exec_context.get("max_position_size", 0.0) or 0.0),
+    )
+    exec_context["universe_context"]["micro_calibration"] = dict(calibration_meta)
+    _persist_strategy_micro_calibration(
+        storage=storage,
+        db_strategy=db_strategy,
+        metadata=calibration_meta,
     )
     base_symbols = list(exec_context["selected_symbols"])
     symbol_capabilities = exec_context["symbol_capabilities"] or {}
@@ -5932,6 +7167,12 @@ def _compute_strategy_optimization_response(
         initial_capital=float(backtest_request.initial_capital),
         contribution_amount=float(backtest_request.contribution_amount),
         contribution_frequency=str(backtest_request.contribution_frequency),
+        micro_strategy_mode=str((exec_context.get("micro_policy") or {}).get("mode", "auto")),
+        micro_equity_threshold=float((exec_context.get("micro_policy") or {}).get("equity_threshold", 0.0)),
+        micro_single_trade_loss_pct=float((exec_context.get("micro_policy") or {}).get("single_trade_loss_pct", 0.0)),
+        micro_cash_reserve_pct=float((exec_context.get("micro_policy") or {}).get("cash_reserve_pct", 0.0)),
+        micro_max_spread_bps=float((exec_context.get("micro_policy") or {}).get("max_spread_bps", 0.0)),
+        micro_policy_active=bool((exec_context.get("micro_policy") or {}).get("active", False)),
         emulate_live_trading=bool(exec_context["emulate_live_trading"]),
         require_fractionable=bool(exec_context["require_fractionable"]),
         max_position_size=float(exec_context["max_position_size"]),
@@ -5963,7 +7204,7 @@ def _compute_strategy_optimization_response(
         optimize_payload = optimizer.optimize(
             context=optimization_context,
             base_symbols=base_symbols,
-            base_parameters=resolved_parameters,
+            base_parameters=calibrated_parameters,
             iterations=int(request.iterations),
             min_trades=int(request.min_trades),
             objective=str(request.objective),
@@ -5986,6 +7227,11 @@ def _compute_strategy_optimization_response(
 
     best_result = optimize_payload["best_result"]
     best_response = _to_backtest_response(best_result)
+    baseline_response = (
+        _to_backtest_response(optimize_payload["baseline_result"])
+        if optimize_payload.get("baseline_result") is not None
+        else None
+    )
     top_candidates = [
         StrategyOptimizationCandidate(**row)
         for row in (optimize_payload.get("top_candidates") or [])
@@ -6022,6 +7268,7 @@ def _compute_strategy_optimization_response(
         ],
         top_candidates=top_candidates,
         best_result=best_response,
+        baseline_result=baseline_response,
         confidence=(
             dict(optimize_payload.get("confidence"))
             if isinstance(optimize_payload.get("confidence"), dict)
@@ -6032,7 +7279,13 @@ def _compute_strategy_optimization_response(
             if isinstance(optimize_payload.get("walk_forward"), dict)
             else None
         ),
-        notes=[str(note) for note in (optimize_payload.get("notes") or [])],
+        notes=(
+            [str(note) for note in (optimize_payload.get("notes") or [])]
+            + ([
+                "Micro profile calibration adjusted parameters: "
+                + ", ".join(str(field) for field in (calibration_meta.get("adjusted_fields") or []))
+            ] if calibration_meta.get("micro_calibrated") else [])
+        ),
     )
 
     storage.create_audit_log(
@@ -6044,6 +7297,13 @@ def _compute_strategy_optimization_response(
             "end_date": request.end_date,
             "contribution_amount": request.contribution_amount,
             "contribution_frequency": request.contribution_frequency,
+            "micro_strategy_mode": str((exec_context.get("micro_policy") or {}).get("mode", "auto")),
+            "micro_policy_active": bool((exec_context.get("micro_policy") or {}).get("active", False)),
+            "investing_policy_active": bool((exec_context.get("investing_policy") or {}).get("active", False)),
+            "investing_policy_reason": str((exec_context.get("investing_policy") or {}).get("reason", "")),
+            "micro_calibrated": bool(calibration_meta.get("micro_calibrated", False)),
+            "micro_calibrated_fields": list(calibration_meta.get("adjusted_fields") or []),
+            "parameter_source": exec_context["universe_context"].get("parameter_source"),
             "requested_iterations": response.requested_iterations,
             "evaluated_iterations": response.evaluated_iterations,
             "objective": response.objective,
@@ -6080,27 +7340,46 @@ async def get_strategy_config(strategy_id: str, db: Session = Depends(get_db)):
     symbols = db_strategy.config.get('symbols', []) if db_strategy.config else []
     normalized_symbols = _normalize_symbols(symbols if isinstance(symbols, list) else [])
     resolved_asset_type = _strategy_config_asset_type(db_strategy.config, normalized_symbols)
-    # Get parameters from config or use adaptive defaults
-    config_params = db_strategy.config.get('parameters', {}) if db_strategy.config else {}
-    adaptive_defaults = _adaptive_strategy_parameter_defaults(storage, symbol_count=len(normalized_symbols))
+    config_payload = _ensure_strategy_baseline_config(
+        storage,
+        db_strategy,
+        strategy_asset_type=resolved_asset_type,
+        force_save=True,
+    )
+    baseline_profile = (
+        dict(config_payload.get(_STRATEGY_BASELINE_PROFILE_KEY))
+        if isinstance(config_payload.get(_STRATEGY_BASELINE_PROFILE_KEY), dict)
+        else {}
+    )
+    baseline_parameters = _sanitize_strategy_parameter_map(
+        config_payload.get(_STRATEGY_BASELINE_PARAMETERS_KEY),
+        fallback=_strategy_default_parameters_for_profile(baseline_profile),
+    )
+    saved_parameters = _sanitize_strategy_parameter_map(
+        config_payload.get("parameters"),
+        fallback=baseline_parameters,
+    )
+    micro_calibration = (
+        dict(config_payload.get(_STRATEGY_MICRO_CALIBRATION_KEY))
+        if isinstance(config_payload.get(_STRATEGY_MICRO_CALIBRATION_KEY), dict)
+        else {}
+    )
+    parameters_overridden = any(
+        abs(float(saved_parameters.get(name, 0.0)) - float(baseline_parameters.get(name, 0.0))) > 1e-9
+        for name in baseline_parameters.keys()
+    )
     default_params = get_default_parameters()
-    
-    # Merge with stored values and convert to API models
-    parameters = []
-    for param in default_params:
-        if param.name in adaptive_defaults:
-            param.value = _safe_float(adaptive_defaults[param.name], param.value)
-        if param.name in config_params:
-            param.value = _safe_float(config_params[param.name], param.value)
-        # Convert to API model
-        parameters.append(StrategyParameter(
+    parameters = [
+        StrategyParameter(
             name=param.name,
-            value=param.value,
+            value=float(saved_parameters.get(param.name, param.value)),
             min_value=param.min_value,
             max_value=param.max_value,
             step=param.step,
             description=param.description,
-        ))
+        )
+        for param in default_params
+    ]
     
     return StrategyConfigResponse(
         strategy_id=str(db_strategy.id),
@@ -6109,6 +7388,10 @@ async def get_strategy_config(strategy_id: str, db: Session = Depends(get_db)):
         asset_type=resolved_asset_type,
         symbols=normalized_symbols,
         parameters=parameters,
+        baseline_parameters=baseline_parameters,
+        baseline_profile=baseline_profile,
+        micro_calibration=micro_calibration,
+        parameters_overridden=bool(parameters_overridden),
         enabled=db_strategy.is_enabled,
         config_version=_strategy_config_version(db_strategy.config),
     )
@@ -6133,6 +7416,19 @@ async def update_strategy_config(
     db_strategy = storage.strategies.get_by_id(strategy_id_int)
     if not db_strategy:
         raise HTTPException(status_code=404, detail="Strategy not found")
+
+    current_symbols_for_baseline = _normalize_symbols(
+        db_strategy.config.get("symbols", [])
+        if isinstance(db_strategy.config, dict) and isinstance(db_strategy.config.get("symbols"), list)
+        else []
+    )
+    current_asset_for_baseline = _strategy_config_asset_type(db_strategy.config, current_symbols_for_baseline)
+    db_strategy.config = _ensure_strategy_baseline_config(
+        storage,
+        db_strategy,
+        strategy_asset_type=current_asset_for_baseline,
+        force_save=False,
+    )
 
     default_params = get_default_parameters()
     param_defs = {param.name: param for param in default_params}
@@ -6188,8 +7484,19 @@ async def update_strategy_config(
                 config_changed = True
 
     if request.parameters is not None:
-        if 'parameters' not in db_strategy.config:
-            db_strategy.config['parameters'] = {}
+        baseline_profile = (
+            dict(db_strategy.config.get(_STRATEGY_BASELINE_PROFILE_KEY))
+            if isinstance(db_strategy.config.get(_STRATEGY_BASELINE_PROFILE_KEY), dict)
+            else {}
+        )
+        baseline_parameters = _sanitize_strategy_parameter_map(
+            db_strategy.config.get(_STRATEGY_BASELINE_PARAMETERS_KEY),
+            fallback=_strategy_default_parameters_for_profile(baseline_profile),
+        )
+        current_parameters = _sanitize_strategy_parameter_map(
+            db_strategy.config.get("parameters"),
+            fallback=baseline_parameters,
+        )
         for param_name, param_value in request.parameters.items():
             if param_name not in param_defs:
                 raise HTTPException(status_code=400, detail=f"Unknown strategy parameter: {param_name}")
@@ -6201,11 +7508,12 @@ async def update_strategy_config(
                     status_code=400,
                     detail=f"Parameter {param_name} must be within [{param_def.min_value}, {param_def.max_value}]",
                 )
-            current_value = _safe_float(db_strategy.config['parameters'].get(param_name), param_def.value)
+            current_value = _safe_float(current_parameters.get(param_name), param_def.value)
             normalized_value = float(param_value)
             if not math.isclose(current_value, normalized_value, rel_tol=0.0, abs_tol=1e-12):
-                db_strategy.config['parameters'][param_name] = normalized_value
+                current_parameters[param_name] = normalized_value
                 config_changed = True
+        db_strategy.config["parameters"] = current_parameters
 
     enabled_changed = False
     if request.enabled is not None:
@@ -6318,14 +7626,40 @@ async def run_strategy_backtest(
     if request.initial_capital < 100 or request.initial_capital > 100_000_000:
         raise HTTPException(status_code=400, detail="initial_capital must be within [100, 100000000]")
     
-    resolved_parameters = _resolve_strategy_backtest_parameters(
+    strategy_symbols_for_params = _normalize_symbols(
+        db_strategy.config.get("symbols", [])
+        if isinstance(db_strategy.config, dict) and isinstance(db_strategy.config.get("symbols"), list)
+        else []
+    )
+    strategy_asset_type_for_params = _strategy_config_asset_type(db_strategy.config, strategy_symbols_for_params)
+    resolved_parameters, parameter_resolution = _resolve_strategy_backtest_parameters(
+        storage=storage,
         db_strategy=db_strategy,
+        strategy_asset_type=strategy_asset_type_for_params,
+        use_workspace_universe=bool(request.use_workspace_universe),
         request_parameters=request.parameters,
     )
     exec_context = _prepare_backtest_execution_context(
         storage=storage,
         db_strategy=db_strategy,
         request=request,
+    )
+    exec_context["universe_context"]["parameter_source"] = str(parameter_resolution.get("parameter_source", "unknown"))
+    exec_context["universe_context"]["baseline_profile"] = dict(parameter_resolution.get("baseline_profile", {}))
+    calibrated_parameters, calibration_meta = _apply_micro_profile_parameter_calibration(
+        parameters=resolved_parameters,
+        initial_capital=float(request.initial_capital),
+        contribution_amount=float(request.contribution_amount),
+        contribution_frequency=str(request.contribution_frequency or "none"),
+        micro_policy=dict(exec_context.get("micro_policy") or {}),
+        parameter_source=str(parameter_resolution.get("parameter_source", "unknown")),
+        max_position_size=float(exec_context.get("max_position_size", 0.0) or 0.0),
+    )
+    exec_context["universe_context"]["micro_calibration"] = dict(calibration_meta)
+    _persist_strategy_micro_calibration(
+        storage=storage,
+        db_strategy=db_strategy,
+        metadata=calibration_meta,
     )
     from config.strategy_config import BacktestRequest as BacktestReq
     
@@ -6336,8 +7670,13 @@ async def run_strategy_backtest(
         initial_capital=request.initial_capital,
         contribution_amount=request.contribution_amount,
         contribution_frequency=request.contribution_frequency,
+        micro_strategy_mode=str((exec_context.get("micro_policy") or {}).get("mode", "auto")),
+        micro_equity_threshold=(exec_context.get("micro_policy") or {}).get("equity_threshold"),
+        micro_single_trade_loss_pct=(exec_context.get("micro_policy") or {}).get("single_trade_loss_pct"),
+        micro_cash_reserve_pct=(exec_context.get("micro_policy") or {}).get("cash_reserve_pct"),
+        micro_max_spread_bps=(exec_context.get("micro_policy") or {}).get("max_spread_bps"),
         symbols=exec_context["selected_symbols"],
-        parameters=resolved_parameters or None,
+        parameters=calibrated_parameters or None,
         emulate_live_trading=exec_context["emulate_live_trading"],
         symbol_capabilities=exec_context["symbol_capabilities"] or None,
         require_fractionable=exec_context["require_fractionable"],
@@ -6358,6 +7697,11 @@ async def run_strategy_backtest(
         result = exec_context["analytics"].run_backtest(backtest_req)
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
+    if isinstance(result.diagnostics, dict):
+        result.diagnostics["micro_calibration"] = dict(calibration_meta)
+        live_parity = result.diagnostics.get("live_parity")
+        if isinstance(live_parity, dict):
+            live_parity["micro_calibration_active"] = bool(calibration_meta.get("micro_calibrated", False))
     
     storage.create_audit_log(
         event_type="strategy_started",
@@ -6371,8 +7715,15 @@ async def run_strategy_backtest(
             "total_trades": result.total_trades,
             "win_rate": result.win_rate,
             "emulate_live_trading": exec_context["emulate_live_trading"],
+            "micro_policy_active": bool((exec_context.get("micro_policy") or {}).get("active", False)),
+            "micro_policy_mode": str((exec_context.get("micro_policy") or {}).get("mode", "auto")),
+            "investing_policy_active": bool((exec_context.get("investing_policy") or {}).get("active", False)),
+            "investing_policy_reason": str((exec_context.get("investing_policy") or {}).get("reason", "")),
+            "micro_calibrated": bool(calibration_meta.get("micro_calibrated", False)),
+            "micro_calibrated_fields": list(calibration_meta.get("adjusted_fields") or []),
             "symbols_source": exec_context["universe_context"].get("symbols_source"),
             "symbols_selected": exec_context["universe_context"].get("symbols_selected"),
+            "parameter_source": exec_context["universe_context"].get("parameter_source"),
         },
     )
     return _to_backtest_response(result)
@@ -7119,6 +8470,18 @@ async def tune_strategy_parameter(
     db_strategy = storage.strategies.get_by_id(strategy_id_int)
     if not db_strategy:
         raise HTTPException(status_code=404, detail="Strategy not found")
+    current_symbols_for_baseline = _normalize_symbols(
+        db_strategy.config.get("symbols", [])
+        if isinstance(db_strategy.config, dict) and isinstance(db_strategy.config.get("symbols"), list)
+        else []
+    )
+    current_asset_for_baseline = _strategy_config_asset_type(db_strategy.config, current_symbols_for_baseline)
+    db_strategy.config = _ensure_strategy_baseline_config(
+        storage,
+        db_strategy,
+        strategy_asset_type=current_asset_for_baseline,
+        force_save=False,
+    )
     if not isinstance(db_strategy.config, dict):
         db_strategy.config = {}
     current_config_version = _strategy_config_version(db_strategy.config)
@@ -7151,11 +8514,20 @@ async def tune_strategy_parameter(
             detail=f"Value {request.value} outside allowed range [{param_def.min_value}, {param_def.max_value}]"
         )
     
-    # Update parameter
-    if 'parameters' not in db_strategy.config:
-        db_strategy.config['parameters'] = {}
-    
-    old_value = db_strategy.config['parameters'].get(request.parameter_name, param_def.value)
+    baseline_profile = (
+        dict(db_strategy.config.get(_STRATEGY_BASELINE_PROFILE_KEY))
+        if isinstance(db_strategy.config.get(_STRATEGY_BASELINE_PROFILE_KEY), dict)
+        else {}
+    )
+    baseline_parameters = _sanitize_strategy_parameter_map(
+        db_strategy.config.get(_STRATEGY_BASELINE_PARAMETERS_KEY),
+        fallback=_strategy_default_parameters_for_profile(baseline_profile),
+    )
+    current_parameters = _sanitize_strategy_parameter_map(
+        db_strategy.config.get("parameters"),
+        fallback=baseline_parameters,
+    )
+    old_value = current_parameters.get(request.parameter_name, param_def.value)
     normalized_new_value = float(request.value)
     changed = not math.isclose(
         _safe_float(old_value, param_def.value),
@@ -7163,7 +8535,8 @@ async def tune_strategy_parameter(
         rel_tol=0.0,
         abs_tol=1e-12,
     )
-    db_strategy.config['parameters'][request.parameter_name] = normalized_new_value
+    current_parameters[request.parameter_name] = normalized_new_value
+    db_strategy.config["parameters"] = current_parameters
     next_config_version = current_config_version
     if changed:
         next_config_version = _strategy_bump_config_version(db_strategy)
@@ -7215,14 +8588,14 @@ from .models import (
 from services.market_screener import MarketScreener
 # In-memory trading preferences (would be persisted in production)
 _trading_preferences = TradingPreferencesResponse(
-    asset_type=AssetType.BOTH,
+    asset_type=AssetType.ETF,
     risk_profile=RiskProfile.BALANCED,
-    weekly_budget=200.0,
+    weekly_budget=ETF_INVESTING_WEEKLY_CONTRIBUTION_DEFAULT,
     screener_limit=50,
     stock_most_active_limit=50,
     stock_preset_limit=50,
     etf_preset_limit=50,
-    screener_mode=ScreenerMode.MOST_ACTIVE,
+    screener_mode=ScreenerMode.PRESET,
     stock_preset=StockPreset.WEEKLY_OPTIMIZED,
     etf_preset=EtfPreset.BALANCED,
 )
@@ -7237,28 +8610,26 @@ def _resolve_preference_screener_limit(
     screener_mode: Optional[ScreenerMode] = None,
 ) -> int:
     """Resolve effective symbol limit for a specific workspace asset/mode context."""
-    resolved_asset = asset_type or preferences.asset_type
-    resolved_mode = screener_mode or preferences.screener_mode
     fallback = max(10, min(200, int(preferences.screener_limit or 50)))
-    stock_most_active = max(10, min(200, int(preferences.stock_most_active_limit or fallback)))
-    stock_preset = max(10, min(200, int(preferences.stock_preset_limit or fallback)))
     etf_preset = max(10, min(200, int(preferences.etf_preset_limit or fallback)))
-
-    if resolved_asset == AssetType.ETF:
-        return etf_preset
-    if resolved_asset == AssetType.STOCK and resolved_mode == ScreenerMode.PRESET:
-        return stock_preset
-    return stock_most_active
+    return etf_preset
 
 
 def _normalize_trading_preference_limits(
     preferences: TradingPreferencesResponse,
 ) -> TradingPreferencesResponse:
-    """Backfill per-mode limits and keep legacy screener_limit aligned with active context."""
+    """Normalize per-mode limits and expose active-context screener_limit."""
     fallback = max(10, min(200, int(preferences.screener_limit or 50)))
+    preferences.asset_type = AssetType.ETF
+    preferences.screener_mode = ScreenerMode.PRESET
+    preferences.weekly_budget = max(
+        ETF_INVESTING_WEEKLY_CONTRIBUTION_DEFAULT,
+        _safe_float(preferences.weekly_budget, ETF_INVESTING_WEEKLY_CONTRIBUTION_DEFAULT),
+    )
     preferences.stock_most_active_limit = max(10, min(200, int(preferences.stock_most_active_limit or fallback)))
     preferences.stock_preset_limit = max(10, min(200, int(preferences.stock_preset_limit or fallback)))
     preferences.etf_preset_limit = max(10, min(200, int(preferences.etf_preset_limit or fallback)))
+    preferences.risk_profile = RiskProfile(preferences.etf_preset.value)
     preferences.screener_limit = _resolve_preference_screener_limit(preferences)
     return preferences
 
@@ -7284,6 +8655,61 @@ def _save_trading_preferences(storage: StorageService, preferences: TradingPrefe
         value=json.dumps(preferences.model_dump()),
         value_type="json",
         description="User trading preferences",
+    )
+
+
+def _governance_policy_response(payload: Dict[str, Any]) -> EtfInvestingPolicyResponse:
+    """Normalize persisted governance payload into API response shape."""
+    allow_list = payload.get("allow_list", [])
+    if not isinstance(allow_list, list):
+        allow_list = []
+    return EtfInvestingPolicyResponse(
+        enabled=bool(payload.get("enabled", True)),
+        dynamic_candidates_enabled=bool(payload.get("dynamic_candidates_enabled", True)),
+        screen_interval_days=max(7, min(180, int(_safe_float(payload.get("screen_interval_days"), 30)))),
+        replacement_interval_days=max(
+            30,
+            min(365, int(_safe_float(payload.get("replacement_interval_days"), 90))),
+        ),
+        max_replacements_per_quarter=max(
+            0,
+            min(5, int(_safe_float(payload.get("max_replacements_per_quarter"), 1))),
+        ),
+        min_hold_days_for_replacement=max(
+            30,
+            min(730, int(_safe_float(payload.get("min_hold_days_for_replacement"), 180))),
+        ),
+        min_replacement_score_delta_pct=max(
+            0.0,
+            min(200.0, _safe_float(payload.get("min_replacement_score_delta_pct"), 20.0)),
+        ),
+        min_dollar_volume=max(
+            1_000_000.0,
+            min(1_000_000_000.0, _safe_float(payload.get("min_dollar_volume"), 50_000_000.0)),
+        ),
+        min_history_days_preferred=max(
+            60,
+            min(2500, int(_safe_float(payload.get("min_history_days_preferred"), 252 * 3))),
+        ),
+        rebalance_drift_threshold_pct=max(
+            1.0,
+            min(25.0, _safe_float(payload.get("rebalance_drift_threshold_pct"), 5.0)),
+        ),
+        buy_only_rebalance=bool(payload.get("buy_only_rebalance", True)),
+        tlh_enabled=bool(payload.get("tlh_enabled", False)),
+        tlh_min_loss_dollars=max(
+            50.0,
+            min(50_000.0, _safe_float(payload.get("tlh_min_loss_dollars"), 250.0)),
+        ),
+        tlh_min_loss_pct=max(
+            1.0,
+            min(50.0, _safe_float(payload.get("tlh_min_loss_pct"), 5.0)),
+        ),
+        tlh_min_hold_days=max(
+            7,
+            min(365, int(_safe_float(payload.get("tlh_min_hold_days"), 30))),
+        ),
+        allow_list=[EtfAllowListItem(**item) for item in allow_list if isinstance(item, dict)],
     )
 
 
@@ -7335,88 +8761,11 @@ def _paginate_assets(assets_raw: List[dict], page: int, page_size: int) -> tuple
     return assets, total_count, total_pages
 
 
-@router.get("/screener/stocks", response_model=ScreenerResponse, tags=["Screener"])
-async def get_active_stocks(
-    limit: int = Query(default=50, ge=10, le=200),
-    page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=25, ge=10, le=100),
-):
-    """
-    Get most actively traded stocks.
-    
-    Args:
-        limit: Number of stocks to return (10-200)
-        
-    Returns:
-        List of actively traded stocks
-    """
-    screener = _create_market_screener()
-    try:
-        stocks = screener.get_active_stocks(limit)
-        regime = screener.detect_market_regime()
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
-    
-    assets, total_count, total_pages = _paginate_assets(stocks, page, page_size)
-    
-    return ScreenerResponse(
-        assets=assets,
-        total_count=total_count,
-        asset_type="stock",
-        limit=limit,
-        page=page,
-        page_size=page_size,
-        total_pages=total_pages,
-        data_source=screener.get_last_source(),
-        market_regime=regime,
-        applied_guardrails={},
-    )
-
-
-@router.get("/screener/etfs", response_model=ScreenerResponse, tags=["Screener"])
-async def get_active_etfs(
-    limit: int = Query(default=50, ge=10, le=200),
-    page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=25, ge=10, le=100),
-):
-    """
-    Get most actively traded ETFs.
-    
-    Args:
-        limit: Number of ETFs to return (10-200)
-        
-    Returns:
-        List of actively traded ETFs
-    """
-    screener = _create_market_screener()
-    try:
-        etfs = screener.get_active_etfs(limit)
-        regime = screener.detect_market_regime()
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
-    
-    assets, total_count, total_pages = _paginate_assets(etfs, page, page_size)
-    
-    return ScreenerResponse(
-        assets=assets,
-        total_count=total_count,
-        asset_type="etf",
-        limit=limit,
-        page=page,
-        page_size=page_size,
-        total_pages=total_pages,
-        data_source=screener.get_last_source(),
-        market_regime=regime,
-        applied_guardrails={},
-    )
-
-
 @router.get("/screener/all", response_model=ScreenerResponse, tags=["Screener"])
 async def get_screener_results(
     asset_type: Optional[AssetType] = None,
     limit: Optional[int] = Query(default=None, ge=10, le=200),
     screener_mode: Optional[ScreenerMode] = None,
-    seed_only: bool = Query(default=False),
     preset_universe_mode: Optional[PresetUniverseMode] = Query(default=None),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=25, ge=10, le=100),
@@ -7446,16 +8795,13 @@ async def get_screener_results(
     account_snapshot = _load_account_snapshot(broker)
     holdings_snapshot = _load_holdings_snapshot(storage, broker)
 
-    # Use preferences if not overridden
-    final_asset_type = asset_type or prefs.asset_type
-    mode_candidate = screener_mode or prefs.screener_mode
-    final_mode = _validate_asset_mode_combo(
-        final_asset_type,
-        mode_candidate,
-        mode_explicit=screener_mode is not None,
-        context="/screener/all request",
-    )
-    mode_auto_corrected = (screener_mode is None) and (final_mode != mode_candidate)
+    if asset_type is not None and asset_type != AssetType.ETF:
+        raise HTTPException(status_code=400, detail="/screener/all supports asset_type=etf only in ETF investing mode")
+    final_asset_type = AssetType.ETF
+    if screener_mode is not None and screener_mode != ScreenerMode.PRESET:
+        raise HTTPException(status_code=400, detail="/screener/all supports screener_mode=preset only in ETF investing mode")
+    final_mode = ScreenerMode.PRESET
+    mode_auto_corrected = screener_mode not in {None, ScreenerMode.PRESET}
     final_limit = (
         max(10, min(200, int(limit)))
         if limit is not None
@@ -7476,8 +8822,6 @@ async def get_screener_results(
         if final_mode == ScreenerMode.PRESET and final_asset_type in (AssetType.STOCK, AssetType.ETF):
             if preset_universe_mode is not None:
                 resolved_preset_universe_mode = preset_universe_mode
-            elif seed_only:
-                resolved_preset_universe_mode = PresetUniverseMode.SEED_ONLY
             preset = (
                 prefs.stock_preset.value
                 if final_asset_type == AssetType.STOCK
@@ -7563,7 +8907,16 @@ async def get_screener_results(
         if relaxed:
             optimized = relaxed
             seed_only_relaxed_fallback_applied = True
-    
+    governance = ETFInvestingGovernanceService(storage)
+    governed = governance.enforce(
+        screener=screener,
+        assets=optimized,
+        role="active",
+        holdings_snapshot=holdings_snapshot,
+        force_screen=False,
+    )
+    optimized = governed.assets
+
     assets, total_count, total_pages = _paginate_assets(optimized, page, page_size)
     
     return ScreenerResponse(
@@ -7596,6 +8949,7 @@ async def get_screener_results(
             "preset_universe_mode": resolved_preset_universe_mode.value,
             "seed_only_relaxed_fallback_applied": seed_only_relaxed_fallback_applied,
             "preset_seed_coverage": preset_metadata or None,
+            "governance": governed.report,
         },
     )
 
@@ -7605,7 +8959,6 @@ async def get_screener_preset(
     asset_type: AssetType,
     preset: ScreenerPreset,
     limit: int = Query(default=50, ge=10, le=200),
-    seed_only: bool = Query(default=False),
     preset_universe_mode: Optional[PresetUniverseMode] = Query(default=None),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=25, ge=10, le=100),
@@ -7630,8 +8983,8 @@ async def get_screener_preset(
     - balanced
     - aggressive
     """
-    if asset_type == AssetType.BOTH:
-        raise HTTPException(status_code=400, detail="Preset screener requires asset_type stock or etf")
+    if asset_type != AssetType.ETF:
+        raise HTTPException(status_code=400, detail="Preset screener supports asset_type=etf only in ETF investing mode")
 
     if not math.isfinite(min_dollar_volume) or not math.isfinite(max_spread_bps) or not math.isfinite(max_sector_weight_pct):
         raise HTTPException(status_code=400, detail="Guardrail values must be finite numbers")
@@ -7652,7 +9005,7 @@ async def get_screener_preset(
     resolved_preset_universe_mode = (
         preset_universe_mode
         if preset_universe_mode is not None
-        else (PresetUniverseMode.SEED_ONLY if seed_only else PresetUniverseMode.SEED_GUARDRAIL_BLEND)
+        else PresetUniverseMode.SEED_GUARDRAIL_BLEND
     )
     try:
         assets_raw = screener.get_preset_assets(
@@ -7727,6 +9080,15 @@ async def get_screener_preset(
         if relaxed:
             optimized = relaxed
             seed_only_relaxed_fallback_applied = True
+    governance = ETFInvestingGovernanceService(storage)
+    governed = governance.enforce(
+        screener=screener,
+        assets=optimized,
+        role="active",
+        holdings_snapshot=holdings_snapshot,
+        force_screen=False,
+    )
+    optimized = governed.assets
     assets, total_count, total_pages = _paginate_assets(optimized, page, page_size)
 
     return ScreenerResponse(
@@ -7756,6 +9118,7 @@ async def get_screener_preset(
             "preset_universe_mode": resolved_preset_universe_mode.value,
             "seed_only_relaxed_fallback_applied": seed_only_relaxed_fallback_applied,
             "preset_seed_coverage": preset_metadata or None,
+            "governance": governed.report,
         },
     )
 
@@ -7824,10 +9187,14 @@ async def update_trading_preferences(request: TradingPreferencesRequest, db: Ses
     if request.weekly_budget is not None:
         if not math.isfinite(request.weekly_budget):
             raise HTTPException(status_code=400, detail="weekly_budget must be a finite number")
-        if request.weekly_budget < 50 or request.weekly_budget > 1_000_000:
-            raise HTTPException(status_code=400, detail="weekly_budget must be within [50, 1000000]")
-    if request.screener_limit is not None and (request.screener_limit < 10 or request.screener_limit > 200):
-        raise HTTPException(status_code=400, detail="screener_limit must be within [10, 200]")
+        if request.weekly_budget < ETF_INVESTING_WEEKLY_CONTRIBUTION_DEFAULT or request.weekly_budget > 1_000_000:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "weekly_budget must be within "
+                    f"[{int(ETF_INVESTING_WEEKLY_CONTRIBUTION_DEFAULT)}, 1000000]"
+                ),
+            )
     if request.stock_most_active_limit is not None and (request.stock_most_active_limit < 10 or request.stock_most_active_limit > 200):
         raise HTTPException(status_code=400, detail="stock_most_active_limit must be within [10, 200]")
     if request.stock_preset_limit is not None and (request.stock_preset_limit < 10 or request.stock_preset_limit > 200):
@@ -7835,9 +9202,10 @@ async def update_trading_preferences(request: TradingPreferencesRequest, db: Ses
     if request.etf_preset_limit is not None and (request.etf_preset_limit < 10 or request.etf_preset_limit > 200):
         raise HTTPException(status_code=400, detail="etf_preset_limit must be within [10, 200]")
 
-    if request.asset_type is not None:
-        current.asset_type = request.asset_type
-    
+    # ETF-investing pivot: lock workspace controls to ETF preset universe.
+    current.asset_type = AssetType.ETF
+    current.screener_mode = ScreenerMode.PRESET
+
     if request.risk_profile is not None:
         current.risk_profile = request.risk_profile
     
@@ -7847,41 +9215,69 @@ async def update_trading_preferences(request: TradingPreferencesRequest, db: Ses
         tracker = get_budget_tracker()
         tracker.set_weekly_budget(request.weekly_budget)
     
-    if request.screener_limit is not None:
-        current.screener_limit = request.screener_limit
-        # Legacy global field updates all scoped limits to preserve backward compatibility.
-        current.stock_most_active_limit = request.screener_limit
-        current.stock_preset_limit = request.screener_limit
-        current.etf_preset_limit = request.screener_limit
     if request.stock_most_active_limit is not None:
         current.stock_most_active_limit = request.stock_most_active_limit
     if request.stock_preset_limit is not None:
         current.stock_preset_limit = request.stock_preset_limit
     if request.etf_preset_limit is not None:
         current.etf_preset_limit = request.etf_preset_limit
-    if request.screener_mode is not None:
-        current.screener_mode = request.screener_mode
-    if request.stock_preset is not None:
-        current.stock_preset = request.stock_preset
     if request.etf_preset is not None:
         current.etf_preset = request.etf_preset
 
-    # Conflict prevention and normalization.
-    current.screener_mode = _validate_asset_mode_combo(
-        current.asset_type,
-        current.screener_mode,
-        mode_explicit=request.screener_mode is not None,
-        context="preferences update",
-    )
-    if current.asset_type == AssetType.ETF:
-        current.risk_profile = RiskProfile(current.etf_preset.value)
-    if current.asset_type == AssetType.STOCK and current.screener_mode == ScreenerMode.PRESET and current.stock_preset is None:
-        raise HTTPException(status_code=400, detail="Stock preset is required for stock preset mode")
+    current.risk_profile = RiskProfile(current.etf_preset.value)
     current = _normalize_trading_preference_limits(current)
 
     _trading_preferences = current
     _save_trading_preferences(storage, current)
     return current
+
+
+@router.get("/etf-investing/policy", response_model=EtfInvestingPolicyResponse, tags=["Preferences"])
+async def get_etf_investing_policy(db: Session = Depends(get_db)):
+    """Return ETF investing governance policy (allow-list + cadence + tax controls)."""
+    storage = StorageService(db)
+    governance = ETFInvestingGovernanceService(storage)
+    return _governance_policy_response(governance.load_policy())
+
+
+@router.put("/etf-investing/policy", response_model=EtfInvestingPolicyResponse, tags=["Preferences"])
+async def update_etf_investing_policy(
+    request: EtfInvestingPolicyUpdateRequest,
+    db: Session = Depends(get_db),
+):
+    """Update ETF investing governance policy."""
+    storage = StorageService(db)
+    governance = ETFInvestingGovernanceService(storage)
+    current = governance.load_policy()
+    updates = request.model_dump(exclude_unset=True)
+    if "allow_list" in updates and isinstance(updates.get("allow_list"), list):
+        updates["allow_list"] = [
+            item.model_dump() if hasattr(item, "model_dump") else item
+            for item in updates.get("allow_list", [])
+            if isinstance(item, (dict, EtfAllowListItem))
+        ]
+    current.update(updates)
+    governance.save_policy(current)
+    persisted = governance.load_policy()
+    storage.create_audit_log(
+        event_type="config_updated",
+        description="ETF investing governance policy updated",
+        details={"updated_fields": sorted(list(updates.keys()))},
+    )
+    return _governance_policy_response(persisted)
+
+
+@router.get("/etf-investing/policy/summary", response_model=EtfInvestingPolicySummaryResponse, tags=["Preferences"])
+async def get_etf_investing_policy_summary(db: Session = Depends(get_db)):
+    """Return ETF governance policy plus runtime state for transparency."""
+    storage = StorageService(db)
+    governance = ETFInvestingGovernanceService(storage)
+    policy_raw = governance.load_policy()
+    state = governance.load_state()
+    return EtfInvestingPolicySummaryResponse(
+        policy=_governance_policy_response(policy_raw),
+        state=state,
+    )
 
 
 @router.get("/preferences/recommendation", tags=["Preferences"])
@@ -7898,10 +9294,8 @@ async def get_preference_recommendation(
     prefs = _load_trading_preferences(storage)
     screener = _create_market_screener()
 
-    normalized_asset_type = asset_type or prefs.asset_type
-    if normalized_asset_type == AssetType.BOTH:
-        normalized_asset_type = AssetType.STOCK
-    stock_presets = {"weekly_optimized", "three_to_five_weekly", "monthly_optimized", "small_budget_weekly", "micro_budget"}
+    _ = asset_type
+    normalized_asset_type = AssetType.ETF
     etf_presets = {"conservative", "balanced", "aggressive"}
     requested_preset = preset.value if preset is not None else None
     config_snapshot = _get_config_snapshot()
@@ -7965,39 +9359,15 @@ async def get_preference_recommendation(
     effective_weekly_budget = (
         _safe_float(weekly_budget, 0.0)
         if weekly_budget is not None
-        else _safe_float(prefs.weekly_budget, 200.0)
+        else _safe_float(prefs.weekly_budget, ETF_INVESTING_WEEKLY_CONTRIBUTION_DEFAULT)
     )
     if effective_weekly_budget <= 0:
-        effective_weekly_budget = 200.0
+        effective_weekly_budget = ETF_INVESTING_WEEKLY_CONTRIBUTION_DEFAULT
 
-    if normalized_asset_type == AssetType.ETF:
-        effective_preset = requested_preset if requested_preset in etf_presets else prefs.etf_preset.value
-        if effective_preset not in etf_presets:
-            effective_preset = "balanced"
-        risk_profile = effective_preset
-    else:
-        if requested_preset in stock_presets:
-            effective_preset = requested_preset
-        elif effective_weekly_budget < 60 or effective_equity < 200:
-            effective_preset = "micro_budget"
-        elif target_trades_per_week <= 3:
-            effective_preset = "monthly_optimized"
-        elif target_trades_per_week <= 5:
-            effective_preset = "three_to_five_weekly"
-        elif effective_weekly_budget < 250 or effective_equity < 5_000:
-            effective_preset = "small_budget_weekly"
-        else:
-            effective_preset = prefs.stock_preset.value
-        if effective_preset not in stock_presets:
-            effective_preset = "weekly_optimized"
-        risk_profile_by_preset = {
-            "micro_budget": "micro_budget",
-            "small_budget_weekly": "conservative",
-            "monthly_optimized": "balanced",
-            "three_to_five_weekly": "balanced",
-            "weekly_optimized": "aggressive",
-        }
-        risk_profile = risk_profile_by_preset.get(effective_preset, "balanced")
+    effective_preset = requested_preset if requested_preset in etf_presets else prefs.etf_preset.value
+    if effective_preset not in etf_presets:
+        effective_preset = "balanced"
+    risk_profile = effective_preset
 
     preset_guardrails = screener.get_preset_guardrails(normalized_asset_type.value, effective_preset)
 
@@ -8072,8 +9442,8 @@ async def get_preference_recommendation(
     }
     response_payload = {
         "asset_type": normalized_asset_type.value,
-        "stock_preset": effective_preset if normalized_asset_type == AssetType.STOCK else prefs.stock_preset.value,
-        "etf_preset": effective_preset if normalized_asset_type == AssetType.ETF else prefs.etf_preset.value,
+        "stock_preset": prefs.stock_preset.value,
+        "etf_preset": effective_preset,
         "preset": effective_preset,
         "risk_profile": risk_profile,
         "guardrails": guardrails,
@@ -8170,6 +9540,16 @@ async def update_weekly_budget(request: BudgetUpdateRequest, db: Session = Depen
         Updated budget status
     """
     global _trading_preferences
+    if not math.isfinite(request.weekly_budget):
+        raise HTTPException(status_code=400, detail="weekly_budget must be finite")
+    if request.weekly_budget < ETF_INVESTING_WEEKLY_CONTRIBUTION_DEFAULT:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "weekly_budget must be at least "
+                f"${ETF_INVESTING_WEEKLY_CONTRIBUTION_DEFAULT:.0f} for ETF investing mode"
+            ),
+        )
     
     tracker = get_budget_tracker()
     tracker.set_weekly_budget(request.weekly_budget)

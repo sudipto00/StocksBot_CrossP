@@ -11,6 +11,9 @@ import {
   Order,
   OrderRequest,
   ConfigUpdateRequest,
+  EtfInvestingPolicy,
+  EtfInvestingPolicySummary,
+  EtfInvestingPolicyUpdateRequest,
   BrokerCredentialsRequest,
   BrokerCredentialsStatusResponse,
   BrokerAccountResponse,
@@ -179,26 +182,45 @@ async function authFetch(input: RequestInfo | URL, init: AuthFetchOptions = {}):
 
 async function buildBackendError(response: Response): Promise<string> {
   const prefix = `Backend returned ${response.status}`;
+  const normalizeErrorFragment = (value: unknown): string | null => {
+    if (value == null) return null;
+    if (typeof value === 'string') {
+      const trimmed = value.trim();
+      return trimmed || null;
+    }
+    if (typeof value === 'number' || typeof value === 'boolean') {
+      return String(value);
+    }
+    if (Array.isArray(value)) {
+      const parts = value
+        .map((item) => normalizeErrorFragment(item))
+        .filter((item): item is string => Boolean(item));
+      return parts.length > 0 ? parts.join('; ') : null;
+    }
+    if (typeof value === 'object') {
+      const record = value as Record<string, unknown>;
+      const nested = normalizeErrorFragment(
+        record.msg ?? record.message ?? record.detail ?? record.error,
+      );
+      if (nested) return nested;
+      try {
+        return JSON.stringify(record);
+      } catch {
+        return '[unserializable error payload]';
+      }
+    }
+    return null;
+  };
   try {
     const contentType = response.headers.get('content-type') || '';
     if (contentType.includes('application/json')) {
       const payload = await response.json();
-      const detail = payload?.detail;
-      if (typeof detail === 'string' && detail.trim()) {
-        return `${prefix}: ${detail.trim()}`;
-      }
-      if (Array.isArray(detail) && detail.length > 0) {
-        const flattened = detail
-          .map((item) => (typeof item?.msg === 'string' ? item.msg : JSON.stringify(item)))
-          .join('; ')
-          .trim();
-        if (flattened) {
-          return `${prefix}: ${flattened}`;
-        }
-      }
-      if (typeof payload?.message === 'string' && payload.message.trim()) {
-        return `${prefix}: ${payload.message.trim()}`;
-      }
+      const detailText = normalizeErrorFragment(payload?.detail);
+      if (detailText) return `${prefix}: ${detailText}`;
+      const messageText = normalizeErrorFragment(payload?.message);
+      if (messageText) return `${prefix}: ${messageText}`;
+      const errorText = normalizeErrorFragment(payload?.error);
+      if (errorText) return `${prefix}: ${errorText}`;
     } else {
       const text = (await response.text()).trim();
       if (text) {
@@ -269,6 +291,38 @@ export async function updateConfig(config: ConfigUpdateRequest): Promise<ConfigR
     throw new Error(await buildBackendError(response));
   }
   
+  return response.json();
+}
+
+export async function getEtfInvestingPolicy(): Promise<EtfInvestingPolicy> {
+  const response = await authFetch(`${BACKEND_URL}/etf-investing/policy`);
+  if (!response.ok) {
+    throw new Error(await buildBackendError(response));
+  }
+  return response.json();
+}
+
+export async function updateEtfInvestingPolicy(
+  request: EtfInvestingPolicyUpdateRequest
+): Promise<EtfInvestingPolicy> {
+  const response = await authFetch(`${BACKEND_URL}/etf-investing/policy`, {
+    method: 'PUT',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(request),
+  });
+  if (!response.ok) {
+    throw new Error(await buildBackendError(response));
+  }
+  return response.json();
+}
+
+export async function getEtfInvestingPolicySummary(): Promise<EtfInvestingPolicySummary> {
+  const response = await authFetch(`${BACKEND_URL}/etf-investing/policy/summary`);
+  if (!response.ok) {
+    throw new Error(await buildBackendError(response));
+  }
   return response.json();
 }
 
@@ -836,10 +890,20 @@ export async function getDashboardAnalyticsBundle(days?: number): Promise<{
 }> {
   const params = new URLSearchParams();
   if (typeof days === 'number' && Number.isFinite(days)) params.set('days', String(days));
-  const response = await authFetch(`${BACKEND_URL}/analytics/dashboard${params.toString() ? `?${params.toString()}` : ''}`);
+  const url = `${BACKEND_URL}/analytics/dashboard${params.toString() ? `?${params.toString()}` : ''}`;
+  let response: Response;
+  try {
+    response = await authFetch(url, {
+      // Dashboard bundle can include expensive broker/analytics aggregation.
+      timeoutMs: 45_000,
+      maxRetries: 1,
+    });
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    throw new Error(`Dashboard analytics request failed: ${reason}`);
+  }
   if (!response.ok) {
-    const body = await response.json().catch(() => null);
-    throw new Error(body?.detail || `Backend returned ${response.status}`);
+    throw new Error(await buildBackendError(response));
   }
   const payload: DashboardAnalyticsBundleResponse = await response.json();
   return {
@@ -919,8 +983,7 @@ export async function updateStrategyConfig(
   });
   
   if (!response.ok) {
-    const body = await response.json().catch(() => null);
-    throw new Error(body?.detail || body?.message || `Backend returned ${response.status}`);
+    throw new Error(await buildBackendError(response));
   }
   
   return response.json();
@@ -955,8 +1018,7 @@ export async function runBacktest(
   });
   
   if (!response.ok) {
-    const body = await response.json().catch(() => null);
-    throw new Error(body?.detail || `Backend returned ${response.status}`);
+    throw new Error(await buildBackendError(response));
   }
   
   return response.json();
@@ -978,8 +1040,7 @@ export async function optimizeStrategy(
   });
 
   if (!response.ok) {
-    const body = await response.json().catch(() => null);
-    throw new Error(body?.detail || `Backend returned ${response.status}`);
+    throw new Error(await buildBackendError(response));
   }
 
   return response.json();
@@ -1001,8 +1062,7 @@ export async function startStrategyOptimization(
   });
 
   if (!response.ok) {
-    const body = await response.json().catch(() => null);
-    throw new Error(body?.detail || `Backend returned ${response.status}`);
+    throw new Error(await buildBackendError(response));
   }
 
   return response.json();
@@ -1019,8 +1079,7 @@ export async function getStrategyOptimizationStatus(
     timeoutMs: 25_000,
   });
   if (!response.ok) {
-    const body = await response.json().catch(() => null);
-    throw new Error(body?.detail || `Backend returned ${response.status}`);
+    throw new Error(await buildBackendError(response));
   }
   return response.json();
 }
@@ -1042,8 +1101,7 @@ export async function cancelStrategyOptimization(
     },
   );
   if (!response.ok) {
-    const body = await response.json().catch(() => null);
-    throw new Error(body?.detail || `Backend returned ${response.status}`);
+    throw new Error(await buildBackendError(response));
   }
   return response.json();
 }
@@ -1057,8 +1115,7 @@ export async function listOptimizerJobs(): Promise<OptimizerJobsListResponse> {
   params.set('include_terminal', 'false');
   const response = await authFetch(`${BACKEND_URL}/optimizer/jobs?${params.toString()}`);
   if (!response.ok) {
-    const body = await response.json().catch(() => null);
-    throw new Error(body?.detail || `Backend returned ${response.status}`);
+    throw new Error(await buildBackendError(response));
   }
   return response.json();
 }
@@ -1074,8 +1131,7 @@ export async function cancelAllOptimizerJobs(force = true): Promise<OptimizerCan
     { method: 'POST' },
   );
   if (!response.ok) {
-    const body = await response.json().catch(() => null);
-    throw new Error(body?.detail || `Backend returned ${response.status}`);
+    throw new Error(await buildBackendError(response));
   }
   return response.json();
 }
@@ -1103,8 +1159,7 @@ export async function purgeOptimizerJobs(options?: {
     method: 'DELETE',
   });
   if (!response.ok) {
-    const body = await response.json().catch(() => null);
-    throw new Error(body?.detail || `Backend returned ${response.status}`);
+    throw new Error(await buildBackendError(response));
   }
   return response.json();
 }
@@ -1122,8 +1177,7 @@ export async function getStrategyOptimizationHistory(
   if (includePayload) params.set('include_payload', 'true');
   const response = await authFetch(`${BACKEND_URL}/strategies/${strategyId}/optimization-history?${params.toString()}`);
   if (!response.ok) {
-    const body = await response.json().catch(() => null);
-    throw new Error(body?.detail || `Backend returned ${response.status}`);
+    throw new Error(await buildBackendError(response));
   }
   return response.json();
 }
@@ -1144,8 +1198,7 @@ export async function getOptimizerHistory(
   params.set('limit_total', String(limitTotal));
   const response = await authFetch(`${BACKEND_URL}/optimizer/history?${params.toString()}`);
   if (!response.ok) {
-    const body = await response.json().catch(() => null);
-    throw new Error(body?.detail || `Backend returned ${response.status}`);
+    throw new Error(await buildBackendError(response));
   }
   return response.json();
 }
@@ -1156,8 +1209,7 @@ export async function getOptimizerHistory(
 export async function getOptimizerHealth(): Promise<OptimizerHealthResponse> {
   const response = await authFetch(`${BACKEND_URL}/optimizer/health`);
   if (!response.ok) {
-    const body = await response.json().catch(() => null);
-    throw new Error(body?.detail || `Backend returned ${response.status}`);
+    throw new Error(await buildBackendError(response));
   }
   return response.json();
 }
@@ -1195,14 +1247,11 @@ export async function getTradingPreferences(): Promise<TradingPreferences> {
   }
 
   const raw = (await response.json()) as TradingPreferences;
-  const normalizedAssetType = raw.asset_type === 'etf' ? 'etf' : 'stock';
-  const fallbackLimit = Math.max(10, Math.min(200, Math.round(Number(raw.screener_limit || 50))));
-  const stockMostActiveLimit = Math.max(10, Math.min(200, Math.round(Number(raw.stock_most_active_limit || fallbackLimit))));
-  const stockPresetLimit = Math.max(10, Math.min(200, Math.round(Number(raw.stock_preset_limit || fallbackLimit))));
-  const etfPresetLimit = Math.max(10, Math.min(200, Math.round(Number(raw.etf_preset_limit || fallbackLimit))));
-  const activeLimit = normalizedAssetType === 'etf'
-    ? etfPresetLimit
-    : ((raw.screener_mode || 'most_active') === 'preset' ? stockPresetLimit : stockMostActiveLimit);
+  const normalizedAssetType = 'etf';
+  const stockMostActiveLimit = Math.max(10, Math.min(200, Math.round(Number(raw.stock_most_active_limit ?? 50))));
+  const stockPresetLimit = Math.max(10, Math.min(200, Math.round(Number(raw.stock_preset_limit ?? 50))));
+  const etfPresetLimit = Math.max(10, Math.min(200, Math.round(Number(raw.etf_preset_limit ?? 50))));
+  const activeLimit = etfPresetLimit;
   return {
     ...raw,
     asset_type: normalizedAssetType,
@@ -1210,7 +1259,7 @@ export async function getTradingPreferences(): Promise<TradingPreferences> {
     stock_most_active_limit: stockMostActiveLimit,
     stock_preset_limit: stockPresetLimit,
     etf_preset_limit: etfPresetLimit,
-    screener_mode: normalizedAssetType === 'stock' ? raw.screener_mode : 'preset',
+    screener_mode: 'preset',
   };
 }
 
@@ -1233,14 +1282,11 @@ export async function updateTradingPreferences(
   }
 
   const raw = (await response.json()) as TradingPreferences;
-  const normalizedAssetType = raw.asset_type === 'etf' ? 'etf' : 'stock';
-  const fallbackLimit = Math.max(10, Math.min(200, Math.round(Number(raw.screener_limit || 50))));
-  const stockMostActiveLimit = Math.max(10, Math.min(200, Math.round(Number(raw.stock_most_active_limit || fallbackLimit))));
-  const stockPresetLimit = Math.max(10, Math.min(200, Math.round(Number(raw.stock_preset_limit || fallbackLimit))));
-  const etfPresetLimit = Math.max(10, Math.min(200, Math.round(Number(raw.etf_preset_limit || fallbackLimit))));
-  const activeLimit = normalizedAssetType === 'etf'
-    ? etfPresetLimit
-    : ((raw.screener_mode || 'most_active') === 'preset' ? stockPresetLimit : stockMostActiveLimit);
+  const normalizedAssetType = 'etf';
+  const stockMostActiveLimit = Math.max(10, Math.min(200, Math.round(Number(raw.stock_most_active_limit ?? 50))));
+  const stockPresetLimit = Math.max(10, Math.min(200, Math.round(Number(raw.stock_preset_limit ?? 50))));
+  const etfPresetLimit = Math.max(10, Math.min(200, Math.round(Number(raw.etf_preset_limit ?? 50))));
+  const activeLimit = etfPresetLimit;
   return {
     ...raw,
     asset_type: normalizedAssetType,
@@ -1248,7 +1294,7 @@ export async function updateTradingPreferences(
     stock_most_active_limit: stockMostActiveLimit,
     stock_preset_limit: stockPresetLimit,
     etf_preset_limit: etfPresetLimit,
-    screener_mode: normalizedAssetType === 'stock' ? raw.screener_mode : 'preset',
+    screener_mode: 'preset',
   };
 }
 
@@ -1315,7 +1361,6 @@ export async function getScreenerAssets(
     stockPreset?: StockPresetPreference;
     etfPreset?: EtfPresetPreference;
     presetUniverseMode?: PresetUniverseModePreference;
-    seedOnly?: boolean;
     minDollarVolume?: number;
     maxSpreadBps?: number;
     maxSectorWeightPct?: number;
@@ -1351,15 +1396,9 @@ export async function getScreenerAssets(
       ? (options.etfPreset || 'balanced')
       : (options.stockPreset || 'weekly_optimized');
     baseParams.append('preset', preset);
-    const universeMode = options.presetUniverseMode
-      || (typeof options.seedOnly === 'boolean'
-        ? (options.seedOnly ? 'seed_only' : 'seed_guardrail_blend')
-        : undefined);
+    const universeMode = options.presetUniverseMode;
     if (universeMode) {
       baseParams.append('preset_universe_mode', universeMode);
-    }
-    if (typeof options.seedOnly === 'boolean') {
-      baseParams.append('seed_only', String(options.seedOnly));
     }
   } else if (mode === 'most_active') {
     baseParams.append('screener_mode', mode);

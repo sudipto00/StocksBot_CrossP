@@ -18,6 +18,7 @@ import time
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from config.strategy_config import BacktestRequest, BacktestResult, get_default_parameters
+from config.investing_defaults import get_scenario2_thresholds
 from services.strategy_analytics import StrategyAnalyticsService, BacktestCancelledError
 
 try:
@@ -38,6 +39,12 @@ class OptimizationContext:
     initial_capital: float
     contribution_amount: float
     contribution_frequency: str
+    micro_strategy_mode: str
+    micro_equity_threshold: float
+    micro_single_trade_loss_pct: float
+    micro_cash_reserve_pct: float
+    micro_max_spread_bps: float
+    micro_policy_active: bool
     emulate_live_trading: bool
     require_fractionable: bool
     max_position_size: float
@@ -73,6 +80,38 @@ class OptimizationCancelledError(RuntimeError):
     """Raised when optimization is canceled by the caller."""
 
 
+def _scenario2_payload_from_diagnostics(diagnostics: Dict[str, Any]) -> Dict[str, Any]:
+    scenario2_report = diagnostics.get("scenario2_report")
+    if not isinstance(scenario2_report, dict):
+        scenario2_report = {}
+    scorecard = scenario2_report.get("scorecard")
+    if not isinstance(scorecard, dict):
+        scorecard = {}
+    readiness = scenario2_report.get("readiness")
+    if not isinstance(readiness, dict):
+        readiness = {}
+    core_results = scenario2_report.get("core_results")
+    if not isinstance(core_results, dict):
+        core_results = {}
+    risk = scenario2_report.get("risk")
+    if not isinstance(risk, dict):
+        risk = {}
+    trading = scenario2_report.get("trading")
+    if not isinstance(trading, dict):
+        trading = {}
+    return {
+        "score": float(scorecard.get("score", 0.0) or 0.0),
+        "confidence_score": float(scorecard.get("confidence_score", 0.0) or 0.0),
+        "pass": bool(scorecard.get("pass", False) or readiness.get("pass", False)),
+        "inconclusive": bool(scorecard.get("inconclusive", False) or readiness.get("inconclusive", False)),
+        "status": str(scorecard.get("status", readiness.get("status", "")) or ""),
+        "xirr_edge": float(core_results.get("alpha_xirr_pct", 0.0) or 0.0),
+        "adjusted_drawdown": float(risk.get("max_drawdown_adjusted_pct", 0.0) or 0.0),
+        "sells_per_month": float(trading.get("sells_per_month", 0.0) or 0.0),
+        "short_term_sell_ratio": float(trading.get("short_term_sell_ratio", 0.0) or 0.0),
+    }
+
+
 def _objective_score_for_result(
     *,
     result: BacktestResult,
@@ -93,7 +132,57 @@ def _objective_score_for_result(
     if isinstance(blocked, dict):
         blocker_penalty += float(blocked.get("risk_circuit_breaker", 0) or 0) * 0.001
         blocker_penalty += float(blocked.get("daily_risk_limit", 0) or 0) * 0.0005
-    if objective == "sharpe":
+    micro_scorecard = diagnostics.get("micro_scorecard") if isinstance(diagnostics, dict) else None
+    micro_dict = micro_scorecard if isinstance(micro_scorecard, dict) else {}
+    micro_final_score = float(micro_dict.get("final_score", 0.0) or 0.0)
+    micro_confidence = float(micro_dict.get("confidence_score", 0.0) or 0.0)
+    micro_pass = bool(micro_dict.get("pass", False))
+    investing_scorecard = diagnostics.get("investing_scorecard") if isinstance(diagnostics, dict) else None
+    investing_dict = investing_scorecard if isinstance(investing_scorecard, dict) else {}
+    investing_final_score = float(investing_dict.get("final_score", 0.0) or 0.0)
+    investing_confidence = float(investing_dict.get("confidence_score", 0.0) or 0.0)
+    investing_pass = bool(investing_dict.get("pass", False))
+    scenario2 = _scenario2_payload_from_diagnostics(diagnostics)
+    scenario2_score = float(scenario2.get("score", 0.0) or 0.0)
+    scenario2_confidence = float(scenario2.get("confidence_score", 0.0) or 0.0)
+    scenario2_pass = bool(scenario2.get("pass", False))
+    scenario2_inconclusive = bool(scenario2.get("inconclusive", False))
+    scenario2_alpha = float(scenario2.get("xirr_edge", 0.0) or 0.0)
+    scenario2_drawdown = abs(float(scenario2.get("adjusted_drawdown", drawdown) or drawdown))
+    scenario2_sells_per_month = max(0.0, float(scenario2.get("sells_per_month", 0.0) or 0.0))
+    scenario2_short_term_ratio = max(0.0, float(scenario2.get("short_term_sell_ratio", 0.0) or 0.0))
+    if objective == "scenario2":
+        objective = "investing"
+    if objective == "micro":
+        base_score = (
+            (micro_final_score * 8.0)
+            + (micro_confidence * 2.0)
+            + (total_return * 0.8)
+            + (sharpe * 12.0)
+            - (drawdown * 0.4)
+        )
+        if not micro_pass:
+            base_score -= 2500.0
+    elif objective == "investing":
+        scenario2_thresholds = get_scenario2_thresholds()
+        max_sells_per_month = float(scenario2_thresholds.get("max_sells_per_month", 6.0) or 6.0)
+        max_short_term_ratio = float(scenario2_thresholds.get("max_short_term_sell_ratio", 0.60) or 0.60)
+        scenario2_turnover_penalty = max(0.0, scenario2_sells_per_month - max_sells_per_month) * 10.0
+        scenario2_turnover_penalty += max(0.0, scenario2_short_term_ratio - max_short_term_ratio) * 120.0
+        base_score = (
+            (scenario2_score * 9.0)
+            + (scenario2_confidence * 2.4)
+            + (scenario2_alpha * 18.0)
+            + (total_return * 0.4)
+            + (sharpe * 6.0)
+            - (scenario2_drawdown * 1.1)
+            - scenario2_turnover_penalty
+        )
+        if scenario2_inconclusive:
+            base_score -= 500.0
+        if not scenario2_pass:
+            base_score -= 2200.0
+    elif objective == "sharpe":
         base_score = (
             (sharpe * 110.0)
             + (total_return * 1.1)
@@ -114,11 +203,26 @@ def _objective_score_for_result(
             + (win_rate * 0.14)
             - (drawdown * 0.9)
         )
-    if strict_min_trades and not meets_min_trades:
+    if strict_min_trades and (
+        not meets_min_trades
+        or (objective == "micro" and not micro_pass)
+        or (objective == "investing" and not scenario2_pass)
+    ):
         shortfall = float(max(1, min_trades - trades))
-        gated_score = -1_000_000.0 - (shortfall * 1000.0) - drawdown
+        if objective == "micro" and not micro_pass:
+            gate_penalty = 2000.0
+        elif objective == "investing" and not scenario2_pass:
+            gate_penalty = 1800.0
+        else:
+            gate_penalty = 1000.0
+        gated_score = -1_000_000.0 - (shortfall * gate_penalty) - drawdown
         return (gated_score, False)
-    return (base_score - trade_penalty - blocker_penalty, meets_min_trades)
+    meets = bool(
+        meets_min_trades
+        and (micro_pass if objective == "micro" else True)
+        and (scenario2_pass if objective == "investing" else True)
+    )
+    return (base_score - trade_penalty - blocker_penalty, meets)
 
 
 def _safe_percentile(values: Sequence[float], pct: float) -> float:
@@ -172,6 +276,8 @@ def _robust_score_from_scenarios(
     objective: str,
     strict_min_trades: bool,
 ) -> Dict[str, float]:
+    if objective == "scenario2":
+        objective = "investing"
     if not scenario_metrics:
         return {
             "score": -1_000_000.0,
@@ -187,17 +293,68 @@ def _robust_score_from_scenarios(
     return_values = [float(item.get("total_return", 0.0) or 0.0) for item in scenario_metrics]
     drawdown_values = [abs(float(item.get("max_drawdown", 0.0) or 0.0)) for item in scenario_metrics]
     trade_values = [max(0.0, float(item.get("total_trades", 0.0) or 0.0)) for item in scenario_metrics]
+    micro_score_values = [max(0.0, float(item.get("micro_final_score", 0.0) or 0.0)) for item in scenario_metrics]
+    micro_confidence_values = [max(0.0, float(item.get("micro_confidence_score", 0.0) or 0.0)) for item in scenario_metrics]
+    micro_pass_values = [1.0 if bool(item.get("micro_pass", False)) else 0.0 for item in scenario_metrics]
+    investing_score_values = [max(0.0, float(item.get("investing_final_score", 0.0) or 0.0)) for item in scenario_metrics]
+    investing_confidence_values = [max(0.0, float(item.get("investing_confidence_score", 0.0) or 0.0)) for item in scenario_metrics]
+    investing_pass_values = [1.0 if bool(item.get("investing_pass", False)) else 0.0 for item in scenario_metrics]
+    scenario2_score_values = [max(0.0, float(item.get("scenario2_score", 0.0) or 0.0)) for item in scenario_metrics]
+    scenario2_confidence_values = [max(0.0, float(item.get("scenario2_confidence_score", 0.0) or 0.0)) for item in scenario_metrics]
+    scenario2_pass_values = [1.0 if bool(item.get("scenario2_pass", False)) else 0.0 for item in scenario_metrics]
+    scenario2_inconclusive_values = [1.0 if bool(item.get("scenario2_inconclusive", False)) else 0.0 for item in scenario_metrics]
+    scenario2_alpha_values = [float(item.get("scenario2_xirr_edge", 0.0) or 0.0) for item in scenario_metrics]
+    scenario2_drawdown_values = [abs(float(item.get("scenario2_adjusted_drawdown", 0.0) or 0.0)) for item in scenario_metrics]
+    scenario2_sells_per_month_values = [max(0.0, float(item.get("scenario2_sells_per_month", 0.0) or 0.0)) for item in scenario_metrics]
+    scenario2_short_term_ratio_values = [max(0.0, float(item.get("scenario2_short_term_sell_ratio", 0.0) or 0.0)) for item in scenario_metrics]
     median_sharpe = float(statistics.median(sharpe_values))
     median_return = float(statistics.median(return_values))
     p95_drawdown = float(_safe_percentile(drawdown_values, 95.0))
     median_trades = float(statistics.median(trade_values))
+    median_micro_score = float(statistics.median(micro_score_values)) if micro_score_values else 0.0
+    median_micro_confidence = float(statistics.median(micro_confidence_values)) if micro_confidence_values else 0.0
+    micro_pass_rate = float(statistics.mean(micro_pass_values)) if micro_pass_values else 0.0
+    median_investing_score = float(statistics.median(investing_score_values)) if investing_score_values else 0.0
+    median_investing_confidence = float(statistics.median(investing_confidence_values)) if investing_confidence_values else 0.0
+    investing_pass_rate = float(statistics.mean(investing_pass_values)) if investing_pass_values else 0.0
+    median_scenario2_score = float(statistics.median(scenario2_score_values)) if scenario2_score_values else 0.0
+    median_scenario2_confidence = float(statistics.median(scenario2_confidence_values)) if scenario2_confidence_values else 0.0
+    scenario2_pass_rate = float(statistics.mean(scenario2_pass_values)) if scenario2_pass_values else 0.0
+    scenario2_inconclusive_rate = float(statistics.mean(scenario2_inconclusive_values)) if scenario2_inconclusive_values else 0.0
+    median_scenario2_alpha = float(statistics.median(scenario2_alpha_values)) if scenario2_alpha_values else 0.0
+    p95_scenario2_drawdown = float(_safe_percentile(scenario2_drawdown_values, 95.0)) if scenario2_drawdown_values else p95_drawdown
+    median_scenario2_sells_per_month = float(statistics.median(scenario2_sells_per_month_values)) if scenario2_sells_per_month_values else 0.0
+    median_scenario2_short_term_ratio = float(statistics.median(scenario2_short_term_ratio_values)) if scenario2_short_term_ratio_values else 0.0
     min_trade_hits = sum(1 for trades in trade_values if trades >= max(0, int(min_trades)))
     pass_rate = float(min_trade_hits / max(1, len(trade_values)))
     loss_probability = float(
         sum(1 for ret in return_values if ret < 0.0) / max(1, len(return_values))
     )
     trade_shortfall = max(0.0, float(min_trades) - median_trades)
-    if objective == "sharpe":
+    if objective == "micro":
+        score = (
+            (median_micro_score * 8.0)
+            + (median_micro_confidence * 2.0)
+            + (median_return * 0.7)
+            - (p95_drawdown * 0.35)
+            - ((1.0 - micro_pass_rate) * 40.0)
+            - (loss_probability * 20.0)
+        )
+    elif objective == "investing":
+        scenario2_turnover_penalty = max(0.0, median_scenario2_sells_per_month - 6.0) * 10.0
+        scenario2_turnover_penalty += max(0.0, median_scenario2_short_term_ratio - 0.60) * 120.0
+        score = (
+            (median_scenario2_score * 9.0)
+            + (median_scenario2_confidence * 2.4)
+            + (median_scenario2_alpha * 18.0)
+            + (median_return * 0.4)
+            - (p95_scenario2_drawdown * 1.1)
+            - ((1.0 - scenario2_pass_rate) * 50.0)
+            - (scenario2_inconclusive_rate * 60.0)
+            - scenario2_turnover_penalty
+            - (loss_probability * 22.0)
+        )
+    elif objective == "sharpe":
         score = (
             (median_sharpe * 120.0)
             + (median_return * 0.8)
@@ -218,11 +375,17 @@ def _robust_score_from_scenarios(
             - (p95_drawdown * 1.2)
             - (loss_probability * 38.0)
         )
-    if strict_min_trades and median_trades < float(min_trades):
+    strict_micro_fail = (objective == "micro" and micro_pass_rate < 0.5)
+    strict_investing_fail = (objective == "investing" and scenario2_pass_rate < 0.5)
+    if strict_min_trades and (median_trades < float(min_trades) or strict_micro_fail or strict_investing_fail):
         score = -1_000_000.0 - (trade_shortfall * 1000.0) - p95_drawdown
     else:
         score -= trade_shortfall * 0.9
-    meets_min = 1.0 if median_trades >= float(min_trades) else 0.0
+    meets_min = 1.0 if (
+        median_trades >= float(min_trades)
+        and (micro_pass_rate >= 0.5 if objective == "micro" else True)
+        and (scenario2_pass_rate >= 0.5 if objective == "investing" else True)
+    ) else 0.0
     return {
         "score": float(score),
         "median_sharpe": median_sharpe,
@@ -231,6 +394,20 @@ def _robust_score_from_scenarios(
         "loss_probability": loss_probability,
         "median_trades": median_trades,
         "min_trade_pass_rate": pass_rate,
+        "median_micro_score": median_micro_score,
+        "median_micro_confidence": median_micro_confidence,
+        "micro_pass_rate": micro_pass_rate,
+        "median_investing_score": median_investing_score,
+        "median_investing_confidence": median_investing_confidence,
+        "investing_pass_rate": investing_pass_rate,
+        "median_scenario2_score": median_scenario2_score,
+        "median_scenario2_confidence": median_scenario2_confidence,
+        "scenario2_pass_rate": scenario2_pass_rate,
+        "scenario2_inconclusive_rate": scenario2_inconclusive_rate,
+        "median_scenario2_alpha": median_scenario2_alpha,
+        "p95_scenario2_adjusted_drawdown": p95_scenario2_drawdown,
+        "median_scenario2_sells_per_month": median_scenario2_sells_per_month,
+        "median_scenario2_short_term_sell_ratio": median_scenario2_short_term_ratio,
         "meets_min_trades": meets_min,
     }
 
@@ -331,6 +508,11 @@ def _evaluate_ensemble_candidate_worker(payload: Dict[str, Any]) -> Dict[str, An
             initial_capital=float(context.get("initial_capital") or 100000.0),
             contribution_amount=float(context.get("contribution_amount") or 0.0),
             contribution_frequency=str(context.get("contribution_frequency") or "none"),
+            micro_strategy_mode=str(context.get("micro_strategy_mode") or "auto"),
+            micro_equity_threshold=float(context.get("micro_equity_threshold") or 0.0) or None,
+            micro_single_trade_loss_pct=float(context.get("micro_single_trade_loss_pct") or 0.0) or None,
+            micro_cash_reserve_pct=float(context.get("micro_cash_reserve_pct") or 0.0) or None,
+            micro_max_spread_bps=float(context.get("micro_max_spread_bps") or 0.0) or None,
             symbols=scenario_symbols,
             parameters=parameters,
             emulate_live_trading=bool(context.get("emulate_live_trading")),
@@ -358,6 +540,14 @@ def _evaluate_ensemble_candidate_worker(payload: Dict[str, Any]) -> Dict[str, An
             result = analytics.run_backtest(request, should_cancel=_worker_should_cancel)
         except BacktestCancelledError as exc:
             raise RuntimeError("Optimization canceled") from exc
+        diagnostics = result.diagnostics if isinstance(result.diagnostics, dict) else {}
+        micro_scorecard = diagnostics.get("micro_scorecard") if isinstance(diagnostics, dict) else {}
+        if not isinstance(micro_scorecard, dict):
+            micro_scorecard = {}
+        investing_scorecard = diagnostics.get("investing_scorecard") if isinstance(diagnostics, dict) else {}
+        if not isinstance(investing_scorecard, dict):
+            investing_scorecard = {}
+        scenario2_payload = _scenario2_payload_from_diagnostics(diagnostics)
         scenario_metrics.append(
             {
                 "sharpe_ratio": float(result.sharpe_ratio or 0.0),
@@ -365,6 +555,20 @@ def _evaluate_ensemble_candidate_worker(payload: Dict[str, Any]) -> Dict[str, An
                 "max_drawdown": abs(float(result.max_drawdown or 0.0)),
                 "total_trades": float(result.total_trades or 0),
                 "win_rate": float(result.win_rate or 0.0),
+                "micro_final_score": float(micro_scorecard.get("final_score", 0.0) or 0.0),
+                "micro_confidence_score": float(micro_scorecard.get("confidence_score", 0.0) or 0.0),
+                "micro_pass": bool(micro_scorecard.get("pass", False)),
+                "investing_final_score": float(investing_scorecard.get("final_score", 0.0) or 0.0),
+                "investing_confidence_score": float(investing_scorecard.get("confidence_score", 0.0) or 0.0),
+                "investing_pass": bool(investing_scorecard.get("pass", False)),
+                "scenario2_score": float(scenario2_payload.get("score", 0.0) or 0.0),
+                "scenario2_confidence_score": float(scenario2_payload.get("confidence_score", 0.0) or 0.0),
+                "scenario2_pass": bool(scenario2_payload.get("pass", False)),
+                "scenario2_inconclusive": bool(scenario2_payload.get("inconclusive", False)),
+                "scenario2_xirr_edge": float(scenario2_payload.get("xirr_edge", 0.0) or 0.0),
+                "scenario2_adjusted_drawdown": abs(float(scenario2_payload.get("adjusted_drawdown", 0.0) or 0.0)),
+                "scenario2_sells_per_month": float(scenario2_payload.get("sells_per_month", 0.0) or 0.0),
+                "scenario2_short_term_sell_ratio": float(scenario2_payload.get("short_term_sell_ratio", 0.0) or 0.0),
             }
         )
     robust = _robust_score_from_scenarios(
@@ -393,6 +597,8 @@ class StrategyOptimizerService:
         "atr_stop_mult",
         "zscore_entry_threshold",
         "dip_buy_threshold_pct",
+        "pullback_rsi_threshold",
+        "pullback_sma_tolerance",
         "max_hold_days",
         "dca_tranches",
         "max_consecutive_losses",
@@ -404,7 +610,7 @@ class StrategyOptimizerService:
         "max_consecutive_losses",
         "max_drawdown_pct",
     }
-    _VALID_OBJECTIVES = {"balanced", "sharpe", "return"}
+    _VALID_OBJECTIVES = {"balanced", "sharpe", "return", "micro", "investing", "scenario2"}
 
     def __init__(self, analytics: StrategyAnalyticsService):
         self.analytics = analytics
@@ -444,6 +650,15 @@ class StrategyOptimizerService:
         )
         base_params = self._normalize_parameters(base_parameters, bounds=runtime_bounds)
         objective_key = self._normalize_objective(objective)
+        if objective_key == "investing":
+            objective_key = "scenario2"
+        investing_policy_active = bool(
+            ((context.universe_context or {}).get("live_parity_context") or {}).get("investing_policy_active", False)
+        )
+        if bool(context.micro_policy_active):
+            objective_key = "micro"
+        elif investing_policy_active and objective_key not in {"micro"}:
+            objective_key = "scenario2"
         rng = random.Random(random_seed)
         ensemble_enabled = bool(ensemble_mode)
         safe_ensemble_runs = max(1, int(ensemble_runs))
@@ -755,6 +970,48 @@ class StrategyOptimizerService:
         if not outcomes:
             raise RuntimeError("Optimizer did not produce any candidate outcome")
 
+        def _same_parameters(candidate: Dict[str, float], baseline: Dict[str, float]) -> bool:
+            if len(candidate) != len(baseline):
+                return False
+            for key, baseline_value in baseline.items():
+                candidate_value = candidate.get(key)
+                if candidate_value is None:
+                    return False
+                if abs(float(candidate_value) - float(baseline_value)) > 0.000001:
+                    return False
+            return True
+
+        baseline_outcome = next(
+            (
+                item
+                for item in outcomes
+                if len(item.symbols) == len(symbols)
+                and all(left == right for left, right in zip(item.symbols, symbols))
+                and _same_parameters(item.parameters, base_params)
+            ),
+            None,
+        )
+        if baseline_outcome is None:
+            baseline_result = self._run_backtest(
+                context=context,
+                symbols=symbols,
+                parameters=base_params,
+                should_cancel=should_cancel,
+            )
+            baseline_score, baseline_meets = self._objective_score(
+                result=baseline_result,
+                min_trades=min_trades,
+                objective=objective_key,
+                strict_min_trades=strict_min_trades,
+            )
+            baseline_outcome = OptimizationOutcome(
+                score=baseline_score,
+                meets_min_trades=baseline_meets,
+                parameters=dict(base_params),
+                symbols=list(symbols),
+                result=baseline_result,
+            )
+
         outcomes.sort(key=lambda item: item.score, reverse=True)
         best = outcomes[0]
         if ensemble_enabled:
@@ -872,6 +1129,7 @@ class StrategyOptimizerService:
             "recommended_symbols": list(best.symbols),
             "top_candidates": payload_candidates,
             "best_result": best.result,
+            "baseline_result": baseline_outcome.result if baseline_outcome else None,
             "confidence": confidence,
             "score": round(best.score, 6),
             "ensemble_mode": bool(ensemble_enabled),
@@ -885,6 +1143,15 @@ class StrategyOptimizerService:
                 (
                     f"Optimization objective: {self._objective_label(objective_key)} "
                     "with drawdown/risk penalties."
+                ),
+                (
+                    "Micro strategy workflow active: optimizer ranks candidates using micro pass/fail + scorecard metrics."
+                    if bool(context.micro_policy_active)
+                    else (
+                        "ETF investing workflow active: optimizer ranks candidates using Scenario-2 readiness metrics."
+                        if investing_policy_active
+                        else "Micro/ETF investing workflow inactive: optimizer uses standard objective scoring."
+                    )
                 ),
                 (
                     f"Minimum trades target: {int(min_trades)} "
@@ -946,6 +1213,11 @@ class StrategyOptimizerService:
             initial_capital=context.initial_capital,
             contribution_amount=context.contribution_amount,
             contribution_frequency=context.contribution_frequency,
+            micro_strategy_mode=context.micro_strategy_mode,
+            micro_equity_threshold=context.micro_equity_threshold,
+            micro_single_trade_loss_pct=context.micro_single_trade_loss_pct,
+            micro_cash_reserve_pct=context.micro_cash_reserve_pct,
+            micro_max_spread_bps=context.micro_max_spread_bps,
             symbols=symbols,
             parameters=parameters,
             emulate_live_trading=context.emulate_live_trading,
@@ -976,6 +1248,12 @@ class StrategyOptimizerService:
             "initial_capital": float(context.initial_capital),
             "contribution_amount": float(context.contribution_amount),
             "contribution_frequency": str(context.contribution_frequency),
+            "micro_strategy_mode": str(context.micro_strategy_mode),
+            "micro_equity_threshold": float(context.micro_equity_threshold),
+            "micro_single_trade_loss_pct": float(context.micro_single_trade_loss_pct),
+            "micro_cash_reserve_pct": float(context.micro_cash_reserve_pct),
+            "micro_max_spread_bps": float(context.micro_max_spread_bps),
+            "micro_policy_active": bool(context.micro_policy_active),
             "emulate_live_trading": bool(context.emulate_live_trading),
             "require_fractionable": bool(context.require_fractionable),
             "max_position_size": float(context.max_position_size),
@@ -1122,7 +1400,21 @@ class StrategyOptimizerService:
             if isinstance(diagnostics.get("live_parity"), dict)
             else {}
         )
+        micro_scorecard = (
+            dict(diagnostics.get("micro_scorecard"))
+            if isinstance(diagnostics.get("micro_scorecard"), dict)
+            else {}
+        )
+        investing_scorecard = (
+            dict(diagnostics.get("investing_scorecard"))
+            if isinstance(diagnostics.get("investing_scorecard"), dict)
+            else {}
+        )
+        scenario2_payload = _scenario2_payload_from_diagnostics(diagnostics)
         base_score = float(backtest_confidence.get("overall_confidence_score", 0.0) or 0.0)
+        micro_confidence_score = float(micro_scorecard.get("confidence_score", 0.0) or 0.0)
+        investing_confidence_score = float(investing_scorecard.get("confidence_score", 0.0) or 0.0)
+        scenario2_confidence_score = float(scenario2_payload.get("confidence_score", 0.0) or 0.0)
         trades = int(best_result.total_trades or 0)
         trade_target = max(1, int(min_trades))
         trade_ratio = min(1.0, float(trades) / float(trade_target))
@@ -1139,6 +1431,12 @@ class StrategyOptimizerService:
             + (0.23 * (walk_forward_score if walk_forward_score is not None else base_score))
             + (0.15 * (trade_ratio * 100.0))
         )
+        if bool(micro_scorecard):
+            composite = (0.7 * composite) + (0.3 * micro_confidence_score)
+        if bool(investing_scorecard):
+            composite = (0.72 * composite) + (0.28 * investing_confidence_score)
+        if scenario2_confidence_score > 0:
+            composite = (0.7 * composite) + (0.3 * scenario2_confidence_score)
         if not best_meets_min_trades:
             composite *= 0.8
         composite = max(0.0, min(100.0, composite))
@@ -1159,6 +1457,36 @@ class StrategyOptimizerService:
             ),
             "execution_fill_model": str(live_parity.get("execution_fill_model", "")),
             "fee_reconciliation_mode": str(live_parity.get("fee_reconciliation_mode", "")),
+            "micro_policy_active": bool(live_parity.get("micro_policy_active", False)),
+            "micro_final_score": (
+                round(float(micro_scorecard.get("final_score", 0.0) or 0.0), 2)
+                if bool(micro_scorecard)
+                else None
+            ),
+            "micro_confidence_score": (
+                round(float(micro_confidence_score), 2)
+                if bool(micro_scorecard)
+                else None
+            ),
+            "micro_pass": bool(micro_scorecard.get("pass", False)) if bool(micro_scorecard) else None,
+            "investing_final_score": (
+                round(float(investing_scorecard.get("final_score", 0.0) or 0.0), 2)
+                if bool(investing_scorecard)
+                else None
+            ),
+            "investing_confidence_score": (
+                round(float(investing_confidence_score), 2)
+                if bool(investing_scorecard)
+                else None
+            ),
+            "investing_pass": bool(investing_scorecard.get("pass", False)) if bool(investing_scorecard) else None,
+            "scenario2_score": round(float(scenario2_payload.get("score", 0.0) or 0.0), 2),
+            "scenario2_confidence_score": round(float(scenario2_confidence_score), 2),
+            "scenario2_status": str(scenario2_payload.get("status", "")),
+            "scenario2_pass": bool(scenario2_payload.get("pass", False)),
+            "scenario2_inconclusive": bool(scenario2_payload.get("inconclusive", False)),
+            "scenario2_xirr_edge_pct": round(float(scenario2_payload.get("xirr_edge", 0.0) or 0.0), 4),
+            "scenario2_adjusted_drawdown_pct": round(float(scenario2_payload.get("adjusted_drawdown", 0.0) or 0.0), 4),
             "total_trades": int(trades),
             "min_trades_target": int(trade_target),
             "meets_min_trades_target": bool(best_meets_min_trades),
@@ -1438,6 +1766,12 @@ class StrategyOptimizerService:
                     initial_capital=context.initial_capital,
                     contribution_amount=context.contribution_amount,
                     contribution_frequency=context.contribution_frequency,
+                    micro_strategy_mode=context.micro_strategy_mode,
+                    micro_equity_threshold=context.micro_equity_threshold,
+                    micro_single_trade_loss_pct=context.micro_single_trade_loss_pct,
+                    micro_cash_reserve_pct=context.micro_cash_reserve_pct,
+                    micro_max_spread_bps=context.micro_max_spread_bps,
+                    micro_policy_active=context.micro_policy_active,
                     emulate_live_trading=context.emulate_live_trading,
                     require_fractionable=context.require_fractionable,
                     max_position_size=context.max_position_size,
@@ -1492,6 +1826,12 @@ class StrategyOptimizerService:
                 initial_capital=context.initial_capital,
                 contribution_amount=context.contribution_amount,
                 contribution_frequency=context.contribution_frequency,
+                micro_strategy_mode=context.micro_strategy_mode,
+                micro_equity_threshold=context.micro_equity_threshold,
+                micro_single_trade_loss_pct=context.micro_single_trade_loss_pct,
+                micro_cash_reserve_pct=context.micro_cash_reserve_pct,
+                micro_max_spread_bps=context.micro_max_spread_bps,
+                micro_policy_active=context.micro_policy_active,
                 emulate_live_trading=context.emulate_live_trading,
                 require_fractionable=context.require_fractionable,
                 max_position_size=context.max_position_size,
@@ -1591,6 +1931,10 @@ class StrategyOptimizerService:
             return "sharpe_priority"
         if objective == "return":
             return "return_priority"
+        if objective == "micro":
+            return "micro_risk_adjusted"
+        if objective in {"investing", "scenario2"}:
+            return "scenario2_system"
         return "balanced_risk_adjusted"
 
     @staticmethod

@@ -215,15 +215,10 @@ class BuyAndHoldStrategy(StrategyInterface):
 
 class MetricsDrivenStrategy(StrategyInterface):
     """
-    Metrics-driven strategy using dip-buy + z-score entries and
-    TP/SL/trailing/ATR/time-based exits.
-
-    Key improvements over baseline:
-    - Composite entry: fires on EITHER dip OR z-score condition (relaxed).
-    - Only enters in range_bound regime (pure mean-reversion).
-    - Dynamic ATR stop ratchets upward each tick.
-    - Time-based exit forces close after max_hold_days.
-    - trailing_stop_pct >= stop_loss_pct to avoid redundancy.
+    ETF-investing strategy:
+    - Global trend gate: SPY > 200DMA
+    - Entry pullback: near SMA50 OR RSI(14) < 45 while symbol is above SMA200
+    - Mechanical exits: TP / trailing / ATR / time
     """
 
     def __init__(self, config: Dict[str, Any]):
@@ -237,8 +232,8 @@ class MetricsDrivenStrategy(StrategyInterface):
         self.dip_buy_threshold_pct = float(config.get("dip_buy_threshold_pct", 1.5))
         self.max_hold_days = int(config.get("max_hold_days", 10))
         self.dca_tranches = max(1, min(3, int(config.get("dca_tranches", 1))))
-        # Only range_bound for dip-buy mean-reversion strategies.
-        self.allowed_regimes = set(config.get("allowed_regimes", ["range_bound"]))
+        self.pullback_sma_tolerance = float(config.get("pullback_sma_tolerance", 1.01))
+        self.pullback_rsi_threshold = float(config.get("pullback_rsi_threshold", 45.0))
 
         self.screener = MarketScreener(
             config.get("alpaca_client"),
@@ -260,6 +255,7 @@ class MetricsDrivenStrategy(StrategyInterface):
         signals: List[Dict[str, Any]] = []
         regime = self.screener.detect_market_regime()
         self.state["last_regime"] = regime
+        broad_trend_allowed = self._is_spy_above_200dma()
         self._tick_count += 1
 
         for symbol in self.symbols:
@@ -282,12 +278,14 @@ class MetricsDrivenStrategy(StrategyInterface):
             position = self.state["positions"].get(symbol)
 
             if position is None:
-                # Composite entry: either dip OR z-score condition triggers.
-                dip_buy_signal = bool(indicators.get("dip_buy_signal", False))
-                zscore_val = indicators.get("zscore20", indicators.get("zscore", 0.0))
-                zscore_signal = (zscore_val is not None and float(zscore_val) <= self.zscore_entry_threshold)
-                entry_signal = dip_buy_signal or zscore_signal
-                if entry_signal and regime in self.allowed_regimes:
+                latest_sma50 = self._latest_sma(points, 50)
+                latest_sma200 = self._latest_sma(points, 200)
+                rsi14 = self._rsi14(points)
+                near_sma50 = latest_sma50 is not None and price <= (latest_sma50 * self.pullback_sma_tolerance)
+                rsi_pullback = rsi14 is not None and rsi14 < self.pullback_rsi_threshold
+                symbol_trend_ok = latest_sma200 is not None and price > latest_sma200
+                entry_signal = broad_trend_allowed and symbol_trend_ok and (near_sma50 or rsi_pullback)
+                if entry_signal:
                     # DCA: split entry into tranches
                     tranche_size = self.position_size / self.dca_tranches
                     qty = tranche_size / price  # fractional shares OK
@@ -309,8 +307,12 @@ class MetricsDrivenStrategy(StrategyInterface):
                         "symbol": symbol,
                         "signal": Signal.BUY,
                         "quantity": qty,
-                        "order_type": "market",
-                        "reason": f"Dip+zscore entry tranche 1/{self.dca_tranches} (regime={regime}, z={zscore_val})",
+                        "order_type": "limit",
+                        "price": round(price * 1.001, 4),
+                        "reason": (
+                            f"Trend+pullback entry tranche 1/{self.dca_tranches} "
+                            f"(SPY200DMA={broad_trend_allowed}, near50={near_sma50}, rsi14={rsi14})"
+                        ),
                     })
                 continue
 
@@ -339,7 +341,8 @@ class MetricsDrivenStrategy(StrategyInterface):
                         "symbol": symbol,
                         "signal": Signal.BUY,
                         "quantity": add_qty,
-                        "order_type": "market",
+                        "order_type": "limit",
+                        "price": round(price * 1.001, 4),
                         "reason": f"DCA tranche {tranches_filled + 1}/{tranches_total} at ${price:.2f}",
                     })
 
@@ -384,6 +387,54 @@ class MetricsDrivenStrategy(StrategyInterface):
                 })
 
         return signals
+
+    def _is_spy_above_200dma(self) -> bool:
+        points = self.screener.get_symbol_chart("SPY", days=260)
+        closes = [float(point.get("close", 0.0) or 0.0) for point in points]
+        closes = [value for value in closes if value > 0]
+        if len(closes) < 200:
+            return False
+        sma200 = sum(closes[-200:]) / 200.0
+        return closes[-1] > sma200
+
+    def _latest_sma(self, points: List[Dict[str, Any]], window: int) -> Any:
+        if not points:
+            return None
+        key = "sma50" if window == 50 else None
+        if key is not None:
+            raw = points[-1].get(key)
+            if raw is not None:
+                try:
+                    value = float(raw)
+                    if value > 0:
+                        return value
+                except (TypeError, ValueError):
+                    pass
+        closes = [float(point.get("close", 0.0) or 0.0) for point in points]
+        closes = [value for value in closes if value > 0]
+        if len(closes) < window:
+            return None
+        return sum(closes[-window:]) / float(window)
+
+    def _rsi14(self, points: List[Dict[str, Any]]) -> Any:
+        closes = [float(point.get("close", 0.0) or 0.0) for point in points]
+        closes = [value for value in closes if value > 0]
+        if len(closes) < 15:
+            return None
+        gains = 0.0
+        losses = 0.0
+        for idx in range(len(closes) - 14, len(closes)):
+            delta = closes[idx] - closes[idx - 1]
+            if delta >= 0:
+                gains += delta
+            else:
+                losses += abs(delta)
+        avg_gain = gains / 14.0
+        avg_loss = losses / 14.0
+        if avg_loss <= 1e-12:
+            return 100.0
+        rs = avg_gain / avg_loss
+        return 100.0 - (100.0 / (1.0 + rs))
 
     def on_stop(self) -> None:
         self.is_running = False

@@ -96,6 +96,7 @@ def init_db() -> None:
         from storage import models  # noqa: F401  # Import to register models
         Base.metadata.create_all(bind=engine)
     ensure_orders_external_id_unique_index()
+    ensure_portfolio_snapshots_mode_column()
 
 
 def run_alembic_upgrade_head() -> bool:
@@ -270,6 +271,29 @@ def ensure_orders_external_id_unique_index() -> None:
             text("CREATE UNIQUE INDEX IF NOT EXISTS ix_orders_external_id ON orders (external_id)")
         )
         logger.info("Ensured unique index ix_orders_external_id on orders.external_id")
+
+
+def ensure_portfolio_snapshots_mode_column() -> None:
+    """
+    Best-effort schema self-heal for portfolio_snapshots.mode.
+    Ensures paper/live snapshots are stored in separate analytics streams.
+    """
+    inspector = inspect(engine)
+    if not inspector.has_table("portfolio_snapshots"):
+        return
+
+    column_names = {str(col.get("name")) for col in inspector.get_columns("portfolio_snapshots")}
+    if "mode" in column_names:
+        return
+
+    with engine.begin() as connection:
+        connection.execute(
+            text("ALTER TABLE portfolio_snapshots ADD COLUMN mode VARCHAR(8) NOT NULL DEFAULT 'paper'")
+        )
+        connection.execute(
+            text("CREATE INDEX IF NOT EXISTS ix_portfolio_snapshots_mode ON portfolio_snapshots (mode)")
+        )
+        logger.info("Added portfolio_snapshots.mode column for paper/live analytics separation")
 
 
 def ensure_optimization_runs_schema() -> None:

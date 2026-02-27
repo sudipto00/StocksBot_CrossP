@@ -1,7 +1,6 @@
 import { useEffect, useState } from 'react';
 import { useLocation } from 'react-router-dom';
 import {
-  STOCK_PRESET_PARAMETER_DEFAULTS,
   ETF_PRESET_PARAMETER_DEFAULTS,
   formatPresetDefaultsForHelp,
 } from '../constants/presetDefaults';
@@ -14,7 +13,7 @@ const tocSections = [
   { id: 'welcome',            label: 'Welcome',             color: 'blue' },
   { id: 'small-budget',       label: 'Small-Budget Guide',  color: 'blue' },
   { id: 'quick-start',        label: 'Quick Start',         color: 'blue' },
-  { id: 'stocks-vs-etfs',     label: 'Stocks vs ETFs',      color: 'gray' },
+  { id: 'etf-investing-mode', label: 'ETF Investing Mode',  color: 'gray' },
   { id: 'preset-guide',       label: 'Preset Guide',        color: 'gray' },
   { id: 'dashboard',          label: 'Dashboard',           color: 'gray' },
   { id: 'screener',           label: 'Screener',            color: 'gray' },
@@ -39,114 +38,43 @@ const tocSections = [
 
 const budgetExamples = [
   {
-    label: 'Starter',
+    label: 'ETF Starter',
     initial: '$100',
-    weekly: '$30',
-    assetType: 'Stocks',
-    preset: 'Small Budget Weekly',
-    riskProfile: 'Conservative',
-    positionSize: '$50 - $80',
-    expectedTrades: '1 - 2 / week',
-    notes: 'Focus on lower-priced large caps (INTC, PFE, CSCO). Keep position sizes small so one bad trade does not wipe out your seed. Start with paper trading for at least 2 weeks.',
-  },
-  {
-    label: 'Budget Builder',
-    initial: '$250',
-    weekly: '$50',
-    assetType: 'Stocks',
-    preset: 'Small Budget Weekly',
-    riskProfile: 'Conservative',
-    positionSize: '$80 - $150',
-    expectedTrades: '2 - 3 / week',
-    notes: 'Same preset as Starter but larger sizing headroom. Consider bumping to 3-5 Trades/Week preset once your account reaches $500+.',
-  },
-  {
-    label: 'Moderate Start',
-    initial: '$500',
-    weekly: '$75',
-    assetType: 'Stocks',
-    preset: '3-5 Trades/Week',
-    riskProfile: 'Balanced',
-    positionSize: '$100 - $200',
-    expectedTrades: '3 - 5 / week',
-    notes: 'Enough capital for diversified positions across multiple sectors. Good balance of activity and risk. Suitable for learning the strategy without being overexposed.',
-  },
-  {
-    label: 'ETF Conservative',
-    initial: '$300',
     weekly: '$50',
     assetType: 'ETFs',
-    preset: 'Conservative',
-    riskProfile: 'Conservative',
-    positionSize: '$100 - $200',
-    expectedTrades: '1 - 2 / week',
-    notes: 'ETFs like SPY and VOO are inherently diversified. Lower volatility means fewer signals but smoother equity curve. Great for hands-off investors who want exposure to broad markets.',
+    preset: 'Balanced',
+    riskProfile: 'Balanced',
+    positionSize: '$25 - $60',
+    expectedTrades: '0 - 2 / week',
+    notes: 'Use core DCA first and keep active trades minimal until account stability is proven.',
+  },
+  {
+    label: 'ETF Builder',
+    initial: '$250',
+    weekly: '$50',
+    assetType: 'ETFs',
+    preset: 'Balanced',
+    riskProfile: 'Balanced',
+    positionSize: '$40 - $100',
+    expectedTrades: '1 - 3 / week',
+    notes: 'Keep DCA consistent and deploy active sleeve only when trend + pullback conditions are met.',
   },
   {
     label: 'ETF Growth',
     initial: '$500',
     weekly: '$100',
     assetType: 'ETFs',
-    preset: 'Balanced',
+    preset: 'Aggressive',
     riskProfile: 'Balanced',
-    positionSize: '$150 - $300',
-    expectedTrades: '2 - 3 / week',
-    notes: 'Mix of broad-market and sector ETFs. Balanced preset gives exposure to QQQ, IWM, and sector rotators alongside SPY core. Good for growing capital steadily.',
-  },
-  {
-    label: 'Micro Budget',
-    initial: '$100',
-    weekly: '$20 - $50',
-    assetType: 'Stocks',
-    preset: 'Micro Budget',
-    riskProfile: 'Micro Budget',
-    positionSize: '$25 - $75',
-    expectedTrades: '1 / week',
-    notes: 'Designed for the smallest accounts. Uses DCA split entries (2 tranches), tight 1.5% stop loss, 10% max drawdown kill switch, and automatic profit reinvestment. Consecutive-loss circuit breaker halts after 2 losses. Budget auto-scales after profitable weeks.',
+    positionSize: '$75 - $150',
+    expectedTrades: '2 - 6 / month',
+    notes: 'Good fit once equity is above $500 and you can handle wider swings while respecting strict risk caps.',
   },
 ];
 
 /* ─────────────────────────────────────────────────────────────────────────────
    PRESET UNIVERSES
    ───────────────────────────────────────────────────────────────────────────── */
-
-const stockPresetUniverses = [
-  {
-    preset: 'Weekly Optimized',
-    key: 'weekly_optimized',
-    goal: 'Higher activity and momentum-oriented stock basket.',
-    bestFor: '$500+ accounts wanting active weekly trades.',
-    symbols: ['NVDA', 'TSLA', 'AMD', 'META', 'AMZN', 'AAPL', 'MSFT', 'GOOGL', 'INTC', 'CRM'],
-  },
-  {
-    preset: '3-5 Trades/Week',
-    key: 'three_to_five_weekly',
-    goal: 'Balanced activity with large-cap diversification.',
-    bestFor: '$300-$500+ accounts seeking moderate activity.',
-    symbols: ['AAPL', 'MSFT', 'AMZN', 'GOOGL', 'JPM', 'V', 'WMT', 'KO', 'PEP', 'DIS'],
-  },
-  {
-    preset: 'Monthly Optimized',
-    key: 'monthly_optimized',
-    goal: 'Lower-turnover large-cap basket for fewer entries.',
-    bestFor: 'Patient investors who check in weekly, not daily.',
-    symbols: ['MSFT', 'AAPL', 'GOOGL', 'JPM', 'V', 'WMT', 'PEP', 'KO', 'CSCO', 'ORCL'],
-  },
-  {
-    preset: 'Small Budget Weekly',
-    key: 'small_budget_weekly',
-    goal: 'Cost-aware weekly basket tuned for smaller accounts.',
-    bestFor: '$100-$300 accounts. Lower-priced stocks keep position sizes affordable.',
-    symbols: ['INTC', 'PFE', 'CSCO', 'PYPL', 'BABA', 'NKE', 'DIS', 'KO', 'XLF', 'IWM'],
-  },
-  {
-    preset: 'Micro Budget',
-    key: 'micro_budget',
-    goal: 'Optimized for micro accounts with DCA entries and profit compounding.',
-    bestFor: '$20-$50/week accounts. Tightest risk controls, 2-tranche DCA, auto budget scaling.',
-    symbols: ['SPY', 'INTC', 'PFE', 'CSCO', 'KO', 'VTI', 'XLF', 'DIS'],
-  },
-];
 
 const etfPresetUniverses = [
   {
@@ -178,55 +106,7 @@ const etfPresetUniverses = [
 
 const presetSettingsRows = [
   {
-    sequence: '1) Stocks > Most Active',
-    mode: 'Stock Most Active',
-    goal: 'Highest-liquidity stock list with adaptive portfolio-aware filtering.',
-    riskProfile: 'Uses current Settings risk profile.',
-    screener: 'Limit slider 10-200. Base: min_dollar_volume 10M, max_spread_bps 50, max_sector_weight_pct 45.',
-    strategy: 'Inherits from current stock preset defaults.',
-  },
-  {
-    sequence: '2) Stocks > Weekly Optimized',
-    mode: 'Stock Preset (weekly_optimized)',
-    goal: 'Higher activity, momentum-leaning weekly cadence.',
-    riskProfile: 'Auto-Optimize target: aggressive.',
-    screener: 'min_dollar_volume 20M, max_spread_bps 35, max_sector_weight_pct 40.',
-    strategy: formatPresetDefaultsForHelp(STOCK_PRESET_PARAMETER_DEFAULTS.weekly_optimized),
-  },
-  {
-    sequence: '3) Stocks > 3-5 Trades/Week',
-    mode: 'Stock Preset (three_to_five_weekly)',
-    goal: 'Balanced weekly turnover and diversification.',
-    riskProfile: 'Auto-Optimize target: balanced.',
-    screener: 'min_dollar_volume 12M, max_spread_bps 45, max_sector_weight_pct 45.',
-    strategy: formatPresetDefaultsForHelp(STOCK_PRESET_PARAMETER_DEFAULTS.three_to_five_weekly),
-  },
-  {
-    sequence: '4) Stocks > Monthly Optimized',
-    mode: 'Stock Preset (monthly_optimized)',
-    goal: 'Lower-turnover swing profile with longer hold window.',
-    riskProfile: 'Auto-Optimize target: balanced.',
-    screener: 'min_dollar_volume 8M, max_spread_bps 60, max_sector_weight_pct 50.',
-    strategy: formatPresetDefaultsForHelp(STOCK_PRESET_PARAMETER_DEFAULTS.monthly_optimized),
-  },
-  {
-    sequence: '5) Stocks > Small Budget Weekly',
-    mode: 'Stock Preset (small_budget_weekly)',
-    goal: 'Budget-sensitive weekly execution with tighter sizing.',
-    riskProfile: 'Auto-Optimize target: conservative.',
-    screener: 'min_dollar_volume 5M, max_spread_bps 80, max_sector_weight_pct 55.',
-    strategy: formatPresetDefaultsForHelp(STOCK_PRESET_PARAMETER_DEFAULTS.small_budget_weekly),
-  },
-  {
-    sequence: '6) Stocks > Micro Budget',
-    mode: 'Stock Preset (micro_budget)',
-    goal: 'Micro account optimization with DCA, compounding, and strict risk controls.',
-    riskProfile: 'Auto-Optimize target: micro_budget.',
-    screener: 'min_dollar_volume 2M, max_spread_bps 150, max_sector_weight_pct 60.',
-    strategy: formatPresetDefaultsForHelp(STOCK_PRESET_PARAMETER_DEFAULTS.micro_budget),
-  },
-  {
-    sequence: '7) ETFs > Conservative',
+    sequence: '1) ETFs > Conservative',
     mode: 'ETF Preset (conservative)',
     goal: 'Defensive ETF profile with stricter liquidity/sector limits.',
     riskProfile: 'Directly set to conservative.',
@@ -234,7 +114,7 @@ const presetSettingsRows = [
     strategy: formatPresetDefaultsForHelp(ETF_PRESET_PARAMETER_DEFAULTS.conservative),
   },
   {
-    sequence: '8) ETFs > Balanced',
+    sequence: '2) ETFs > Balanced',
     mode: 'ETF Preset (balanced)',
     goal: 'Moderate ETF mix balancing rotation and drawdown control.',
     riskProfile: 'Directly set to balanced.',
@@ -242,7 +122,7 @@ const presetSettingsRows = [
     strategy: formatPresetDefaultsForHelp(ETF_PRESET_PARAMETER_DEFAULTS.balanced),
   },
   {
-    sequence: '9) ETFs > Aggressive',
+    sequence: '3) ETFs > Aggressive',
     mode: 'ETF Preset (aggressive)',
     goal: 'Higher-beta ETF profile seeking larger moves.',
     riskProfile: 'Directly set to aggressive.',
@@ -256,18 +136,6 @@ const presetSettingsRows = [
    ───────────────────────────────────────────────────────────────────────────── */
 
 const universeWiringRows = [
-  {
-    mode: 'Stocks + Most Active',
-    source: 'Alpaca most-active stocks (strict mode blocks fallback)',
-    behavior: 'Uses /screener/all with screener_mode=most_active; slider controls 10-200 symbols.',
-    notes: 'Portfolio-aware guardrails and overlap/concentration penalties are applied before final ranking.',
-  },
-  {
-    mode: 'Stocks + Strategy Preset',
-    source: 'Curated stock preset seed symbols + active stock backfill',
-    behavior: 'Uses /screener/preset; preset selection swaps seed universe and re-optimizes guardrails.',
-    notes: 'If preset seed has fewer symbols than requested limit, backfill comes from active stocks.',
-  },
   {
     mode: 'ETFs + Preset',
     source: 'Curated ETF preset seed symbols + active ETF backfill',
@@ -293,27 +161,27 @@ const strategyParameterDefinitions = [
   },
   {
     name: 'Stop Loss (%)',
-    meaning: 'If a stock drops this percentage below your entry price, the position is automatically sold to limit losses.',
+    meaning: 'If an ETF position drops this percentage below your entry price, it is automatically sold to limit losses.',
     example: '2% stop loss on a $50 entry triggers a sell at $49.',
   },
   {
     name: 'Take Profit (%)',
-    meaning: 'When a stock rises this percentage above entry, the position is sold to lock in gains.',
+    meaning: 'When price rises this percentage above entry, the position is sold to lock in gains.',
     example: '5% take profit on a $50 entry triggers a sell at $52.50.',
   },
   {
     name: 'Trailing Stop (%)',
-    meaning: 'A dynamic stop that follows the price upward. If the stock rises to $55 then drops 2.5%, it sells at ~$53.63 instead of waiting for the fixed stop.',
-    example: 'Protects profits on stocks that run up before pulling back.',
+    meaning: 'A dynamic stop that follows the price upward. If price rises to $55 then drops 2.5%, it sells at ~$53.63 instead of waiting for the fixed stop.',
+    example: 'Protects profits when an ETF trends up and then pulls back.',
   },
   {
     name: 'ATR Stop Multiplier',
-    meaning: 'Uses the stock\'s own volatility (Average True Range) to set a smarter stop distance. Higher values give volatile stocks more room.',
-    example: '1.8x ATR on a stock with ATR of $1.50 sets the stop $2.70 below the high.',
+    meaning: 'Uses the symbol\'s own volatility (Average True Range) to set a smarter stop distance. Higher values give volatile symbols more room.',
+    example: '1.8x ATR on an ETF with ATR of $1.50 sets the stop $2.70 below the high.',
   },
   {
     name: 'Z-Score Entry Threshold',
-    meaning: 'Measures how far below its recent average a stock has fallen. More negative = deeper dip required. Values closer to 0 trigger on smaller pullbacks.',
+    meaning: 'Measures how far below its recent average price has fallen. More negative = deeper dip required. Values closer to 0 trigger on smaller pullbacks.',
     example: '-1.0 triggers on moderate dips; -2.0 waits for significant selloffs.',
   },
   {
@@ -348,15 +216,13 @@ const strategyParameterDefinitions = [
    ───────────────────────────────────────────────────────────────────────────── */
 
 const controlDefinitions = [
-  { name: 'Asset Type', location: 'Screener', meaning: 'Switches between Stocks and ETFs. ETFs use Preset mode only.', range: 'Stocks or ETFs' },
-  { name: 'Universe Source', location: 'Screener (Stocks)', meaning: 'Choose Most Active (dynamic) or Strategy Preset (curated) stock universe.', range: 'Most Active or Preset' },
-  { name: 'Most Active Count', location: 'Screener (Stocks + Most Active)', meaning: 'Number of ranked active stocks to fetch and screen.', range: '10-200' },
-  { name: 'Preset', location: 'Screener', meaning: 'Selects a curated seed universe and default risk/strategy profile.', range: 'Stock: 5 (incl. Micro Budget), ETF: 3' },
+  { name: 'Asset Type', location: 'Screener', meaning: 'Locked to ETF mode in investing workflow.', range: 'ETF only' },
+  { name: 'Preset', location: 'Screener', meaning: 'Selects the curated ETF seed universe and default risk/strategy profile.', range: 'Conservative, Balanced, Aggressive' },
   { name: 'Weekly Budget ($)', location: 'Screener', meaning: 'Maximum amount you plan to invest each week. Used for sizing and optimization. Micro Budget preset supports as low as $20/week.', range: '$50-$1,000,000' },
   { name: 'Max Position Size ($)', location: 'Screener + Settings', meaning: 'Per-position dollar cap. Runner may size lower based on buying power.', range: '$1-$10,000,000' },
   { name: 'Daily Loss Limit ($)', location: 'Screener + Settings', meaning: 'If daily losses reach this amount, new orders are blocked for the day.', range: '$1-$1,000,000' },
-  { name: 'Min Dollar Volume ($)', location: 'Screener', meaning: 'Liquidity floor. Stocks trading less than this daily volume are excluded.', range: '$0-$1T' },
-  { name: 'Max Spread (bps)', location: 'Screener', meaning: 'Trading cost filter. Stocks with wider bid-ask spreads are excluded.', range: '1-2000' },
+  { name: 'Min Dollar Volume ($)', location: 'Screener', meaning: 'Liquidity floor. ETFs trading less than this daily volume are excluded.', range: '$0-$1T' },
+  { name: 'Max Spread (bps)', location: 'Screener', meaning: 'Trading cost filter. ETFs with wider bid-ask spreads are excluded.', range: '1-2000' },
   { name: 'Max Sector Weight (%)', location: 'Screener', meaning: 'Caps how much of your screened universe comes from one sector.', range: '5-100%' },
   { name: 'Auto Regime Adjust', location: 'Screener', meaning: 'Automatically adapts volume/spread filters based on current market conditions (trending, ranging, volatile).', range: 'On or Off' },
   { name: 'Paper Trading Mode', location: 'Settings', meaning: 'Toggle between paper (simulated) and live (real money) Alpaca account.', range: 'Paper or Live' },
@@ -434,7 +300,7 @@ const troubleshootingTips = [
 const faqItems = [
   {
     q: 'Can I really start trading with just $100?',
-    a: 'Yes. Use the "Small Budget Weekly" stock preset and set position sizes to $50-$80. Alpaca supports fractional shares, so even high-priced stocks like AAPL can be purchased in small dollar amounts. Always start with paper trading to validate your setup before risking real money.',
+    a: 'Yes. Use ETF Balanced with strict risk caps and small position sizes (for example $25-$60 while learning). Alpaca fractional shares help when ETF share prices are high. Start with paper trading before risking real money.',
   },
   {
     q: 'What is the Micro Budget preset?',
@@ -445,8 +311,8 @@ const faqItems = [
     a: 'DCA (Dollar-Cost Averaging) tranches split your position entry into multiple buys. Instead of buying $100 all at once, 2 tranches means two $50 buys at different dip signals, giving you a better average entry price. The Micro Budget preset uses 2 tranches by default; all other presets use 1 (no split).',
   },
   {
-    q: 'Should I choose Stocks or ETFs?',
-    a: 'ETFs are simpler and inherently diversified, making them ideal for beginners or hands-off investors. Individual stocks offer more signals and potentially higher returns, but with more volatility. With small budgets ($100-$300), stocks in the Small Budget preset are specifically chosen for affordability.',
+    q: 'Should I choose ETF Balanced or ETF Conservative?',
+    a: 'Use ETF Conservative when you want lower volatility and fewer active entries. Use ETF Balanced when you want a moderate active sleeve while maintaining diversification. For $100-$300 starts, Conservative is typically easier to manage.',
   },
   {
     q: 'What does "paper trading" mean?',
@@ -458,7 +324,7 @@ const faqItems = [
   },
   {
     q: 'What is a "dip buy" strategy?',
-    a: 'StocksBot uses a mean-reversion approach. It waits for a stock to dip below its recent average (measured by SMA50 and Z-Score), buys the dip, and sells when the price recovers. Think of it as "buy low, sell when it bounces back."',
+    a: 'The strategy waits for an ETF to dip below its recent average (using SMA50 and Z-Score), buys the pullback, and exits on recovery or risk controls. Think of it as disciplined pullback buying.',
   },
   {
     q: 'What if the market crashes?',
@@ -490,7 +356,7 @@ const faqItems = [
   },
   {
     q: 'How do I add or remove symbols from my strategy?',
-    a: 'Use the Screener to browse available stocks/ETFs, click the chart button, then use the "pin to strategy" action. To remove symbols, go to the Strategy page and edit the symbol list directly.',
+    a: 'Use the Screener to browse available ETFs, click the chart button, then use the "pin to strategy" action. To remove symbols, go to the Strategy page and edit the symbol list directly.',
   },
 ];
 
@@ -629,8 +495,8 @@ function exportHelpPdf() {
 
   /* ── sections ── */
   const welcomeHtml = section('Welcome to StocksBot', `
-    <p>StocksBot is an automated trading assistant that scans for stocks and ETFs experiencing temporary price dips, buys them at a discount, and sells when prices recover. This "dip-buy" or mean-reversion approach works well for building wealth gradually with small, regular investments.</p>
-    <p><strong>Step 1: Screen</strong> — The Screener finds liquid stocks/ETFs that match your risk profile and budget.<br/>
+    <p>StocksBot is an automated ETF investing assistant that blends disciplined DCA with a tightly controlled active sleeve. It prioritizes risk controls, low turnover, and consistency over constant trading.</p>
+    <p><strong>Step 1: Screen</strong> — The Screener builds a liquid ETF universe with guardrails and preset profiles.<br/>
     <strong>Step 2: Strategize</strong> — Create strategies with your chosen symbols and tune entry/exit parameters.<br/>
     <strong>Step 3: Automate</strong> — Start the Runner. It monitors markets, enters dip-buy trades, and manages exits automatically.</p>
     ${callout('Tip', 'New to trading? Start with paper trading (simulated money) and a small budget preset.')}
@@ -640,7 +506,7 @@ function exportHelpPdf() {
   const budgetDetailsHtml = budgetExamples.map((r) => `<p><strong>${r.label} (${r.initial} + ${r.weekly}/wk):</strong> ${r.notes}</p>`).join('');
   const goldenRules = [
     '<strong>Paper trade first.</strong> Run for 1-2 weeks with simulated money to validate your setup.',
-    '<strong>Keep position sizes under 30% of capital.</strong> With $200, do not put more than $60 in a single stock.',
+    '<strong>Keep position sizes under 30% of capital.</strong> With $200, do not put more than $60 in a single ETF position.',
     '<strong>Use Conservative risk profile.</strong> Smaller accounts cannot absorb large drawdowns.',
     '<strong>Set weekly budget honestly.</strong> Only invest money you will not need for bills or emergencies.',
     '<strong>Reinvest gains.</strong> Let winning trades compound. Even $5 of profit adds to your buying power.',
@@ -663,7 +529,7 @@ function exportHelpPdf() {
     '<strong>Connect your broker.</strong> Go to Settings and save your Alpaca API credentials to Keychain. Start with paper trading keys.',
     '<strong>Load credentials.</strong> Click Load Keys from Keychain and confirm status badges show keys available.',
     '<strong>Set your budget.</strong> In Settings, configure your risk profile (Conservative for small accounts), weekly budget, and position size limits.',
-    '<strong>Choose your universe.</strong> Open Screener, select Stocks or ETFs, pick a preset matching your budget, and confirm the symbol list loads.',
+    '<strong>Choose your universe.</strong> Open Screener, select ETF preset and preset-universe mode, then confirm symbols load.',
     '<strong>Inspect charts.</strong> Click any symbol to view its chart with SMA50/SMA250 overlays.',
     '<strong>Build a strategy.</strong> Pin symbols to a strategy from the chart, or create one directly on the Strategy page.',
     '<strong>Configure strategy parameters.</strong> Review the parameter sliders on the Strategy page. For small budgets, preset defaults are a good starting point.',
@@ -673,40 +539,29 @@ function exportHelpPdf() {
   ];
   const quickStartHtml = section('Quick Start (Step by Step)', ol(quickStartSteps));
 
-  const stocksVsEtfsHtml = section('Stocks vs ETFs', `
-    <h3>Individual Stocks</h3>
+  const etfInvestingModeHtml = section('ETF Investing Mode', `
+    <h3>Why ETF-Only</h3>
     ${ul([
-      '<strong>More signals:</strong> Individual stocks dip more often, generating more trade opportunities.',
-      '<strong>Higher potential:</strong> Single stocks can bounce 3-8% from a dip.',
-      '<strong>More volatility:</strong> Larger drawdowns possible. Earnings can gap stocks down 10%+.',
-      '<strong>Small Budget preset:</strong> Curated lower-priced stocks (INTC, PFE, CSCO) keep costs manageable.',
-      '<strong>Best for:</strong> Active investors comfortable with daily monitoring.',
-    ])}
-    <h3>ETFs (Exchange-Traded Funds)</h3>
-    ${ul([
-      '<strong>Built-in diversification:</strong> One ETF like SPY holds 500 stocks.',
-      '<strong>Fewer signals:</strong> ETFs move less dramatically.',
-      '<strong>Smoother equity curve:</strong> Less volatility, steadier growth.',
-      '<strong>Simpler decisions:</strong> Fewer symbols, preset mode only.',
-      '<strong>Best for:</strong> Beginners, hands-off investors, capital preservation.',
+      '<strong>Built-in diversification:</strong> One ETF like SPY holds hundreds of companies.',
+      '<strong>Lower operational noise:</strong> Fewer symbols, lower turnover, cleaner execution.',
+      '<strong>Smoother equity curve:</strong> Less single-name event risk.',
+      '<strong>Policy alignment:</strong> DCA + active sleeve + kill switches are tuned for ETF behavior.',
+      '<strong>Best for:</strong> Small recurring contributions and disciplined long-term execution.',
     ])}
     <h3>Budget-Based Recommendation</h3>
     ${table(['Budget Range', 'Recommended', 'Reasoning'], [
-      ['$100 - $200', 'Stocks (Small Budget Weekly)', 'Lower-priced stocks let you build multiple small positions.'],
-      ['$200 - $400', 'Either (depends on preference)', 'Stocks for activity; ETFs for simplicity.'],
-      ['$400 - $500+', 'Either or Both', 'Enough capital for meaningful positions in both.'],
+      ['$100 - $200', 'ETF Balanced + strict risk caps', 'Keeps active sleeve small while core DCA compounds.'],
+      ['$200 - $400', 'ETF Balanced or ETF Conservative', 'Better stability while still allowing selective active entries.'],
+      ['$400 - $500+', 'ETF Balanced or ETF Aggressive', 'More flexibility for active sleeve without overconcentration.'],
     ])}
   `);
 
-  const stockPresetRows = stockPresetUniverses.map((p) => [p.preset, p.goal, p.bestFor, p.symbols.join(', ')]);
   const etfPresetRows = etfPresetUniverses.map((p) => [p.preset, p.goal, p.bestFor, p.symbols.join(', ')]);
   const presetMatrixRows = presetSettingsRows.map((r) => [r.sequence, r.goal, r.riskProfile, r.screener, `<span class="mono">${r.strategy}</span>`]);
   const presetGuideHtml = section('Preset Guide', `
-    <h3>Stock Presets</h3>
-    ${table(['Preset', 'Goal', 'Best For', 'Seed Symbols'], stockPresetRows)}
     <h3>ETF Presets</h3>
     ${table(['Preset', 'Goal', 'Best For', 'Seed Symbols'], etfPresetRows)}
-    ${callout('Note', "If a preset's seed list has fewer symbols than your requested limit, the app backfills from currently active stocks/ETFs.")}
+    ${callout('Note', "If a preset's seed list has fewer symbols than your requested limit, the app backfills from currently active ETFs.")}
     <h3>Full Preset Settings Matrix</h3>
     <p class="small">Default guardrails and strategy parameters for each preset. Auto-Optimize may adjust these based on your equity, buying power, and holdings.</p>
     ${table(['Preset', 'Goal', 'Risk Profile', 'Screener Guardrails', 'Strategy Defaults'], presetMatrixRows)}
@@ -719,13 +574,13 @@ function exportHelpPdf() {
     '<strong>Strategy Runner card</strong> shows runner state, loaded strategies, poll interval, broker connectivity, and sleep/auto-resume status.',
     '<strong>Start/Stop controls</strong> manage the strategy execution engine.',
     '<strong>Panic Stop</strong> is available directly from Dashboard for emergency freeze and liquidation.',
-    "<strong>Holdings table</strong> shows each position's symbol, type, market value, and portfolio weight %. Filter by Stocks or ETFs.",
+    "<strong>Holdings table</strong> shows each position's symbol, market value, and portfolio weight within ETF-focused workflow.",
   ]));
 
   const screenerHtml = section('Screener', `
     ${ul([
-      '<strong>Asset Type</strong> selects Stocks or ETFs. ETF mode uses Preset only.',
-      '<strong>Stocks</strong> support Most Active mode (dynamic, 10-200 symbols) or Strategy Preset mode (curated seed lists).',
+      '<strong>Asset Type</strong> is fixed to ETFs in investing mode.',
+      '<strong>Preset</strong> controls curated ETF seed universe and guardrail defaults.',
       '<strong>Workspace Controls</strong> let you set budget, position limits, daily loss caps, and quality filters.',
       '<strong>Charts</strong> display price with SMA50 and SMA250 overlays. Use timeframe switches and pin-to-strategy action.',
       '<strong>Auto Regime Adjust</strong> adapts quality filters based on current market conditions.',
@@ -899,11 +754,11 @@ function exportHelpPdf() {
 </head>
 <body>
   <h1>StocksBot Help &amp; Guide</h1>
-  <p class="subtitle">Complete reference for trading stocks and ETFs &middot; Generated ${date}</p>
+  <p class="subtitle">Complete reference for ETF-first investing workflows &middot; Generated ${date}</p>
   ${welcomeHtml}
   ${smallBudgetHtml}
   ${quickStartHtml}
-  ${stocksVsEtfsHtml}
+  ${etfInvestingModeHtml}
   ${presetGuideHtml}
   ${dashboardHtml}
   ${screenerHtml}
@@ -981,7 +836,7 @@ function HelpPage() {
           </button>
         </div>
         <p className="text-gray-400">
-          Everything you need to start trading stocks and ETFs with StocksBot, from first setup to advanced tuning.
+          Everything you need to run ETF-first disciplined investing with StocksBot, from first setup to advanced tuning.
         </p>
         <div className="mt-4 flex flex-wrap gap-2 text-xs">
           {tocSections.map((s) => (
@@ -1012,14 +867,13 @@ function HelpPage() {
       >
         <div className="text-sm text-blue-100 space-y-3">
           <p>
-            StocksBot is an automated trading assistant that scans for stocks and ETFs experiencing temporary price
-            dips, buys them at a discount, and sells when prices recover. This &quot;dip-buy&quot; or mean-reversion approach
-            works well for building wealth gradually with small, regular investments.
+            StocksBot is an ETF-first investing assistant that combines core DCA with a tightly controlled active sleeve.
+            It looks for disciplined pullback entries, applies strict risk controls, and keeps trade frequency low.
           </p>
           <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mt-4">
             <div className="rounded bg-blue-950/40 p-3">
               <p className="font-semibold text-blue-200 mb-1">Step 1: Screen</p>
-              <p className="text-xs">The Screener finds liquid stocks/ETFs that match your risk profile and budget.</p>
+              <p className="text-xs">The Screener finds liquid ETFs that match your preset, risk profile, and budget.</p>
             </div>
             <div className="rounded bg-blue-950/40 p-3">
               <p className="font-semibold text-blue-200 mb-1">Step 2: Strategize</p>
@@ -1097,7 +951,7 @@ function HelpPage() {
           <h4 className="text-sm font-semibold text-blue-200 mt-4 mb-2">Golden Rules for Small Accounts</h4>
           <ol className="list-decimal pl-5 space-y-1.5 text-sm">
             <li><strong>Paper trade first.</strong> Run for 1-2 weeks with simulated money to validate your setup.</li>
-            <li><strong>Keep position sizes under 30% of capital.</strong> With $200, do not put more than $60 in a single stock.</li>
+            <li><strong>Keep position sizes under 30% of capital.</strong> With $200, do not put more than $60 in a single ETF position.</li>
             <li><strong>Use Conservative risk profile.</strong> Smaller accounts cannot absorb large drawdowns.</li>
             <li><strong>Set weekly budget honestly.</strong> Only invest money you will not need for bills or emergencies.</li>
             <li><strong>Reinvest gains.</strong> Let winning trades compound. Even $5 of profit adds to your buying power.</li>
@@ -1140,8 +994,8 @@ function HelpPage() {
             profile (Conservative for small accounts), weekly budget, and position size limits.
           </li>
           <li>
-            <strong>Choose your universe.</strong> Open <span className="font-semibold">Screener</span>, select Stocks or ETFs,
-            pick a preset matching your budget (see Small-Budget Guide above), and confirm the symbol list loads.
+            <strong>Choose your universe.</strong> Open <span className="font-semibold">Screener</span>, select an ETF preset
+            and preset-universe mode, then confirm the symbol list loads.
           </li>
           <li>
             <strong>Inspect charts.</strong> Click any symbol to view its chart with SMA50/SMA250 overlays.
@@ -1180,36 +1034,23 @@ function HelpPage() {
       </CollapsibleSection>
 
       {/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-         4. STOCKS vs ETFs
+         4. ETF INVESTING MODE
          ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */}
       <CollapsibleSection
-        id="stocks-vs-etfs"
-        title="Stocks vs ETFs: Which Should I Choose?"
-        subtitle="Understand the trade-offs for your budget and goals."
+        id="etf-investing-mode"
+        title="ETF Investing Mode"
+        subtitle="Why the app is now ETF-first and how to use it."
         accentColor="purple"
       >
         <div className="text-sm text-gray-200 space-y-4">
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <div className="rounded bg-purple-950/30 border border-purple-800/40 p-4">
-              <h4 className="font-semibold text-purple-200 mb-2">Individual Stocks</h4>
-              <ul className="space-y-1.5 text-xs">
-                <li><strong>More signals:</strong> Individual stocks dip more often, generating more trade opportunities.</li>
-                <li><strong>Higher potential:</strong> Single stocks can bounce 3-8% from a dip. More upside per trade.</li>
-                <li><strong>More volatility:</strong> Also means larger drawdowns. A bad earnings report can gap a stock down 10%+.</li>
-                <li><strong>Small Budget preset:</strong> Curated lower-priced stocks (INTC, PFE, CSCO) keep per-share costs manageable.</li>
-                <li><strong>Best for:</strong> Active investors comfortable with daily monitoring and some volatility.</li>
-              </ul>
-            </div>
-            <div className="rounded bg-purple-950/30 border border-purple-800/40 p-4">
-              <h4 className="font-semibold text-purple-200 mb-2">ETFs (Exchange-Traded Funds)</h4>
-              <ul className="space-y-1.5 text-xs">
-                <li><strong>Built-in diversification:</strong> One ETF like SPY holds 500 stocks. Less single-stock risk.</li>
-                <li><strong>Fewer signals:</strong> ETFs move less dramatically, so dip-buy opportunities are rarer.</li>
-                <li><strong>Smoother equity curve:</strong> Less volatility means steadier account growth.</li>
-                <li><strong>Simpler decisions:</strong> Fewer symbols to analyze. Preset mode only, so setup is faster.</li>
-                <li><strong>Best for:</strong> Beginners, hands-off investors, or those prioritizing capital preservation.</li>
-              </ul>
-            </div>
+          <div className="rounded bg-purple-950/30 border border-purple-800/40 p-4">
+            <h4 className="font-semibold text-purple-200 mb-2">Why ETF-Only</h4>
+            <ul className="space-y-1.5 text-xs">
+              <li><strong>Diversification:</strong> Broad ETFs reduce single-name blow-up risk.</li>
+              <li><strong>Lower turnover:</strong> Fewer forced trades and cleaner signal quality.</li>
+              <li><strong>Smoother equity curve:</strong> Better fit for recurring small contributions.</li>
+              <li><strong>Policy fit:</strong> DCA + active sleeve + kill switches map directly to ETF workflows.</li>
+            </ul>
           </div>
 
           <h4 className="font-semibold text-purple-200 mt-2">Budget-Based Recommendation</h4>
@@ -1225,18 +1066,18 @@ function HelpPage() {
               <tbody className="text-xs">
                 <tr className="border-t border-purple-800/30">
                   <td className="px-4 py-2 text-white">$100 - $200</td>
-                  <td className="px-4 py-2">Stocks (Small Budget Weekly)</td>
-                  <td className="px-4 py-2">Lower-priced stocks let you build multiple small positions. ETFs like SPY ($500+/share) may exceed single-position budget even with fractional shares.</td>
+                  <td className="px-4 py-2">ETF Balanced + strict caps</td>
+                  <td className="px-4 py-2">Keep active sleeve small while core DCA compounds weekly.</td>
                 </tr>
                 <tr className="border-t border-purple-800/30">
                   <td className="px-4 py-2 text-white">$200 - $400</td>
-                  <td className="px-4 py-2">Either (depends on preference)</td>
-                  <td className="px-4 py-2">Stocks for more activity; ETFs for simplicity. Consider splitting: run one stock strategy and one ETF strategy side by side.</td>
+                  <td className="px-4 py-2">ETF Balanced or Conservative</td>
+                  <td className="px-4 py-2">Better stability with controlled active entries.</td>
                 </tr>
                 <tr className="border-t border-purple-800/30">
                   <td className="px-4 py-2 text-white">$400 - $500+</td>
-                  <td className="px-4 py-2">Either or Both</td>
-                  <td className="px-4 py-2">Enough capital for meaningful positions in both. ETF Balanced preset works well alongside Stock 3-5 Trades/Week preset.</td>
+                  <td className="px-4 py-2">ETF Balanced or Aggressive</td>
+                  <td className="px-4 py-2">Supports larger active sleeve while keeping concentration capped.</td>
                 </tr>
               </tbody>
             </table>
@@ -1250,37 +1091,10 @@ function HelpPage() {
       <CollapsibleSection
         id="preset-guide"
         title="Preset Guide"
-        subtitle="Which preset to choose, seed universes, and default settings."
+        subtitle="ETF presets, seed universes, and default settings."
         accentColor="gray"
       >
         <div className="text-sm text-gray-200 space-y-5">
-          {/* Stock Presets */}
-          <div>
-            <h4 className="font-semibold text-blue-300 mb-2">Stock Presets</h4>
-            <div className="overflow-x-auto">
-              <table className="min-w-full text-sm text-left text-gray-200">
-                <thead className="bg-gray-900 text-gray-400 uppercase text-xs">
-                  <tr>
-                    <th className="px-4 py-3">Preset</th>
-                    <th className="px-4 py-3">Goal</th>
-                    <th className="px-4 py-3">Best For</th>
-                    <th className="px-4 py-3">Seed Symbols</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {stockPresetUniverses.map((p) => (
-                    <tr key={p.key} className="border-t border-gray-700 align-top">
-                      <td className="px-4 py-3 text-white font-medium">{p.preset}</td>
-                      <td className="px-4 py-3">{p.goal}</td>
-                      <td className="px-4 py-3 text-xs">{p.bestFor}</td>
-                      <td className="px-4 py-3 font-mono text-xs">{p.symbols.join(', ')}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </div>
-
           {/* ETF Presets */}
           <div>
             <h4 className="font-semibold text-blue-300 mb-2">ETF Presets</h4>
@@ -1309,8 +1123,7 @@ function HelpPage() {
           </div>
 
           <Callout type="info">
-            If a preset&apos;s seed list has fewer symbols than your requested limit, the app backfills from currently active
-            stocks/ETFs of the same type.
+            If a preset&apos;s seed list has fewer symbols than your requested limit, the app backfills from currently active ETFs.
           </Callout>
 
           {/* Preset Settings Matrix */}
@@ -1363,7 +1176,7 @@ function HelpPage() {
           <li><strong>Strategy Runner card</strong> shows runner state, loaded strategies, poll interval, broker connectivity, and sleep/auto-resume status.</li>
           <li><strong>Start/Stop controls</strong> manage the strategy execution engine.</li>
           <li><strong>Panic Stop</strong> is available directly from Dashboard for emergency freeze and liquidation.</li>
-          <li><strong>Holdings table</strong> shows each position&apos;s symbol, type, market value, and portfolio weight %. Filter by Stocks or ETFs.</li>
+          <li><strong>Holdings table</strong> shows each position&apos;s symbol, type, market value, and portfolio weight in ETF mode.</li>
         </ul>
         <Callout type="tip">
           Check the Dashboard at least once a week to make sure the runner is active and your P&L trend is healthy.
@@ -1373,12 +1186,12 @@ function HelpPage() {
       <CollapsibleSection
         id="screener"
         title="Screener"
-        subtitle="Find and filter stocks/ETFs, inspect charts, and pin symbols to strategies."
+        subtitle="Find and filter ETFs, inspect charts, and pin symbols to strategies."
         accentColor="gray"
       >
         <ul className="space-y-2 text-sm text-gray-200">
-          <li><strong>Asset Type</strong> selects Stocks or ETFs. ETF mode uses Preset only.</li>
-          <li><strong>Stocks</strong> support Most Active mode (dynamic, 10-200 symbols) or Strategy Preset mode (curated seed lists).</li>
+          <li><strong>Asset Type</strong> is fixed to ETF mode for the investing workflow.</li>
+          <li><strong>Preset</strong> controls curated ETF seed lists and guardrail defaults.</li>
           <li><strong>Workspace Controls</strong> let you set budget, position limits, daily loss caps, and quality filters (volume, spread, sector weight).</li>
           <li><strong>Charts</strong> display price with SMA50 and SMA250 overlays. Use timeframe switches and pin-to-strategy action.</li>
           <li><strong>Auto Regime Adjust</strong> adapts quality filters based on current market conditions (trending, ranging, volatile).</li>
@@ -1500,7 +1313,7 @@ function HelpPage() {
           <h4 className="font-semibold text-amber-200 mt-2">Accuracy Notes</h4>
           <ul className="list-disc pl-5 space-y-1.5 text-sm">
             <li><strong>Transaction costs:</strong> Standard backtests now apply a default 1 bps fee per trade. This prevents unrealistically inflated returns. Live-trading emulation sets fees to 0.</li>
-            <li><strong>Stop fills on gaps:</strong> When a stock gaps down below your stop, the backtest now fills at the actual low (or worse), not at your stop price. This matches real-world execution.</li>
+            <li><strong>Stop fills on gaps:</strong> When an ETF gaps down below your stop, the backtest now fills at the actual low (or worse), not at your stop price. This matches real-world execution.</li>
             <li><strong>Sharpe ratio</strong> uses Bessel-corrected sample variance (n-1 denominator) for unbiased estimation.</li>
             <li><strong>Sortino ratio</strong> uses total observation count as denominator for downside deviation, not just count of negative returns.</li>
           </ul>
@@ -1790,7 +1603,7 @@ function HelpPage() {
             </div>
             <div className="rounded bg-red-950/30 border border-red-800/40 p-3">
               <p className="font-semibold text-red-200 mb-1">Trailing Stop (per trade)</p>
-              <p className="text-xs">A dynamic stop that follows price upward and locks in gains. If a stock rises then reverses, it sells before giving back all profit.</p>
+              <p className="text-xs">A dynamic stop that follows price upward and locks in gains. If price rises then reverses, it sells before giving back all profit.</p>
             </div>
             <div className="rounded bg-red-950/30 border border-red-800/40 p-3">
               <p className="font-semibold text-red-200 mb-1">Daily Loss Limit (account-level)</p>
@@ -1798,7 +1611,7 @@ function HelpPage() {
             </div>
             <div className="rounded bg-red-950/30 border border-red-800/40 p-3">
               <p className="font-semibold text-red-200 mb-1">Max Position Size (per trade)</p>
-              <p className="text-xs">Caps how much money goes into any single position. Prevents overconcentration in one stock.</p>
+              <p className="text-xs">Caps how much money goes into any single position. Prevents overconcentration in one ETF.</p>
             </div>
             <div className="rounded bg-red-950/30 border border-red-800/40 p-3">
               <p className="font-semibold text-red-200 mb-1">Consecutive-Loss Circuit Breaker</p>

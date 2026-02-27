@@ -61,9 +61,30 @@ export interface StatusResponse {
 export interface ConfigResponse {
   environment: string;
   trading_enabled: boolean;
+  read_only_mode: boolean;
   paper_trading: boolean;
+  mode_switch_cooldown_seconds: number;
+  last_mode_switch_at?: string | null;
+  mode_switch_available_at?: string | null;
   max_position_size: number;
   risk_limit_daily: number;
+  micro_mode_enabled: boolean;
+  micro_mode_auto_enabled: boolean;
+  micro_mode_equity_threshold: number;
+  micro_mode_single_trade_loss_pct: number;
+  micro_mode_cash_reserve_pct: number;
+  micro_mode_max_spread_bps: number;
+  etf_investing_mode_enabled: boolean;
+  etf_investing_auto_enabled: boolean;
+  etf_investing_core_dca_pct: number;
+  etf_investing_active_sleeve_pct: number;
+  etf_investing_max_trades_per_day: number;
+  etf_investing_max_concurrent_positions: number;
+  etf_investing_max_symbol_exposure_pct: number;
+  etf_investing_max_total_exposure_pct: number;
+  etf_investing_single_position_equity_threshold: number;
+  etf_investing_daily_loss_limit_pct: number;
+  etf_investing_weekly_loss_limit_pct: number;
   tick_interval_seconds: number;
   streaming_enabled: boolean;
   strict_alpaca_data: boolean;
@@ -149,8 +170,26 @@ export interface OrderRequest {
 export interface ConfigUpdateRequest {
   trading_enabled?: boolean;
   paper_trading?: boolean;
+  mode_switch_confirm?: boolean;
   max_position_size?: number;
   risk_limit_daily?: number;
+  micro_mode_enabled?: boolean;
+  micro_mode_auto_enabled?: boolean;
+  micro_mode_equity_threshold?: number;
+  micro_mode_single_trade_loss_pct?: number;
+  micro_mode_cash_reserve_pct?: number;
+  micro_mode_max_spread_bps?: number;
+  etf_investing_mode_enabled?: boolean;
+  etf_investing_auto_enabled?: boolean;
+  etf_investing_core_dca_pct?: number;
+  etf_investing_active_sleeve_pct?: number;
+  etf_investing_max_trades_per_day?: number;
+  etf_investing_max_concurrent_positions?: number;
+  etf_investing_max_symbol_exposure_pct?: number;
+  etf_investing_max_total_exposure_pct?: number;
+  etf_investing_single_position_equity_threshold?: number;
+  etf_investing_daily_loss_limit_pct?: number;
+  etf_investing_weekly_loss_limit_pct?: number;
   tick_interval_seconds?: number;
   streaming_enabled?: boolean;
   strict_alpaca_data?: boolean;
@@ -168,6 +207,57 @@ export interface ConfigUpdateRequest {
   smtp_use_tls?: boolean;
   smtp_use_ssl?: boolean;
   smtp_timeout_seconds?: number;
+}
+
+export interface EtfAllowListItem {
+  symbol: string;
+  role: 'dca' | 'active' | 'both';
+  max_weight_pct: number;
+  min_trade_size: number;
+  enabled: boolean;
+}
+
+export interface EtfInvestingPolicy {
+  enabled: boolean;
+  dynamic_candidates_enabled: boolean;
+  screen_interval_days: number;
+  replacement_interval_days: number;
+  max_replacements_per_quarter: number;
+  min_hold_days_for_replacement: number;
+  min_replacement_score_delta_pct: number;
+  min_dollar_volume: number;
+  min_history_days_preferred: number;
+  rebalance_drift_threshold_pct: number;
+  buy_only_rebalance: boolean;
+  tlh_enabled: boolean;
+  tlh_min_loss_dollars: number;
+  tlh_min_loss_pct: number;
+  tlh_min_hold_days: number;
+  allow_list: EtfAllowListItem[];
+}
+
+export interface EtfInvestingPolicyUpdateRequest {
+  enabled?: boolean;
+  dynamic_candidates_enabled?: boolean;
+  screen_interval_days?: number;
+  replacement_interval_days?: number;
+  max_replacements_per_quarter?: number;
+  min_hold_days_for_replacement?: number;
+  min_replacement_score_delta_pct?: number;
+  min_dollar_volume?: number;
+  min_history_days_preferred?: number;
+  rebalance_drift_threshold_pct?: number;
+  buy_only_rebalance?: boolean;
+  tlh_enabled?: boolean;
+  tlh_min_loss_dollars?: number;
+  tlh_min_loss_pct?: number;
+  tlh_min_hold_days?: number;
+  allow_list?: EtfAllowListItem[];
+}
+
+export interface EtfInvestingPolicySummary {
+  policy: EtfInvestingPolicy;
+  state: Record<string, unknown>;
 }
 
 export interface BrokerCredentialsRequest {
@@ -381,7 +471,6 @@ export interface RunnerStartRequest {
   stock_preset?: 'weekly_optimized' | 'three_to_five_weekly' | 'monthly_optimized' | 'small_budget_weekly' | 'micro_budget';
   etf_preset?: 'conservative' | 'balanced' | 'aggressive';
   screener_limit?: number;
-  seed_only?: boolean;
   preset_universe_mode?: 'seed_only' | 'seed_guardrail_blend' | 'guardrail_only';
   min_dollar_volume?: number;
   max_spread_bps?: number;
@@ -505,6 +594,15 @@ export interface PortfolioAnalyticsResponse {
   total_pnl: number;
 }
 
+export interface Scenario2Thresholds {
+  alpha_min_pct: number;
+  max_drawdown_pct: number;
+  min_trades: number;
+  min_months: number;
+  max_sells_per_month: number;
+  max_short_term_sell_ratio: number;
+}
+
 export interface PortfolioSummaryResponse {
   total_trades: number;
   total_pnl: number;
@@ -514,6 +612,29 @@ export interface PortfolioSummaryResponse {
   total_positions: number;
   total_position_value: number;
   equity: number;
+  bot_xirr_pct?: number | null;
+  dca_benchmark_xirr_pct?: number | null;
+  edge_xirr_pct?: number | null;
+  monthly_edge?: {
+    current_month?: {
+      month: string;
+      bot_xirr_pct?: number | null;
+      dca_benchmark_xirr_pct?: number | null;
+      edge_xirr_pct?: number | null;
+      bot_total_return_pct?: number | null;
+      dca_benchmark_total_return_pct?: number | null;
+    } | null;
+    months?: Array<{
+      month: string;
+      bot_xirr_pct?: number | null;
+      dca_benchmark_xirr_pct?: number | null;
+      edge_xirr_pct?: number | null;
+      bot_total_return_pct?: number | null;
+      dca_benchmark_total_return_pct?: number | null;
+    }>;
+    benchmark_weights?: Record<string, number>;
+  };
+  scenario2_thresholds?: Scenario2Thresholds;
 }
 
 export interface DashboardAnalyticsBundleResponse {
@@ -542,6 +663,10 @@ export interface StrategyConfig {
   description?: string;
   symbols: string[];
   parameters: StrategyParameter[];
+  baseline_parameters?: Record<string, number>;
+  baseline_profile?: Record<string, unknown>;
+  micro_calibration?: Record<string, unknown>;
+  parameters_overridden?: boolean;
   enabled: boolean;
   config_version: number;
 }
@@ -572,6 +697,11 @@ export interface BacktestRequest {
   initial_capital?: number;
   contribution_amount?: number;
   contribution_frequency?: 'none' | 'weekly' | 'monthly';
+  micro_strategy_mode?: 'off' | 'auto' | 'on';
+  micro_equity_threshold?: number;
+  micro_single_trade_loss_pct?: number;
+  micro_cash_reserve_pct?: number;
+  micro_max_spread_bps?: number;
   symbols?: string[];
   parameters?: Record<string, number>;
   emulate_live_trading?: boolean;
@@ -581,7 +711,6 @@ export interface BacktestRequest {
   stock_preset?: 'weekly_optimized' | 'three_to_five_weekly' | 'monthly_optimized' | 'small_budget_weekly' | 'micro_budget';
   etf_preset?: 'conservative' | 'balanced' | 'aggressive';
   screener_limit?: number;
-  seed_only?: boolean;
   preset_universe_mode?: 'seed_only' | 'seed_guardrail_blend' | 'guardrail_only';
   min_dollar_volume?: number;
   max_spread_bps?: number;
@@ -626,6 +755,16 @@ export interface BacktestAdvancedMetrics {
   avg_hold_days: number;
   slippage_bps_applied: number;
   fees_paid?: number;
+  expectancy_r?: number;
+  payoff_ratio?: number;
+  twr_annualized_pct?: number;
+  xirr_pct?: number;
+  benchmark_xirr_pct?: number;
+  xirr_excess_pct?: number;
+  subperiod_positive_ratio_pct?: number;
+  subperiod_quarterly_positive_ratio_pct?: number;
+  subperiod_fold_stability_pct?: number;
+  max_single_trade_loss_pct_base?: number;
 }
 
 export interface BacktestLiveParityReport {
@@ -637,6 +776,7 @@ export interface BacktestLiveParityReport {
   credentials_available: boolean;
   workspace_universe_enabled: boolean;
   universe_source: string;
+  parameter_source?: string;
   asset_type?: 'stock' | 'etf' | null;
   screener_mode?: 'most_active' | 'preset' | null;
   preset?: string | null;
@@ -663,6 +803,121 @@ export interface BacktestLiveParityReport {
   simulate_queue_position?: boolean;
   enforce_liquidity_limits?: boolean;
   fee_reconciliation_mode?: string;
+  micro_policy_active?: boolean;
+  micro_policy_mode?: 'off' | 'auto' | 'on' | string;
+  micro_policy_reason?: string;
+  investing_policy_active?: boolean;
+  investing_policy_reason?: string;
+}
+
+export interface BacktestMicroScorecard {
+  active: boolean;
+  mode: 'off' | 'auto' | 'on' | string;
+  reason?: string;
+  asset_type?: 'stock' | 'etf' | string;
+  pass: boolean;
+  verdict: 'pass' | 'watchlist' | 'fail' | string;
+  hard_gates_pass: boolean;
+  hard_gates: Record<string, boolean>;
+  final_score: number;
+  confidence_score: number;
+  metrics?: Record<string, number | string | boolean>;
+  components?: Record<string, number>;
+}
+
+export interface BacktestInvestingScorecard {
+  active: boolean;
+  reason?: string;
+  asset_type?: 'stock' | 'etf' | string;
+  pass: boolean;
+  verdict: 'pass' | 'watchlist' | 'fail' | string;
+  hard_gates_pass: boolean;
+  hard_gates: Record<string, boolean>;
+  final_score: number;
+  confidence_score: number;
+  metrics?: Record<string, number | string | boolean>;
+  components?: Record<string, number>;
+}
+
+export interface BacktestScenario2Report {
+  active: boolean;
+  inputs?: {
+    start_date?: string;
+    end_date?: string;
+    initial_capital?: number;
+    contribution_amount?: number;
+    contribution_frequency?: 'none' | 'weekly' | 'monthly' | string;
+    contribution_events?: number;
+    bucket_split?: {
+      core_dca_pct?: number;
+      active_sleeve_pct?: number;
+    };
+  };
+  core_results?: {
+    final_equity?: number;
+    total_contributions?: number;
+    adjusted_equity_final?: number;
+    xirr_strategy_pct?: number;
+    xirr_benchmark_pct?: number;
+    alpha_xirr_pct?: number;
+  };
+  risk?: {
+    max_drawdown_adjusted_pct?: number;
+    time_under_water_days?: number;
+    active_exposure_avg_pct?: number;
+    total_exposure_avg_pct?: number;
+    max_single_symbol_exposure_pct?: number;
+    no_activity_days?: number;
+    no_activity_ratio_pct?: number;
+  };
+  trading?: {
+    buy_count?: number;
+    sell_count?: number;
+    completed_round_trips?: number;
+    trades_per_month?: number;
+    win_rate_pct?: number;
+    average_win?: number;
+    average_loss?: number;
+    payoff_ratio?: number;
+    expectancy?: number;
+    sells_per_month?: number;
+    short_term_sells?: number;
+    short_term_sell_ratio?: number;
+    sells_by_month?: Record<string, number>;
+  };
+  tax_estimate?: {
+    short_term_rate?: number;
+    long_term_rate?: number;
+    realized_short_term_gains?: number;
+    realized_short_term_losses?: number;
+    realized_long_term_gains?: number;
+    realized_long_term_losses?: number;
+    estimated_tax_drag?: number;
+    after_tax_final_equity?: number;
+    after_tax_xirr_pct?: number;
+  };
+  stability?: {
+    subperiod_positive_segments?: number;
+    subperiod_total_segments?: number;
+    subperiod_segment_returns_pct?: number[];
+  };
+  readiness?: {
+    status?: 'pass' | 'fail' | 'inconclusive' | string;
+    pass?: boolean;
+    inconclusive?: boolean;
+    minimum_trades_required?: number;
+    minimum_months_required?: number;
+    thresholds?: Scenario2Thresholds;
+    gate_results?: Record<string, boolean>;
+    reasons?: string[];
+  };
+  scorecard?: {
+    score?: number;
+    confidence_score?: number;
+    status?: 'pass' | 'fail' | 'inconclusive' | string;
+    pass?: boolean;
+    inconclusive?: boolean;
+  };
 }
 
 export interface BacktestUniverseContext {
@@ -700,6 +955,14 @@ export interface BacktestDiagnostics {
   parameters_used: Record<string, number>;
   contribution_amount?: number;
   contribution_frequency?: 'none' | 'weekly' | 'monthly';
+  micro_strategy_mode?: 'off' | 'auto' | 'on' | string;
+  micro_policy_active?: boolean;
+  micro_policy_reason?: string;
+  micro_equity_threshold?: number;
+  micro_single_trade_loss_pct?: number;
+  micro_cash_reserve_pct?: number;
+  micro_max_spread_bps?: number;
+  micro_calibration?: Record<string, unknown>;
   contribution_events?: number;
   capital_contributions_total?: number;
   capital_base_for_return?: number;
@@ -707,6 +970,9 @@ export interface BacktestDiagnostics {
   live_parity?: BacktestLiveParityReport;
   universe_context?: BacktestUniverseContext;
   confidence?: Record<string, unknown>;
+  micro_scorecard?: BacktestMicroScorecard;
+  investing_scorecard?: BacktestInvestingScorecard;
+  scenario2_report?: BacktestScenario2Report;
 }
 
 export interface BacktestResult {
@@ -734,6 +1000,11 @@ export interface StrategyOptimizationRequest {
   initial_capital?: number;
   contribution_amount?: number;
   contribution_frequency?: 'none' | 'weekly' | 'monthly';
+  micro_strategy_mode?: 'off' | 'auto' | 'on';
+  micro_equity_threshold?: number;
+  micro_single_trade_loss_pct?: number;
+  micro_cash_reserve_pct?: number;
+  micro_max_spread_bps?: number;
   symbols?: string[];
   parameters?: Record<string, number>;
   emulate_live_trading?: boolean;
@@ -743,7 +1014,6 @@ export interface StrategyOptimizationRequest {
   stock_preset?: 'weekly_optimized' | 'three_to_five_weekly' | 'monthly_optimized' | 'small_budget_weekly' | 'micro_budget';
   etf_preset?: 'conservative' | 'balanced' | 'aggressive';
   screener_limit?: number;
-  seed_only?: boolean;
   preset_universe_mode?: 'seed_only' | 'seed_guardrail_blend' | 'guardrail_only';
   min_dollar_volume?: number;
   max_spread_bps?: number;
@@ -758,7 +1028,7 @@ export interface StrategyOptimizationRequest {
   execution_seed?: number;
   iterations?: number;
   min_trades?: number;
-  objective?: 'balanced' | 'sharpe' | 'return';
+  objective?: 'balanced' | 'sharpe' | 'return' | 'micro' | 'investing' | 'scenario2';
   strict_min_trades?: boolean;
   walk_forward_enabled?: boolean;
   walk_forward_folds?: number;
@@ -829,6 +1099,7 @@ export interface StrategyOptimizationResult {
   recommended_symbols: string[];
   top_candidates: StrategyOptimizationCandidate[];
   best_result: BacktestResult;
+  baseline_result?: BacktestResult | null;
   confidence?: Record<string, unknown>;
   walk_forward?: StrategyOptimizationWalkForwardReport | null;
   notes: string[];
@@ -1005,7 +1276,6 @@ export interface TradingPreferencesUpdateRequest {
   asset_type?: AssetTypePreference;
   risk_profile?: RiskProfilePreference;
   weekly_budget?: number;
-  screener_limit?: number;
   stock_most_active_limit?: number;
   stock_preset_limit?: number;
   etf_preset_limit?: number;

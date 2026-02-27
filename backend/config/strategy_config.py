@@ -52,6 +52,11 @@ class BacktestRequest(BaseModel):
     initial_capital: float = 100000.0
     contribution_amount: float = 0.0
     contribution_frequency: str = "none"
+    micro_strategy_mode: str = "auto"
+    micro_equity_threshold: Optional[float] = None
+    micro_single_trade_loss_pct: Optional[float] = None
+    micro_cash_reserve_pct: Optional[float] = None
+    micro_max_spread_bps: Optional[float] = None
     symbols: Optional[List[str]] = None
     parameters: Optional[Dict[str, float]] = None
     emulate_live_trading: bool = True
@@ -118,7 +123,7 @@ def get_default_parameters() -> List[StrategyParameter]:
     return [
         StrategyParameter(
             name="position_size",
-            value=1000.0,
+            value=800.0,
             min_value=50.0,
             max_value=10000.0,
             step=25.0,
@@ -126,7 +131,7 @@ def get_default_parameters() -> List[StrategyParameter]:
         ),
         StrategyParameter(
             name="stop_loss_pct",
-            value=2.0,
+            value=3.0,
             min_value=0.5,
             max_value=10.0,
             step=0.25,
@@ -134,7 +139,7 @@ def get_default_parameters() -> List[StrategyParameter]:
         ),
         StrategyParameter(
             name="take_profit_pct",
-            value=5.0,
+            value=6.0,
             min_value=1.0,
             max_value=20.0,
             step=0.5,
@@ -142,7 +147,7 @@ def get_default_parameters() -> List[StrategyParameter]:
         ),
         StrategyParameter(
             name="risk_per_trade",
-            value=1.0,
+            value=0.5,
             min_value=0.1,
             max_value=5.0,
             step=0.1,
@@ -150,7 +155,7 @@ def get_default_parameters() -> List[StrategyParameter]:
         ),
         StrategyParameter(
             name="trailing_stop_pct",
-            value=2.5,
+            value=3.0,
             min_value=0.5,
             max_value=15.0,
             step=0.25,
@@ -158,7 +163,7 @@ def get_default_parameters() -> List[StrategyParameter]:
         ),
         StrategyParameter(
             name="atr_stop_mult",
-            value=2.0,
+            value=1.8,
             min_value=0.5,
             max_value=5.0,
             step=0.1,
@@ -166,7 +171,7 @@ def get_default_parameters() -> List[StrategyParameter]:
         ),
         StrategyParameter(
             name="zscore_entry_threshold",
-            value=-1.2,
+            value=-0.8,
             min_value=-4.0,
             max_value=-0.2,
             step=0.1,
@@ -174,15 +179,31 @@ def get_default_parameters() -> List[StrategyParameter]:
         ),
         StrategyParameter(
             name="dip_buy_threshold_pct",
-            value=1.5,
+            value=1.0,
             min_value=0.3,
             max_value=10.0,
             step=0.05,
             description="Percent below SMA50 required to consider dip buy"
         ),
         StrategyParameter(
+            name="pullback_rsi_threshold",
+            value=45.0,
+            min_value=20.0,
+            max_value=60.0,
+            step=1.0,
+            description="RSI(14) pullback threshold used with trend gate (entry when RSI is below this value)"
+        ),
+        StrategyParameter(
+            name="pullback_sma_tolerance",
+            value=1.01,
+            min_value=1.0,
+            max_value=1.03,
+            step=0.001,
+            description="SMA50 pullback tolerance multiplier (1.01 = price within 1% above SMA50)"
+        ),
+        StrategyParameter(
             name="max_hold_days",
-            value=10.0,
+            value=20.0,
             min_value=1.0,
             max_value=60.0,
             step=1.0,
@@ -198,7 +219,7 @@ def get_default_parameters() -> List[StrategyParameter]:
         ),
         StrategyParameter(
             name="max_consecutive_losses",
-            value=3.0,
+            value=2.0,
             min_value=1.0,
             max_value=10.0,
             step=1.0,
@@ -206,7 +227,7 @@ def get_default_parameters() -> List[StrategyParameter]:
         ),
         StrategyParameter(
             name="max_drawdown_pct",
-            value=15.0,
+            value=12.0,
             min_value=3.0,
             max_value=50.0,
             step=1.0,

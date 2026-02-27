@@ -225,7 +225,7 @@ class AlpacaBroker(BrokerInterface):
         }
 
     def _get_asset_capabilities(self, symbol: str) -> Dict[str, Any]:
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         cached = self._asset_capabilities_cache.get(symbol)
         if cached:
             expires_at = cached.get("expires_at")

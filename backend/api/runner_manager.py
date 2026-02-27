@@ -14,6 +14,19 @@ from engine.strategies import MetricsDrivenStrategy
 from services.broker import PaperBroker
 from services.order_execution import OrderExecutionService
 from services.budget_tracker import get_budget_tracker
+from config.investing_defaults import (
+    ETF_INVESTING_MODE_ENABLED_DEFAULT,
+    ETF_INVESTING_AUTO_ENABLED_DEFAULT,
+    ETF_INVESTING_CORE_DCA_PCT_DEFAULT,
+    ETF_INVESTING_ACTIVE_SLEEVE_PCT_DEFAULT,
+    ETF_INVESTING_MAX_TRADES_PER_DAY_DEFAULT,
+    ETF_INVESTING_MAX_CONCURRENT_POSITIONS_DEFAULT,
+    ETF_INVESTING_MAX_SYMBOL_EXPOSURE_PCT_DEFAULT,
+    ETF_INVESTING_MAX_TOTAL_EXPOSURE_PCT_DEFAULT,
+    ETF_INVESTING_SINGLE_POSITION_EQUITY_THRESHOLD_DEFAULT,
+    ETF_INVESTING_DAILY_LOSS_LIMIT_PCT_DEFAULT,
+    ETF_INVESTING_WEEKLY_LOSS_LIMIT_PCT_DEFAULT,
+)
 from storage.database import SessionLocal
 from storage.service import StorageService
 import json
@@ -188,6 +201,23 @@ class RunnerManager:
         broker: Optional[Any] = None,
         max_position_size: float = 10000.0,
         risk_limit_daily: float = 500.0,
+        micro_mode_enabled: bool = False,
+        micro_mode_auto_enabled: bool = True,
+        micro_mode_equity_threshold: float = 2500.0,
+        micro_mode_single_trade_loss_pct: float = 1.5,
+        micro_mode_cash_reserve_pct: float = 5.0,
+        micro_mode_max_spread_bps: float = 40.0,
+        etf_investing_mode_enabled: bool = ETF_INVESTING_MODE_ENABLED_DEFAULT,
+        etf_investing_auto_enabled: bool = ETF_INVESTING_AUTO_ENABLED_DEFAULT,
+        etf_investing_core_dca_pct: float = ETF_INVESTING_CORE_DCA_PCT_DEFAULT,
+        etf_investing_active_sleeve_pct: float = ETF_INVESTING_ACTIVE_SLEEVE_PCT_DEFAULT,
+        etf_investing_max_trades_per_day: int = ETF_INVESTING_MAX_TRADES_PER_DAY_DEFAULT,
+        etf_investing_max_concurrent_positions: int = ETF_INVESTING_MAX_CONCURRENT_POSITIONS_DEFAULT,
+        etf_investing_max_symbol_exposure_pct: float = ETF_INVESTING_MAX_SYMBOL_EXPOSURE_PCT_DEFAULT,
+        etf_investing_max_total_exposure_pct: float = ETF_INVESTING_MAX_TOTAL_EXPOSURE_PCT_DEFAULT,
+        etf_investing_single_position_equity_threshold: float = ETF_INVESTING_SINGLE_POSITION_EQUITY_THRESHOLD_DEFAULT,
+        etf_investing_daily_loss_limit_pct: float = ETF_INVESTING_DAILY_LOSS_LIMIT_PCT_DEFAULT,
+        etf_investing_weekly_loss_limit_pct: float = ETF_INVESTING_WEEKLY_LOSS_LIMIT_PCT_DEFAULT,
         tick_interval: float = 60.0,
         streaming_enabled: bool = False,
     ) -> StrategyRunner:
@@ -211,6 +241,23 @@ class RunnerManager:
                 max_position_size=max_position_size,
                 risk_limit_daily=risk_limit_daily,
                 enable_budget_tracking=True,
+                micro_mode_enabled=micro_mode_enabled,
+                micro_mode_auto_enabled=micro_mode_auto_enabled,
+                micro_mode_equity_threshold=micro_mode_equity_threshold,
+                micro_mode_single_trade_loss_pct=micro_mode_single_trade_loss_pct,
+                micro_mode_cash_reserve_pct=micro_mode_cash_reserve_pct,
+                micro_mode_max_spread_bps=micro_mode_max_spread_bps,
+                etf_investing_mode_enabled=etf_investing_mode_enabled,
+                etf_investing_auto_enabled=etf_investing_auto_enabled,
+                etf_investing_core_dca_pct=etf_investing_core_dca_pct,
+                etf_investing_active_sleeve_pct=etf_investing_active_sleeve_pct,
+                etf_investing_max_trades_per_day=etf_investing_max_trades_per_day,
+                etf_investing_max_concurrent_positions=etf_investing_max_concurrent_positions,
+                etf_investing_max_symbol_exposure_pct=etf_investing_max_symbol_exposure_pct,
+                etf_investing_max_total_exposure_pct=etf_investing_max_total_exposure_pct,
+                etf_investing_single_position_equity_threshold=etf_investing_single_position_equity_threshold,
+                etf_investing_daily_loss_limit_pct=etf_investing_daily_loss_limit_pct,
+                etf_investing_weekly_loss_limit_pct=etf_investing_weekly_loss_limit_pct,
             )
             
             # Create runner
@@ -227,6 +274,23 @@ class RunnerManager:
             if self.runner.order_execution_service:
                 self.runner.order_execution_service.max_position_size = max_position_size
                 self.runner.order_execution_service.risk_limit_daily = risk_limit_daily
+                self.runner.order_execution_service.micro_mode_enabled = bool(micro_mode_enabled)
+                self.runner.order_execution_service.micro_mode_auto_enabled = bool(micro_mode_auto_enabled)
+                self.runner.order_execution_service.micro_mode_equity_threshold = float(micro_mode_equity_threshold)
+                self.runner.order_execution_service.micro_mode_single_trade_loss_pct = float(micro_mode_single_trade_loss_pct)
+                self.runner.order_execution_service.micro_mode_cash_reserve_pct = float(micro_mode_cash_reserve_pct)
+                self.runner.order_execution_service.micro_mode_max_spread_bps = float(micro_mode_max_spread_bps)
+                self.runner.order_execution_service.etf_investing_mode_enabled = bool(etf_investing_mode_enabled)
+                self.runner.order_execution_service.etf_investing_auto_enabled = bool(etf_investing_auto_enabled)
+                self.runner.order_execution_service.etf_investing_core_dca_pct = float(etf_investing_core_dca_pct)
+                self.runner.order_execution_service.etf_investing_active_sleeve_pct = float(etf_investing_active_sleeve_pct)
+                self.runner.order_execution_service.etf_investing_max_trades_per_day = int(etf_investing_max_trades_per_day)
+                self.runner.order_execution_service.etf_investing_max_concurrent_positions = int(etf_investing_max_concurrent_positions)
+                self.runner.order_execution_service.etf_investing_max_symbol_exposure_pct = float(etf_investing_max_symbol_exposure_pct)
+                self.runner.order_execution_service.etf_investing_max_total_exposure_pct = float(etf_investing_max_total_exposure_pct)
+                self.runner.order_execution_service.etf_investing_single_position_equity_threshold = float(etf_investing_single_position_equity_threshold)
+                self.runner.order_execution_service.etf_investing_daily_loss_limit_pct = float(etf_investing_daily_loss_limit_pct)
+                self.runner.order_execution_service.etf_investing_weekly_loss_limit_pct = float(etf_investing_weekly_loss_limit_pct)
         
         return self.runner
     
@@ -236,6 +300,23 @@ class RunnerManager:
         broker: Optional[Any] = None,
         max_position_size: float = 10000.0,
         risk_limit_daily: float = 500.0,
+        micro_mode_enabled: bool = False,
+        micro_mode_auto_enabled: bool = True,
+        micro_mode_equity_threshold: float = 2500.0,
+        micro_mode_single_trade_loss_pct: float = 1.5,
+        micro_mode_cash_reserve_pct: float = 5.0,
+        micro_mode_max_spread_bps: float = 40.0,
+        etf_investing_mode_enabled: bool = ETF_INVESTING_MODE_ENABLED_DEFAULT,
+        etf_investing_auto_enabled: bool = ETF_INVESTING_AUTO_ENABLED_DEFAULT,
+        etf_investing_core_dca_pct: float = ETF_INVESTING_CORE_DCA_PCT_DEFAULT,
+        etf_investing_active_sleeve_pct: float = ETF_INVESTING_ACTIVE_SLEEVE_PCT_DEFAULT,
+        etf_investing_max_trades_per_day: int = ETF_INVESTING_MAX_TRADES_PER_DAY_DEFAULT,
+        etf_investing_max_concurrent_positions: int = ETF_INVESTING_MAX_CONCURRENT_POSITIONS_DEFAULT,
+        etf_investing_max_symbol_exposure_pct: float = ETF_INVESTING_MAX_SYMBOL_EXPOSURE_PCT_DEFAULT,
+        etf_investing_max_total_exposure_pct: float = ETF_INVESTING_MAX_TOTAL_EXPOSURE_PCT_DEFAULT,
+        etf_investing_single_position_equity_threshold: float = ETF_INVESTING_SINGLE_POSITION_EQUITY_THRESHOLD_DEFAULT,
+        etf_investing_daily_loss_limit_pct: float = ETF_INVESTING_DAILY_LOSS_LIMIT_PCT_DEFAULT,
+        etf_investing_weekly_loss_limit_pct: float = ETF_INVESTING_WEEKLY_LOSS_LIMIT_PCT_DEFAULT,
         tick_interval: float = 60.0,
         streaming_enabled: bool = False,
         alpaca_client: Optional[Dict[str, str]] = None,
@@ -261,6 +342,23 @@ class RunnerManager:
                 broker=broker,
                 max_position_size=max_position_size,
                 risk_limit_daily=risk_limit_daily,
+                micro_mode_enabled=micro_mode_enabled,
+                micro_mode_auto_enabled=micro_mode_auto_enabled,
+                micro_mode_equity_threshold=micro_mode_equity_threshold,
+                micro_mode_single_trade_loss_pct=micro_mode_single_trade_loss_pct,
+                micro_mode_cash_reserve_pct=micro_mode_cash_reserve_pct,
+                micro_mode_max_spread_bps=micro_mode_max_spread_bps,
+                etf_investing_mode_enabled=etf_investing_mode_enabled,
+                etf_investing_auto_enabled=etf_investing_auto_enabled,
+                etf_investing_core_dca_pct=etf_investing_core_dca_pct,
+                etf_investing_active_sleeve_pct=etf_investing_active_sleeve_pct,
+                etf_investing_max_trades_per_day=etf_investing_max_trades_per_day,
+                etf_investing_max_concurrent_positions=etf_investing_max_concurrent_positions,
+                etf_investing_max_symbol_exposure_pct=etf_investing_max_symbol_exposure_pct,
+                etf_investing_max_total_exposure_pct=etf_investing_max_total_exposure_pct,
+                etf_investing_single_position_equity_threshold=etf_investing_single_position_equity_threshold,
+                etf_investing_daily_loss_limit_pct=etf_investing_daily_loss_limit_pct,
+                etf_investing_weekly_loss_limit_pct=etf_investing_weekly_loss_limit_pct,
                 tick_interval=tick_interval,
                 streaming_enabled=streaming_enabled,
             )
@@ -300,7 +398,11 @@ class RunnerManager:
 
                 # Load active DB strategies into runner before start using metrics-driven logic.
                 skipped_invalid = []
-                allowed_params = set(self._strategy_param_defaults_from_prefs({"asset_type": "stock", "stock_preset": "weekly_optimized"}).keys())
+                allowed_params = set(
+                    self._strategy_param_defaults_from_prefs(
+                        {"asset_type": "etf", "etf_preset": "balanced"}
+                    ).keys()
+                )
                 account_info: Dict[str, Any] = {}
                 try:
                     account_info = runner.broker.get_account_info()
@@ -308,7 +410,7 @@ class RunnerManager:
                     account_info = {}
                 account_equity = self._safe_float(account_info.get("equity", account_info.get("portfolio_value", 0.0)), 0.0)
                 account_buying_power = self._safe_float(account_info.get("buying_power", 0.0), 0.0)
-                weekly_budget = self._safe_float(prefs.get("weekly_budget", 200.0), 200.0)
+                weekly_budget = self._safe_float(prefs.get("weekly_budget", 50.0), 50.0)
                 budget_tracker = get_budget_tracker(weekly_budget)
                 budget_tracker.set_weekly_budget(weekly_budget)
                 remaining_weekly_budget = self._safe_float(
@@ -327,6 +429,7 @@ class RunnerManager:
                     config = db_strategy.config or {}
                     raw_symbols = config.get("symbols", [])
                     strategy_specific_override = per_strategy_override_symbols.get(str(db_strategy.id), [])
+                    workspace_override_active = bool(strategy_specific_override or override_symbols)
                     symbols = (
                         list(strategy_specific_override)
                         if strategy_specific_override
@@ -337,18 +440,11 @@ class RunnerManager:
                     if not symbols:
                         skipped_invalid.append(db_strategy.name)
                         continue
-                    params = config.get("parameters", {}) if isinstance(config.get("parameters", {}), dict) else {}
-                    preset_defaults = self._strategy_param_defaults_from_prefs(prefs)
-                    validated_params: Dict[str, float] = {}
-                    for key, value in params.items():
-                        if key not in allowed_params:
-                            continue
-                        try:
-                            numeric = float(value)
-                        except (TypeError, ValueError):
-                            continue
-                        if math.isfinite(numeric):
-                            validated_params[key] = numeric
+                    saved_params = config.get("parameters", {}) if isinstance(config.get("parameters"), dict) else {}
+                    baseline_params = config.get("baseline_parameters", {}) if isinstance(config.get("baseline_parameters"), dict) else {}
+                    preset_defaults = self._strategy_param_defaults_from_config(config, prefs)
+                    raw_param_source = baseline_params if workspace_override_active else saved_params
+                    validated_params = self._validated_strategy_params(raw_param_source, allowed_params)
                     merged_params = {**preset_defaults, **validated_params}
                     dynamic_position_size = self._dynamic_position_size(
                         requested_position_size=float(merged_params.get("position_size", 1000.0)),
@@ -373,6 +469,8 @@ class RunnerManager:
                             "atr_stop_mult": float(merged_params.get("atr_stop_mult", 2.0)),
                             "zscore_entry_threshold": float(merged_params.get("zscore_entry_threshold", -1.2)),
                             "dip_buy_threshold_pct": float(merged_params.get("dip_buy_threshold_pct", 1.5)),
+                            "pullback_rsi_threshold": float(merged_params.get("pullback_rsi_threshold", 45.0)),
+                            "pullback_sma_tolerance": float(merged_params.get("pullback_sma_tolerance", 1.01)),
                             "max_hold_days": int(merged_params.get("max_hold_days", 10)),
                             "dca_tranches": int(merged_params.get("dca_tranches", 1)),
                             "alpaca_client": alpaca_client,
@@ -452,30 +550,98 @@ class RunnerManager:
 
     def _strategy_param_defaults_from_prefs(self, prefs: Dict[str, Any]) -> Dict[str, float]:
         """Preset-based defaults used when strategy-specific parameters are not set."""
-        asset_type = str(prefs.get("asset_type", "stock"))
-        stock_preset = str(prefs.get("stock_preset", "weekly_optimized"))
+        asset_type = str(prefs.get("asset_type", "etf"))
         etf_preset = str(prefs.get("etf_preset", "balanced"))
 
-        # Stock presets — all enforce TP:SL >= 2.0:1 for positive expected value.
-        # trailing_stop_pct >= stop_loss_pct to avoid redundancy.
-        # max_hold_days caps holding period for timely exits.
-        stock_defaults = {
-            "weekly_optimized": {"position_size": 1200, "risk_per_trade": 1.5, "stop_loss_pct": 2.0, "take_profit_pct": 5.0, "trailing_stop_pct": 2.5, "atr_stop_mult": 2.0, "zscore_entry_threshold": -1.2, "dip_buy_threshold_pct": 1.5, "max_hold_days": 10, "dca_tranches": 1, "max_consecutive_losses": 3, "max_drawdown_pct": 15.0},
-            "three_to_five_weekly": {"position_size": 1000, "risk_per_trade": 1.2, "stop_loss_pct": 2.5, "take_profit_pct": 6.0, "trailing_stop_pct": 2.8, "atr_stop_mult": 1.9, "zscore_entry_threshold": -1.3, "dip_buy_threshold_pct": 2.0, "max_hold_days": 7, "dca_tranches": 1, "max_consecutive_losses": 3, "max_drawdown_pct": 15.0},
-            "monthly_optimized": {"position_size": 900, "risk_per_trade": 1.0, "stop_loss_pct": 3.5, "take_profit_pct": 8.0, "trailing_stop_pct": 3.5, "atr_stop_mult": 2.2, "zscore_entry_threshold": -1.5, "dip_buy_threshold_pct": 2.5, "max_hold_days": 30, "dca_tranches": 1, "max_consecutive_losses": 3, "max_drawdown_pct": 15.0},
-            "small_budget_weekly": {"position_size": 500, "risk_per_trade": 0.8, "stop_loss_pct": 2.0, "take_profit_pct": 5.0, "trailing_stop_pct": 2.5, "atr_stop_mult": 1.8, "zscore_entry_threshold": -1.2, "dip_buy_threshold_pct": 1.5, "max_hold_days": 10, "dca_tranches": 1, "max_consecutive_losses": 3, "max_drawdown_pct": 15.0},
-            "micro_budget": {"position_size": 75, "risk_per_trade": 0.5, "stop_loss_pct": 1.5, "take_profit_pct": 4.0, "trailing_stop_pct": 2.0, "atr_stop_mult": 1.5, "zscore_entry_threshold": -1.0, "dip_buy_threshold_pct": 1.2, "max_hold_days": 7, "dca_tranches": 2, "max_consecutive_losses": 2, "max_drawdown_pct": 10.0},
-        }
-        # ETF presets — relaxed z-score/dip thresholds (ETFs move less than stocks).
-        # Tighter stops with higher TP for better reward:risk.
         etf_defaults = {
-            "conservative": {"position_size": 1000, "risk_per_trade": 0.8, "stop_loss_pct": 2.0, "take_profit_pct": 5.0, "trailing_stop_pct": 2.5, "atr_stop_mult": 1.6, "zscore_entry_threshold": -1.0, "dip_buy_threshold_pct": 1.2, "max_hold_days": 12, "dca_tranches": 1, "max_consecutive_losses": 3, "max_drawdown_pct": 15.0},
-            "balanced": {"position_size": 1000, "risk_per_trade": 1.0, "stop_loss_pct": 2.5, "take_profit_pct": 6.0, "trailing_stop_pct": 2.8, "atr_stop_mult": 1.9, "zscore_entry_threshold": -1.2, "dip_buy_threshold_pct": 1.5, "max_hold_days": 10, "dca_tranches": 1, "max_consecutive_losses": 3, "max_drawdown_pct": 15.0},
-            "aggressive": {"position_size": 1300, "risk_per_trade": 1.4, "stop_loss_pct": 3.5, "take_profit_pct": 8.0, "trailing_stop_pct": 3.5, "atr_stop_mult": 2.0, "zscore_entry_threshold": -1.5, "dip_buy_threshold_pct": 2.0, "max_hold_days": 8, "dca_tranches": 1, "max_consecutive_losses": 3, "max_drawdown_pct": 15.0},
+            "conservative": {
+                "position_size": 500,
+                "risk_per_trade": 0.5,
+                "stop_loss_pct": 3.0,
+                "take_profit_pct": 6.0,
+                "trailing_stop_pct": 3.0,
+                "atr_stop_mult": 1.6,
+                "zscore_entry_threshold": -0.7,
+                "dip_buy_threshold_pct": 0.8,
+                "pullback_rsi_threshold": 45.0,
+                "pullback_sma_tolerance": 1.01,
+                "max_hold_days": 20,
+                "dca_tranches": 1,
+                "max_consecutive_losses": 2,
+                "max_drawdown_pct": 12.0,
+            },
+            "balanced": {
+                "position_size": 800,
+                "risk_per_trade": 0.5,
+                "stop_loss_pct": 3.0,
+                "take_profit_pct": 6.5,
+                "trailing_stop_pct": 3.0,
+                "atr_stop_mult": 1.8,
+                "zscore_entry_threshold": -0.8,
+                "dip_buy_threshold_pct": 1.0,
+                "pullback_rsi_threshold": 45.0,
+                "pullback_sma_tolerance": 1.01,
+                "max_hold_days": 18,
+                "dca_tranches": 1,
+                "max_consecutive_losses": 2,
+                "max_drawdown_pct": 12.0,
+            },
+            "aggressive": {
+                "position_size": 1000,
+                "risk_per_trade": 0.5,
+                "stop_loss_pct": 3.0,
+                "take_profit_pct": 8.0,
+                "trailing_stop_pct": 3.5,
+                "atr_stop_mult": 2.0,
+                "zscore_entry_threshold": -1.0,
+                "dip_buy_threshold_pct": 1.2,
+                "pullback_rsi_threshold": 45.0,
+                "pullback_sma_tolerance": 1.01,
+                "max_hold_days": 15,
+                "dca_tranches": 1,
+                "max_consecutive_losses": 2,
+                "max_drawdown_pct": 14.0,
+            },
         }
+        # Pivot behavior: use ETF presets as canonical defaults for runner/backtests.
+        # Any non-ETF asset_type falls back to ETF balanced so legacy rows remain executable.
         if asset_type == "etf":
             return etf_defaults.get(etf_preset, etf_defaults["balanced"])
-        return stock_defaults.get(stock_preset, stock_defaults["weekly_optimized"])
+        return etf_defaults["balanced"]
+
+    def _strategy_param_defaults_from_config(
+        self,
+        strategy_config: Dict[str, Any],
+        fallback_prefs: Dict[str, Any],
+    ) -> Dict[str, float]:
+        """Resolve per-strategy defaults, preferring persisted baseline profile."""
+        profile = strategy_config.get("baseline_profile", {})
+        if isinstance(profile, dict):
+            asset_type = str(profile.get("asset_type", "")).strip().lower()
+            etf_preset = str(profile.get("etf_preset", "")).strip().lower()
+            if asset_type in {"stock", "etf"}:
+                return self._strategy_param_defaults_from_prefs(
+                    {
+                        "asset_type": "etf" if asset_type != "etf" else asset_type,
+                        "etf_preset": etf_preset or "balanced",
+                    }
+                )
+        return self._strategy_param_defaults_from_prefs(fallback_prefs)
+
+    def _validated_strategy_params(self, raw_params: Any, allowed_params: set[str]) -> Dict[str, float]:
+        """Parse finite numeric strategy params and discard unknown keys."""
+        source = raw_params if isinstance(raw_params, dict) else {}
+        validated_params: Dict[str, float] = {}
+        for key, value in source.items():
+            if key not in allowed_params:
+                continue
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(numeric):
+                validated_params[key] = numeric
+        return validated_params
 
     def _normalize_symbols(self, raw_symbols: list[Any]) -> list[str]:
         """Normalize symbol list and keep only valid unique symbols."""

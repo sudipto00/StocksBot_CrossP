@@ -282,6 +282,7 @@ class StorageService:
         unrealized_pnl: float,
         realized_pnl_total: float,
         open_positions: int,
+        mode: str = "paper",
         timestamp: Optional[datetime] = None,
     ) -> PortfolioSnapshot:
         """Persist an account/portfolio snapshot row."""
@@ -293,24 +294,30 @@ class StorageService:
             unrealized_pnl=float(unrealized_pnl),
             realized_pnl_total=float(realized_pnl_total),
             open_positions=int(open_positions),
+            mode=str(mode or "paper").strip().lower(),
             timestamp=timestamp,
         )
 
-    def get_recent_portfolio_snapshots(self, limit: int = 5000) -> List[PortfolioSnapshot]:
+    def get_recent_portfolio_snapshots(
+        self,
+        limit: int = 5000,
+        mode: Optional[str] = None,
+    ) -> List[PortfolioSnapshot]:
         """Return most recent snapshots in ascending order."""
-        return self.portfolio_snapshots.get_recent(limit=limit)
+        return self.portfolio_snapshots.get_recent(limit=limit, mode=mode)
 
-    def get_latest_portfolio_snapshot(self) -> Optional[PortfolioSnapshot]:
+    def get_latest_portfolio_snapshot(self, mode: Optional[str] = None) -> Optional[PortfolioSnapshot]:
         """Return latest snapshot row, if present."""
-        return self.portfolio_snapshots.get_latest()
+        return self.portfolio_snapshots.get_latest(mode=mode)
 
     def get_portfolio_snapshots_since(
         self,
         cutoff: Optional[datetime] = None,
         limit: int = 5000,
+        mode: Optional[str] = None,
     ) -> List[PortfolioSnapshot]:
         """Get snapshots with optional UTC cutoff."""
-        snapshots = self.get_recent_portfolio_snapshots(limit=limit)
+        snapshots = self.get_recent_portfolio_snapshots(limit=limit, mode=mode)
         if cutoff is None:
             return snapshots
         cutoff_utc = cutoff if cutoff.tzinfo else cutoff.replace(tzinfo=timezone.utc)

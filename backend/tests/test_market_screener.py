@@ -5,6 +5,7 @@ Tests for Market Screener Service.
 import pytest
 from datetime import date
 from services.market_screener import MarketScreener, AssetType
+import services.market_screener as market_screener_module
 
 
 def test_market_screener_initialization():
@@ -401,3 +402,50 @@ def test_coerce_datetime_supports_end_of_day_for_date_only_inputs():
     assert end_from_string.second == 59
     assert end_from_string.microsecond == 999999
     assert end_from_date == end_from_string
+
+
+def test_market_screener_runtime_credentials_honor_explicit_mode(monkeypatch):
+    """Runtime credential payload should drive TradingClient paper/live mode."""
+    created: dict = {}
+
+    class FakeDataClient:
+        def __init__(self, api_key: str, secret_key: str):
+            self.api_key = api_key
+            self.secret_key = secret_key
+
+    def fake_create_trading_client(self, api_key: str, secret_key: str, paper: bool):
+        created["paper"] = paper
+        return object()
+
+    monkeypatch.setattr(market_screener_module, "StockHistoricalDataClient", FakeDataClient)
+    monkeypatch.setattr(MarketScreener, "_create_trading_client", fake_create_trading_client, raising=True)
+
+    MarketScreener(alpaca_client={"api_key": "key", "secret_key": "secret", "paper": False})
+    assert created["paper"] is False
+
+
+def test_market_screener_env_credentials_honor_settings_mode(monkeypatch):
+    """Env credential fallback should use settings.alpaca_paper rather than forcing paper mode."""
+    created: dict = {}
+
+    class FakeDataClient:
+        def __init__(self, api_key: str, secret_key: str):
+            self.api_key = api_key
+            self.secret_key = secret_key
+
+    class StubSettings:
+        alpaca_api_key = "key"
+        alpaca_secret_key = "secret"
+        alpaca_paper = False
+
+    def fake_create_trading_client(self, api_key: str, secret_key: str, paper: bool):
+        created["paper"] = paper
+        return object()
+
+    monkeypatch.setattr(market_screener_module, "StockHistoricalDataClient", FakeDataClient)
+    monkeypatch.setattr(market_screener_module, "has_alpaca_credentials", lambda: True)
+    monkeypatch.setattr(market_screener_module, "get_settings", lambda: StubSettings())
+    monkeypatch.setattr(MarketScreener, "_create_trading_client", fake_create_trading_client, raising=True)
+
+    MarketScreener()
+    assert created["paper"] is False

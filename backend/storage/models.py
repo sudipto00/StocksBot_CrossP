@@ -227,6 +227,7 @@ class PortfolioSnapshot(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     timestamp = Column(DateTime, default=func.now(), nullable=False, index=True)
+    mode = Column(String(8), nullable=False, default="paper", index=True)
     equity = Column(Float, nullable=False, default=0.0)
     cash = Column(Float, nullable=False, default=0.0)
     buying_power = Column(Float, nullable=False, default=0.0)

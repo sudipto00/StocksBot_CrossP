@@ -68,9 +68,11 @@ class MarketScreener:
         self._last_preset_metadata: Dict[str, Any] = {}
         runtime_api_key = None
         runtime_secret_key = None
+        runtime_paper = True
         if isinstance(alpaca_client, dict):
             runtime_api_key = (alpaca_client.get("api_key") or "").strip()
             runtime_secret_key = (alpaca_client.get("secret_key") or "").strip()
+            runtime_paper = bool(alpaca_client.get("paper", True))
 
         if StockHistoricalDataClient:
             if runtime_api_key and runtime_secret_key:
@@ -81,7 +83,7 @@ class MarketScreener:
                 self._trading_client = self._create_trading_client(
                     api_key=runtime_api_key,
                     secret_key=runtime_secret_key,
-                    paper=True,
+                    paper=runtime_paper,
                 )
             elif has_alpaca_credentials():
                 settings = get_settings()
@@ -92,7 +94,7 @@ class MarketScreener:
                 self._trading_client = self._create_trading_client(
                     api_key=settings.alpaca_api_key,
                     secret_key=settings.alpaca_secret_key,
-                    paper=True,
+                    paper=bool(settings.alpaca_paper),
                 )
         if self.require_real_data and self._data_client is None:
             raise RuntimeError(
@@ -343,9 +345,9 @@ class MarketScreener:
             "micro_budget": ["SOFI", "INTC", "PFE", "CSCO", "KO", "HOOD", "SNAP", "DIS"],
         }
         etf_presets = {
-            "conservative": ["SPY", "VOO", "IVV", "AGG", "TLT", "XLP", "XLV", "VEA", "VTI", "DIA"],
-            "balanced": ["SPY", "QQQ", "VTI", "IWM", "XLF", "XLK", "XLI", "VEA", "VWO", "AGG"],
-            "aggressive": ["QQQ", "IWM", "XLE", "XLK", "XLY", "EEM", "VWO", "XLF", "SPY", "DIA"],
+            "conservative": ["SPY", "VTI", "QQQ", "IWM", "XLV", "AGG"],
+            "balanced": ["SPY", "QQQ", "VTI", "IWM", "XLK", "XLV"],
+            "aggressive": ["QQQ", "SPY", "IWM", "XLK", "XLV"],
         }
 
         # Pull a wider active universe so preset seed symbols have a better chance
@@ -1286,40 +1288,24 @@ class MarketScreener:
         
         Returns well-known, liquid ETFs when API is unavailable.
         """
-        # Popular, liquid ETFs.
+        # ETF-investing pivot: keep fallback universe intentionally narrow and liquid.
         etf_seed = [
-            ("SPY", "SPDR S&P 500 ETF"), ("QQQ", "Invesco QQQ Trust"), ("IWM", "iShares Russell 2000 ETF"),
-            ("VTI", "Vanguard Total Stock Market ETF"), ("EEM", "iShares MSCI Emerging Markets ETF"), ("GLD", "SPDR Gold Shares"),
-            ("XLF", "Financial Select Sector SPDR"), ("XLE", "Energy Select Sector SPDR"), ("XLK", "Technology Select Sector SPDR"),
-            ("TLT", "iShares 20+ Year Treasury Bond ETF"), ("VOO", "Vanguard S&P 500 ETF"), ("VEA", "Vanguard FTSE Developed Markets ETF"),
-            ("AGG", "iShares Core U.S. Aggregate Bond ETF"), ("VWO", "Vanguard FTSE Emerging Markets ETF"), ("IVV", "iShares Core S&P 500 ETF"),
-            ("DIA", "SPDR Dow Jones Industrial Average ETF"), ("XLV", "Health Care Select Sector SPDR"), ("XLI", "Industrial Select Sector SPDR"),
-            ("XLP", "Consumer Staples Select Sector SPDR"), ("XLY", "Consumer Discretionary Select Sector SPDR"), ("XLC", "Communication Services Select Sector SPDR"),
-            ("XLB", "Materials Select Sector SPDR"), ("XLRE", "Real Estate Select Sector SPDR"), ("XLU", "Utilities Select Sector SPDR"),
-            ("SMH", "VanEck Semiconductor ETF"), ("SOXX", "iShares Semiconductor ETF"), ("ARKK", "ARK Innovation ETF"),
-            ("ARKQ", "ARK Autonomous Tech ETF"), ("ARKG", "ARK Genomic Revolution ETF"), ("ARKW", "ARK Next Generation Internet ETF"),
-            ("HYG", "iShares iBoxx High Yield Corporate Bond ETF"), ("LQD", "iShares iBoxx Investment Grade Corporate Bond ETF"),
-            ("BND", "Vanguard Total Bond Market ETF"), ("IEF", "iShares 7-10 Year Treasury Bond ETF"), ("SHY", "iShares 1-3 Year Treasury Bond ETF"),
-            ("TIP", "iShares TIPS Bond ETF"), ("VNQ", "Vanguard Real Estate ETF"), ("IYR", "iShares U.S. Real Estate ETF"),
-            ("GDX", "VanEck Gold Miners ETF"), ("SLV", "iShares Silver Trust"), ("USO", "United States Oil Fund"),
-            ("UNG", "United States Natural Gas Fund"), ("DBC", "Invesco DB Commodity Index Tracking Fund"), ("KRE", "SPDR S&P Regional Banking ETF"),
-            ("XBI", "SPDR S&P Biotech ETF"), ("IBB", "iShares Biotechnology ETF"), ("ICLN", "iShares Global Clean Energy ETF"),
-            ("TAN", "Invesco Solar ETF"), ("PBW", "Invesco WilderHill Clean Energy ETF"), ("JETS", "U.S. Global Jets ETF"),
-            ("ITA", "iShares U.S. Aerospace & Defense ETF"), ("PAVE", "Global X U.S. Infrastructure Development ETF"), ("BOTZ", "Global X Robotics & Artificial Intelligence ETF"),
-            ("ROBO", "ROBO Global Robotics and Automation Index ETF"), ("CLOU", "Global X Cloud Computing ETF"), ("SKYY", "First Trust Cloud Computing ETF"),
-            ("FINX", "Global X FinTech ETF"), ("KWEB", "KraneShares CSI China Internet ETF"), ("FXI", "iShares China Large-Cap ETF"),
-            ("EWJ", "iShares MSCI Japan ETF"), ("EWZ", "iShares MSCI Brazil ETF"), ("EFA", "iShares MSCI EAFE ETF"),
-            ("SCHD", "Schwab U.S. Dividend Equity ETF"), ("VIG", "Vanguard Dividend Appreciation ETF"), ("DVY", "iShares Select Dividend ETF"),
-            ("SPLV", "Invesco S&P 500 Low Volatility ETF"), ("SPHD", "Invesco S&P 500 High Dividend Low Volatility ETF"), ("RSP", "Invesco S&P 500 Equal Weight ETF"),
-            ("MTUM", "iShares MSCI USA Momentum Factor ETF"), ("QUAL", "iShares MSCI USA Quality Factor ETF"), ("USMV", "iShares MSCI USA Min Vol Factor ETF"),
-            ("EFAV", "iShares MSCI EAFE Min Vol Factor ETF"), ("VTV", "Vanguard Value ETF"), ("VUG", "Vanguard Growth ETF"),
-            ("IWF", "iShares Russell 1000 Growth ETF"), ("IWD", "iShares Russell 1000 Value ETF"), ("MDY", "SPDR S&P MidCap 400 ETF"),
-            ("IJH", "iShares Core S&P Mid-Cap ETF"), ("IJR", "iShares Core S&P Small-Cap ETF"), ("VB", "Vanguard Small-Cap ETF"),
-            ("SCHA", "Schwab U.S. Small-Cap ETF"), ("SCHF", "Schwab International Equity ETF"), ("SCHX", "Schwab U.S. Large-Cap ETF"),
-            ("SCHB", "Schwab U.S. Broad Market ETF"), ("ACWI", "iShares MSCI ACWI ETF"), ("VT", "Vanguard Total World Stock ETF"),
-            ("BIL", "SPDR Bloomberg 1-3 Month T-Bill ETF"), ("SGOV", "iShares 0-3 Month Treasury Bond ETF"), ("VGSH", "Vanguard Short-Term Treasury ETF"),
-            ("VCSH", "Vanguard Short-Term Corporate Bond ETF"), ("BSV", "Vanguard Short-Term Bond ETF"), ("MUB", "iShares National Muni Bond ETF"),
-            ("EMB", "iShares J.P. Morgan USD Emerging Markets Bond ETF"), ("PFF", "iShares Preferred and Income Securities ETF"),
+            ("SPY", "SPDR S&P 500 ETF"),
+            ("VTI", "Vanguard Total Stock Market ETF"),
+            ("QQQ", "Invesco QQQ Trust"),
+            ("IWM", "iShares Russell 2000 ETF"),
+            ("XLK", "Technology Select Sector SPDR"),
+            ("XLV", "Health Care Select Sector SPDR"),
+            ("XLF", "Financial Select Sector SPDR"),
+            ("XLI", "Industrial Select Sector SPDR"),
+            ("XLP", "Consumer Staples Select Sector SPDR"),
+            ("AGG", "iShares Core U.S. Aggregate Bond ETF"),
+            ("BND", "Vanguard Total Bond Market ETF"),
+            ("VOO", "Vanguard S&P 500 ETF"),
+            ("IVV", "iShares Core S&P 500 ETF"),
+            ("DIA", "SPDR Dow Jones Industrial Average ETF"),
+            ("VIG", "Vanguard Dividend Appreciation ETF"),
+            ("SCHD", "Schwab U.S. Dividend Equity ETF"),
         ]
         popular_etfs = []
         base_volume = 90_000_000

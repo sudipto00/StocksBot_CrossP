@@ -55,8 +55,8 @@ test-backend:
 	cd backend && python -m pytest tests/ -v
 
 test-new:
-	@echo "Running tests for new features (market screener, budget, risk profiles)..."
-	cd backend && python -m pytest tests/test_market_screener.py tests/test_budget_tracker.py tests/test_risk_profiles.py tests/test_order_execution.py -v
+	@echo "Running tests for ETF investing workflows (market screener, budget, order execution)..."
+	cd backend && python -m pytest tests/test_market_screener.py tests/test_budget_tracker.py tests/test_order_execution.py -v
 
 test-coverage:
 	@echo "Running backend tests with coverage..."
@@ -112,8 +112,6 @@ api-test:
 	@echo "Testing API endpoints (backend must be running)..."
 	@echo "\n=== Market Screener ==="
 	curl -s http://127.0.0.1:8000/screener/stocks?limit=5 | python -m json.tool || echo "Backend not running"
-	@echo "\n=== Risk Profiles ==="
-	curl -s http://127.0.0.1:8000/risk-profiles | python -m json.tool || echo "Backend not running"
 	@echo "\n=== Budget Status ==="
 	curl -s http://127.0.0.1:8000/budget/status | python -m json.tool || echo "Backend not running"
 	@echo "\n=== Preferences ==="
@@ -135,7 +133,7 @@ clean:
 quick-test:
 	@echo "Quick test of recent changes..."
 	@echo "1. Running new feature tests..."
-	cd backend && python -m pytest tests/test_market_screener.py tests/test_budget_tracker.py tests/test_risk_profiles.py -v --tb=short
+	cd backend && python -m pytest tests/test_market_screener.py tests/test_budget_tracker.py tests/test_order_execution.py -v --tb=short
 	@echo "2. Linting frontend..."
 	cd ui && npm run lint
 	@echo "3. Building frontend..."

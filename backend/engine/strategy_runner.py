@@ -17,6 +17,8 @@ from services.broker import BrokerInterface, OrderSide, OrderType
 from services.order_execution import OrderExecutionService
 
 logger = logging.getLogger(__name__)
+_RECONCILIATION_BLOCKED_KEY = "broker_reconciliation_blocked_v1"
+_RECONCILIATION_STATUS_KEY = "broker_reconciliation_status_v1"
 
 
 class StrategyStatus(Enum):
@@ -258,6 +260,20 @@ class StrategyRunner:
                     self._resume_from_sleep()
                 # Fetch market data for all symbols
                 market_data = self._fetch_market_data()
+
+                if self.order_execution_service:
+                    try:
+                        dca_report = self.order_execution_service.maybe_execute_weekly_dca(
+                            market_data=market_data,
+                        )
+                        if isinstance(dca_report, dict) and bool(dca_report.get("executed")):
+                            logger.info(
+                                "Weekly DCA executed: week=%s orders=%s",
+                                dca_report.get("week_key"),
+                                len(dca_report.get("orders") or []),
+                            )
+                    except Exception as dca_exc:
+                        logger.warning("Weekly DCA execution attempt failed: %s", dca_exc)
                 
                 # Process each strategy
                 for name, strategy in self.strategies.items():
@@ -785,6 +801,29 @@ class StrategyRunner:
         discrepancies = len(discrepancy_rows)
         self.last_reconciliation_at = datetime.now(timezone.utc)
         self.last_reconciliation_discrepancies = discrepancies
+        try:
+            if self.storage:
+                self.storage.set_config_value(
+                    key=_RECONCILIATION_BLOCKED_KEY,
+                    value="true" if discrepancies > 0 else "false",
+                    value_type="bool",
+                    description="True when latest broker/local reconciliation is unresolved",
+                )
+                self.storage.set_config_value(
+                    key=_RECONCILIATION_STATUS_KEY,
+                    value=json.dumps(
+                        {
+                            "reconciled_at": self.last_reconciliation_at.isoformat(),
+                            "discrepancy_count": int(discrepancies),
+                            "discrepancies": discrepancy_rows[:100],
+                        },
+                        separators=(",", ":"),
+                    ),
+                    value_type="json",
+                    description="Latest broker/local reconciliation status snapshot",
+                )
+        except Exception:
+            logger.debug("Failed to persist reconciliation status snapshot", exc_info=True)
         if sync_changes:
             self.storage.create_audit_log(
                 event_type="config_updated",
@@ -978,6 +1017,15 @@ class StrategyRunner:
                 order_type = signal_data.get("order_type", "market")
                 price = signal_data.get("price")
                 reason = signal_data.get("reason", "")
+                logger.info(
+                    "Signal decision: strategy=%s symbol=%s signal=%s qty=%s order_type=%s reason=%s",
+                    strategy.name,
+                    symbol,
+                    getattr(signal, "value", signal),
+                    quantity,
+                    order_type,
+                    reason,
+                )
                 
                 # Convert signal to order side
                 if signal.value in ["buy"]:
@@ -1023,6 +1071,16 @@ class StrategyRunner:
                     )
                 
                 print(f"[StrategyRunner] Executed {signal.value} order for {symbol}: {order}")
+                logger.info(
+                    "Order result: strategy=%s symbol=%s signal=%s broker_order_id=%s status=%s filled_qty=%s avg_fill_price=%s",
+                    strategy.name,
+                    symbol,
+                    signal.value,
+                    order.get("id"),
+                    order.get("status"),
+                    order.get("filled_quantity"),
+                    order.get("avg_fill_price"),
+                )
                 
                 # Record in storage if available and execution service is not used.
                 if self.storage and not self.order_execution_service:

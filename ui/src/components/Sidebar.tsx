@@ -95,32 +95,32 @@ function Sidebar() {
       {/* Logo */}
       <div className="p-6 border-b border-gray-800">
         <h1 className="text-2xl font-bold text-white">StocksBot</h1>
-        <p className="text-xs text-gray-400 mt-1">Cross-Platform Trading</p>
+        <p className="text-xs text-gray-400 mt-1">Scenario 2 Co-Pilot</p>
       </div>
 
       {/* Navigation */}
       <nav className="flex-1 p-4 space-y-2">
         <p className="px-2 text-[11px] uppercase tracking-wide text-gray-500">Workspace</p>
         <NavLink to="/" className={navLinkClass} end onMouseEnter={() => prefetchRoute('/')}>
-          <span className="mr-3">📊</span>
-          Dashboard
+          <span className="mr-3">Home</span>
+          Cockpit
         </NavLink>
 
         <NavLink to="/screener" className={navLinkClass} onMouseEnter={() => prefetchRoute('/screener')}>
-          <span className="mr-3">🔍</span>
-          Screener
+          <span className="mr-3">Universe</span>
+          ETFs
         </NavLink>
 
         <NavLink to="/strategy" className={navLinkClass} onMouseEnter={() => prefetchRoute('/strategy')}>
-          <span className="mr-3">⚙️</span>
-          Strategy
+          <span className="mr-3">Strategy</span>
+          Backtest
         </NavLink>
 
         <p className="px-2 pt-3 text-[11px] uppercase tracking-wide text-gray-500">Operations</p>
 
         <NavLink to="/audit" className={navLinkClass} onMouseEnter={() => prefetchRoute('/audit')}>
-          <span className="mr-3">📋</span>
-          Audit
+          <span className="mr-3">Logs</span>
+          Reports
         </NavLink>
 
         <NavLink to="/settings" className={navLinkClass} onMouseEnter={() => prefetchRoute('/settings')}>

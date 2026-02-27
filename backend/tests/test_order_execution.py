@@ -7,7 +7,7 @@ from unittest.mock import Mock, patch, MagicMock
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from datetime import datetime
+from datetime import datetime, timedelta
 import uuid
 
 from app import app
@@ -19,6 +19,8 @@ from services.order_execution import (
     BrokerError
 )
 from storage.service import StorageService
+from storage.models import OrderSideEnum, TradeTypeEnum
+from services.etf_investing_governance import ETFInvestingGovernanceService
 
 # Create test database - use temporary file that gets cleaned up
 import tempfile
@@ -68,8 +70,24 @@ def setup_database():
     """Create and drop test database for each test."""
     app.dependency_overrides[get_db] = override_get_db
     Base.metadata.create_all(bind=engine)
-    # Trading gate must be enabled for order endpoint tests unless explicitly overridden.
-    client.post("/config", json={"trading_enabled": True})
+    # Trading gate must be enabled for order endpoint tests unless explicitly
+    # overridden. Also reset micro-policy toggles to avoid cross-module config
+    # bleed from tests that intentionally enable micro mode.
+    client.post(
+        "/config",
+        json={
+            "trading_enabled": True,
+            "micro_mode_enabled": False,
+            "micro_mode_auto_enabled": True,
+            "micro_mode_equity_threshold": 2500.0,
+            "micro_mode_single_trade_loss_pct": 1.5,
+            "micro_mode_cash_reserve_pct": 5.0,
+            "micro_mode_max_spread_bps": 40.0,
+            # Keep this suite on generic order-execution pathways.
+            "etf_investing_mode_enabled": False,
+            "etf_investing_auto_enabled": False,
+        },
+    )
     yield
     Base.metadata.drop_all(bind=engine)
     app.dependency_overrides.pop(get_db, None)
@@ -107,7 +125,9 @@ def execution_service(paper_broker, storage_service):
         storage=storage_service,
         max_position_size=10000.0,
         risk_limit_daily=500.0,
-        enable_budget_tracking=False  # Disable budget tracking for tests
+        enable_budget_tracking=False,  # Disable budget tracking for tests
+        etf_investing_mode_enabled=False,
+        etf_investing_auto_enabled=False,
     )
 
 
@@ -171,6 +191,59 @@ def test_validate_order_exceeds_buying_power(execution_service):
             side="buy",
             order_type="market",
             quantity=10,  # 10 * $100 = $1,000 > $100 balance
+        )
+
+
+def test_validate_order_micro_single_trade_loss_guardrail(execution_service):
+    """Micro policy should block entries that exceed projected single-trade loss cap."""
+    execution_service.max_position_size = 1_000_000.0
+    execution_service.micro_mode_enabled = True
+    execution_service.micro_mode_single_trade_loss_pct = 1.0
+
+    with pytest.raises(OrderValidationError, match="single-trade loss cap"):
+        execution_service.validate_order(
+            symbol="AAPL",
+            side="buy",
+            order_type="market",
+            quantity=1000,  # $100,000 notional -> projected 2% stop-loss = $2,000
+        )
+
+
+def test_validate_order_micro_spread_guardrail(execution_service):
+    """Micro policy should block entries with excessive spread."""
+    execution_service.max_position_size = 1_000_000.0
+    execution_service.micro_mode_enabled = True
+    execution_service.micro_mode_max_spread_bps = 20.0
+    execution_service.broker.get_market_data = Mock(return_value={
+        "price": 100.0,
+        "bid": 95.0,
+        "ask": 105.0,
+        "volume": 100_000,
+    })
+
+    with pytest.raises(OrderValidationError, match="spread guardrail"):
+        execution_service.validate_order(
+            symbol="AAPL",
+            side="buy",
+            order_type="market",
+            quantity=1,
+        )
+
+
+def test_validate_order_blocked_when_reconciliation_unresolved(execution_service):
+    """Validation must block entries while reconciliation mismatch flag is active."""
+    execution_service.storage.set_config_value(
+        "broker_reconciliation_blocked_v1",
+        "true",
+        value_type="bool",
+        description="test flag",
+    )
+    with pytest.raises(OrderValidationError, match="reconciliation mismatch"):
+        execution_service.validate_order(
+            symbol="AAPL",
+            side="buy",
+            order_type="market",
+            quantity=1,
         )
 
 
@@ -819,3 +892,48 @@ def test_oco_group_cancels_sibling_after_first_exit_fill(execution_service):
     refreshed_sl = execution_service.storage.orders.get_by_id(stop_loss.id)
     assert refreshed_sl is not None
     assert refreshed_sl.status.value == "cancelled"
+
+
+def test_validate_order_blocks_wash_sale_rebuy(execution_service, storage_service):
+    """ETF investing guard should block same-symbol rebuy inside wash-sale window after a loss sell."""
+    execution_service.etf_investing_mode_enabled = True
+    execution_service.etf_investing_auto_enabled = False
+    execution_service.broker.get_market_data = Mock(return_value={
+        "price": 100.0,
+        "bid": 99.95,
+        "ask": 100.05,
+        "volume": 2_000_000,
+    })
+
+    order = storage_service.create_order(
+        symbol="SPY",
+        side="sell",
+        order_type="market",
+        quantity=1,
+        price=100.0,
+    )
+    loss_trade = storage_service.trades.create(
+        order_id=order.id,
+        symbol="SPY",
+        side=OrderSideEnum.SELL,
+        type=TradeTypeEnum.CLOSE,
+        quantity=1,
+        price=95.0,
+        executed_at=datetime.now() - timedelta(days=5),
+        auto_commit=False,
+    )
+    loss_trade.realized_pnl = -5.0
+    storage_service.db.commit()
+
+    with pytest.raises(OrderValidationError, match="wash-sale guard"):
+        execution_service.validate_order(
+            symbol="SPY",
+            side="buy",
+            order_type="limit",
+            quantity=1,
+            price=100.0,
+        )
+
+    governance_state = ETFInvestingGovernanceService(storage_service).load_state()
+    wash_locks = governance_state.get("wash_sale_locks", {})
+    assert "SPY" in wash_locks

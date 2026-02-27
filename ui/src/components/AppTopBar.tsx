@@ -1,8 +1,10 @@
 import { useEffect, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
-import { getSystemHealthSnapshot, getStrategies, getTradingPreferences } from '../api/backend';
+import { getConfig, getPortfolioSummary, getSystemHealthSnapshot, getStrategies, getTradingPreferences } from '../api/backend';
 import { RunnerStatus, StrategyStatus } from '../api/types';
 import { formatDateTime, formatTime, getLocalTimeZoneLabel } from '../utils/datetime';
+import StatusPill from './StatusPill';
+import WhyButton from './WhyButton';
 
 function AppTopBar() {
   const location = useLocation();
@@ -16,8 +18,19 @@ function AppTopBar() {
   const [killSwitchActive, setKillSwitchActive] = useState(false);
   const [sleeping, setSleeping] = useState(false);
   const [nextMarketOpenAt, setNextMarketOpenAt] = useState<string | null>(null);
+  const [modeLabel, setModeLabel] = useState<'PAPER' | 'LIVE'>('PAPER');
+  const [equity, setEquity] = useState<number | null>(null);
+  const [principalEstimate, setPrincipalEstimate] = useState<number | null>(null);
+  const [adjustedEquity, setAdjustedEquity] = useState<number | null>(null);
+  const [alphaXirrPct, setAlphaXirrPct] = useState<number | null>(null);
   const [query, setQuery] = useState('');
   const [timezoneLabel] = useState(getLocalTimeZoneLabel());
+  const usdFormatter = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' });
+
+  const formatCurrency = (value: number | null): string => {
+    if (value == null || !Number.isFinite(value)) return 'n/a';
+    return usdFormatter.format(value);
+  };
 
   const formatNextOpen = (value: string | null): string => {
     if (!value) return '';
@@ -27,28 +40,25 @@ function AppTopBar() {
 
   const sync = async () => {
     try {
-      const [strategiesRes, prefs, runnerRes] = await Promise.all([
+      const [strategiesRes, prefs, runnerRes, configRes] = await Promise.all([
         getStrategies(),
         getTradingPreferences(),
         getSystemHealthSnapshot(),
+        getConfig().catch(() => null),
       ]);
+      const summaryRes = await getPortfolioSummary().catch(() => null);
 
       const active = strategiesRes.strategies.filter((s) => s.status === StrategyStatus.ACTIVE);
       setStrategyLabel(active.length ? active.map((s) => s.name).join(', ') : 'No active strategy');
 
-      if (prefs.asset_type === 'stock') {
-        setUniverseLabel(prefs.screener_mode === 'most_active' ? `Stocks | Most Active (${prefs.screener_limit})` : `Stocks | ${prefs.stock_preset}`);
-      } else if (prefs.asset_type === 'etf') {
-        setUniverseLabel(`ETFs | ${prefs.etf_preset}`);
-      } else {
-        setUniverseLabel(prefs.screener_mode === 'most_active' ? `Stocks | Most Active (${prefs.screener_limit})` : `Stocks | ${prefs.stock_preset}`);
-      }
+      setUniverseLabel(`ETFs | ${prefs.etf_preset} (${prefs.screener_limit})`);
 
       setRunnerLabel(runnerRes.runner_status);
       setCriticalCount(runnerRes.critical_event_count);
       setKillSwitchActive(Boolean(runnerRes.kill_switch_active));
       setSleeping(Boolean(runnerRes.sleeping || runnerRes.runner_status === RunnerStatus.SLEEPING));
       setNextMarketOpenAt(runnerRes.next_market_open_at || null);
+      setModeLabel(configRes?.paper_trading === false ? 'LIVE' : 'PAPER');
       setLastBrokerSync(
         runnerRes.last_broker_sync_at
           ? formatTime(runnerRes.last_broker_sync_at)
@@ -56,6 +66,20 @@ function AppTopBar() {
           ? formatTime(runnerRes.last_successful_poll_at)
           : ''
       );
+      if (summaryRes) {
+        const summaryEquity = Number(summaryRes.equity);
+        const totalPnl = Number(summaryRes.total_pnl);
+        const principal = Number.isFinite(summaryEquity) && Number.isFinite(totalPnl) ? (summaryEquity - totalPnl) : Number.NaN;
+        setEquity(Number.isFinite(summaryEquity) ? summaryEquity : null);
+        setPrincipalEstimate(Number.isFinite(principal) ? principal : null);
+        setAdjustedEquity(Number.isFinite(totalPnl) ? totalPnl : null);
+        setAlphaXirrPct(Number.isFinite(Number(summaryRes.edge_xirr_pct)) ? Number(summaryRes.edge_xirr_pct) : null);
+      } else {
+        setEquity(null);
+        setPrincipalEstimate(null);
+        setAdjustedEquity(null);
+        setAlphaXirrPct(null);
+      }
       setLastSync(formatTime(new Date()));
     } catch {
       setRunnerLabel('error');
@@ -102,6 +126,17 @@ function AppTopBar() {
 
   const runnerColor =
     runnerLabel === RunnerStatus.RUNNING ? 'text-green-300' : runnerLabel === RunnerStatus.ERROR ? 'text-red-300' : 'text-yellow-200';
+  const botStateLabel = killSwitchActive
+    ? 'KILL SWITCHED'
+    : runnerLabel === RunnerStatus.RUNNING
+    ? 'ON'
+    : 'PAUSED';
+  const botStateTone = killSwitchActive
+    ? 'fail'
+    : runnerLabel === RunnerStatus.RUNNING
+    ? 'pass'
+    : 'warn';
+  const modeTone = modeLabel === 'LIVE' ? 'fail' : 'info';
 
   const handleQuickSearch = () => {
     const q = query.trim().toLowerCase();
@@ -118,9 +153,17 @@ function AppTopBar() {
   return (
     <div className="sticky top-0 z-30 border-b border-gray-800 bg-gray-950/95 backdrop-blur">
       <div className="px-5 py-3 flex flex-wrap items-center gap-3">
+        <StatusPill label={modeLabel} tone={modeTone} />
+        <StatusPill label={botStateLabel} tone={botStateTone as 'pass' | 'warn' | 'fail'} />
         <div className="text-xs text-gray-200 bg-gray-800 rounded px-2 py-1">Strategy: <span className="font-semibold">{strategyLabel}</span></div>
         <div className="text-xs text-gray-200 bg-gray-800 rounded px-2 py-1">Universe: <span className="font-semibold">{universeLabel}</span></div>
         <div className="text-xs bg-gray-800 rounded px-2 py-1">Runner: <span className={`font-semibold ${runnerColor}`}>{runnerLabel.toUpperCase()}</span></div>
+        <div className="text-xs bg-gray-800 rounded px-2 py-1">Equity: <span className="font-semibold">{formatCurrency(equity)}</span></div>
+        <div className="text-xs bg-gray-800 rounded px-2 py-1">Contributions (est): <span className="font-semibold">{formatCurrency(principalEstimate)}</span></div>
+        <div className="text-xs bg-gray-800 rounded px-2 py-1">Adjusted Equity: <span className="font-semibold">{formatCurrency(adjustedEquity)}</span></div>
+        <div className="text-xs bg-gray-800 rounded px-2 py-1">
+          Alpha: <span className={`font-semibold ${(alphaXirrPct ?? 0) >= 0 ? 'text-emerald-300' : 'text-rose-300'}`}>{alphaXirrPct == null ? 'n/a' : `${alphaXirrPct.toFixed(2)}%`}</span>
+        </div>
         <div className="text-xs bg-gray-800 rounded px-2 py-1">Broker Sync: <span className="font-semibold">{lastBrokerSync || '-'}</span></div>
         <div className="text-xs bg-gray-800 rounded px-2 py-1">TZ: <span className="font-semibold">{timezoneLabel}</span></div>
         {killSwitchActive && <div className="text-xs bg-red-900/70 text-red-200 rounded px-2 py-1 font-semibold">KILL SWITCH ACTIVE</div>}
@@ -144,6 +187,7 @@ function AppTopBar() {
             Alerts
             {criticalCount > 0 && <span className="ml-1 rounded bg-red-600 px-1.5 text-xs text-white">{criticalCount}</span>}
           </button>
+          <WhyButton compact onClick={() => navigate('/strategy')} />
           <span className="text-xs text-gray-400">Sync: {lastSync || '...'}</span>
         </div>
       </div>

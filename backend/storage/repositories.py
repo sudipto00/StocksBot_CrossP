@@ -508,10 +508,15 @@ class PortfolioSnapshotRepository:
         unrealized_pnl: float,
         realized_pnl_total: float,
         open_positions: int,
+        mode: str = "paper",
         timestamp: Optional[datetime] = None,
     ) -> PortfolioSnapshot:
+        snapshot_mode = str(mode or "paper").strip().lower()
+        if snapshot_mode not in {"paper", "live"}:
+            snapshot_mode = "paper"
         snapshot = PortfolioSnapshot(
             timestamp=_to_db_datetime(timestamp) if timestamp is not None else datetime.now(timezone.utc).replace(tzinfo=None),
+            mode=snapshot_mode,
             equity=equity,
             cash=cash,
             buying_power=buying_power,
@@ -525,24 +530,25 @@ class PortfolioSnapshotRepository:
         self.db.refresh(snapshot)
         return snapshot
 
-    def get_recent(self, limit: int = 5000) -> List[PortfolioSnapshot]:
+    def get_recent(self, limit: int = 5000, mode: Optional[str] = None) -> List[PortfolioSnapshot]:
         """Get most recent snapshots in ascending time order."""
-        rows = (
-            self.db.query(PortfolioSnapshot)
-            .order_by(PortfolioSnapshot.timestamp.desc())
-            .limit(limit)
-            .all()
-        )
+        query = self.db.query(PortfolioSnapshot)
+        if mode is not None:
+            snapshot_mode = str(mode or "").strip().lower()
+            if snapshot_mode in {"paper", "live"}:
+                query = query.filter(PortfolioSnapshot.mode == snapshot_mode)
+        rows = query.order_by(PortfolioSnapshot.timestamp.desc()).limit(limit).all()
         rows.reverse()
         return rows
 
-    def get_latest(self) -> Optional[PortfolioSnapshot]:
+    def get_latest(self, mode: Optional[str] = None) -> Optional[PortfolioSnapshot]:
         """Get latest snapshot row."""
-        return (
-            self.db.query(PortfolioSnapshot)
-            .order_by(PortfolioSnapshot.timestamp.desc())
-            .first()
-        )
+        query = self.db.query(PortfolioSnapshot)
+        if mode is not None:
+            snapshot_mode = str(mode or "").strip().lower()
+            if snapshot_mode in {"paper", "live"}:
+                query = query.filter(PortfolioSnapshot.mode == snapshot_mode)
+        return query.order_by(PortfolioSnapshot.timestamp.desc()).first()
 
 
 class OptimizationRunRepository:

@@ -8,6 +8,19 @@ from enum import Enum
 import re
 from pydantic import BaseModel, Field, field_validator, model_validator
 from config.paths import default_log_directory, default_audit_export_directory
+from config.investing_defaults import (
+    ETF_INVESTING_MODE_ENABLED_DEFAULT,
+    ETF_INVESTING_AUTO_ENABLED_DEFAULT,
+    ETF_INVESTING_CORE_DCA_PCT_DEFAULT,
+    ETF_INVESTING_ACTIVE_SLEEVE_PCT_DEFAULT,
+    ETF_INVESTING_MAX_TRADES_PER_DAY_DEFAULT,
+    ETF_INVESTING_MAX_CONCURRENT_POSITIONS_DEFAULT,
+    ETF_INVESTING_MAX_SYMBOL_EXPOSURE_PCT_DEFAULT,
+    ETF_INVESTING_MAX_TOTAL_EXPOSURE_PCT_DEFAULT,
+    ETF_INVESTING_SINGLE_POSITION_EQUITY_THRESHOLD_DEFAULT,
+    ETF_INVESTING_DAILY_LOSS_LIMIT_PCT_DEFAULT,
+    ETF_INVESTING_WEEKLY_LOSS_LIMIT_PCT_DEFAULT,
+)
 
 
 # ============================================================================
@@ -59,9 +72,93 @@ class ConfigResponse(BaseModel):
     """Configuration response."""
     environment: str = Field(default="development", description="Environment name")
     trading_enabled: bool = Field(default=False, description="Whether trading is enabled")
+    read_only_mode: bool = Field(
+        default=True,
+        description="Explicit read-only mode flag (true when trading is disabled)",
+    )
     paper_trading: bool = Field(default=True, description="Whether in paper trading mode")
+    mode_switch_cooldown_seconds: int = Field(
+        default=60,
+        description="Minimum cooldown between paper/live mode switches",
+    )
+    last_mode_switch_at: Optional[str] = Field(
+        default=None,
+        description="ISO timestamp of the most recent paper/live mode switch",
+    )
+    mode_switch_available_at: Optional[str] = Field(
+        default=None,
+        description="ISO timestamp when the next mode switch is allowed",
+    )
     max_position_size: float = Field(default=10000.0, description="Maximum position size")
     risk_limit_daily: float = Field(default=500.0, description="Daily risk limit")
+    micro_mode_enabled: bool = Field(
+        default=False,
+        description="Manually force-enable micro-strategy execution guardrails",
+    )
+    micro_mode_auto_enabled: bool = Field(
+        default=True,
+        description="Automatically enable micro-strategy guardrails when account size is below threshold",
+    )
+    micro_mode_equity_threshold: float = Field(
+        default=2500.0,
+        description="Account equity/buying-power threshold for auto micro guardrails",
+    )
+    micro_mode_single_trade_loss_pct: float = Field(
+        default=1.5,
+        description="Max allowed projected single-trade loss as percent of equity in micro mode",
+    )
+    micro_mode_cash_reserve_pct: float = Field(
+        default=5.0,
+        description="Minimum equity reserve percent to keep unallocated in micro mode",
+    )
+    micro_mode_max_spread_bps: float = Field(
+        default=40.0,
+        description="Maximum allowed bid/ask spread in bps in micro mode",
+    )
+    etf_investing_mode_enabled: bool = Field(
+        default=ETF_INVESTING_MODE_ENABLED_DEFAULT,
+        description="Enable ETF-first investing guardrails for low-frequency swing/DCA workflows",
+    )
+    etf_investing_auto_enabled: bool = Field(
+        default=ETF_INVESTING_AUTO_ENABLED_DEFAULT,
+        description="Auto-enable ETF investing guardrails when workspace asset type is ETF",
+    )
+    etf_investing_core_dca_pct: float = Field(
+        default=ETF_INVESTING_CORE_DCA_PCT_DEFAULT,
+        description="Percent of new recurring capital allocated to core DCA sleeve",
+    )
+    etf_investing_active_sleeve_pct: float = Field(
+        default=ETF_INVESTING_ACTIVE_SLEEVE_PCT_DEFAULT,
+        description="Percent of new recurring capital allocated to active sleeve",
+    )
+    etf_investing_max_trades_per_day: int = Field(
+        default=ETF_INVESTING_MAX_TRADES_PER_DAY_DEFAULT,
+        description="Maximum entry orders allowed per calendar day when ETF investing policy is active",
+    )
+    etf_investing_max_concurrent_positions: int = Field(
+        default=ETF_INVESTING_MAX_CONCURRENT_POSITIONS_DEFAULT,
+        description="Maximum concurrent open positions when ETF investing policy is active",
+    )
+    etf_investing_max_symbol_exposure_pct: float = Field(
+        default=ETF_INVESTING_MAX_SYMBOL_EXPOSURE_PCT_DEFAULT,
+        description="Maximum per-symbol market-value exposure as percent of equity",
+    )
+    etf_investing_max_total_exposure_pct: float = Field(
+        default=ETF_INVESTING_MAX_TOTAL_EXPOSURE_PCT_DEFAULT,
+        description="Maximum total long exposure as percent of equity",
+    )
+    etf_investing_single_position_equity_threshold: float = Field(
+        default=ETF_INVESTING_SINGLE_POSITION_EQUITY_THRESHOLD_DEFAULT,
+        description="Until equity reaches this level, restrict to a single open position",
+    )
+    etf_investing_daily_loss_limit_pct: float = Field(
+        default=ETF_INVESTING_DAILY_LOSS_LIMIT_PCT_DEFAULT,
+        description="Daily loss cap as percent of equity while ETF investing policy is active",
+    )
+    etf_investing_weekly_loss_limit_pct: float = Field(
+        default=ETF_INVESTING_WEEKLY_LOSS_LIMIT_PCT_DEFAULT,
+        description="Weekly loss cap as percent of equity while ETF investing policy is active",
+    )
     tick_interval_seconds: float = Field(default=60.0, description="Strategy runner polling interval in seconds")
     streaming_enabled: bool = Field(default=False, description="Enable websocket trade-update streaming when broker supports it")
     strict_alpaca_data: bool = Field(
@@ -209,8 +306,106 @@ class ConfigUpdateRequest(BaseModel):
     """Configuration update request."""
     trading_enabled: Optional[bool] = Field(None, description="Enable/disable trading")
     paper_trading: Optional[bool] = Field(None, description="Enable/disable paper trading")
+    mode_switch_confirm: Optional[bool] = Field(
+        None,
+        description="Required true when changing paper/live mode",
+    )
     max_position_size: Optional[float] = Field(None, description="Maximum position size", gt=0)
     risk_limit_daily: Optional[float] = Field(None, description="Daily risk limit", gt=0)
+    micro_mode_enabled: Optional[bool] = Field(
+        None,
+        description="Manually force-enable micro-strategy execution guardrails",
+    )
+    micro_mode_auto_enabled: Optional[bool] = Field(
+        None,
+        description="Automatically enable micro-strategy guardrails for small accounts",
+    )
+    micro_mode_equity_threshold: Optional[float] = Field(
+        None,
+        description="Account equity/buying-power threshold for auto micro guardrails",
+        ge=100,
+        le=1_000_000,
+    )
+    micro_mode_single_trade_loss_pct: Optional[float] = Field(
+        None,
+        description="Max projected single-trade loss pct of equity in micro mode",
+        ge=0.1,
+        le=10.0,
+    )
+    micro_mode_cash_reserve_pct: Optional[float] = Field(
+        None,
+        description="Required unallocated equity reserve pct in micro mode",
+        ge=0.0,
+        le=50.0,
+    )
+    micro_mode_max_spread_bps: Optional[float] = Field(
+        None,
+        description="Maximum spread in bps allowed for entries in micro mode",
+        ge=1.0,
+        le=300.0,
+    )
+    etf_investing_mode_enabled: Optional[bool] = Field(
+        None,
+        description="Enable ETF-first investing guardrails",
+    )
+    etf_investing_auto_enabled: Optional[bool] = Field(
+        None,
+        description="Auto-enable ETF investing guardrails when workspace asset type is ETF",
+    )
+    etf_investing_core_dca_pct: Optional[float] = Field(
+        None,
+        description="Percent of new recurring capital allocated to core DCA sleeve",
+        ge=50.0,
+        le=95.0,
+    )
+    etf_investing_active_sleeve_pct: Optional[float] = Field(
+        None,
+        description="Percent of new recurring capital allocated to active sleeve",
+        ge=5.0,
+        le=50.0,
+    )
+    etf_investing_max_trades_per_day: Optional[int] = Field(
+        None,
+        description="Maximum entry orders allowed per calendar day when ETF investing policy is active",
+        ge=1,
+        le=20,
+    )
+    etf_investing_max_concurrent_positions: Optional[int] = Field(
+        None,
+        description="Maximum concurrent open positions when ETF investing policy is active",
+        ge=1,
+        le=50,
+    )
+    etf_investing_max_symbol_exposure_pct: Optional[float] = Field(
+        None,
+        description="Maximum per-symbol market-value exposure as percent of equity",
+        ge=2.0,
+        le=50.0,
+    )
+    etf_investing_max_total_exposure_pct: Optional[float] = Field(
+        None,
+        description="Maximum total long exposure as percent of equity",
+        ge=10.0,
+        le=100.0,
+    )
+    etf_investing_single_position_equity_threshold: Optional[float] = Field(
+        None,
+        description="Until equity reaches this level, restrict to a single open position",
+        ge=100.0,
+        le=1_000_000.0,
+    )
+    etf_investing_daily_loss_limit_pct: Optional[float] = Field(
+        None,
+        description="Daily loss cap as percent of equity while ETF investing policy is active",
+        ge=0.2,
+        le=10.0,
+    )
+    etf_investing_weekly_loss_limit_pct: Optional[float] = Field(
+        None,
+        description="Weekly loss cap as percent of equity while ETF investing policy is active",
+        ge=0.5,
+        le=20.0,
+    )
     tick_interval_seconds: Optional[float] = Field(None, description="Runner polling interval in seconds", gt=0)
     streaming_enabled: Optional[bool] = Field(None, description="Enable websocket trade-update streaming")
     strict_alpaca_data: Optional[bool] = Field(
@@ -520,7 +715,6 @@ class RunnerStartRequest(BaseModel):
         description="Optional ETF preset override for workspace runner universe.",
     )
     screener_limit: Optional[int] = Field(default=None, ge=10, le=200, description="Universe size cap for workspace-backed runner starts.")
-    seed_only: Optional[bool] = Field(default=None, description="Compatibility flag for preset universe mode.")
     preset_universe_mode: Optional[Literal["seed_only", "seed_guardrail_blend", "guardrail_only"]] = Field(
         default=None,
         description="Preset universe mode when screener_mode=preset.",
@@ -599,6 +793,22 @@ class StrategyConfigResponse(BaseModel):
     )
     symbols: List[str] = Field(default_factory=list, description="Trading symbols")
     parameters: List[StrategyParameter] = Field(default_factory=list, description="Strategy parameters")
+    baseline_parameters: Dict[str, float] = Field(
+        default_factory=dict,
+        description="Immutable strategy baseline parameters captured at creation",
+    )
+    baseline_profile: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Baseline profile metadata (asset_type/preset snapshot)",
+    )
+    micro_calibration: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Latest persisted micro-calibration metadata and adjusted fields",
+    )
+    parameters_overridden: bool = Field(
+        default=False,
+        description="Whether saved strategy parameters diverge from baseline snapshot",
+    )
     enabled: bool = Field(default=True, description="Whether strategy is enabled")
     config_version: int = Field(default=1, ge=1, description="Monotonic strategy configuration version")
 
@@ -643,6 +853,34 @@ class BacktestRequest(BaseModel):
         default="none",
         description="Recurring contribution frequency applied during backtest.",
     )
+    micro_strategy_mode: Literal["off", "auto", "on"] = Field(
+        default="auto",
+        description="Micro-strategy workflow mode: off, auto by capital profile, or always on",
+    )
+    micro_equity_threshold: Optional[float] = Field(
+        default=None,
+        ge=100,
+        le=1_000_000,
+        description="Optional override threshold for auto micro-strategy mode",
+    )
+    micro_single_trade_loss_pct: Optional[float] = Field(
+        default=None,
+        ge=0.1,
+        le=10.0,
+        description="Optional override for max projected single-trade loss pct in micro mode",
+    )
+    micro_cash_reserve_pct: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=50.0,
+        description="Optional override for required unallocated cash/equity reserve pct in micro mode",
+    )
+    micro_max_spread_bps: Optional[float] = Field(
+        default=None,
+        ge=1.0,
+        le=300.0,
+        description="Optional override for spread guardrail in micro mode",
+    )
     symbols: Optional[List[str]] = Field(None, description="Symbols to backtest")
     parameters: Optional[Dict[str, float]] = Field(None, description="Strategy parameters")
     # Live-equivalence controls (optional for backward compatibility).
@@ -671,7 +909,6 @@ class BacktestRequest(BaseModel):
         description="Optional ETF preset override for workspace universe backtests.",
     )
     screener_limit: Optional[int] = Field(default=None, ge=10, le=200, description="Universe size cap for workspace-backed runs.")
-    seed_only: Optional[bool] = Field(default=None, description="Compatibility flag for preset universe mode.")
     preset_universe_mode: Optional[Literal["seed_only", "seed_guardrail_blend", "guardrail_only"]] = Field(
         default=None,
         description="Preset universe mode when screener_mode=preset.",
@@ -770,6 +1007,34 @@ class StrategyOptimizationRequest(BaseModel):
         default="none",
         description="Recurring contribution frequency applied during optimization backtests.",
     )
+    micro_strategy_mode: Literal["off", "auto", "on"] = Field(
+        default="auto",
+        description="Micro-strategy workflow mode: off, auto by capital profile, or always on",
+    )
+    micro_equity_threshold: Optional[float] = Field(
+        default=None,
+        ge=100,
+        le=1_000_000,
+        description="Optional override threshold for auto micro-strategy mode",
+    )
+    micro_single_trade_loss_pct: Optional[float] = Field(
+        default=None,
+        ge=0.1,
+        le=10.0,
+        description="Optional override for max projected single-trade loss pct in micro mode",
+    )
+    micro_cash_reserve_pct: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=50.0,
+        description="Optional override for required unallocated cash/equity reserve pct in micro mode",
+    )
+    micro_max_spread_bps: Optional[float] = Field(
+        default=None,
+        ge=1.0,
+        le=300.0,
+        description="Optional override for spread guardrail in micro mode",
+    )
     symbols: Optional[List[str]] = Field(None, description="Optional explicit symbol universe")
     parameters: Optional[Dict[str, float]] = Field(None, description="Optional base parameter overrides")
     emulate_live_trading: bool = Field(
@@ -797,7 +1062,6 @@ class StrategyOptimizationRequest(BaseModel):
         description="Optional ETF preset override for workspace-backed optimization",
     )
     screener_limit: Optional[int] = Field(default=None, ge=10, le=200, description="Universe size cap.")
-    seed_only: Optional[bool] = Field(default=None, description="Compatibility flag for preset universe mode.")
     preset_universe_mode: Optional[Literal["seed_only", "seed_guardrail_blend", "guardrail_only"]] = Field(
         default=None,
         description="Preset universe mode when screener_mode=preset.",
@@ -843,10 +1107,10 @@ class StrategyOptimizationRequest(BaseModel):
         description="Optional deterministic seed for execution simulation randomness",
     )
     iterations: int = Field(default=36, ge=8, le=240, description="Number of optimization candidates to evaluate")
-    min_trades: int = Field(default=12, ge=0, le=1000, description="Minimum desired trade count for scoring penalty")
-    objective: Literal["balanced", "sharpe", "return"] = Field(
-        default="balanced",
-        description="Optimization objective: balanced risk-adjusted, Sharpe-priority, or return-priority",
+    min_trades: int = Field(default=50, ge=0, le=1000, description="Minimum desired trade count for scoring penalty")
+    objective: Literal["balanced", "sharpe", "return", "micro", "investing", "scenario2"] = Field(
+        default="scenario2",
+        description="Optimization objective: balanced, Sharpe-priority, return-priority, micro-profile, ETF-investing profile, or Scenario-2 system profile",
     )
     strict_min_trades: bool = Field(
         default=False,
@@ -949,6 +1213,10 @@ class StrategyOptimizationResponse(BaseModel):
     recommended_symbols: List[str] = Field(default_factory=list, description="Recommended symbol universe")
     top_candidates: List[StrategyOptimizationCandidate] = Field(default_factory=list, description="Top candidate summaries")
     best_result: BacktestResponse = Field(..., description="Backtest result for recommended configuration")
+    baseline_result: Optional[BacktestResponse] = Field(
+        default=None,
+        description="Baseline backtest result before optimizer adjustments (same window + symbols)",
+    )
     confidence: Dict[str, Any] = Field(
         default_factory=dict,
         description="Composite confidence summary for transferring optimizer output to live execution",
@@ -1160,7 +1428,6 @@ class TradingPreferencesRequest(BaseModel):
     asset_type: Optional[AssetType] = Field(None, description="Preferred asset type")
     risk_profile: Optional[RiskProfile] = Field(None, description="Risk profile")
     weekly_budget: Optional[float] = Field(None, description="Weekly budget", gt=0)
-    screener_limit: Optional[int] = Field(None, description="Screener result limit", ge=10, le=200)
     stock_most_active_limit: Optional[int] = Field(
         None,
         description="Stock most-active universe limit",
@@ -1196,6 +1463,69 @@ class TradingPreferencesResponse(BaseModel):
     screener_mode: ScreenerMode = Field(..., description="Screener mode")
     stock_preset: StockPreset = Field(..., description="Stock strategy preset")
     etf_preset: EtfPreset = Field(..., description="ETF strategy preset")
+
+
+class EtfAllowListItem(BaseModel):
+    """ETF universe allow-list entry."""
+    symbol: str = Field(..., min_length=1, max_length=12)
+    role: Literal["dca", "active", "both"] = Field(default="both")
+    max_weight_pct: float = Field(default=10.0, ge=1.0, le=100.0)
+    min_trade_size: float = Field(default=1.0, ge=1.0, le=100_000.0)
+    enabled: bool = Field(default=True)
+
+    @field_validator("symbol")
+    @classmethod
+    def normalize_symbol(cls, value: str) -> str:
+        symbol = str(value or "").strip().upper()
+        if not re.match(r"^[A-Z][A-Z0-9.\-]{0,11}$", symbol):
+            raise ValueError("Invalid symbol format")
+        return symbol
+
+
+class EtfInvestingPolicyResponse(BaseModel):
+    """ETF investing universe governance policy."""
+    enabled: bool = True
+    dynamic_candidates_enabled: bool = True
+    screen_interval_days: int = Field(default=30, ge=7, le=180)
+    replacement_interval_days: int = Field(default=90, ge=30, le=365)
+    max_replacements_per_quarter: int = Field(default=1, ge=0, le=5)
+    min_hold_days_for_replacement: int = Field(default=180, ge=30, le=730)
+    min_replacement_score_delta_pct: float = Field(default=20.0, ge=0.0, le=200.0)
+    min_dollar_volume: float = Field(default=50_000_000.0, ge=1_000_000.0, le=1_000_000_000.0)
+    min_history_days_preferred: int = Field(default=252 * 3, ge=60, le=2500)
+    rebalance_drift_threshold_pct: float = Field(default=5.0, ge=1.0, le=25.0)
+    buy_only_rebalance: bool = True
+    tlh_enabled: bool = False
+    tlh_min_loss_dollars: float = Field(default=250.0, ge=50.0, le=50_000.0)
+    tlh_min_loss_pct: float = Field(default=5.0, ge=1.0, le=50.0)
+    tlh_min_hold_days: int = Field(default=30, ge=7, le=365)
+    allow_list: List[EtfAllowListItem] = Field(default_factory=list)
+
+
+class EtfInvestingPolicyUpdateRequest(BaseModel):
+    """Partial ETF investing policy update request."""
+    enabled: Optional[bool] = None
+    dynamic_candidates_enabled: Optional[bool] = None
+    screen_interval_days: Optional[int] = Field(default=None, ge=7, le=180)
+    replacement_interval_days: Optional[int] = Field(default=None, ge=30, le=365)
+    max_replacements_per_quarter: Optional[int] = Field(default=None, ge=0, le=5)
+    min_hold_days_for_replacement: Optional[int] = Field(default=None, ge=30, le=730)
+    min_replacement_score_delta_pct: Optional[float] = Field(default=None, ge=0.0, le=200.0)
+    min_dollar_volume: Optional[float] = Field(default=None, ge=1_000_000.0, le=1_000_000_000.0)
+    min_history_days_preferred: Optional[int] = Field(default=None, ge=60, le=2500)
+    rebalance_drift_threshold_pct: Optional[float] = Field(default=None, ge=1.0, le=25.0)
+    buy_only_rebalance: Optional[bool] = None
+    tlh_enabled: Optional[bool] = None
+    tlh_min_loss_dollars: Optional[float] = Field(default=None, ge=50.0, le=50_000.0)
+    tlh_min_loss_pct: Optional[float] = Field(default=None, ge=1.0, le=50.0)
+    tlh_min_hold_days: Optional[int] = Field(default=None, ge=7, le=365)
+    allow_list: Optional[List[EtfAllowListItem]] = None
+
+
+class EtfInvestingPolicySummaryResponse(BaseModel):
+    """Current ETF governance policy plus runtime state report."""
+    policy: EtfInvestingPolicyResponse
+    state: Dict[str, Any] = Field(default_factory=dict)
 
 
 # ============================================================================

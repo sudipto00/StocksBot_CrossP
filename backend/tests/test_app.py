@@ -69,6 +69,8 @@ def test_get_config():
     assert "environment" in data
     assert "trading_enabled" in data
     assert "paper_trading" in data
+    assert "read_only_mode" in data
+    assert "mode_switch_cooldown_seconds" in data
     assert "max_position_size" in data
     assert "risk_limit_daily" in data
     assert "broker" in data
@@ -110,6 +112,120 @@ def test_update_config_smtp_fields():
     assert data["smtp_use_tls"] is True
     assert data["smtp_use_ssl"] is False
     assert data["smtp_timeout_seconds"] == 20
+
+
+def test_mode_switch_requires_explicit_confirmation():
+    """Paper/live mode switch must require mode_switch_confirm=true."""
+    response = client.post("/config", json={"paper_trading": False})
+    assert response.status_code == 400
+    assert "mode_switch_confirm" in response.json().get("detail", "")
+
+
+def test_mode_switch_applies_cooldown():
+    """Back-to-back mode switches should be blocked by cooldown timer."""
+    first = client.post("/config", json={"paper_trading": False, "mode_switch_confirm": True})
+    assert first.status_code == 200
+    payload = first.json()
+    assert payload["paper_trading"] is False
+    assert payload["trading_enabled"] is False
+    assert payload.get("last_mode_switch_at")
+    assert payload.get("mode_switch_available_at")
+
+    second = client.post("/config", json={"paper_trading": True, "mode_switch_confirm": True})
+    assert second.status_code == 409
+    assert "cooldown" in str(second.json().get("detail", "")).lower()
+
+
+def test_get_etf_investing_policy_default():
+    """ETF investing governance policy should be available with defaults."""
+    response = client.get("/etf-investing/policy")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["enabled"] is True
+    assert payload["screen_interval_days"] >= 7
+    assert payload["replacement_interval_days"] >= 30
+    assert isinstance(payload["allow_list"], list)
+    assert len(payload["allow_list"]) > 0
+
+
+def test_update_etf_investing_policy_persists():
+    """Policy update endpoint should persist allow-list and thresholds."""
+    update = {
+        "min_dollar_volume": 60000000,
+        "max_replacements_per_quarter": 1,
+        "allow_list": [
+            {"symbol": "SPY", "role": "both", "max_weight_pct": 60, "min_trade_size": 1, "enabled": True},
+            {"symbol": "QQQ", "role": "both", "max_weight_pct": 40, "min_trade_size": 1, "enabled": True},
+        ],
+    }
+    put_response = client.put("/etf-investing/policy", json=update)
+    assert put_response.status_code == 200
+    updated = put_response.json()
+    assert updated["min_dollar_volume"] == 60000000
+    assert len(updated["allow_list"]) == 2
+
+    summary = client.get("/etf-investing/policy/summary")
+    assert summary.status_code == 200
+    summary_payload = summary.json()
+    assert "policy" in summary_payload
+    assert "state" in summary_payload
+    assert summary_payload["policy"]["min_dollar_volume"] == 60000000
+    assert isinstance(summary_payload["state"].get("wash_sale_locks"), dict)
+
+
+def test_dashboard_analytics_bundle_loads():
+    """Dashboard analytics bundle should return without server errors."""
+    response = client.get("/analytics/dashboard")
+    assert response.status_code == 200
+    payload = response.json()
+    assert "analytics" in payload
+    assert "summary" in payload
+    assert "broker_account" in payload
+
+
+def test_portfolio_summary_exposes_scenario2_thresholds(monkeypatch):
+    """Portfolio summary should surface Scenario-2 threshold config for UI verdict logic."""
+    monkeypatch.setenv("STOCKSBOT_SCENARIO2_ALPHA_MIN_PCT", "3.5")
+    monkeypatch.setenv("STOCKSBOT_SCENARIO2_MAX_DRAWDOWN_PCT", "22")
+    monkeypatch.setenv("STOCKSBOT_SCENARIO2_MIN_TRADES", "70")
+    monkeypatch.setenv("STOCKSBOT_SCENARIO2_MIN_MONTHS", "20")
+    monkeypatch.setenv("STOCKSBOT_SCENARIO2_MAX_SELLS_PER_MONTH", "4.5")
+    monkeypatch.setenv("STOCKSBOT_SCENARIO2_MAX_SHORT_TERM_SELL_RATIO", "0.4")
+    with api_routes._portfolio_summary_cache_lock:
+        api_routes._portfolio_summary_cache.clear()
+    response = client.get("/analytics/summary")
+    assert response.status_code == 200
+    payload = response.json()
+    thresholds = payload.get("scenario2_thresholds") or {}
+    assert thresholds.get("alpha_min_pct") == 3.5
+    assert thresholds.get("max_drawdown_pct") == 22.0
+    assert thresholds.get("min_trades") == 70
+    assert thresholds.get("min_months") == 20.0
+    assert thresholds.get("max_sells_per_month") == 4.5
+    assert thresholds.get("max_short_term_sell_ratio") == 0.4
+
+
+def test_update_config_micro_policy_fields():
+    """Micro policy settings should persist through runtime config."""
+    response = client.post(
+        "/config",
+        json={
+            "micro_mode_enabled": True,
+            "micro_mode_auto_enabled": True,
+            "micro_mode_equity_threshold": 1800.0,
+            "micro_mode_single_trade_loss_pct": 1.2,
+            "micro_mode_cash_reserve_pct": 6.5,
+            "micro_mode_max_spread_bps": 32.0,
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["micro_mode_enabled"] is True
+    assert data["micro_mode_auto_enabled"] is True
+    assert data["micro_mode_equity_threshold"] == 1800.0
+    assert data["micro_mode_single_trade_loss_pct"] == 1.2
+    assert data["micro_mode_cash_reserve_pct"] == 6.5
+    assert data["micro_mode_max_spread_bps"] == 32.0
 
 
 def test_get_positions():
